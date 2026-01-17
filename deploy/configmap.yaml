@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tag-config
+  labels:
+    app: tag
+data:
+  config.yaml: |
+    server:
+      http_port: 8080
+      bind_ip: "0.0.0.0"
+
+    cache:
+      enabled: true
+      endpoints:
+        - "ocache-0.ocache-headless.default.svc.cluster.local:9000"
+        - "ocache-1.ocache-headless.default.svc.cluster.local:9000"
+        - "ocache-2.ocache-headless.default.svc.cluster.local:9000"
+      ttl: 60m
+      size_threshold: 1073741824  # 1GB - max object size to cache
+
+    log:
+      level: "info"

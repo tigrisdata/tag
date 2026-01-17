@@ -1,0 +1,367 @@
+package cache
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+func TestMetaFromHTTPHeaders(t *testing.T) {
+	// Use http.Header.Set() to ensure canonical header names are used.
+	headers := make(http.Header)
+	headers.Set("ETag", `"abc123"`)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Content-Length", "1024")
+	headers.Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
+	headers.Set("Cache-Control", "max-age=3600")
+	headers.Set("X-Amz-Meta-Custom", "custom-value")
+	headers.Set("X-Amz-Storage-Class", "STANDARD")
+
+	obj := MetaFromHTTPHeaders("test-bucket", "test-key", http.StatusOK, headers)
+
+	if obj.Bucket != "test-bucket" {
+		t.Errorf("Bucket = %q, want %q", obj.Bucket, "test-bucket")
+	}
+
+	if obj.Key != "test-key" {
+		t.Errorf("Key = %q, want %q", obj.Key, "test-key")
+	}
+
+	if obj.ETag != `"abc123"` {
+		t.Errorf("ETag = %q, want %q", obj.ETag, `"abc123"`)
+	}
+
+	if obj.ContentType != "application/json" {
+		t.Errorf("ContentType = %q, want %q", obj.ContentType, "application/json")
+	}
+
+	if obj.ContentLength != 1024 {
+		t.Errorf("ContentLength = %d, want %d", obj.ContentLength, 1024)
+	}
+
+	if obj.CacheControl != "max-age=3600" {
+		t.Errorf("CacheControl = %q, want %q", obj.CacheControl, "max-age=3600")
+	}
+
+	if obj.StorageClass != "STANDARD" {
+		t.Errorf("StorageClass = %q, want %q", obj.StorageClass, "STANDARD")
+	}
+
+	if obj.StatusCode != http.StatusOK {
+		t.Errorf("StatusCode = %d, want %d", obj.StatusCode, http.StatusOK)
+	}
+}
+
+func TestCachedObjectMeta_WriteHeaders(t *testing.T) {
+	// Use Unix timestamp for LastModified
+	lastModified := time.Date(2023, 1, 15, 10, 30, 0, 0, time.UTC).Unix()
+
+	obj := &CachedObjectMeta{
+		Key:           "test-key",
+		Bucket:        "test-bucket",
+		ETag:          `"abc123"`,
+		ContentType:   "application/json",
+		ContentLength: 1024,
+		LastModified:  lastModified,
+		CacheControl:  "max-age=3600",
+		StorageClass:  "STANDARD",
+		UserMetadata: map[string]string{
+			"X-Amz-Meta-Custom": "custom-value",
+		},
+		StatusCode: http.StatusOK,
+	}
+
+	w := httptest.NewRecorder()
+	obj.WriteHeaders(w)
+
+	if w.Header().Get("ETag") != `"abc123"` {
+		t.Errorf("ETag header = %q, want %q", w.Header().Get("ETag"), `"abc123"`)
+	}
+
+	if w.Header().Get("Content-Type") != "application/json" {
+		t.Errorf("Content-Type header = %q, want %q", w.Header().Get("Content-Type"), "application/json")
+	}
+
+	if w.Header().Get("Content-Length") != "1024" {
+		t.Errorf("Content-Length header = %q, want %q", w.Header().Get("Content-Length"), "1024")
+	}
+
+	if w.Header().Get("Cache-Control") != "max-age=3600" {
+		t.Errorf("Cache-Control header = %q, want %q", w.Header().Get("Cache-Control"), "max-age=3600")
+	}
+
+	if w.Header().Get("X-Amz-Meta-Custom") != "custom-value" {
+		t.Errorf("X-Amz-Meta-Custom header = %q, want %q", w.Header().Get("X-Amz-Meta-Custom"), "custom-value")
+	}
+}
+
+func TestCachedObjectMeta_IsCacheable(t *testing.T) {
+	tests := []struct {
+		name         string
+		cacheControl string
+		contentLen   int64
+		maxSize      int64
+		expected     bool
+	}{
+		{
+			name:         "cacheable object",
+			cacheControl: "max-age=3600",
+			contentLen:   1024,
+			maxSize:      1024 * 1024,
+			expected:     true,
+		},
+		{
+			name:         "no-store",
+			cacheControl: "no-store",
+			contentLen:   1024,
+			maxSize:      1024 * 1024,
+			expected:     false,
+		},
+		{
+			name:         "private",
+			cacheControl: "private",
+			contentLen:   1024,
+			maxSize:      1024 * 1024,
+			expected:     false,
+		},
+		{
+			name:         "too large",
+			cacheControl: "max-age=3600",
+			contentLen:   10 * 1024 * 1024,
+			maxSize:      1024 * 1024,
+			expected:     false,
+		},
+		{
+			name:         "no cache control",
+			cacheControl: "",
+			contentLen:   1024,
+			maxSize:      1024 * 1024,
+			expected:     true,
+		},
+		{
+			name:         "public cache control",
+			cacheControl: "public, max-age=3600",
+			contentLen:   1024,
+			maxSize:      1024 * 1024,
+			expected:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := &CachedObjectMeta{
+				CacheControl:  tt.cacheControl,
+				ContentLength: tt.contentLen,
+			}
+
+			result := obj.IsCacheable(tt.maxSize)
+			if result != tt.expected {
+				t.Errorf("IsCacheable(%d) = %v, want %v", tt.maxSize, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestMakeMetaKey(t *testing.T) {
+	expected := "meta|my-bucket|path/to/object.txt"
+	result := MakeMetaKey("my-bucket", "path/to/object.txt")
+	if result != expected {
+		t.Errorf("MakeMetaKey() = %q, want %q", result, expected)
+	}
+}
+
+func TestMakeBodyKey(t *testing.T) {
+	expected := "body|my-bucket|path/to/object.txt"
+	result := MakeBodyKey("my-bucket", "path/to/object.txt")
+	if result != expected {
+		t.Errorf("MakeBodyKey() = %q, want %q", result, expected)
+	}
+}
+
+func TestMetaFromHTTPHeaders_InvalidContentLength(t *testing.T) {
+	headers := http.Header{
+		"Content-Length": []string{"not-a-number"},
+	}
+
+	obj := MetaFromHTTPHeaders("bucket", "key", http.StatusOK, headers)
+
+	// Should default to 0 for invalid content length
+	if obj.ContentLength != 0 {
+		t.Errorf("ContentLength = %d, want 0 for invalid value", obj.ContentLength)
+	}
+}
+
+func TestMetaFromHTTPHeaders_InvalidLastModified(t *testing.T) {
+	headers := http.Header{
+		"Last-Modified": []string{"invalid-date"},
+	}
+
+	obj := MetaFromHTTPHeaders("bucket", "key", http.StatusOK, headers)
+
+	// Should default to 0 for invalid date (Unix timestamp)
+	if obj.LastModified != 0 {
+		t.Errorf("LastModified = %d, want 0 for invalid value", obj.LastModified)
+	}
+}
+
+func TestMetaFromHTTPHeaders_MultipleMetadataHeaders(t *testing.T) {
+	headers := http.Header{
+		"X-Amz-Meta-Key1": []string{"value1"},
+		"X-Amz-Meta-Key2": []string{"value2"},
+		"X-Amz-Meta-Key3": []string{"value3"},
+	}
+
+	obj := MetaFromHTTPHeaders("bucket", "key", http.StatusOK, headers)
+
+	if len(obj.UserMetadata) != 3 {
+		t.Errorf("UserMetadata count = %d, want 3", len(obj.UserMetadata))
+	}
+}
+
+func TestCachedObjectMeta_MatchesETag(t *testing.T) {
+	tests := []struct {
+		name     string
+		objETag  string
+		reqETag  string
+		expected bool
+	}{
+		{
+			name:     "exact match with quotes",
+			objETag:  `"abc123"`,
+			reqETag:  `"abc123"`,
+			expected: true,
+		},
+		{
+			name:     "match without quotes",
+			objETag:  `"abc123"`,
+			reqETag:  `abc123`,
+			expected: true,
+		},
+		{
+			name:     "wildcard",
+			objETag:  `"abc123"`,
+			reqETag:  `*`,
+			expected: true,
+		},
+		{
+			name:     "no match",
+			objETag:  `"abc123"`,
+			reqETag:  `"def456"`,
+			expected: false,
+		},
+		{
+			name:     "empty request etag",
+			objETag:  `"abc123"`,
+			reqETag:  ``,
+			expected: false,
+		},
+		{
+			name:     "empty object etag",
+			objETag:  ``,
+			reqETag:  `"abc123"`,
+			expected: false,
+		},
+		{
+			name:     "weak validator match",
+			objETag:  `"abc123"`,
+			reqETag:  `W/"abc123"`,
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := &CachedObjectMeta{ETag: tt.objETag}
+			result := obj.MatchesETag(tt.reqETag)
+			if result != tt.expected {
+				t.Errorf("MatchesETag(%q) = %v, want %v", tt.reqETag, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCachedObjectMeta_IsModifiedSince(t *testing.T) {
+	objTime := time.Date(2023, 6, 15, 10, 0, 0, 0, time.UTC)
+	obj := &CachedObjectMeta{LastModified: objTime.Unix()}
+
+	tests := []struct {
+		name     string
+		since    time.Time
+		expected bool
+	}{
+		{
+			name:     "modified after",
+			since:    time.Date(2023, 6, 15, 9, 0, 0, 0, time.UTC),
+			expected: true,
+		},
+		{
+			name:     "not modified before",
+			since:    time.Date(2023, 6, 15, 11, 0, 0, 0, time.UTC),
+			expected: false,
+		},
+		{
+			name:     "same time",
+			since:    objTime,
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := obj.IsModifiedSince(tt.since)
+			if result != tt.expected {
+				t.Errorf("IsModifiedSince(%v) = %v, want %v", tt.since, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCachedObjectMeta_EncodeDecodeMeta(t *testing.T) {
+	original := &CachedObjectMeta{
+		Key:           "test-key",
+		Bucket:        "test-bucket",
+		ETag:          `"abc123"`,
+		ContentType:   "application/json",
+		ContentLength: 1024,
+		LastModified:  time.Now().Unix(),
+		CacheControl:  "max-age=3600",
+		StorageClass:  "STANDARD",
+		UserMetadata: map[string]string{
+			"X-Amz-Meta-Custom": "value",
+		},
+		StatusCode: http.StatusOK,
+	}
+
+	// Encode
+	data, err := original.Encode()
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+
+	// Decode
+	decoded, err := DecodeMeta(data)
+	if err != nil {
+		t.Fatalf("DecodeMeta() error = %v", err)
+	}
+
+	// Compare
+	if decoded.Key != original.Key {
+		t.Errorf("Key = %q, want %q", decoded.Key, original.Key)
+	}
+	if decoded.Bucket != original.Bucket {
+		t.Errorf("Bucket = %q, want %q", decoded.Bucket, original.Bucket)
+	}
+	if decoded.ETag != original.ETag {
+		t.Errorf("ETag = %q, want %q", decoded.ETag, original.ETag)
+	}
+	if decoded.ContentType != original.ContentType {
+		t.Errorf("ContentType = %q, want %q", decoded.ContentType, original.ContentType)
+	}
+	if decoded.ContentLength != original.ContentLength {
+		t.Errorf("ContentLength = %d, want %d", decoded.ContentLength, original.ContentLength)
+	}
+	if decoded.StatusCode != original.StatusCode {
+		t.Errorf("StatusCode = %d, want %d", decoded.StatusCode, original.StatusCode)
+	}
+}
