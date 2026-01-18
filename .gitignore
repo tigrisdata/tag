@@ -3,4 +3,4 @@
 *.pb.gw.go
 
 # Go build artifacts
-**/tag
+
