@@ -57,9 +57,7 @@ jobs:
         run: make test-race
 
       - name: Run coverage tests
-        run: |
-          go test -coverprofile=coverage.out -timeout 120s ./...
-          go tool cover -html=coverage.out -o coverage.html
+        run: make test-coverage
 
       - name: Upload coverage reports
         uses: actions/upload-artifact@v4
