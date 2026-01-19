@@ -50,15 +50,15 @@ test-proxy:
 
 .PHONY: test-race
 test-race:
-	@echo "Running tests with race detector..."
+	@echo "Running unit tests with race detector..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	go test -race -v -timeout 120s $(TESTFLAGS) ./...
+	go test -race -v -timeout 120s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
 
 .PHONY: test-coverage
 test-coverage:
-	@echo "Running tests with coverage..."
+	@echo "Running unit tests with coverage..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	go test -coverprofile=coverage.out -timeout 60s $(TESTFLAGS) ./...
+	go test -coverprofile=coverage.out -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated at coverage.html"
 
