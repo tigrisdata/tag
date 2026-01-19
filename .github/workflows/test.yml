@@ -35,7 +35,7 @@ jobs:
 
       - name: Configure git for private modules
         run: |
-          git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
+          git config --global url."https://x-access-token:${{ secrets.GH_BOT_ACCESS_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       - name: Setup Go
         uses: actions/setup-go@v5
