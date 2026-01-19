@@ -24,14 +24,17 @@ jobs:
       matrix:
         include:
           - runner: namespace-profile-ubuntu-2404
+            arch: x86_64
             goos: linux
             goarch: amd64
             suffix: linux-amd64
           - runner: namespace-profile-ubuntu-2404-arm
+            arch: aarch64
             goos: linux
             goarch: arm64
             suffix: linux-arm64
           - runner: namespace-profile-macos-1561-arm
+            arch: arm64
             goos: darwin
             goarch: arm64
             suffix: darwin-arm64
@@ -80,8 +83,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          token: ${{ secrets.BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -108,7 +110,7 @@ jobs:
 
       - name: Run semantic-release
         env:
-          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
         run: npx semantic-release --debug
 
       - name: Get new release tag
@@ -129,7 +131,7 @@ jobs:
       - name: Upload binaries to release
         if: steps.new_tag.outputs.new_release == 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
         run: |
           TAG=${{ steps.new_tag.outputs.new_tag }}
           echo "Uploading binaries for release $TAG"
@@ -146,8 +148,6 @@ jobs:
 
       - name: Create module tag
         if: steps.new_tag.outputs.new_release == 'true'
-        env:
-          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           TAG=${{ steps.new_tag.outputs.new_tag }}
           MODULE_TAG="tag/$TAG"
