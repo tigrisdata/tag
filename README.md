@@ -21,6 +21,20 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 - Access to an [ocache](https://github.com/tigrisdata/ocache) cluster (for caching)
 - Tigris account with access credentials
 
+### Developer Setup (One-Time)
+
+This project depends on private Tigris repositories. Configure Go and Git to access them:
+
+```bash
+# Tell Go to fetch tigrisdata repos directly (not via proxy)
+export GOPRIVATE=github.com/tigrisdata
+
+# Configure Git to use SSH for tigrisdata repos
+git config --global url."git@github.com:tigrisdata/".insteadOf "https://github.com/tigrisdata/"
+```
+
+Add the `GOPRIVATE` export to your shell profile (e.g., `~/.bashrc` or `~/.zshrc`) for persistence.
+
 ### Build
 
 ```bash

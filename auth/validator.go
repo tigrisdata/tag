@@ -314,4 +314,3 @@ func (v *RequestValidator) deriveSigningKey(secretKey, dateStr, region string) [
 	kSigning := hmacSHA256(kService, []byte(terminationString))
 	return kSigning
 }
-

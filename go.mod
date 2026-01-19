@@ -11,7 +11,7 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
-	github.com/tigrisdata/ocache/client v0.0.0-00010101000000-000000000000
+	github.com/tigrisdata/ocache/client v1.2.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -69,10 +69,10 @@ require (
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46 // indirect
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
-	github.com/tigrisdata/ocache/common v0.0.0-00010101000000-000000000000 // indirect
-	github.com/tigrisdata/ocache/coordinator v0.0.0-00010101000000-000000000000 // indirect
-	github.com/tigrisdata/ocache/coordinator/proto v0.0.0-00010101000000-000000000000 // indirect
-	github.com/tigrisdata/ocache/proto v0.0.0-00010101000000-000000000000 // indirect
+	github.com/tigrisdata/ocache/common v1.2.0 // indirect
+	github.com/tigrisdata/ocache/coordinator v1.2.0 // indirect
+	github.com/tigrisdata/ocache/coordinator/proto v1.2.0 // indirect
+	github.com/tigrisdata/ocache/proto v1.2.0 // indirect
 	github.com/uber/jaeger-client-go v2.28.0+incompatible // indirect
 	github.com/uber/jaeger-lib v2.2.0+incompatible // indirect
 	go.etcd.io/etcd/api/v3 v3.5.0 // indirect
@@ -95,14 +95,4 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250303144028-a0af3efb3deb // indirect
 	google.golang.org/grpc v1.72.2 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
-)
-
-// Local development: replace with local ocache modules
-// When deploying, remove these replace directives and use versioned tags
-replace (
-	github.com/tigrisdata/ocache/client => ../../../../ocache/client
-	github.com/tigrisdata/ocache/common => ../../../../ocache/common
-	github.com/tigrisdata/ocache/coordinator => ../../../../ocache/coordinator
-	github.com/tigrisdata/ocache/coordinator/proto => ../../../../ocache/coordinator/proto
-	github.com/tigrisdata/ocache/proto => ../../../../ocache/proto
 )

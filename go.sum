@@ -327,6 +327,16 @@ github.com/stretchr/testify v1.5.1/go.mod h1:5W2xD1RspED5o8YsWQXVCued0rvSQ+mT+I5
 github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
+github.com/tigrisdata/ocache/client v1.2.0 h1:0XfwByKR99XqS39E82+gv8WSrE4D7JK0U7y+j6KFbJY=
+github.com/tigrisdata/ocache/client v1.2.0/go.mod h1:KQ9XCYFbd407lI4empZTdgiJCjfbE8MwtnPwbaQ0Q4E=
+github.com/tigrisdata/ocache/common v1.2.0 h1:sKyC/T630R39ks135fjTcCOpb34H1AKzRXpHjFeLfDw=
+github.com/tigrisdata/ocache/common v1.2.0/go.mod h1:5dy2d/b+59f2TljpvOTbYuwtSQxh9fSUhCLhCITV1F4=
+github.com/tigrisdata/ocache/coordinator v1.2.0 h1:uc6C3e6BKZuuGprsKFBbqTObYeATNkiT3+mFP+PbI9c=
+github.com/tigrisdata/ocache/coordinator v1.2.0/go.mod h1:7Tz/rsPMUKEao2BLv6mLrwHqHvG8IsRQGl7J1O1NnBU=
+github.com/tigrisdata/ocache/coordinator/proto v1.2.0 h1:K27TAoAcPsGeh2uvSSF+wQq11kSmRm8g3ck6csGO6gE=
+github.com/tigrisdata/ocache/coordinator/proto v1.2.0/go.mod h1:VJRxHBf/TquQ8vtMaJX5VYSxHFe20N61TqgUWJb1ySM=
+github.com/tigrisdata/ocache/proto v1.2.0 h1:YcWH9aibjBP2MBgDQKSm9DYp81GXyJSYzAL+6IqUANk=
+github.com/tigrisdata/ocache/proto v1.2.0/go.mod h1:7Yo5vs0iLy/K/KZGenC7oV9zBqexyKEOyZdstdzFmJQ=
 github.com/tv42/httpunix v0.0.0-20150427012821-b75d8614f926/go.mod h1:9ESjWnEqriFuLhtthL60Sar/7RFoluCcXsuvEwTV5KM=
 github.com/uber/jaeger-client-go v2.28.0+incompatible h1:G4QSBfvPKvg5ZM2j9MrJFdfI5iSljY/WnJqOGFao6HI=
 github.com/uber/jaeger-client-go v2.28.0+incompatible/go.mod h1:WVhlPFC8FDjOFMMWRy2pZqQJSXxYSwNYOkTr/Z6d3Kk=
