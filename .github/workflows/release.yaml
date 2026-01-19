@@ -146,18 +146,3 @@ jobs:
             done
           done
 
-      - name: Create module tag
-        if: steps.new_tag.outputs.new_release == 'true'
-        run: |
-          TAG=${{ steps.new_tag.outputs.new_tag }}
-          MODULE_TAG="tag/$TAG"
-
-          echo "Creating module tag: $MODULE_TAG"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git tag -a "$MODULE_TAG" -m "Release $MODULE_TAG"
-          git push origin "$MODULE_TAG"
-
-          echo "Created and pushed module tag: $MODULE_TAG"
