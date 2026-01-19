@@ -1,0 +1,71 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  workflow_call:
+
+env:
+  GO_VERSION: "1.24.2"
+  GOPRIVATE: github.com/tigrisdata
+
+jobs:
+  test:
+    runs-on: namespace-profile-ubuntu-2404
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure git for private modules
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run linting
+        run: make lint-ci
+
+      - name: Run unit tests
+        run: make test
+
+      - name: Run integration tests
+        run: make test-integration
+
+      - name: Run tests with race detector
+        run: make test-race
+
+      - name: Run coverage tests
+        run: |
+          go test -coverprofile=coverage.out -timeout 120s ./...
+          go tool cover -html=coverage.out -o coverage.html
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            coverage.out
+            coverage.html
+          retention-days: 7

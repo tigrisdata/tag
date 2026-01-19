@@ -22,9 +22,13 @@ build:
 # Testing targets
 .PHONY: test
 test:
-	@echo "Running all tests..."
+	@echo "Running unit tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	go test -v -timeout 60s $(TESTFLAGS) ./...
+	go test -v -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
+
+.PHONY: test-all
+test-all: test test-integration
+	@echo "All tests completed!"
 
 .PHONY: test-auth
 test-auth:
@@ -57,6 +61,33 @@ test-coverage:
 	go test -coverprofile=coverage.out -timeout 60s $(TESTFLAGS) ./...
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated at coverage.html"
+
+# Integration test targets
+.PHONY: test-integration
+test-integration:
+	@echo "Running integration tests..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	go test -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
+
+.PHONY: test-integration-short
+test-integration-short:
+	@echo "Running integration tests (short mode)..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	go test -v -short -timeout 30s $(TESTFLAGS) ./tests/integration/...
+
+.PHONY: test-integration-race
+test-integration-race:
+	@echo "Running integration tests with race detector..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	go test -race -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
+
+.PHONY: test-integration-coverage
+test-integration-coverage:
+	@echo "Running integration tests with coverage..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	go test -coverprofile=coverage-integration.out -timeout 300s $(TESTFLAGS) ./tests/integration/...
+	go tool cover -html=coverage-integration.out -o coverage-integration.html
+	@echo "Integration coverage report generated at coverage-integration.html"
 
 # Code quality targets
 .PHONY: lint
@@ -124,12 +155,19 @@ help:
 	@echo "  build         - Build the TAG binary"
 	@echo ""
 	@echo "Test targets:"
-	@echo "  test          - Run all unit tests"
+	@echo "  test          - Run unit tests only"
+	@echo "  test-all      - Run all tests (unit + integration)"
 	@echo "  test-auth     - Run auth package tests"
 	@echo "  test-cache    - Run cache package tests"
 	@echo "  test-proxy    - Run proxy package tests"
-	@echo "  test-race     - Run tests with race detector"
-	@echo "  test-coverage - Run tests with coverage report"
+	@echo "  test-race     - Run unit tests with race detector"
+	@echo "  test-coverage - Run unit tests with coverage report"
+	@echo ""
+	@echo "Integration test targets:"
+	@echo "  test-integration          - Run integration tests"
+	@echo "  test-integration-short    - Run integration tests (short mode)"
+	@echo "  test-integration-race     - Run integration tests with race detector"
+	@echo "  test-integration-coverage - Run integration tests with coverage report"
 	@echo ""
 	@echo "  To run specific tests, use TEST or TESTRUN variable:"
 	@echo "    make test TEST=TestMyFunction      - Run exact test name"

@@ -1,0 +1,163 @@
+name: Release
+
+on:
+  push:
+    branches: [release]
+
+env:
+  GO_VERSION: "1.24.2"
+  GOPRIVATE: github.com/tigrisdata
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
+  build-binaries:
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+
+    strategy:
+      matrix:
+        include:
+          - runner: namespace-profile-ubuntu-2404
+            goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - runner: namespace-profile-ubuntu-2404-arm
+            goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - runner: namespace-profile-macos-1561-arm
+            goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure git for private modules
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build binary
+        run: |
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o tag ./cmd/tag
+
+      - name: Rename binary with platform suffix
+        run: |
+          mv tag tag-${{ matrix.suffix }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tag-${{ matrix.suffix }}
+          path: tag-${{ matrix.suffix }}
+          retention-days: 1
+
+  release:
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BOT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: |
+          echo "Downloaded artifacts:"
+          find artifacts -type f -ls
+
+      - name: Get tags before release
+        id: before_release
+        run: |
+          git fetch --tags
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "none")
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest tag before release: $LATEST_TAG"
+
+      - name: Run semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: npx semantic-release --debug
+
+      - name: Get new release tag
+        id: new_tag
+        run: |
+          git fetch --tags
+          NEW_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "none")
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "New tag after release: $NEW_TAG"
+          if [ "$NEW_TAG" != "${{ steps.before_release.outputs.latest_tag }}" ] && [ "$NEW_TAG" != "none" ]; then
+            echo "new_release=true" >> $GITHUB_OUTPUT
+            echo "New release detected: $NEW_TAG"
+          else
+            echo "new_release=false" >> $GITHUB_OUTPUT
+            echo "No new release"
+          fi
+
+      - name: Upload binaries to release
+        if: steps.new_tag.outputs.new_release == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${{ steps.new_tag.outputs.new_tag }}
+          echo "Uploading binaries for release $TAG"
+
+          # Flatten and upload binaries
+          for artifact_dir in artifacts/*/; do
+            for binary in "$artifact_dir"*; do
+              if [ -f "$binary" ]; then
+                echo "Uploading $binary"
+                gh release upload "$TAG" "$binary" --clobber
+              fi
+            done
+          done
+
+      - name: Create module tag
+        if: steps.new_tag.outputs.new_release == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${{ steps.new_tag.outputs.new_tag }}
+          MODULE_TAG="tag/$TAG"
+
+          echo "Creating module tag: $MODULE_TAG"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$MODULE_TAG" -m "Release $MODULE_TAG"
+          git push origin "$MODULE_TAG"
+
+          echo "Created and pushed module tag: $MODULE_TAG"
