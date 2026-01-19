@@ -1,0 +1,47 @@
+name: Lint PR Title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    # Skip validation for release PRs (main -> release branch)
+    if: github.event.pull_request.base.ref != 'release'
+    steps:
+      - name: Validate PR title
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # All valid conventional commit types
+          types: |
+            feat
+            fix
+            perf
+            docs
+            style
+            refactor
+            test
+            build
+            ci
+            chore
+            revert
+          requireScope: false
+          subjectPattern: ^.+$
+          subjectPatternError: |
+            PR title must follow conventional commit format: type: description
+
+            Release-triggering types:
+            - feat: new features (minor release)
+            - fix: bug fixes (patch release)
+            - perf: performance improvements (patch release)
+
+            Non-release types (still valid):
+            - docs, style, refactor, test, build, ci, chore, revert
+
+            Examples:
+            - feat: add user authentication
+            - fix: resolve memory leak in cache
+            - ci: update GitHub Actions workflow
