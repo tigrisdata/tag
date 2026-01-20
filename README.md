@@ -166,13 +166,69 @@ See [docs/metrics.md](docs/metrics.md) for complete metrics reference.
 
 ### Docker
 
+#### Quick Start
+
 ```bash
-docker build -t tag:latest -f deploy/Dockerfile .
+# Single node (TAG + ocache)
+cd docker
+docker-compose up -d
+
+# Cluster mode (2 TAG + 3 ocache)
+docker-compose -f docker-compose-cluster.yml up -d
+```
+
+#### Environment Variables
+
+Create a `.env` file in the `docker/` directory:
+
+```bash
+# Required
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
+
+# Optional
+TAG_LOG_LEVEL=info
+```
+
+#### Single Node Setup
+
+```bash
+# Start services
+docker-compose -f docker/docker-compose.yml up -d
+
+# View logs
+docker-compose -f docker/docker-compose.yml logs -f tag
+
+# Stop services
+docker-compose -f docker/docker-compose.yml down
+```
+
+#### Cluster Setup
+
+```bash
+# Start 2 TAG nodes + 3 ocache cluster
+docker-compose -f docker/docker-compose-cluster.yml up -d
+
+# TAG endpoints are available at:
+# - http://localhost:8081 (tag-1)
+# - http://localhost:8082 (tag-2)
+
+# Stop cluster
+docker-compose -f docker/docker-compose-cluster.yml down -v
+```
+
+#### Building Local Image
+
+```bash
+# Build image locally
+docker build -t tag:local -f docker/Dockerfile .
+
+# Run with local image
 docker run -p 8080:8080 \
   -e AWS_ACCESS_KEY_ID=your_key \
   -e AWS_SECRET_ACCESS_KEY=your_secret \
-  -e TAG_OCACHE_ENDPOINTS=ocache:9000 \
-  tag:latest
+  -e TAG_OCACHE_ENDPOINTS=host.docker.internal:9000 \
+  tag:local
 ```
 
 ### Kubernetes
