@@ -4,7 +4,7 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 
 ## Features
 
-- **S3-Compatible API**: Supports GET, PUT, DELETE, HEAD, and COPY operations
+- **S3-Compatible API**: Supports all S3 API endpoints supported by Tigris
 - **Transparent Caching**: Automatic caching of objects with configurable TTL and size thresholds
 - **Request Coalescing**: Streaming broadcast pattern reduces duplicate upstream requests under concurrent load
 - **Range Request Caching**: Background fetch of full objects on range cache miss for optimal ML training workloads
@@ -148,15 +148,7 @@ See [docs/deployment.md](docs/deployment.md) for complete deployment guide inclu
 
 ## API Reference
 
-TAG implements a subset of the S3 API:
-
-| Operation | Endpoint | Description |
-|-----------|----------|-------------|
-| GetObject | `GET /{bucket}/{key}` | Retrieve object (with caching) |
-| PutObject | `PUT /{bucket}/{key}` | Upload object (invalidates cache) |
-| DeleteObject | `DELETE /{bucket}/{key}` | Delete object (invalidates cache) |
-| HeadObject | `HEAD /{bucket}/{key}` | Get object metadata |
-| CopyObject | `PUT /{bucket}/{key}` with `x-amz-copy-source` | Copy object |
+TAG supports all S3 API endpoints supported by Tigris, including bucket operations, object operations, multipart uploads, and more. See the [Tigris S3 API documentation](https://www.tigrisdata.com/docs/api/s3/) for the complete list of supported operations.
 
 ### Response Headers
 
