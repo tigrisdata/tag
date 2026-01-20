@@ -46,65 +46,69 @@ aws s3 cp s3://your-bucket/your-key ./local-file \
 
 ## Docker
 
-### Build Image
+### Quick Start
 
 ```bash
-docker build -t tag:latest -f deploy/Dockerfile .
+# Single node (TAG + ocache)
+cd docker
+docker-compose up -d
+
+# Cluster mode (2 TAG + 3 ocache)
+docker-compose -f docker-compose-cluster.yml up -d
 ```
 
-### Run Container
+### Environment Variables
+
+Create a `.env` file in the `docker/` directory:
 
 ```bash
-# Basic run (no caching)
-docker run -p 8080:8080 \
-  -e AWS_ACCESS_KEY_ID=your_key \
-  -e AWS_SECRET_ACCESS_KEY=your_secret \
-  tag:latest
+# Required
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
 
-# With caching
-docker run -p 8080:8080 \
-  -e AWS_ACCESS_KEY_ID=your_key \
-  -e AWS_SECRET_ACCESS_KEY=your_secret \
-  -e TAG_OCACHE_ENDPOINTS=ocache:9000 \
-  tag:latest
-
-# With configuration file
-docker run -p 8080:8080 \
-  -v /path/to/config.yaml:/etc/tag/config.yaml:ro \
-  -e AWS_ACCESS_KEY_ID=your_key \
-  -e AWS_SECRET_ACCESS_KEY=your_secret \
-  tag:latest
+# Optional
+TAG_LOG_LEVEL=info
 ```
 
-### Docker Compose
+### Single Node Setup
 
-```yaml
-version: '3.8'
+```bash
+# Start services
+docker-compose -f docker/docker-compose.yml up -d
 
-services:
-  tag:
-    build:
-      context: .
-      dockerfile: deploy/Dockerfile
-    ports:
-      - "8080:8080"
-    environment:
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - TAG_OCACHE_ENDPOINTS=ocache:9000
-      - TAG_LOG_LEVEL=info
-    depends_on:
-      - ocache
+# View logs
+docker-compose -f docker/docker-compose.yml logs -f tag
 
-  ocache:
-    image: tigrisdata/ocache:latest
-    ports:
-      - "9000:9000"
-    volumes:
-      - ocache-data:/data
+# Stop services
+docker-compose -f docker/docker-compose.yml down
+```
 
-volumes:
-  ocache-data:
+### Cluster Setup
+
+```bash
+# Start 2 TAG nodes + 3 ocache cluster
+docker-compose -f docker/docker-compose-cluster.yml up -d
+
+# TAG endpoints are available at:
+# - http://localhost:8081 (tag-1)
+# - http://localhost:8082 (tag-2)
+
+# Stop cluster
+docker-compose -f docker/docker-compose-cluster.yml down -v
+```
+
+### Building Local Image
+
+```bash
+# Build image locally
+docker build -t tag:local -f docker/Dockerfile .
+
+# Run with local image
+docker run -p 8080:8080 \
+  -e AWS_ACCESS_KEY_ID=your_key \
+  -e AWS_SECRET_ACCESS_KEY=your_secret \
+  -e TAG_OCACHE_ENDPOINTS=host.docker.internal:9000 \
+  tag:local
 ```
 
 ## Kubernetes
