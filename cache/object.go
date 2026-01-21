@@ -59,10 +59,11 @@ func MetaFromHTTPHeaders(bucket, key string, statusCode int, headers http.Header
 	}
 
 	// Extract user metadata (x-amz-meta-*)
+	// Store with lowercase key to match S3 convention
 	for k, v := range headers {
 		lk := strings.ToLower(k)
 		if strings.HasPrefix(lk, "x-amz-meta-") && len(v) > 0 {
-			meta.UserMetadata[k] = v[0]
+			meta.UserMetadata[lk] = v[0]
 		}
 	}
 
@@ -90,8 +91,10 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter) {
 	if m.StorageClass != "" {
 		w.Header().Set("x-amz-storage-class", m.StorageClass)
 	}
+	// Write user metadata with lowercase keys per S3 convention
 	for k, v := range m.UserMetadata {
-		w.Header().Set(k, v)
+		lk := strings.ToLower(k)
+		w.Header().Set(lk, v)
 	}
 }
 

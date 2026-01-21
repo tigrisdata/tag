@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -233,9 +234,17 @@ func (r *ResponseCapture) ContentLength() int64 {
 }
 
 // copyHeaders copies headers from src to dst.
+// For x-amz-meta-* headers, the key is lowercased to match S3 convention,
+// since Go's http.Header canonicalizes keys (e.g., x-amz-meta-foo → X-Amz-Meta-Foo).
 func copyHeaders(dst, src http.Header) {
 	for k, v := range src {
-		dst[k] = v
+		lower := strings.ToLower(k)
+		if strings.HasPrefix(lower, "x-amz-meta-") {
+			// Use lowercase for metadata headers per S3 convention
+			dst[lower] = v
+		} else {
+			dst[k] = v
+		}
 	}
 }
 

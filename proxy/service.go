@@ -172,6 +172,47 @@ func (s *Service) HandlePassthrough(w http.ResponseWriter, r *http.Request) erro
 	return s.forwarder.Forward(r.Context(), w, r)
 }
 
+// HandleCompleteMultipartUpload handles CompleteMultipartUpload with idempotency caching.
+// This caches successful completion responses in ocache to support idempotent calls,
+// matching tigris-os behavior where a second CompleteMultipartUpload call returns success.
+func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request) error {
+	bucket, key := ParseBucketKey(r)
+	uploadId := r.URL.Query().Get("uploadId")
+	ctx := r.Context()
+
+	log.Debug().Str("bucket", bucket).Str("key", key).Str("uploadId", uploadId).Msg("HandleCompleteMultipartUpload")
+
+	// Check ocache first for idempotent completion (works across TAG pods)
+	if s.cache.IsEnabled() {
+		entry, found, err := s.cache.GetCompletion(ctx, bucket, key, uploadId)
+		if err == nil && found {
+			log.Debug().Str("uploadId", uploadId).Msg("CompleteMultipartUpload cache hit - returning cached response")
+			for k, v := range entry.Headers {
+				w.Header().Set(k, v)
+			}
+			w.WriteHeader(entry.StatusCode)
+			_, _ = w.Write(entry.Body)
+			return nil
+		}
+	}
+
+	// Forward to upstream with response capture
+	capture, err := s.forwarder.ForwardWithCapture(ctx, w, r)
+	if err != nil {
+		return err
+	}
+
+	// Cache successful completions (2xx status codes) in ocache
+	if capture.StatusCode >= 200 && capture.StatusCode < 300 {
+		if cacheErr := s.cache.PutCompletion(ctx, bucket, key, uploadId, capture.StatusCode, capture.Headers, capture.Body); cacheErr != nil {
+			log.Debug().Err(cacheErr).Msg("Failed to cache completion response")
+			// Don't fail the request if caching fails
+		}
+	}
+
+	return nil
+}
+
 // ParseBucketKey extracts bucket and key from request path.
 func ParseBucketKey(r *http.Request) (bucket, key string) {
 	path := strings.TrimPrefix(r.URL.Path, "/")
@@ -210,4 +251,9 @@ func extractTotalSizeFromContentRange(contentRange string) int64 {
 		return 0
 	}
 	return total
+}
+
+// GetRegion returns the configured upstream region.
+func (s *Service) GetRegion() string {
+	return s.config.Upstream.Region
 }

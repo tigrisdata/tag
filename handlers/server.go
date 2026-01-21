@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -46,7 +48,18 @@ func (s *Server) setupRouter() *mux.Router {
 	// S3 API routes - path style
 	// The order matters - more specific routes should come first
 
-	// Object operations with query parameters
+	// CompleteMultipartUpload - POST with uploadId but no partNumber
+	// Must be registered before generic handleObjectWithQuery to cache completion responses
+	r.HandleFunc("/{bucket}/{object:.+}", s.handleCompleteMultipartUpload).
+		Queries("uploadId", "{uploadId}").
+		Methods("POST").
+		MatcherFunc(func(r *http.Request, rm *mux.RouteMatch) bool {
+			// Only match if partNumber is NOT present (CompleteMultipartUpload)
+			// UploadPart has both uploadId and partNumber
+			return r.URL.Query().Get("partNumber") == ""
+		})
+
+	// Object operations with query parameters (UploadPart, ListParts, AbortMultipartUpload, etc.)
 	r.HandleFunc("/{bucket}/{object:.+}", s.handleObjectWithQuery).
 		Queries("uploadId", "{uploadId}").
 		Methods("PUT", "POST", "DELETE", "GET")
@@ -175,8 +188,21 @@ func getBucketName(r *http.Request) string {
 	return vars["bucket"]
 }
 
-// validateBucketName checks if bucket name is non-empty.
+// validBucketNameRegex validates basic S3 bucket name format:
+// - Must start with a lowercase letter or number
+// - Can contain lowercase letters, numbers, hyphens, and dots
+// - Must end with a lowercase letter or number
+var validBucketNameRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`)
+
+// validateBucketName checks if bucket name follows S3 naming rules.
 // Returns true if valid, false if invalid (error already written to response).
+// S3 bucket naming rules:
+// - 3-63 characters
+// - Lowercase letters, numbers, hyphens, dots only
+// - Must start and end with letter or number
+// - Cannot contain consecutive dots (..)
+// - Cannot contain dot-dash (.-) or dash-dot (-.) patterns
+// - Cannot contain underscores
 func validateBucketName(w http.ResponseWriter, r *http.Request) bool {
 	bucket := getBucketName(r)
 	if bucket == "" {
@@ -184,6 +210,42 @@ func validateBucketName(w http.ResponseWriter, r *http.Request) bool {
 		WriteError(w, r, ErrInvalidArgument)
 		return false
 	}
+
+	// Length check: 3-63 characters
+	if len(bucket) < 3 || len(bucket) > 63 {
+		log.Debug().Str("bucket", bucket).Msg("Bucket name length invalid")
+		WriteError(w, r, ErrInvalidBucketName)
+		return false
+	}
+
+	// Must match valid pattern (start/end with letter or number)
+	if !validBucketNameRegex.MatchString(bucket) {
+		log.Debug().Str("bucket", bucket).Msg("Bucket name format invalid")
+		WriteError(w, r, ErrInvalidBucketName)
+		return false
+	}
+
+	// Cannot contain consecutive dots (..)
+	if strings.Contains(bucket, "..") {
+		log.Debug().Str("bucket", bucket).Msg("Bucket name contains consecutive dots")
+		WriteError(w, r, ErrInvalidBucketName)
+		return false
+	}
+
+	// Cannot contain dot-dash (.-) or dash-dot (-.)
+	if strings.Contains(bucket, ".-") || strings.Contains(bucket, "-.") {
+		log.Debug().Str("bucket", bucket).Msg("Bucket name contains invalid dot-dash pattern")
+		WriteError(w, r, ErrInvalidBucketName)
+		return false
+	}
+
+	// Cannot contain underscore
+	if strings.Contains(bucket, "_") {
+		log.Debug().Str("bucket", bucket).Msg("Bucket name contains underscore")
+		WriteError(w, r, ErrInvalidBucketName)
+		return false
+	}
+
 	return true
 }
 
@@ -292,6 +354,18 @@ func (s *Server) handleListObjectsV2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.service.HandlePassthrough(w, r); err != nil {
+		handleError(w, r, err)
+	}
+}
+
+// handleCompleteMultipartUpload handles CompleteMultipartUpload with idempotency caching.
+// This caches successful completion responses in ocache to support idempotent calls,
+// matching tigris-os behavior where a second CompleteMultipartUpload returns success.
+func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request) {
+	if !validateBucketName(w, r) {
+		return
+	}
+	if err := s.service.HandleCompleteMultipartUpload(w, r); err != nil {
 		handleError(w, r, err)
 	}
 }
@@ -407,13 +481,17 @@ func (s *Server) handleBucketTagging(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleBucketLocation handles GetBucketLocation operation.
+// Returns the configured region directly instead of proxying to upstream.
 func (s *Server) handleBucketLocation(w http.ResponseWriter, r *http.Request) {
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+
+	region := s.service.GetRegion()
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">%s</LocationConstraint>`, region)
 }
 
 // handleDeleteObjects handles DeleteObjects (multi-object delete) operation.

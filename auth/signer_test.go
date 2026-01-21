@@ -163,7 +163,7 @@ func TestBuildCanonicalQueryString(t *testing.T) {
 		{
 			name:     "parameters with special characters",
 			query:    "prefix=test/path&marker=file name.txt",
-			expected: "marker=file+name.txt&prefix=test%2Fpath",
+			expected: "marker=file%20name.txt&prefix=test%2Fpath", // AWS SigV4 uses %20 for spaces, not +
 		},
 	}
 
@@ -229,6 +229,59 @@ func TestHashSHA256(t *testing.T) {
 			result := hashSHA256([]byte(tt.input))
 			if result != tt.expected {
 				t.Errorf("hashSHA256(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestAwsURIEncode(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		encodeSlash bool
+		expected    string
+	}{
+		// Unreserved characters should not be encoded
+		{name: "lowercase letters", input: "abcxyz", encodeSlash: true, expected: "abcxyz"},
+		{name: "uppercase letters", input: "ABCXYZ", encodeSlash: true, expected: "ABCXYZ"},
+		{name: "digits", input: "0123456789", encodeSlash: true, expected: "0123456789"},
+		{name: "unreserved special", input: "_-~.", encodeSlash: true, expected: "_-~."},
+
+		// Spaces should be %20, not +
+		{name: "space", input: "hello world", encodeSlash: true, expected: "hello%20world"},
+		{name: "multiple spaces", input: "a b c", encodeSlash: true, expected: "a%20b%20c"},
+
+		// Slash handling
+		{name: "slash with encodeSlash true", input: "a/b/c", encodeSlash: true, expected: "a%2Fb%2Fc"},
+		{name: "slash with encodeSlash false", input: "a/b/c", encodeSlash: false, expected: "a/b/c"},
+
+		// Special characters should be percent-encoded
+		{name: "at sign", input: "user@example.com", encodeSlash: true, expected: "user%40example.com"},
+		{name: "ampersand", input: "a&b", encodeSlash: true, expected: "a%26b"},
+		{name: "equals", input: "a=b", encodeSlash: true, expected: "a%3Db"},
+		{name: "plus sign", input: "a+b", encodeSlash: true, expected: "a%2Bb"},
+		{name: "percent", input: "100%", encodeSlash: true, expected: "100%25"},
+		{name: "colon", input: "a:b", encodeSlash: true, expected: "a%3Ab"},
+		{name: "question mark", input: "a?b", encodeSlash: true, expected: "a%3Fb"},
+		{name: "hash", input: "a#b", encodeSlash: true, expected: "a%23b"},
+
+		// Mixed content
+		{name: "path with space", input: "path/to/my file.txt", encodeSlash: false, expected: "path/to/my%20file.txt"},
+		{name: "query param value", input: "hello world!", encodeSlash: true, expected: "hello%20world%21"},
+
+		// Empty string
+		{name: "empty string", input: "", encodeSlash: true, expected: ""},
+
+		// Unicode characters should be UTF-8 encoded then percent-encoded
+		{name: "unicode", input: "日本", encodeSlash: true, expected: "%E6%97%A5%E6%9C%AC"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := awsURIEncode(tt.input, tt.encodeSlash)
+			if result != tt.expected {
+				t.Errorf("awsURIEncode(%q, %v) = %q, want %q",
+					tt.input, tt.encodeSlash, result, tt.expected)
 			}
 		})
 	}

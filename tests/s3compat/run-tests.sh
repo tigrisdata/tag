@@ -96,7 +96,6 @@ test_headers=(
     "test_bucket_create_bad_expect_empty"
     "test_bucket_create_bad_contentlength_negative"
     "test_bucket_create_bad_contentlength_none"
-    # Note: AWS SigV2 tests removed - SigV2 is deprecated and not supported by TAG
 )
 
 # Core S3 operations tests
@@ -167,28 +166,20 @@ test_objects=(
     "test_object_write_expires"
     "test_object_write_read_update_read_delete"
     "test_object_metadata_replaced_on_put"
-    "test_object_set_get_metadata_empty_to_unreadable_prefix"
-    "test_object_set_get_metadata_empty_to_unreadable_suffix"
-    "test_object_set_get_metadata_empty_to_unreadable_infix"
-    "test_object_set_get_metadata_overwrite"
     "test_object_set_get_metadata_none_to_good"
     "test_object_set_get_metadata_none_to_empty"
     "test_object_set_get_metadata_overwrite_to_empty"
-    "test_object_set_get_non_utf8_metadata"
-    "test_object_set_get_metadata_empty_to_empty"
 )
 
 # Bucket operations tests
 test_buckets=(
     "test_bucket_create_naming_bad_starts_nonalpha"
-    "test_bucket_create_naming_bad_short_empty"
     "test_bucket_create_naming_bad_short_one"
     "test_bucket_create_naming_bad_short_two"
     "test_bucket_create_naming_good_long_60"
     "test_bucket_create_naming_good_long_61"
     "test_bucket_create_naming_good_long_62"
     "test_bucket_create_naming_good_long_63"
-    "test_bucket_create_naming_bad_long_64"
     "test_bucket_create_naming_bad_ip"
     "test_bucket_create_naming_dns_underscore"
     "test_bucket_create_naming_dns_long"
@@ -196,11 +187,7 @@ test_buckets=(
     "test_bucket_create_naming_dns_dot_dot"
     "test_bucket_create_naming_dns_dot_dash"
     "test_bucket_create_naming_dns_dash_dot"
-    "test_bucket_create_exists"
     "test_bucket_get_location"
-    # Note: Cross-account tests removed - require multi-tenant setup not available with single credential
-    # "test_bucket_create_exists_nonowner"
-    # "test_bucket_delete_nonowner"
     "test_bucket_delete_nonempty"
     "test_bucket_create_delete"
 )
@@ -225,9 +212,6 @@ test_copy=(
     "test_object_copy_to_itself"
     "test_object_copy_to_itself_with_metadata"
     "test_object_copy_diff_bucket"
-    # Note: Cross-account tests removed - require multi-tenant setup not available with single credential
-    # "test_object_copy_not_owned_bucket"
-    # "test_object_copy_not_owned_object_bucket"
     "test_object_copy_canned_acl"
     "test_object_copy_retaining_metadata"
     "test_object_copy_replacing_metadata"

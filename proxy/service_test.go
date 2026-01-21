@@ -200,3 +200,42 @@ func TestCopyHeaders(t *testing.T) {
 		t.Errorf("Content-Length = %q, want %q", dst.Get("Content-Length"), "100")
 	}
 }
+
+func TestCopyHeaders_MetadataLowercase(t *testing.T) {
+	// Create headers using Set() to ensure proper canonical form
+	// This simulates how Go's HTTP library stores headers from real responses
+	src := http.Header{}
+	src.Set("X-Amz-Meta-Custom-Key", "custom-value")
+	src.Set("X-Amz-Meta-Another", "another-value")
+	src.Set("Content-Type", "application/octet-stream")
+	src.Set("ETag", `"abc123"`)
+
+	dst := http.Header{}
+	copyHeaders(dst, src)
+
+	// Metadata headers should be stored with lowercase keys
+	if _, ok := dst["x-amz-meta-custom-key"]; !ok {
+		t.Error("x-amz-meta-custom-key should be stored with lowercase key")
+	}
+	// Check canonical key is NOT used (it would be "X-Amz-Meta-Custom-Key")
+	if _, ok := dst["X-Amz-Meta-Custom-Key"]; ok {
+		t.Error("X-Amz-Meta-Custom-Key should NOT be stored with canonical key")
+	}
+
+	if _, ok := dst["x-amz-meta-another"]; !ok {
+		t.Error("x-amz-meta-another should be stored with lowercase key")
+	}
+
+	// Non-metadata headers should retain canonical form and be accessible via Get
+	if dst.Get("Content-Type") != "application/octet-stream" {
+		t.Errorf("Content-Type = %q, want %q", dst.Get("Content-Type"), "application/octet-stream")
+	}
+	if dst.Get("ETag") != `"abc123"` {
+		t.Errorf("ETag = %q, want %q", dst.Get("ETag"), `"abc123"`)
+	}
+
+	// Verify metadata values are correct
+	if dst["x-amz-meta-custom-key"][0] != "custom-value" {
+		t.Errorf("x-amz-meta-custom-key value = %q, want %q", dst["x-amz-meta-custom-key"][0], "custom-value")
+	}
+}
