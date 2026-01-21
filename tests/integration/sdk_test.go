@@ -846,9 +846,6 @@ func TestSDK_GetObject_WithCache(t *testing.T) {
 	client := env.GetS3Client()
 	ctx := context.Background()
 
-	// Reset counter before first request
-	env.ResetUpstreamRequestCount()
-
 	// First GET - should fetch from upstream and cache
 	result1, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String("test-bucket"),
@@ -864,10 +861,8 @@ func TestSDK_GetObject_WithCache(t *testing.T) {
 		t.Errorf("First request: expected body %q, got %q", objectContent, body1)
 	}
 
-	firstRequestCount := env.GetUpstreamRequestCount()
-	if firstRequestCount != 1 {
-		t.Errorf("Expected 1 upstream request for first GET, got %d", firstRequestCount)
-	}
+	// Verify first request was a cache miss
+	env.AssertXCacheMiss(t)
 
 	// Wait for cache to be populated
 	time.Sleep(200 * time.Millisecond)
@@ -887,13 +882,10 @@ func TestSDK_GetObject_WithCache(t *testing.T) {
 		t.Errorf("Second request: expected body %q, got %q", objectContent, body2)
 	}
 
-	secondRequestCount := env.GetUpstreamRequestCount()
-	// Should still be 1 - second request served from cache
-	if secondRequestCount != 1 {
-		t.Errorf("Expected 1 total upstream request (cache hit), got %d", secondRequestCount)
-	}
+	// Verify second request was a cache hit
+	env.AssertXCacheHit(t)
 
-	t.Logf("Cache behavior verified: %d upstream requests for 2 SDK GetObject calls", secondRequestCount)
+	t.Logf("Cache behavior verified: first request X-Cache: MISS, second request X-Cache: HIT")
 }
 
 // TestSDK_HeadObject_WithCache verifies HeadObject with caching enabled.
@@ -911,8 +903,6 @@ func TestSDK_HeadObject_WithCache(t *testing.T) {
 	client := env.GetS3Client()
 	ctx := context.Background()
 
-	env.ResetUpstreamRequestCount()
-
 	// First GET to populate cache
 	result, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String("test-bucket"),
@@ -924,10 +914,8 @@ func TestSDK_HeadObject_WithCache(t *testing.T) {
 	io.ReadAll(result.Body)
 	result.Body.Close()
 
-	getRequestCount := env.GetUpstreamRequestCount()
-	if getRequestCount != 1 {
-		t.Errorf("Expected 1 upstream request for GET, got %d", getRequestCount)
-	}
+	// Verify GET was a cache miss
+	env.AssertXCacheMiss(t)
 
 	// Wait for cache to be populated
 	time.Sleep(200 * time.Millisecond)
@@ -950,13 +938,10 @@ func TestSDK_HeadObject_WithCache(t *testing.T) {
 		t.Error("Expected ETag to be set from cache")
 	}
 
-	// Should still be 1 - HEAD served from cache
-	headRequestCount := env.GetUpstreamRequestCount()
-	if headRequestCount != 1 {
-		t.Errorf("Expected 1 total upstream request (HEAD from cache), got %d", headRequestCount)
-	}
+	// Verify HEAD was served from cache
+	env.AssertXCacheHit(t)
 
-	t.Logf("HEAD from cache verified: %d upstream requests for GET + HEAD", headRequestCount)
+	t.Logf("HEAD from cache verified: GET X-Cache: MISS, HEAD X-Cache: HIT")
 }
 
 // TestSDK_ContentTypePreservation_WithCache verifies Content-Type is preserved through cache.
@@ -979,8 +964,6 @@ func TestSDK_ContentTypePreservation_WithCache(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		env.ResetUpstreamRequestCount()
-
 		// Put object with specific content type
 		_, err := client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:      aws.String("test-bucket"),
@@ -1003,6 +986,9 @@ func TestSDK_ContentTypePreservation_WithCache(t *testing.T) {
 		io.ReadAll(getResult.Body)
 		getResult.Body.Close()
 
+		// Verify GET was cache miss
+		env.AssertXCacheMiss(t)
+
 		// Wait for cache
 		time.Sleep(200 * time.Millisecond)
 
@@ -1014,6 +1000,9 @@ func TestSDK_ContentTypePreservation_WithCache(t *testing.T) {
 		if err != nil {
 			t.Fatalf("HeadObject failed for %s: %v", tc.key, err)
 		}
+
+		// Verify HEAD was cache hit
+		env.AssertXCacheHit(t)
 
 		if aws.ToString(headResult.ContentType) != tc.contentType {
 			t.Errorf("For %s: expected cached Content-Type %q, got %q",
@@ -1046,8 +1035,6 @@ func TestSDK_UserMetadata_WithCache(t *testing.T) {
 		t.Fatalf("PutObject failed: %v", err)
 	}
 
-	env.ResetUpstreamRequestCount()
-
 	// First GET - populates cache
 	getResult, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String("test-bucket"),
@@ -1059,10 +1046,8 @@ func TestSDK_UserMetadata_WithCache(t *testing.T) {
 	io.ReadAll(getResult.Body)
 	getResult.Body.Close()
 
-	firstCount := env.GetUpstreamRequestCount()
-	if firstCount != 1 {
-		t.Errorf("Expected 1 upstream request for first GET, got %d", firstCount)
-	}
+	// Verify GET was cache miss
+	env.AssertXCacheMiss(t)
 
 	// Wait for cache
 	time.Sleep(200 * time.Millisecond)
@@ -1076,6 +1061,9 @@ func TestSDK_UserMetadata_WithCache(t *testing.T) {
 		t.Fatalf("HeadObject failed: %v", err)
 	}
 
+	// Verify HEAD was served from cache
+	env.AssertXCacheHit(t)
+
 	// Verify metadata is preserved from cache
 	if headResult.Metadata == nil {
 		t.Fatal("Expected metadata to be preserved in cache")
@@ -1086,13 +1074,7 @@ func TestSDK_UserMetadata_WithCache(t *testing.T) {
 		t.Errorf("Expected cached custom metadata 'cached-meta-value', got %q", headResult.Metadata["custom"])
 	}
 
-	// Verify HEAD was served from cache
-	secondCount := env.GetUpstreamRequestCount()
-	if secondCount != 1 {
-		t.Errorf("Expected 1 total upstream request (HEAD from cache), got %d", secondCount)
-	}
-
-	t.Logf("User metadata caching verified: %d upstream requests", secondCount)
+	t.Logf("User metadata caching verified: GET X-Cache: MISS, HEAD X-Cache: HIT")
 }
 
 // TestSDK_CacheInvalidationOnPut verifies that PUT invalidates cached entries
@@ -1117,8 +1099,6 @@ func TestSDK_CacheInvalidationOnPut(t *testing.T) {
 		t.Fatalf("Initial PutObject failed: %v", err)
 	}
 
-	env.ResetUpstreamRequestCount()
-
 	// Step 2: GET object - should come from upstream (cache miss)
 	result1, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String("test-bucket"),
@@ -1134,10 +1114,8 @@ func TestSDK_CacheInvalidationOnPut(t *testing.T) {
 		t.Errorf("First GET: expected %q, got %q", initialContent, body1)
 	}
 
-	countAfterFirstGet := env.GetUpstreamRequestCount()
-	if countAfterFirstGet != 1 {
-		t.Errorf("Expected 1 upstream request after first GET, got %d", countAfterFirstGet)
-	}
+	// Verify first GET was cache miss
+	env.AssertXCacheMiss(t)
 
 	// Wait for cache to be populated
 	time.Sleep(200 * time.Millisecond)
@@ -1157,11 +1135,9 @@ func TestSDK_CacheInvalidationOnPut(t *testing.T) {
 		t.Errorf("Second GET (cache): expected %q, got %q", initialContent, body2)
 	}
 
-	countAfterSecondGet := env.GetUpstreamRequestCount()
-	if countAfterSecondGet != 1 {
-		t.Errorf("Expected 1 upstream request after second GET (cache hit), got %d", countAfterSecondGet)
-	}
-	t.Logf("Cache hit verified: %d upstream requests for 2 GETs", countAfterSecondGet)
+	// Verify second GET was cache hit
+	env.AssertXCacheHit(t)
+	t.Logf("Cache hit verified")
 
 	// Step 4: PUT object with new value - should invalidate cache
 	updatedContent := []byte("updated content version 2")
@@ -1173,9 +1149,6 @@ func TestSDK_CacheInvalidationOnPut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Update PutObject failed: %v", err)
 	}
-
-	// Reset counter to track requests after invalidation
-	env.ResetUpstreamRequestCount()
 
 	// Step 5: GET object - should come from upstream with new value (cache miss due to invalidation)
 	result3, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -1192,10 +1165,8 @@ func TestSDK_CacheInvalidationOnPut(t *testing.T) {
 		t.Errorf("Third GET (after invalidation): expected %q, got %q", updatedContent, body3)
 	}
 
-	countAfterThirdGet := env.GetUpstreamRequestCount()
-	if countAfterThirdGet != 1 {
-		t.Errorf("Expected 1 upstream request after third GET (cache invalidated), got %d", countAfterThirdGet)
-	}
+	// Verify third GET was cache miss (cache invalidated by PUT)
+	env.AssertXCacheMiss(t)
 	t.Logf("Cache invalidation verified: upstream hit with new data")
 
 	// Wait for cache to be populated with new value
@@ -1216,11 +1187,9 @@ func TestSDK_CacheInvalidationOnPut(t *testing.T) {
 		t.Errorf("Fourth GET (new cache): expected %q, got %q", updatedContent, body4)
 	}
 
-	countAfterFourthGet := env.GetUpstreamRequestCount()
-	if countAfterFourthGet != 1 {
-		t.Errorf("Expected 1 upstream request after fourth GET (new cache hit), got %d", countAfterFourthGet)
-	}
-	t.Logf("New cache entry verified: %d upstream requests for 2 GETs after update", countAfterFourthGet)
+	// Verify fourth GET was cache hit
+	env.AssertXCacheHit(t)
+	t.Logf("New cache entry verified")
 }
 
 // TestSDK_GetObjectRange_WithCache verifies Range requests work with caching enabled.
@@ -1240,8 +1209,6 @@ func TestSDK_GetObjectRange_WithCache(t *testing.T) {
 	client := env.GetS3Client()
 	ctx := context.Background()
 
-	env.ResetUpstreamRequestCount()
-
 	// First: Full GET to populate cache
 	result1, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
@@ -1257,17 +1224,13 @@ func TestSDK_GetObjectRange_WithCache(t *testing.T) {
 		t.Errorf("Full GET: expected %q, got %q", fullContent, body1)
 	}
 
-	firstRequestCount := env.GetUpstreamRequestCount()
-	if firstRequestCount != 1 {
-		t.Errorf("Expected 1 upstream request for full GET, got %d", firstRequestCount)
-	}
+	// Verify full GET was cache miss
+	env.AssertXCacheMiss(t)
 
 	// Wait for cache to be populated
 	time.Sleep(200 * time.Millisecond)
 
 	// Second: Range request - should be served from cached full object
-	env.ResetUpstreamRequestCount()
-
 	result2, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -1284,12 +1247,10 @@ func TestSDK_GetObjectRange_WithCache(t *testing.T) {
 		t.Errorf("Range GET: expected %q, got %q", expectedRange, body2)
 	}
 
-	rangeRequestCount := env.GetUpstreamRequestCount()
-	if rangeRequestCount != 0 {
-		t.Errorf("Expected 0 upstream requests for range request (cache hit), got %d", rangeRequestCount)
-	}
+	// Verify range request was served from cache
+	env.AssertXCacheHit(t)
 
-	t.Logf("Range from cache verified: %d upstream requests for range request after full GET cached", rangeRequestCount)
+	t.Logf("Range from cache verified: full GET X-Cache: MISS, range GET X-Cache: HIT")
 }
 
 // TestSDK_GetObjectRange_SingleByteAtZero verifies Range request for single byte at position 0.
@@ -1320,11 +1281,11 @@ func TestSDK_GetObjectRange_SingleByteAtZero(t *testing.T) {
 	io.ReadAll(result1.Body)
 	result1.Body.Close()
 
+	// Verify full GET was cache miss
+	env.AssertXCacheMiss(t)
+
 	// Wait for cache to be populated
 	time.Sleep(200 * time.Millisecond)
-
-	// Reset counter for range request
-	env.ResetUpstreamRequestCount()
 
 	// Range request for single byte at position 0 (bytes=0-0)
 	// This is the edge case that requires special handling in ocache
@@ -1344,10 +1305,8 @@ func TestSDK_GetObjectRange_SingleByteAtZero(t *testing.T) {
 		t.Errorf("Range GET (bytes=0-0): expected %q, got %q (len=%d)", expectedByte, body2, len(body2))
 	}
 
-	rangeRequestCount := env.GetUpstreamRequestCount()
-	if rangeRequestCount != 0 {
-		t.Errorf("Expected 0 upstream requests for range request (cache hit), got %d", rangeRequestCount)
-	}
+	// Verify range request was served from cache
+	env.AssertXCacheHit(t)
 
 	t.Logf("Byte-0 quirk verified: single byte at position 0 returned correctly: %q", body2)
 }
@@ -1439,13 +1398,15 @@ func TestSDK_DeleteObjects_WithCache(t *testing.T) {
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+
+		// Verify each GET was a cache miss (populating cache)
+		env.AssertXCacheMiss(t)
 	}
 
 	// Wait for cache to be populated
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify all are cached
-	env.ResetUpstreamRequestCount()
+	// Verify all are cached by checking X-Cache header
 	for _, key := range keys {
 		resp, err := client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
@@ -1456,9 +1417,9 @@ func TestSDK_DeleteObjects_WithCache(t *testing.T) {
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-	}
-	if count := env.GetUpstreamRequestCount(); count != 0 {
-		t.Errorf("Expected 0 upstream requests for cached objects, got %d", count)
+
+		// Verify each GET was a cache hit
+		env.AssertXCacheHit(t)
 	}
 
 	// Build delete request

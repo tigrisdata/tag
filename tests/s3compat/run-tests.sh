@@ -96,11 +96,7 @@ test_headers=(
     "test_bucket_create_bad_expect_empty"
     "test_bucket_create_bad_contentlength_negative"
     "test_bucket_create_bad_contentlength_none"
-    "test_object_create_bad_md5_invalid_garbage_aws2"
-    "test_object_create_bad_ua_empty_aws2"
-    "test_object_create_bad_ua_none_aws2"
-    "test_bucket_create_bad_ua_empty_aws2"
-    "test_bucket_create_bad_ua_none_aws2"
+    # Note: AWS SigV2 tests removed - SigV2 is deprecated and not supported by TAG
 )
 
 # Core S3 operations tests
@@ -202,8 +198,9 @@ test_buckets=(
     "test_bucket_create_naming_dns_dash_dot"
     "test_bucket_create_exists"
     "test_bucket_get_location"
-    "test_bucket_create_exists_nonowner"
-    "test_bucket_delete_nonowner"
+    # Note: Cross-account tests removed - require multi-tenant setup not available with single credential
+    # "test_bucket_create_exists_nonowner"
+    # "test_bucket_delete_nonowner"
     "test_bucket_delete_nonempty"
     "test_bucket_create_delete"
 )
@@ -228,8 +225,9 @@ test_copy=(
     "test_object_copy_to_itself"
     "test_object_copy_to_itself_with_metadata"
     "test_object_copy_diff_bucket"
-    "test_object_copy_not_owned_bucket"
-    "test_object_copy_not_owned_object_bucket"
+    # Note: Cross-account tests removed - require multi-tenant setup not available with single credential
+    # "test_object_copy_not_owned_bucket"
+    # "test_object_copy_not_owned_object_bucket"
     "test_object_copy_canned_acl"
     "test_object_copy_retaining_metadata"
     "test_object_copy_replacing_metadata"

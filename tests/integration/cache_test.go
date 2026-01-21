@@ -36,7 +36,6 @@ func TestCache_HitWithMetadata(t *testing.T) {
 	assert.False(t, env.IsCached(bucket, key), "Object should not be cached before first GET")
 
 	// First GET - should be cache miss, goes to upstream
-	env.ResetUpstreamRequestCount()
 	resp1, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -46,7 +45,7 @@ func TestCache_HitWithMetadata(t *testing.T) {
 	resp1.Body.Close()
 
 	assert.Equal(t, content, body1, "First GET should return correct content")
-	assert.Equal(t, int32(1), env.GetUpstreamRequestCount(), "First GET should hit upstream (cache miss)")
+	env.AssertXCacheMiss(t) // First GET should be cache miss
 	assert.NotEmpty(t, aws.ToString(resp1.ETag), "Response should have ETag")
 
 	// Save the ETag for comparison
@@ -59,7 +58,6 @@ func TestCache_HitWithMetadata(t *testing.T) {
 	assert.True(t, env.IsCached(bucket, key), "Object should be cached after first GET")
 
 	// Second GET - should be cache hit, no upstream request
-	env.ResetUpstreamRequestCount()
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -69,7 +67,7 @@ func TestCache_HitWithMetadata(t *testing.T) {
 	resp2.Body.Close()
 
 	assert.Equal(t, content, body2, "Second GET should return same content")
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "Second GET should NOT hit upstream (cache hit)")
+	env.AssertXCacheHit(t) // Second GET should be cache hit
 	assert.Equal(t, etag1, aws.ToString(resp2.ETag), "Cache hit should return same ETag")
 }
 
@@ -99,8 +97,8 @@ func TestCache_IfNoneMatch304(t *testing.T) {
 	etag := aws.ToString(resp1.ETag)
 	require.NotEmpty(t, etag, "ETag should not be empty")
 
-	// Reset counter for conditional request
-	env.ResetUpstreamRequestCount()
+	// Wait for cache to be populated
+	time.Sleep(100 * time.Millisecond)
 
 	// GET with If-None-Match matching the ETag - should return 304
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -115,8 +113,8 @@ func TestCache_IfNoneMatch304(t *testing.T) {
 		errStr := err.Error()
 		assert.True(t, strings.Contains(errStr, "304") || strings.Contains(errStr, "NotModified"),
 			"Should get 304 Not Modified, got: %v", err)
-		// Should be served from cache without hitting upstream
-		assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "304 response should not hit upstream")
+		// Should be served from cache
+		env.AssertXCacheHit(t) // 304 response should be served from cache
 		return
 	}
 
@@ -157,8 +155,8 @@ func TestCache_IfModifiedSince304(t *testing.T) {
 		lastModified = time.Now()
 	}
 
-	// Reset counter for conditional request
-	env.ResetUpstreamRequestCount()
+	// Wait for cache to be populated
+	time.Sleep(100 * time.Millisecond)
 
 	// Use a time in the future to ensure 304 response
 	futureTime := lastModified.Add(1 * time.Hour)
@@ -175,7 +173,7 @@ func TestCache_IfModifiedSince304(t *testing.T) {
 		errStr := err.Error()
 		assert.True(t, strings.Contains(errStr, "304") || strings.Contains(errStr, "NotModified"),
 			"Should get 304 Not Modified, got: %v", err)
-		assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "304 response should not hit upstream")
+		env.AssertXCacheHit(t) // 304 response should be served from cache
 		return
 	}
 
@@ -210,8 +208,8 @@ func TestCache_HeadFromCache(t *testing.T) {
 	etag := aws.ToString(resp1.ETag)
 	contentLength := aws.ToInt64(resp1.ContentLength)
 
-	// Reset counter
-	env.ResetUpstreamRequestCount()
+	// Wait for cache to be populated
+	time.Sleep(100 * time.Millisecond)
 
 	// HEAD request - should be served from cache
 	resp2, err := client.HeadObject(ctx, &s3.HeadObjectInput{
@@ -220,7 +218,7 @@ func TestCache_HeadFromCache(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "HEAD should be served from cache")
+	env.AssertXCacheHit(t) // HEAD should be served from cache
 	assert.Equal(t, etag, aws.ToString(resp2.ETag), "HEAD should return same ETag as GET")
 	assert.Equal(t, contentLength, aws.ToInt64(resp2.ContentLength), "HEAD should return same Content-Length")
 }
@@ -249,6 +247,7 @@ func TestCache_InvalidateOnPut(t *testing.T) {
 	body1, _ := io.ReadAll(resp1.Body)
 	resp1.Body.Close()
 	assert.Equal(t, originalContent, body1)
+	env.AssertXCacheMiss(t) // First GET should be cache miss
 
 	// Wait for async cache write to complete
 	time.Sleep(100 * time.Millisecond)
@@ -267,9 +266,6 @@ func TestCache_InvalidateOnPut(t *testing.T) {
 	// Verify cache is invalidated (object removed from cache)
 	assert.False(t, env.IsCached(bucket, key), "Object should NOT be in cache after PUT (cache invalidated)")
 
-	// Reset counter
-	env.ResetUpstreamRequestCount()
-
 	// GET should return new content (cache was invalidated)
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
@@ -280,7 +276,7 @@ func TestCache_InvalidateOnPut(t *testing.T) {
 	resp2.Body.Close()
 
 	assert.Equal(t, newContent, body2, "GET after PUT should return new content")
-	assert.Equal(t, int32(1), env.GetUpstreamRequestCount(), "GET after PUT should hit upstream (cache invalidated)")
+	env.AssertXCacheMiss(t) // GET after PUT should be cache miss (cache invalidated)
 
 	// Wait for async cache write to complete
 	time.Sleep(100 * time.Millisecond)
@@ -311,6 +307,7 @@ func TestCache_InvalidateOnDelete(t *testing.T) {
 	require.NoError(t, err)
 	io.Copy(io.Discard, resp1.Body)
 	resp1.Body.Close()
+	env.AssertXCacheMiss(t) // First GET should be cache miss
 
 	// Wait for async cache write to complete
 	time.Sleep(100 * time.Millisecond)
@@ -318,8 +315,7 @@ func TestCache_InvalidateOnDelete(t *testing.T) {
 	// Verify content is in cache (metadata exists)
 	assert.True(t, env.IsCached(bucket, key), "Object should be cached after first GET")
 
-	// Verify it's cached (via upstream request count)
-	env.ResetUpstreamRequestCount()
+	// Verify it's cached (via X-Cache status)
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -327,7 +323,7 @@ func TestCache_InvalidateOnDelete(t *testing.T) {
 	require.NoError(t, err)
 	io.Copy(io.Discard, resp2.Body)
 	resp2.Body.Close()
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "Should be cache hit before delete")
+	env.AssertXCacheHit(t) // Should be cache hit before delete
 
 	// DELETE the object - should invalidate cache
 	_, err = client.DeleteObject(ctx, &s3.DeleteObjectInput{
@@ -371,9 +367,12 @@ func TestCache_RangeServedFromCache(t *testing.T) {
 	require.NoError(t, err)
 	io.Copy(io.Discard, resp1.Body)
 	resp1.Body.Close()
+	env.AssertXCacheMiss(t) // First GET should be cache miss
+
+	// Wait for cache to be populated
+	time.Sleep(100 * time.Millisecond)
 
 	// Verify full object is cached
-	env.ResetUpstreamRequestCount()
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -381,10 +380,7 @@ func TestCache_RangeServedFromCache(t *testing.T) {
 	require.NoError(t, err)
 	io.Copy(io.Discard, resp2.Body)
 	resp2.Body.Close()
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "Full GET should be cache hit")
-
-	// Reset counter
-	env.ResetUpstreamRequestCount()
+	env.AssertXCacheHit(t) // Full GET should be cache hit
 
 	// Range request - should be served from cache (full object is cached)
 	resp3, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -397,10 +393,9 @@ func TestCache_RangeServedFromCache(t *testing.T) {
 	resp3.Body.Close()
 
 	assert.Equal(t, []byte("0123456789"), body3, "Range request should return correct bytes")
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "Range request should be served from cache when full object is cached")
+	env.AssertXCacheHit(t) // Range request should be served from cache when full object is cached
 
 	// Test another range from same cached object
-	env.ResetUpstreamRequestCount()
 	resp4, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -411,7 +406,7 @@ func TestCache_RangeServedFromCache(t *testing.T) {
 	resp4.Body.Close()
 
 	assert.Equal(t, []byte("ABCDEFGHIJ"), body4, "Second range request should return correct bytes")
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "Second range request should also be served from cache")
+	env.AssertXCacheHit(t) // Second range request should also be served from cache
 }
 
 // TestCache_RangeSingleByteAtZero verifies the byte-0 quirk handling.
@@ -439,12 +434,12 @@ func TestCache_RangeSingleByteAtZero(t *testing.T) {
 	resp1.Body.Close()
 
 	assert.Equal(t, content, body1, "Full GET should return complete content")
+	env.AssertXCacheMiss(t) // First GET should be cache miss
 
 	// Wait for cache to be populated
 	time.Sleep(100 * time.Millisecond)
 
 	// Second: Full GET to verify cache hit
-	env.ResetUpstreamRequestCount()
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -453,11 +448,10 @@ func TestCache_RangeSingleByteAtZero(t *testing.T) {
 	io.ReadAll(resp2.Body)
 	resp2.Body.Close()
 
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "Second full GET should be cache hit")
+	env.AssertXCacheHit(t) // Second full GET should be cache hit
 
 	// Third: Range request for single byte at position 0 (bytes=0-0)
 	// This tests the ocache byte-0 quirk handling
-	env.ResetUpstreamRequestCount()
 	resp3, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -468,10 +462,9 @@ func TestCache_RangeSingleByteAtZero(t *testing.T) {
 	resp3.Body.Close()
 
 	assert.Equal(t, []byte("A"), body3, "Range bytes=0-0 should return single byte 'A'")
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "Range request should be served from cache")
+	env.AssertXCacheHit(t) // Range request should be served from cache
 
 	// Fourth: Test other single-byte ranges work too (not just byte 0)
-	env.ResetUpstreamRequestCount()
 	resp4, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -482,10 +475,9 @@ func TestCache_RangeSingleByteAtZero(t *testing.T) {
 	resp4.Body.Close()
 
 	assert.Equal(t, []byte("B"), body4, "Range bytes=1-1 should return single byte 'B'")
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "Range request should be served from cache")
+	env.AssertXCacheHit(t) // Range request should be served from cache
 
 	// Fifth: Test last byte
-	env.ResetUpstreamRequestCount()
 	resp5, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -496,7 +488,7 @@ func TestCache_RangeSingleByteAtZero(t *testing.T) {
 	resp5.Body.Close()
 
 	assert.Equal(t, []byte("Z"), body5, "Range bytes=25-25 should return single byte 'Z'")
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "Range request should be served from cache")
+	env.AssertXCacheHit(t) // Range request should be served from cache
 }
 
 // TestCache_LargeObjectStreaming verifies large objects are handled correctly with streaming.
@@ -519,7 +511,6 @@ func TestCache_LargeObjectStreaming(t *testing.T) {
 	ctx := context.Background()
 
 	// First GET - cache miss, fetches from upstream
-	env.ResetUpstreamRequestCount()
 	resp1, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -530,10 +521,12 @@ func TestCache_LargeObjectStreaming(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, content, body1, "First GET should return correct content")
-	assert.Equal(t, int32(1), env.GetUpstreamRequestCount(), "First GET should hit upstream")
+	env.AssertXCacheMiss(t) // First GET should be cache miss
+
+	// Wait for cache to be populated (large objects may take longer)
+	time.Sleep(200 * time.Millisecond)
 
 	// Second GET - cache hit
-	env.ResetUpstreamRequestCount()
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -544,7 +537,7 @@ func TestCache_LargeObjectStreaming(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, content, body2, "Second GET should return same content")
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "Second GET should be cache hit")
+	env.AssertXCacheHit(t) // Second GET should be cache hit
 }
 
 // TestCache_MultipleObjectsIndependent verifies different objects are cached independently.
@@ -577,11 +570,13 @@ func TestCache_MultipleObjectsIndependent(t *testing.T) {
 		require.NoError(t, err)
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+		env.AssertXCacheMiss(t) // First GET of each object should be cache miss
 	}
 
-	// Reset and verify all are cached
-	env.ResetUpstreamRequestCount()
+	// Wait for cache to be populated
+	time.Sleep(100 * time.Millisecond)
 
+	// Verify all are cached
 	for key, expectedContent := range objects {
 		resp, err := client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
@@ -592,9 +587,8 @@ func TestCache_MultipleObjectsIndependent(t *testing.T) {
 		resp.Body.Close()
 
 		assert.Equal(t, expectedContent, body, "Object %s should have correct content", key)
+		env.AssertXCacheHit(t) // Second GET of each object should be cache hit
 	}
-
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "All GETs should be cache hits")
 }
 
 // TestCache_CacheHitHeaders verifies cache hits include correct headers including X-Cache.
@@ -630,7 +624,6 @@ func TestCache_CacheHitHeaders(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Second request - cache hit
-	env.ResetUpstreamRequestCount()
 	resp2, err := env.DoSignedRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
 	require.NoError(t, err)
 	defer resp2.Body.Close()
@@ -638,7 +631,7 @@ func TestCache_CacheHitHeaders(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp2.StatusCode)
 	assert.Equal(t, etag, resp2.Header.Get("ETag"), "Cache hit should have same ETag")
 	assert.Equal(t, "HIT", resp2.Header.Get("X-Cache"), "Second request should be cache HIT")
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "Should be cache hit")
+	env.AssertXCacheHit(t) // Should be cache hit
 }
 
 // TestCache_XCacheForRangeRequests verifies X-Cache headers for range requests.
@@ -877,8 +870,7 @@ func TestCache_InvalidateOnDeleteObjects(t *testing.T) {
 		assert.True(t, env.IsCached(bucket, key), "Object %s should be cached after GET", key)
 	}
 
-	// Verify all are cached (via upstream request count)
-	env.ResetUpstreamRequestCount()
+	// Verify all are cached (via X-Cache status)
 	for _, key := range keys {
 		resp, err := client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
@@ -887,8 +879,8 @@ func TestCache_InvalidateOnDeleteObjects(t *testing.T) {
 		require.NoError(t, err)
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+		env.AssertXCacheHit(t) // All GETs should be cache hits before delete
 	}
-	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "All GETs should be cache hits before delete")
 
 	// Build delete request
 	objectIds := make([]types.ObjectIdentifier, len(keys))

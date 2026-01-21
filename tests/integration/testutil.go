@@ -8,7 +8,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -33,6 +36,147 @@ const (
 	TestRegion = "us-east-1"
 )
 
+// XCacheStatus represents the possible X-Cache header values.
+type XCacheStatus string
+
+const (
+	// XCacheHit indicates the response was served from cache.
+	XCacheHit XCacheStatus = "HIT"
+	// XCacheMiss indicates the response was fetched from upstream (cache miss).
+	XCacheMiss XCacheStatus = "MISS"
+	// XCacheDisabled indicates caching is disabled.
+	XCacheDisabled XCacheStatus = "DISABLED"
+	// XCacheUnknown indicates no X-Cache header was present.
+	XCacheUnknown XCacheStatus = ""
+)
+
+// XCacheTracker tracks X-Cache header values from TAG server responses.
+// It is thread-safe and can track both the last response and per-key values.
+type XCacheTracker struct {
+	mu          sync.RWMutex
+	lastStatus  XCacheStatus
+	lastBucket  string
+	lastKey     string
+	perKeyCache map[string]XCacheStatus // key format: "bucket/key"
+}
+
+// NewXCacheTracker creates a new X-Cache tracker.
+func NewXCacheTracker() *XCacheTracker {
+	return &XCacheTracker{
+		perKeyCache: make(map[string]XCacheStatus),
+	}
+}
+
+// Record records an X-Cache header value from a response.
+func (t *XCacheTracker) Record(bucket, key string, status XCacheStatus) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.lastStatus = status
+	t.lastBucket = bucket
+	t.lastKey = key
+
+	if bucket != "" && key != "" {
+		cacheKey := bucket + "/" + key
+		t.perKeyCache[cacheKey] = status
+	}
+}
+
+// GetLast returns the most recent X-Cache status.
+func (t *XCacheTracker) GetLast() XCacheStatus {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.lastStatus
+}
+
+// Get returns the X-Cache status for a specific bucket/key.
+func (t *XCacheTracker) Get(bucket, key string) XCacheStatus {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	cacheKey := bucket + "/" + key
+	return t.perKeyCache[cacheKey]
+}
+
+// Reset clears all tracked values.
+func (t *XCacheTracker) Reset() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.lastStatus = XCacheUnknown
+	t.lastBucket = ""
+	t.lastKey = ""
+	t.perKeyCache = make(map[string]XCacheStatus)
+}
+
+// xCacheResponseWriter wraps http.ResponseWriter to capture the X-Cache header.
+type xCacheResponseWriter struct {
+	http.ResponseWriter
+	tracker     *XCacheTracker
+	bucket      string
+	key         string
+	wroteHeader bool
+}
+
+func (w *xCacheResponseWriter) WriteHeader(statusCode int) {
+	if !w.wroteHeader {
+		w.wroteHeader = true
+		// Capture X-Cache header before writing
+		xCache := w.Header().Get("X-Cache")
+		if xCache != "" {
+			w.tracker.Record(w.bucket, w.key, XCacheStatus(xCache))
+		}
+	}
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *xCacheResponseWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// Flush implements http.Flusher if underlying writer supports it.
+func (w *xCacheResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// xCacheTrackingMiddleware returns middleware that captures X-Cache headers from responses.
+func xCacheTrackingMiddleware(tracker *XCacheTracker) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Parse bucket/key from path for tracking
+			bucket, key := parseBucketKeyFromPath(r.URL.Path)
+
+			// Wrap response writer to capture X-Cache
+			wrapper := &xCacheResponseWriter{
+				ResponseWriter: w,
+				tracker:        tracker,
+				bucket:         bucket,
+				key:            key,
+			}
+
+			// Call the actual handler
+			next.ServeHTTP(wrapper, r)
+		})
+	}
+}
+
+// parseBucketKeyFromPath extracts bucket and key from URL path.
+// Path format: /{bucket}/{key} or /{bucket}
+func parseBucketKeyFromPath(path string) (bucket, key string) {
+	path = strings.TrimPrefix(path, "/")
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) >= 1 {
+		bucket = parts[0]
+	}
+	if len(parts) >= 2 {
+		key = parts[1]
+	}
+	return
+}
+
 // TestEnvironment holds all components needed for integration testing.
 type TestEnvironment struct {
 	// UpstreamServer is the mock upstream Tigris server.
@@ -53,8 +197,10 @@ type TestEnvironment struct {
 	S3Backend *s3mem.Backend
 	// MemoryCache is the in-memory cache client for cache-enabled tests (nil for non-cache tests).
 	MemoryCache *cacheclient.MemoryCache
-	// UpstreamRequestCount tracks the number of requests made to upstream (for cache tests).
+	// UpstreamRequestCount tracks the number of requests made to upstream (for coalescing tests).
 	UpstreamRequestCount *int32
+	// XCacheTracker tracks X-Cache headers from TAG server responses.
+	XCacheTracker *XCacheTracker
 }
 
 // NewTestEnvironment creates a new test environment with gofakes3 in-memory backend.
@@ -97,7 +243,7 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 	backend := s3mem.New()
 	faker := gofakes3.New(backend)
 
-	// Track upstream requests to verify cache behavior
+	// Track upstream requests for coalescing tests
 	var requestCount int32
 	counter := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -140,9 +286,13 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 	// Create service
 	service := proxy.NewService(forwarder, testCache, cfg)
 
-	// Create TAG server
+	// Create X-Cache tracker
+	xCacheTracker := NewXCacheTracker()
+
+	// Create TAG server with X-Cache tracking middleware
 	server := handlers.NewServer(service, "127.0.0.1", 0)
-	tagServer := httptest.NewServer(server.Router())
+	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
+	tagServer := httptest.NewServer(wrappedRouter)
 
 	// Create signer for test requests (pointing to TAG server)
 	signer := auth.NewRequestSigner(tagServer.URL, TestRegion)
@@ -158,6 +308,7 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 		S3Backend:            backend,
 		MemoryCache:          memoryCache,
 		UpstreamRequestCount: &requestCount,
+		XCacheTracker:        xCacheTracker,
 	}
 }
 
@@ -193,9 +344,13 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 	// Create service
 	service := proxy.NewService(forwarder, testCache, cfg)
 
-	// Create TAG server
+	// Create X-Cache tracker
+	xCacheTracker := NewXCacheTracker()
+
+	// Create TAG server with X-Cache tracking middleware
 	server := handlers.NewServer(service, "127.0.0.1", 0)
-	tagServer := httptest.NewServer(server.Router())
+	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
+	tagServer := httptest.NewServer(wrappedRouter)
 
 	// Create signer for test requests (pointing to TAG server)
 	signer := auth.NewRequestSigner(tagServer.URL, TestRegion)
@@ -209,6 +364,7 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 		Service:        service,
 		Signer:         signer,
 		S3Backend:      backend,
+		XCacheTracker:  xCacheTracker,
 	}
 }
 
@@ -429,4 +585,63 @@ func (e *TestEnvironment) GetCachedMeta(bucket, key string) ([]byte, bool) {
 func (e *TestEnvironment) IsCached(bucket, key string) bool {
 	_, found := e.GetCachedMeta(bucket, key)
 	return found
+}
+
+// GetLastXCacheStatus returns the X-Cache status from the most recent response.
+func (e *TestEnvironment) GetLastXCacheStatus() XCacheStatus {
+	if e.XCacheTracker == nil {
+		return XCacheUnknown
+	}
+	return e.XCacheTracker.GetLast()
+}
+
+// GetXCacheStatus returns the X-Cache status for a specific bucket/key.
+func (e *TestEnvironment) GetXCacheStatus(bucket, key string) XCacheStatus {
+	if e.XCacheTracker == nil {
+		return XCacheUnknown
+	}
+	return e.XCacheTracker.Get(bucket, key)
+}
+
+// ResetXCacheTracker clears the X-Cache tracking history.
+func (e *TestEnvironment) ResetXCacheTracker() {
+	if e.XCacheTracker != nil {
+		e.XCacheTracker.Reset()
+	}
+}
+
+// AssertXCacheHit asserts the last request was a cache hit.
+func (e *TestEnvironment) AssertXCacheHit(t *testing.T) {
+	t.Helper()
+	status := e.GetLastXCacheStatus()
+	if status != XCacheHit {
+		t.Errorf("Expected X-Cache: HIT, got: %s", status)
+	}
+}
+
+// AssertXCacheMiss asserts the last request was a cache miss.
+func (e *TestEnvironment) AssertXCacheMiss(t *testing.T) {
+	t.Helper()
+	status := e.GetLastXCacheStatus()
+	if status != XCacheMiss {
+		t.Errorf("Expected X-Cache: MISS, got: %s", status)
+	}
+}
+
+// AssertXCacheDisabled asserts the last request had cache disabled.
+func (e *TestEnvironment) AssertXCacheDisabled(t *testing.T) {
+	t.Helper()
+	status := e.GetLastXCacheStatus()
+	if status != XCacheDisabled {
+		t.Errorf("Expected X-Cache: DISABLED, got: %s", status)
+	}
+}
+
+// AssertXCacheStatusFor asserts X-Cache status for a specific bucket/key.
+func (e *TestEnvironment) AssertXCacheStatusFor(t *testing.T, bucket, key string, expected XCacheStatus) {
+	t.Helper()
+	status := e.GetXCacheStatus(bucket, key)
+	if status != expected {
+		t.Errorf("Expected X-Cache: %s for %s/%s, got: %s", expected, bucket, key, status)
+	}
 }
