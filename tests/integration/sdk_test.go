@@ -1351,3 +1351,151 @@ func TestSDK_GetObjectRange_SingleByteAtZero(t *testing.T) {
 
 	t.Logf("Byte-0 quirk verified: single byte at position 0 returned correctly: %q", body2)
 }
+
+// TestSDK_DeleteObjects verifies DeleteObjects (bulk delete) operation with AWS SDK.
+func TestSDK_DeleteObjects(t *testing.T) {
+	env := NewTestEnvironment()
+	defer env.Close()
+
+	bucket := "test-bucket"
+	keys := []string{"delete1.txt", "delete2.txt", "delete3.txt"}
+
+	// Pre-populate test objects
+	for _, key := range keys {
+		if err := env.PutTestObject(bucket, key, []byte("content for "+key)); err != nil {
+			t.Fatalf("Failed to pre-populate test data: %v", err)
+		}
+	}
+
+	client := env.GetS3Client()
+	ctx := context.Background()
+
+	// Build delete request
+	objectIds := make([]types.ObjectIdentifier, len(keys))
+	for i, key := range keys {
+		objectIds[i] = types.ObjectIdentifier{Key: aws.String(key)}
+	}
+
+	// Delete all objects
+	result, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String(bucket),
+		Delete: &types.Delete{
+			Objects: objectIds,
+		},
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjects failed: %v", err)
+	}
+
+	// Verify all objects were deleted
+	if len(result.Deleted) != len(keys) {
+		t.Errorf("Expected %d deleted objects, got %d", len(keys), len(result.Deleted))
+	}
+	if len(result.Errors) > 0 {
+		t.Errorf("Expected no errors, got %d errors", len(result.Errors))
+	}
+
+	// Verify objects no longer exist
+	for _, key := range keys {
+		_, err := client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		if err == nil {
+			t.Errorf("Expected error for deleted object %s, got nil", key)
+		}
+	}
+
+	t.Logf("DeleteObjects verified: %d objects deleted successfully", len(result.Deleted))
+}
+
+// TestSDK_DeleteObjects_WithCache verifies DeleteObjects with caching enabled.
+// Objects should be removed from cache after bulk deletion.
+func TestSDK_DeleteObjects_WithCache(t *testing.T) {
+	env := NewTestEnvironmentWithCache()
+	defer env.Close()
+
+	bucket := "test-bucket"
+	keys := []string{"delete1.txt", "delete2.txt", "delete3.txt"}
+
+	// Pre-populate test objects
+	for _, key := range keys {
+		if err := env.PutTestObject(bucket, key, []byte("content for "+key)); err != nil {
+			t.Fatalf("Failed to pre-populate test data: %v", err)
+		}
+	}
+
+	client := env.GetS3Client()
+	ctx := context.Background()
+
+	// GET all objects to populate cache
+	for _, key := range keys {
+		resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			t.Fatalf("GetObject for %s failed: %v", key, err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	// Wait for cache to be populated
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify all are cached
+	env.ResetUpstreamRequestCount()
+	for _, key := range keys {
+		resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			t.Fatalf("GetObject for %s failed: %v", key, err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	if count := env.GetUpstreamRequestCount(); count != 0 {
+		t.Errorf("Expected 0 upstream requests for cached objects, got %d", count)
+	}
+
+	// Build delete request
+	objectIds := make([]types.ObjectIdentifier, len(keys))
+	for i, key := range keys {
+		objectIds[i] = types.ObjectIdentifier{Key: aws.String(key)}
+	}
+
+	// Delete all objects - should invalidate cache
+	result, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String(bucket),
+		Delete: &types.Delete{
+			Objects: objectIds,
+		},
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjects failed: %v", err)
+	}
+
+	// Verify all objects were deleted
+	if len(result.Deleted) != len(keys) {
+		t.Errorf("Expected %d deleted objects, got %d", len(keys), len(result.Deleted))
+	}
+	if len(result.Errors) > 0 {
+		t.Errorf("Expected no errors, got %d errors", len(result.Errors))
+	}
+
+	// Verify objects no longer exist (cache should be invalidated)
+	for _, key := range keys {
+		_, err := client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		if err == nil {
+			t.Errorf("Expected error for deleted object %s, got nil", key)
+		}
+	}
+
+	t.Logf("DeleteObjects with cache verified: %d objects deleted and cache invalidated", len(result.Deleted))
+}

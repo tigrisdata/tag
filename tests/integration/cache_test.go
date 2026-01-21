@@ -11,6 +11,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -31,6 +32,9 @@ func TestCache_HitWithMetadata(t *testing.T) {
 	client := env.GetS3Client()
 	ctx := context.Background()
 
+	// Verify object is NOT in cache initially
+	assert.False(t, env.IsCached(bucket, key), "Object should not be cached before first GET")
+
 	// First GET - should be cache miss, goes to upstream
 	env.ResetUpstreamRequestCount()
 	resp1, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -47,6 +51,12 @@ func TestCache_HitWithMetadata(t *testing.T) {
 
 	// Save the ETag for comparison
 	etag1 := aws.ToString(resp1.ETag)
+
+	// Wait for async cache write to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify object IS now in cache (metadata exists)
+	assert.True(t, env.IsCached(bucket, key), "Object should be cached after first GET")
 
 	// Second GET - should be cache hit, no upstream request
 	env.ResetUpstreamRequestCount()
@@ -240,6 +250,12 @@ func TestCache_InvalidateOnPut(t *testing.T) {
 	resp1.Body.Close()
 	assert.Equal(t, originalContent, body1)
 
+	// Wait for async cache write to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify original content is in cache (metadata exists)
+	assert.True(t, env.IsCached(bucket, key), "Object should be cached after first GET")
+
 	// PUT new content - should invalidate cache
 	_, err = client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
@@ -247,6 +263,9 @@ func TestCache_InvalidateOnPut(t *testing.T) {
 		Body:   bytes.NewReader(newContent),
 	})
 	require.NoError(t, err)
+
+	// Verify cache is invalidated (object removed from cache)
+	assert.False(t, env.IsCached(bucket, key), "Object should NOT be in cache after PUT (cache invalidated)")
 
 	// Reset counter
 	env.ResetUpstreamRequestCount()
@@ -262,6 +281,12 @@ func TestCache_InvalidateOnPut(t *testing.T) {
 
 	assert.Equal(t, newContent, body2, "GET after PUT should return new content")
 	assert.Equal(t, int32(1), env.GetUpstreamRequestCount(), "GET after PUT should hit upstream (cache invalidated)")
+
+	// Wait for async cache write to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify new content is now cached (metadata exists)
+	assert.True(t, env.IsCached(bucket, key), "Object should be cached again after GET")
 }
 
 // TestCache_InvalidateOnDelete verifies DELETE invalidates the cache.
@@ -287,7 +312,13 @@ func TestCache_InvalidateOnDelete(t *testing.T) {
 	io.Copy(io.Discard, resp1.Body)
 	resp1.Body.Close()
 
-	// Verify it's cached
+	// Wait for async cache write to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify content is in cache (metadata exists)
+	assert.True(t, env.IsCached(bucket, key), "Object should be cached after first GET")
+
+	// Verify it's cached (via upstream request count)
 	env.ResetUpstreamRequestCount()
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
@@ -304,6 +335,9 @@ func TestCache_InvalidateOnDelete(t *testing.T) {
 		Key:    aws.String(key),
 	})
 	require.NoError(t, err)
+
+	// Verify cache is invalidated (object removed from cache)
+	assert.False(t, env.IsCached(bucket, key), "Object should NOT be in cache after DELETE")
 
 	// GET should now return 404
 	_, err = client.GetObject(ctx, &s3.GetObjectInput{
@@ -801,4 +835,92 @@ func TestCache_HeaderPreservation(t *testing.T) {
 
 	t.Logf("Header preservation verified: ETag=%s, Content-Type=%s, Content-Length=%s, Last-Modified=%s",
 		upstreamETag, upstreamContentType, upstreamContentLength, upstreamLastModified)
+}
+
+// TestCache_InvalidateOnDeleteObjects verifies DeleteObjects invalidates cache for all deleted objects.
+func TestCache_InvalidateOnDeleteObjects(t *testing.T) {
+	env := NewTestEnvironmentWithCache()
+	defer env.Close()
+
+	bucket := "cache-test-bucket"
+	keys := []string{"bulk-delete1.txt", "bulk-delete2.txt", "bulk-delete3.txt"}
+
+	// Create objects
+	for _, key := range keys {
+		require.NoError(t, env.PutTestObject(bucket, key, []byte("content for "+key)))
+	}
+
+	client := env.GetS3Client()
+	ctx := context.Background()
+
+	// Verify objects are NOT in cache initially
+	for _, key := range keys {
+		assert.False(t, env.IsCached(bucket, key), "Object %s should not be cached initially", key)
+	}
+
+	// GET all objects to populate cache
+	for _, key := range keys {
+		resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		require.NoError(t, err)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	// Wait for cache to be populated
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify all objects ARE now in cache (metadata exists)
+	for _, key := range keys {
+		assert.True(t, env.IsCached(bucket, key), "Object %s should be cached after GET", key)
+	}
+
+	// Verify all are cached (via upstream request count)
+	env.ResetUpstreamRequestCount()
+	for _, key := range keys {
+		resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		require.NoError(t, err)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	assert.Equal(t, int32(0), env.GetUpstreamRequestCount(), "All GETs should be cache hits before delete")
+
+	// Build delete request
+	objectIds := make([]types.ObjectIdentifier, len(keys))
+	for i, key := range keys {
+		objectIds[i] = types.ObjectIdentifier{Key: aws.String(key)}
+	}
+
+	// DeleteObjects - should invalidate cache for all deleted objects
+	result, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String(bucket),
+		Delete: &types.Delete{
+			Objects: objectIds,
+		},
+	})
+	require.NoError(t, err)
+	assert.Len(t, result.Deleted, len(keys))
+
+	// Verify all objects are removed from cache
+	for _, key := range keys {
+		assert.False(t, env.IsCached(bucket, key), "Object %s should NOT be in cache after DeleteObjects", key)
+	}
+
+	// Verify objects no longer exist in upstream (404 returned)
+	for _, key := range keys {
+		_, err := client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		assert.Error(t, err, "GET after DeleteObjects should return error for %s", key)
+		assert.True(t, strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "404"),
+			"Error should indicate object not found for %s", key)
+	}
+
+	t.Logf("DeleteObjects cache invalidation verified: %d objects deleted and cache invalidated", len(keys))
 }

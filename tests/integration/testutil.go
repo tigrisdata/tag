@@ -390,3 +390,43 @@ func (e *TestEnvironment) ResetUpstreamRequestCount() {
 		atomic.StoreInt32(e.UpstreamRequestCount, 0)
 	}
 }
+
+// GetCachedObject reads an object directly from the cache for test verification.
+// Returns (body, found). If not found or cache is disabled, returns (nil, false).
+func (e *TestEnvironment) GetCachedObject(bucket, key string) ([]byte, bool) {
+	if e.MemoryCache == nil {
+		return nil, false
+	}
+
+	// Use the same key format as the cache package
+	bodyKey := "body|" + bucket + "|" + key
+	// Body is stored via PutStream, so we need to use GetStream to retrieve it
+	var buf bytes.Buffer
+	err := e.MemoryCache.GetStream(context.Background(), bodyKey, &buf)
+	if err != nil {
+		return nil, false
+	}
+	return buf.Bytes(), true
+}
+
+// GetCachedMeta reads object metadata directly from the cache for test verification.
+// Returns (metadata bytes, found). If not found or cache is disabled, returns (nil, false).
+func (e *TestEnvironment) GetCachedMeta(bucket, key string) ([]byte, bool) {
+	if e.MemoryCache == nil {
+		return nil, false
+	}
+
+	// Use the same key format as the cache package
+	metaKey := "meta|" + bucket + "|" + key
+	meta, err := e.MemoryCache.Get(context.Background(), metaKey)
+	if err != nil || meta == nil {
+		return nil, false
+	}
+	return meta, true
+}
+
+// IsCached checks if an object exists in the cache.
+func (e *TestEnvironment) IsCached(bucket, key string) bool {
+	_, found := e.GetCachedMeta(bucket, key)
+	return found
+}
