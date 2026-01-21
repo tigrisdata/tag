@@ -216,6 +216,9 @@ func (f *Forwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWrite
 	capture.Body, readErr = io.ReadAll(io.TeeReader(resp.Body, w))
 	if readErr != nil {
 		log.Warn().Err(readErr).Msg("Failed to fully capture response body")
+		capture.Complete = false
+	} else {
+		capture.Complete = true
 	}
 
 	return capture, nil
@@ -226,6 +229,7 @@ type ResponseCapture struct {
 	StatusCode int
 	Headers    http.Header
 	Body       []byte
+	Complete   bool // True if body was fully captured without errors
 }
 
 // ContentLength returns the content length from headers or body length.

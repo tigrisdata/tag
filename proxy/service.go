@@ -203,7 +203,8 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	}
 
 	// Cache successful completions (2xx status codes) in ocache
-	if capture.StatusCode >= 200 && capture.StatusCode < 300 {
+	// Only cache if the body was fully captured to avoid storing corrupted responses
+	if capture.StatusCode >= 200 && capture.StatusCode < 300 && capture.Complete {
 		if cacheErr := s.cache.PutCompletion(ctx, bucket, key, uploadId, capture.StatusCode, capture.Headers, capture.Body); cacheErr != nil {
 			log.Debug().Err(cacheErr).Msg("Failed to cache completion response")
 			// Don't fail the request if caching fails
