@@ -109,6 +109,11 @@ func (s *Server) setupRouter() *mux.Router {
 		Queries("location", "").
 		Methods("GET")
 
+	// DeleteObjects (multi-object delete)
+	r.HandleFunc("/{bucket}", s.handleDeleteObjects).
+		Queries("delete", "").
+		Methods("POST")
+
 	// Basic bucket operations (ListObjects V1, CreateBucket, DeleteBucket, HeadBucket)
 	r.HandleFunc("/{bucket}", s.handleBucket).Methods("GET", "HEAD", "PUT", "DELETE")
 
@@ -407,6 +412,16 @@ func (s *Server) handleBucketLocation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.service.HandlePassthrough(w, r); err != nil {
+		handleError(w, r, err)
+	}
+}
+
+// handleDeleteObjects handles DeleteObjects (multi-object delete) operation.
+func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request) {
+	if !validateBucketName(w, r) {
+		return
+	}
+	if err := s.service.HandleDeleteObjects(w, r); err != nil {
 		handleError(w, r, err)
 	}
 }
