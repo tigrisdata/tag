@@ -4,7 +4,7 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 
 ## Features
 
-- **S3-Compatible API**: Supports GET, PUT, DELETE, HEAD, and COPY operations
+- **S3-Compatible API**: Supports all S3 API endpoints supported by Tigris
 - **Transparent Caching**: Automatic caching of objects with configurable TTL and size thresholds
 - **Request Coalescing**: Streaming broadcast pattern reduces duplicate upstream requests under concurrent load
 - **Range Request Caching**: Background fetch of full objects on range cache miss for optimal ML training workloads
@@ -71,47 +71,22 @@ make test-proxy
 
 # Run with race detector
 make test-race
+
+# Run S3 compatibility tests (requires AWS credentials)
+make s3-test-local && make s3-tests
 ```
+
+See [docs/s3-compatibility-testing.md](docs/s3-compatibility-testing.md) for detailed S3 compatibility testing guide.
 
 ## Configuration
 
-TAG can be configured via YAML file or environment variables.
+TAG can be configured via YAML file or environment variables. Key settings:
 
-### Environment Variables
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` - Tigris credentials (required)
+- `TAG_OCACHE_ENDPOINTS` - Comma-separated ocache endpoints for caching
+- `TAG_LOG_LEVEL` - Log level: debug, info, warn, error
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `AWS_ACCESS_KEY_ID` | S3 access key for authentication | (required) |
-| `AWS_SECRET_ACCESS_KEY` | S3 secret key for authentication | (required) |
-| `TAG_UPSTREAM_ENDPOINT` | Tigris S3 endpoint URL | `https://t3.storage.dev` |
-| `TAG_OCACHE_ENDPOINTS` | Comma-separated ocache endpoints | (none - caching disabled) |
-| `TAG_CACHE_DISABLED` | Disable caching (`true`/`1`) | `false` |
-| `TAG_LOG_LEVEL` | Log level (debug, info, warn, error) | `info` |
-
-### Configuration File
-
-```yaml
-server:
-  http_port: 8080
-  bind_ip: "0.0.0.0"
-
-cache:
-  enabled: true
-  endpoints:
-    - "ocache-0:9000"
-    - "ocache-1:9000"
-  ttl: 60m
-  size_threshold: 1073741824  # 1GB
-
-broadcast:
-  chunk_size: 65536           # 64KB
-  channel_buffer: 32          # 32 chunks per listener
-
-log:
-  level: "info"
-```
-
-See [docs/configuration.md](docs/configuration.md) for detailed configuration reference.
+See [docs/configuration.md](docs/configuration.md) for full configuration reference.
 
 ## Architecture
 
@@ -147,26 +122,13 @@ See [docs/architecture.md](docs/architecture.md) for detailed architecture docum
 
 ## Metrics
 
-TAG exposes Prometheus metrics at `/metrics`:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `tag_requests_total` | Counter | Total requests by operation and status |
-| `tag_request_duration_seconds` | Histogram | Request latency by operation |
-| `tag_cache_hits_total` | Counter | Cache hit count |
-| `tag_cache_misses_total` | Counter | Cache miss count |
-| `tag_broadcast_shared_total` | Counter | Requests that joined existing broadcasts |
-| `tag_broadcast_fetches_total` | Counter | Upstream fetches (broadcast initiators) |
-| `tag_active_broadcasts` | Gauge | Current active broadcast streams |
-| `tag_background_fetches_triggered_total` | Counter | Background fetches from range requests |
+TAG exposes Prometheus metrics at `/metrics` including request counts, latencies, cache hit/miss rates, and broadcast statistics.
 
 See [docs/metrics.md](docs/metrics.md) for complete metrics reference.
 
 ## Deployment
 
 ### Docker
-
-#### Quick Start
 
 ```bash
 # Single node (TAG + ocache)
@@ -177,85 +139,21 @@ docker-compose up -d
 docker-compose -f docker-compose-cluster.yml up -d
 ```
 
-#### Environment Variables
-
-Create a `.env` file in the `docker/` directory:
-
-```bash
-# Required
-AWS_ACCESS_KEY_ID=your_access_key
-AWS_SECRET_ACCESS_KEY=your_secret_key
-
-# Optional
-TAG_LOG_LEVEL=info
-```
-
-#### Single Node Setup
-
-```bash
-# Start services
-docker-compose -f docker/docker-compose.yml up -d
-
-# View logs
-docker-compose -f docker/docker-compose.yml logs -f tag
-
-# Stop services
-docker-compose -f docker/docker-compose.yml down
-```
-
-#### Cluster Setup
-
-```bash
-# Start 2 TAG nodes + 3 ocache cluster
-docker-compose -f docker/docker-compose-cluster.yml up -d
-
-# TAG endpoints are available at:
-# - http://localhost:8081 (tag-1)
-# - http://localhost:8082 (tag-2)
-
-# Stop cluster
-docker-compose -f docker/docker-compose-cluster.yml down -v
-```
-
-#### Building Local Image
-
-```bash
-# Build image locally
-docker build -t tag:local -f docker/Dockerfile .
-
-# Run with local image
-docker run -p 8080:8080 \
-  -e AWS_ACCESS_KEY_ID=your_key \
-  -e AWS_SECRET_ACCESS_KEY=your_secret \
-  -e TAG_OCACHE_ENDPOINTS=host.docker.internal:9000 \
-  tag:local
-```
-
 ### Kubernetes
 
 ```bash
-# Create credentials secret
 kubectl create secret generic tag-credentials \
   --from-literal=AWS_ACCESS_KEY_ID=your_key \
   --from-literal=AWS_SECRET_ACCESS_KEY=your_secret
 
-# Apply manifests
 kubectl apply -f deploy/
 ```
 
-See [docs/deployment.md](docs/deployment.md) for production deployment guide.
+See [docs/deployment.md](docs/deployment.md) for complete deployment guide including environment setup, cluster configuration, and production considerations.
 
 ## API Reference
 
-TAG implements a subset of the S3 API:
-
-| Operation | Endpoint | Description |
-|-----------|----------|-------------|
-| GetObject | `GET /{bucket}/{key}` | Retrieve object (with caching) |
-| PutObject | `PUT /{bucket}/{key}` | Upload object (invalidates cache) |
-| DeleteObject | `DELETE /{bucket}/{key}` | Delete object (invalidates cache) |
-| HeadObject | `HEAD /{bucket}/{key}` | Get object metadata |
-| CopyObject | `PUT /{bucket}/{key}` with `x-amz-copy-source` | Copy object |
+TAG supports all S3 API endpoints supported by Tigris, including bucket operations, object operations, multipart uploads, and more. See the [Tigris S3 API documentation](https://www.tigrisdata.com/docs/api/s3/) for the complete list of supported operations.
 
 ### Response Headers
 
@@ -269,6 +167,8 @@ TAG implements a subset of the S3 API:
 - Objects with `Cache-Control: no-store` or `private` are not cached
 - Range requests trigger background fetch of full object (if within threshold)
 - PUT/DELETE operations invalidate the cache entry
+
+See [docs/usage.md](docs/usage.md) for examples using AWS CLI and Python boto3.
 
 ## Development
 

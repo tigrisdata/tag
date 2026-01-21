@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -215,6 +216,9 @@ func (f *Forwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWrite
 	capture.Body, readErr = io.ReadAll(io.TeeReader(resp.Body, w))
 	if readErr != nil {
 		log.Warn().Err(readErr).Msg("Failed to fully capture response body")
+		capture.Complete = false
+	} else {
+		capture.Complete = true
 	}
 
 	return capture, nil
@@ -225,6 +229,7 @@ type ResponseCapture struct {
 	StatusCode int
 	Headers    http.Header
 	Body       []byte
+	Complete   bool // True if body was fully captured without errors
 }
 
 // ContentLength returns the content length from headers or body length.
@@ -233,9 +238,17 @@ func (r *ResponseCapture) ContentLength() int64 {
 }
 
 // copyHeaders copies headers from src to dst.
+// For x-amz-meta-* headers, the key is lowercased to match S3 convention,
+// since Go's http.Header canonicalizes keys (e.g., x-amz-meta-foo → X-Amz-Meta-Foo).
 func copyHeaders(dst, src http.Header) {
 	for k, v := range src {
-		dst[k] = v
+		lower := strings.ToLower(k)
+		if strings.HasPrefix(lower, "x-amz-meta-") {
+			// Use lowercase for metadata headers per S3 convention
+			dst[lower] = v
+		} else {
+			dst[k] = v
+		}
 	}
 }
 

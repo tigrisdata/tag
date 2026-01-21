@@ -219,6 +219,60 @@ func TestMetaFromHTTPHeaders_MultipleMetadataHeaders(t *testing.T) {
 	}
 }
 
+func TestMetaFromHTTPHeaders_MetadataLowercaseKeys(t *testing.T) {
+	// Go's http.Header canonicalizes keys (e.g., x-amz-meta-foo -> X-Amz-Meta-Foo)
+	// Our code should store metadata with lowercase keys per S3 convention
+	headers := http.Header{
+		"X-Amz-Meta-Custom-Key": []string{"custom-value"},
+		"X-Amz-Meta-Another":    []string{"another-value"},
+	}
+
+	obj := MetaFromHTTPHeaders("bucket", "key", http.StatusOK, headers)
+
+	// Keys should be stored lowercase
+	if _, ok := obj.UserMetadata["x-amz-meta-custom-key"]; !ok {
+		t.Error("UserMetadata should store key as lowercase 'x-amz-meta-custom-key'")
+	}
+	if _, ok := obj.UserMetadata["X-Amz-Meta-Custom-Key"]; ok {
+		t.Error("UserMetadata should NOT store key as canonical 'X-Amz-Meta-Custom-Key'")
+	}
+
+	// Values should be preserved
+	if obj.UserMetadata["x-amz-meta-custom-key"] != "custom-value" {
+		t.Errorf("UserMetadata[x-amz-meta-custom-key] = %q, want %q",
+			obj.UserMetadata["x-amz-meta-custom-key"], "custom-value")
+	}
+	if obj.UserMetadata["x-amz-meta-another"] != "another-value" {
+		t.Errorf("UserMetadata[x-amz-meta-another] = %q, want %q",
+			obj.UserMetadata["x-amz-meta-another"], "another-value")
+	}
+}
+
+func TestCachedObjectMeta_WriteHeaders_MetadataLowercase(t *testing.T) {
+	meta := &CachedObjectMeta{
+		Key:         "test-key",
+		Bucket:      "test-bucket",
+		ContentType: "application/octet-stream",
+		UserMetadata: map[string]string{
+			"x-amz-meta-custom": "custom-value",
+			"x-amz-meta-foo":    "foo-value",
+		},
+		StatusCode: http.StatusOK,
+	}
+
+	w := httptest.NewRecorder()
+	meta.WriteHeaders(w)
+
+	// Metadata headers should be written with lowercase keys
+	// http.Header.Get is case-insensitive, so it will find headers regardless of case
+	if w.Header().Get("x-amz-meta-custom") != "custom-value" {
+		t.Errorf("x-amz-meta-custom = %q, want %q", w.Header().Get("x-amz-meta-custom"), "custom-value")
+	}
+	if w.Header().Get("x-amz-meta-foo") != "foo-value" {
+		t.Errorf("x-amz-meta-foo = %q, want %q", w.Header().Get("x-amz-meta-foo"), "foo-value")
+	}
+}
+
 func TestCachedObjectMeta_MatchesETag(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -288,3 +288,50 @@ cache:
 		t.Error("Cache.Enabled = false, want true (auto-enabled with endpoints)")
 	}
 }
+
+func TestCacheAutoEnabledFromEnv(t *testing.T) {
+	// Create a config file WITHOUT cache endpoints
+	content := `
+server:
+  http_port: 8080
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	// Set cache endpoints via environment variable
+	t.Setenv("TAG_OCACHE_ENDPOINTS", "localhost:9000")
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Verify cache is auto-enabled when endpoints are configured via environment
+	if !cfg.Cache.Enabled {
+		t.Error("Cache.Enabled = false, want true (auto-enabled with endpoints from env)")
+	}
+	if len(cfg.Cache.Endpoints) != 1 {
+		t.Errorf("Cache.Endpoints length = %d, want 1", len(cfg.Cache.Endpoints))
+	}
+	if cfg.Cache.Endpoints[0] != "localhost:9000" {
+		t.Errorf("Cache.Endpoints[0] = %q, want localhost:9000", cfg.Cache.Endpoints[0])
+	}
+}
+
+func TestNewDefaultCacheAutoEnabledFromEnv(t *testing.T) {
+	// Set cache endpoints via environment variable
+	t.Setenv("TAG_OCACHE_ENDPOINTS", "localhost:9000")
+
+	cfg := NewDefault()
+
+	// Verify cache is auto-enabled when endpoints are configured via environment
+	if !cfg.Cache.Enabled {
+		t.Error("Cache.Enabled = false, want true (auto-enabled with endpoints from env)")
+	}
+	if len(cfg.Cache.Endpoints) != 1 {
+		t.Errorf("Cache.Endpoints length = %d, want 1", len(cfg.Cache.Endpoints))
+	}
+}

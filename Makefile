@@ -186,8 +186,87 @@ help:
 	@echo "  run           - Run TAG with default options"
 	@echo "  run-verbose   - Run TAG with debug logging"
 	@echo ""
+	@echo "S3 compatibility test targets:"
+	@echo "  s3-test-local      - Start local S3 test env (TAG on host, ocache in Docker)"
+	@echo "  s3-test-local-down - Stop local S3 test environment"
+	@echo "  s3-tests           - Run S3 compatibility tests (ceph s3-tests)"
+	@echo "  s3-tests-clean     - Remove cloned s3-tests repository"
+	@echo ""
+	@echo "  LOCAL DEVELOPMENT (recommended - no GH_TOKEN needed):"
+	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
+	@echo "    export AWS_SECRET_ACCESS_KEY=<your-secret>"
+	@echo "    make s3-test-local      # Starts ocache + TAG locally"
+	@echo "    make s3-tests           # Run tests"
+	@echo "    make s3-test-local-down # Cleanup"
+	@echo ""
+	@echo "  CI/DOCKER BUILD (requires GH_TOKEN for private repos):"
+	@echo "  s3-test-infra      - Start S3 test infrastructure (TAG + ocache in Docker)"
+	@echo "  s3-test-infra-down - Stop S3 test infrastructure"
+	@echo "    export GH_TOKEN=<your-github-pat>"
+	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
+	@echo "    export AWS_SECRET_ACCESS_KEY=<your-secret>"
+	@echo "    make s3-test-infra && make s3-tests"
+	@echo ""
 	@echo "Other targets:"
 	@echo "  clean         - Remove built binary and generated files"
 	@echo "  help          - Show this help message"
+
+# S3 compatibility tests
+S3_TEST_COMPOSE := docker compose -f tests/s3compat/docker-compose.yml
+
+.PHONY: s3-test-infra
+s3-test-infra:
+	@echo "Starting S3 test infrastructure..."
+	@if [ -z "$$GH_TOKEN" ]; then \
+		echo "Error: GH_TOKEN environment variable is not set."; \
+		echo "Set it to a GitHub Personal Access Token with repo access:"; \
+		echo "  export GH_TOKEN=<your-github-pat>"; \
+		echo "Create a PAT at: https://github.com/settings/tokens"; \
+		exit 1; \
+	fi
+	$(S3_TEST_COMPOSE) --profile full build
+	$(S3_TEST_COMPOSE) --profile full up -d --wait
+
+.PHONY: s3-test-infra-down
+s3-test-infra-down:
+	@echo "Stopping S3 test infrastructure..."
+	$(S3_TEST_COMPOSE) --profile full down -v
+
+# Local development: Run TAG on host, only ocache in Docker (no GH_TOKEN needed)
+.PHONY: s3-test-local
+s3-test-local: build
+	@echo "Starting S3 test infrastructure (local mode)..."
+	@if [ -z "$$AWS_ACCESS_KEY_ID" ] || [ -z "$$AWS_SECRET_ACCESS_KEY" ]; then \
+		echo "Error: AWS credentials not set."; \
+		echo "  export AWS_ACCESS_KEY_ID=<your-key>"; \
+		echo "  export AWS_SECRET_ACCESS_KEY=<your-secret>"; \
+		exit 1; \
+	fi
+	$(S3_TEST_COMPOSE) up -d ocache --wait
+	@echo "Starting TAG locally..."
+	@TAG_UPSTREAM_ENDPOINT=$${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev} \
+		TAG_OCACHE_ENDPOINTS=localhost:9000 \
+		TAG_LOG_LEVEL=$${TAG_LOG_LEVEL:-debug} \
+		./$(BINARY_NAME) &
+	@echo "Waiting for TAG to be ready..."
+	@timeout 30 bash -c 'until curl -s http://localhost:8080/health > /dev/null 2>&1; do sleep 1; done' || \
+		(echo "TAG failed to start"; exit 1)
+	@echo "TAG is ready at http://localhost:8080"
+
+.PHONY: s3-test-local-down
+s3-test-local-down:
+	@echo "Stopping S3 test infrastructure (local mode)..."
+	-@pkill -f "./$(BINARY_NAME)" 2>/dev/null || true
+	$(S3_TEST_COMPOSE) down -v
+
+.PHONY: s3-tests
+s3-tests:
+	@echo "Running S3 compatibility tests..."
+	cd tests/s3compat && ./run-tests.sh
+
+.PHONY: s3-tests-clean
+s3-tests-clean:
+	@echo "Cleaning up S3 test artifacts..."
+	rm -rf tests/s3compat/s3-tests
 
 .DEFAULT_GOAL := help
