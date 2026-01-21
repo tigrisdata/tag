@@ -71,7 +71,12 @@ make test-proxy
 
 # Run with race detector
 make test-race
+
+# Run S3 compatibility tests (requires AWS credentials)
+make s3-test-local && make s3-tests
 ```
+
+See [docs/s3-compatibility-testing.md](docs/s3-compatibility-testing.md) for detailed S3 compatibility testing guide.
 
 ## Configuration
 

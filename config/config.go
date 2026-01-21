@@ -171,7 +171,13 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Cache.Endpoints = splitEndpoints(endpoints)
 	}
 
-	// Disable cache from environment
+	// Auto-enable cache when endpoints are configured via environment
+	// This must run AFTER endpoints are set from environment
+	if len(cfg.Cache.Endpoints) > 0 && !cfg.Cache.Enabled {
+		cfg.Cache.Enabled = true
+	}
+
+	// Disable cache from environment (explicit disable takes precedence)
 	if disabled := os.Getenv("TAG_CACHE_DISABLED"); disabled == "true" || disabled == "1" {
 		cfg.Cache.Enabled = false
 	}

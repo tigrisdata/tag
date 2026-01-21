@@ -60,8 +60,26 @@ func NewRequestSigner(endpoint, region string) *RequestSigner {
 func (s *RequestSigner) SignRequest(ctx context.Context, method, path string,
 	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header) (*http.Request, error) {
 
-	// Build the full URL
-	fullURL := s.endpoint + path
+	// Build the full URL using url.URL to properly handle encoding
+	// This ensures special characters like % are properly encoded
+	baseURL, err := url.Parse(s.endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse endpoint: %w", err)
+	}
+
+	// Split path and query string
+	pathPart := path
+	queryPart := ""
+	if idx := strings.Index(path, "?"); idx != -1 {
+		pathPart = path[:idx]
+		queryPart = path[idx+1:]
+	}
+
+	// Set path (Go will properly encode special characters like % when converting to string)
+	baseURL.Path = pathPart
+	baseURL.RawQuery = queryPart
+
+	fullURL := baseURL.String()
 
 	// Create the new request with streaming body
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
@@ -121,8 +139,9 @@ func (s *RequestSigner) signHTTP(req *http.Request, accessKey, secretKey, bodyHa
 
 // buildCanonicalRequest builds the canonical request string for signing.
 func (s *RequestSigner) buildCanonicalRequest(req *http.Request, bodyHash string) (string, string) {
-	// Canonical URI (URL-encoded path)
-	canonicalURI := req.URL.EscapedPath()
+	// Canonical URI - use AWS SigV4 encoding which encodes more characters than Go's EscapedPath
+	// Specifically, + must be encoded as %2B per AWS spec, but Go's EscapedPath leaves it unencoded
+	canonicalURI := awsURIEncode(req.URL.Path, false)
 	if canonicalURI == "" {
 		canonicalURI = "/"
 	}
@@ -159,13 +178,13 @@ func (s *RequestSigner) buildCanonicalQueryString(query url.Values) string {
 	}
 	sort.Strings(keys)
 
-	// Build sorted key=value pairs
+	// Build sorted key=value pairs using AWS SigV4 encoding
 	pairs := make([]string, 0, len(query))
 	for _, k := range keys {
 		values := query[k]
 		sort.Strings(values)
 		for _, v := range values {
-			pairs = append(pairs, url.QueryEscape(k)+"="+url.QueryEscape(v))
+			pairs = append(pairs, awsURIEncode(k, true)+"="+awsURIEncode(v, true))
 		}
 	}
 
@@ -283,4 +302,23 @@ func hashSHA256(data []byte) string {
 	h := sha256.New()
 	h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// awsURIEncode encodes a string per AWS SigV4 spec (RFC 3986).
+// Unlike url.QueryEscape, this encodes spaces as %20 not +.
+// Set encodeSlash to false for path encoding (S3 bucket/key paths).
+func awsURIEncode(s string, encodeSlash bool) string {
+	var result strings.Builder
+	result.Grow(len(s) * 3) // Worst case: all chars need encoding
+	for _, c := range []byte(s) {
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-' || c == '~' || c == '.' {
+			result.WriteByte(c)
+		} else if c == '/' && !encodeSlash {
+			result.WriteByte(c)
+		} else {
+			result.WriteString(fmt.Sprintf("%%%02X", c))
+		}
+	}
+	return result.String()
 }

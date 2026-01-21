@@ -197,8 +197,9 @@ func (v *RequestValidator) computePresignedSignature(r *http.Request, authInfo *
 
 // buildCanonicalRequest builds the canonical request for signature verification.
 func (v *RequestValidator) buildCanonicalRequest(r *http.Request, signedHeaders []string, bodyHash string) string {
-	// Canonical URI
-	canonicalURI := r.URL.EscapedPath()
+	// Canonical URI - use AWS SigV4 encoding which encodes more characters than Go's EscapedPath
+	// Specifically, + must be encoded as %2B per AWS spec, but Go's EscapedPath leaves it unencoded
+	canonicalURI := awsURIEncode(r.URL.Path, false)
 	if canonicalURI == "" {
 		canonicalURI = "/"
 	}
@@ -224,8 +225,9 @@ func (v *RequestValidator) buildCanonicalRequest(r *http.Request, signedHeaders 
 
 // buildCanonicalRequestPresigned builds the canonical request for presigned URL verification.
 func (v *RequestValidator) buildCanonicalRequestPresigned(r *http.Request, signedHeaders []string, bodyHash string) string {
-	// Canonical URI
-	canonicalURI := r.URL.EscapedPath()
+	// Canonical URI - use AWS SigV4 encoding which encodes more characters than Go's EscapedPath
+	// Specifically, + must be encoded as %2B per AWS spec, but Go's EscapedPath leaves it unencoded
+	canonicalURI := awsURIEncode(r.URL.Path, false)
 	if canonicalURI == "" {
 		canonicalURI = "/"
 	}
@@ -264,13 +266,13 @@ func (v *RequestValidator) buildCanonicalQueryString(query url.Values) string {
 	}
 	sort.Strings(keys)
 
-	// Build sorted key=value pairs
+	// Build sorted key=value pairs using AWS SigV4 encoding
 	pairs := make([]string, 0, len(query))
 	for _, k := range keys {
 		values := query[k]
 		sort.Strings(values)
 		for _, val := range values {
-			pairs = append(pairs, url.QueryEscape(k)+"="+url.QueryEscape(val))
+			pairs = append(pairs, awsURIEncode(k, true)+"="+awsURIEncode(val, true))
 		}
 	}
 
