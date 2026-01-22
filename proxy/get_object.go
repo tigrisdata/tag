@@ -94,7 +94,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			w.Header().Set(XCacheHeader, XCacheHit)
 			w.WriteHeader(meta.StatusCode)
 			if bodyReader != nil {
-				if _, copyErr := io.Copy(w, bodyReader); copyErr != nil {
+				n, copyErr := io.Copy(w, bodyReader)
+				metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+				if copyErr != nil {
 					log.Warn().Err(copyErr).Msg("Failed to copy cached content to response")
 				}
 			}
@@ -316,6 +318,7 @@ func (s *Service) writeChunksToResponse(
 	w.WriteHeader(status)
 
 	// Receive and write chunks
+	var totalBytesOut int64
 	for chunk := range listener.Chunks() {
 		if chunk.Err != nil {
 			if chunk.Err == broadcast.ErrSlowConsumer {
@@ -325,7 +328,9 @@ func (s *Service) writeChunksToResponse(
 		}
 
 		if len(chunk.Data) > 0 {
-			if _, writeErr := w.Write(chunk.Data); writeErr != nil {
+			n, writeErr := w.Write(chunk.Data)
+			totalBytesOut += int64(n)
+			if writeErr != nil {
 				return writeErr
 			}
 			// Flush if ResponseWriter supports it
@@ -334,6 +339,9 @@ func (s *Service) writeChunksToResponse(
 			}
 		}
 	}
+
+	// Track bytes out to client
+	metrics.BytesTransferred.WithLabelValues("out").Add(float64(totalBytesOut))
 
 	return nil
 }
@@ -479,6 +487,9 @@ func (s *Service) serveRangeFromCache(
 		return err
 	}
 
+	// Track bytes out (range served from cache)
+	metrics.BytesTransferred.WithLabelValues("out").Add(float64(contentLength))
+
 	metrics.RecordRangeFromCacheHit()
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
 	return nil
@@ -525,7 +536,9 @@ func (s *Service) handleRangeWithBackgroundCache(
 	w.WriteHeader(resp.StatusCode)
 
 	// Stream Range response body to client
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	n, err := io.Copy(w, resp.Body)
+	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+	if err != nil {
 		log.Warn().Err(err).Msg("Failed to copy range response body")
 		return err
 	}
