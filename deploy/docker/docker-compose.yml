@@ -7,7 +7,6 @@ services:
     environment:
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - TAG_UPSTREAM_ENDPOINT=${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev}
       - TAG_OCACHE_ENDPOINTS=ocache:9000
       - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-info}
     depends_on:
