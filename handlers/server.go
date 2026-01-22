@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog/log"
+	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy"
 )
 
@@ -34,10 +35,22 @@ func NewServer(service *proxy.Service, bindIP string, port int) *Server {
 	return s
 }
 
+// connectionTrackingMiddleware tracks active HTTP connections.
+func (s *Server) connectionTrackingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		metrics.ActiveConnections.Inc()
+		defer metrics.ActiveConnections.Dec()
+		next.ServeHTTP(w, r)
+	})
+}
+
 // setupRouter configures the S3-compatible routes.
 func (s *Server) setupRouter() *mux.Router {
 	r := mux.NewRouter()
 	r.SkipClean(true) // Preserve path for S3 compatibility
+
+	// Apply connection tracking middleware
+	r.Use(s.connectionTrackingMiddleware)
 
 	// Health check endpoint
 	r.HandleFunc("/health", s.handleHealth).Methods("GET")
