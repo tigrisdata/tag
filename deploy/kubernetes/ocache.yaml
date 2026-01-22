@@ -1,0 +1,119 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ocache-headless
+  labels:
+    app: ocache
+spec:
+  clusterIP: None
+  selector:
+    app: ocache
+  ports:
+    - name: data
+      port: 9000
+      targetPort: 9000
+    - name: http
+      port: 9001
+      targetPort: 9001
+    - name: cluster
+      port: 7000
+      targetPort: 7000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ocache
+  labels:
+    app: ocache
+spec:
+  serviceName: ocache-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ocache
+  template:
+    metadata:
+      labels:
+        app: ocache
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: ocache
+          image: tigrisdata/ocache:latest
+          imagePullPolicy: Always
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          args:
+            - "-disk=/data"
+            - "-listen-addr=:9000"
+            - "-advertise-addr=$(POD_NAME).ocache-headless:9000"
+            - "-listen-http=:9001"
+            - "-cluster-enabled"
+            - "-node-id=$(POD_NAME)"
+            - "-cluster-addr=:7000"
+            - "-seeds=ocache-headless:7000"
+            - "-max-disk-usage=107374182400"
+          ports:
+            - name: data
+              containerPort: 9000
+              protocol: TCP
+            - name: http
+              containerPort: 9001
+              protocol: TCP
+            - name: cluster
+              containerPort: 7000
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: ocache
+                topologyKey: kubernetes.io/hostname
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 100Gi
