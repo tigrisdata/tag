@@ -11,6 +11,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/auth"
+	"github.com/tigrisdata/tag/metrics"
 )
 
 // AuthErrorCode represents the type of authentication error.
@@ -49,23 +50,33 @@ func mapAuthError(err error) *AuthError {
 		return nil
 	}
 
+	var reason string
+	var code AuthErrorCode
+
 	// Check for specific auth errors
 	if errors.Is(err, auth.ErrSignatureMismatch) {
-		return &AuthError{Code: ErrCodeSignatureMismatch, Err: err}
-	}
-	if errors.Is(err, auth.ErrUnknownAccessKey) {
-		return &AuthError{Code: ErrCodeInvalidAccessKey, Err: err}
-	}
-	if errors.Is(err, auth.ErrExpiredRequest) {
-		return &AuthError{Code: ErrCodeExpiredRequest, Err: err}
-	}
-	if errors.Is(err, auth.ErrMissingAuth) || errors.Is(err, auth.ErrInvalidAuthFormat) ||
+		reason = "signature_mismatch"
+		code = ErrCodeSignatureMismatch
+	} else if errors.Is(err, auth.ErrUnknownAccessKey) {
+		reason = "unknown_access_key"
+		code = ErrCodeInvalidAccessKey
+	} else if errors.Is(err, auth.ErrExpiredRequest) {
+		reason = "expired_request"
+		code = ErrCodeExpiredRequest
+	} else if errors.Is(err, auth.ErrMissingAuth) || errors.Is(err, auth.ErrInvalidAuthFormat) ||
 		errors.Is(err, auth.ErrUnsupportedAuthScheme) || errors.Is(err, auth.ErrMissingContentHash) {
-		return &AuthError{Code: ErrCodeMalformedAuth, Err: err}
+		reason = "malformed_auth"
+		code = ErrCodeMalformedAuth
+	} else {
+		// Default to internal error
+		reason = "internal_error"
+		code = ErrCodeInternal
 	}
 
-	// Default to internal error
-	return &AuthError{Code: ErrCodeInternal, Err: err}
+	// Record the auth failure metric
+	metrics.RecordAuthFailure(reason)
+
+	return &AuthError{Code: code, Err: err}
 }
 
 // IsAuthError checks if the error is an AuthError and returns it.
@@ -138,8 +149,15 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.
 		fwdReq.ContentLength = r.ContentLength
 	}
 
+	// Track bytes in from request body
+	if r.ContentLength > 0 {
+		metrics.BytesTransferred.WithLabelValues("in").Add(float64(r.ContentLength))
+	}
+
 	// Forward to Tigris
+	upstreamStart := time.Now()
 	resp, err := f.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest(r.Method, time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("method", r.Method).Str("path", path).Msg("Failed to forward request")
 		return err
@@ -149,9 +167,12 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.
 	// Stream response back to client
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Warn().Err(err).Msg("Failed to copy response body to client")
+	n, copyErr := io.Copy(w, resp.Body)
+	if copyErr != nil {
+		log.Warn().Err(copyErr).Msg("Failed to copy response body to client")
 	}
+	// Track bytes out from response body
+	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 
 	return nil
 }
@@ -193,8 +214,15 @@ func (f *Forwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWrite
 		fwdReq.ContentLength = r.ContentLength
 	}
 
+	// Track bytes in from request body
+	if r.ContentLength > 0 {
+		metrics.BytesTransferred.WithLabelValues("in").Add(float64(r.ContentLength))
+	}
+
 	// Forward to Tigris
+	upstreamStart := time.Now()
 	resp, err := f.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest(r.Method, time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("method", r.Method).Str("path", path).Msg("Failed to forward request")
 		return nil, err
@@ -220,6 +248,9 @@ func (f *Forwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWrite
 	} else {
 		capture.Complete = true
 	}
+
+	// Track bytes out from response body
+	metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
 
 	return capture, nil
 }
@@ -288,7 +319,14 @@ func (f *Forwarder) DoRequestWithCreds(ctx context.Context, r *http.Request, acc
 		fwdReq.ContentLength = r.ContentLength
 	}
 
+	// Track bytes in from request body
+	if r.ContentLength > 0 {
+		metrics.BytesTransferred.WithLabelValues("in").Add(float64(r.ContentLength))
+	}
+
+	upstreamStart := time.Now()
 	resp, err := f.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest(r.Method, time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("method", r.Method).Str("path", path).Msg("Failed to forward request")
 		return nil, err
@@ -309,7 +347,9 @@ func (f *Forwarder) DoFullObjectRequest(ctx context.Context, bucket, key, access
 		return nil, err
 	}
 
+	upstreamStart := time.Now()
 	resp, err := f.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest("GET", time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background fetch failed")
 		return nil, err
