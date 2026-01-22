@@ -16,6 +16,18 @@ import (
 	"github.com/tigrisdata/tag/proxy/broadcast"
 )
 
+// countingWriter wraps an io.Writer to count bytes written.
+type countingWriter struct {
+	w       io.Writer
+	written int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.written += int64(n)
+	return n, err
+}
+
 // HandleGetObject handles GET requests for objects with cache-first logic.
 // Uses streaming broadcast for request coalescing to reduce upstream load.
 // Supports conditional requests (If-None-Match, If-Modified-Since).
@@ -319,6 +331,13 @@ func (s *Service) writeChunksToResponse(
 
 	// Receive and write chunks
 	var totalBytesOut int64
+	defer func() {
+		// Track bytes out to client, even on error
+		if totalBytesOut > 0 {
+			metrics.BytesTransferred.WithLabelValues("out").Add(float64(totalBytesOut))
+		}
+	}()
+
 	for chunk := range listener.Chunks() {
 		if chunk.Err != nil {
 			if chunk.Err == broadcast.ErrSlowConsumer {
@@ -339,9 +358,6 @@ func (s *Service) writeChunksToResponse(
 			}
 		}
 	}
-
-	// Track bytes out to client
-	metrics.BytesTransferred.WithLabelValues("out").Add(float64(totalBytesOut))
 
 	return nil
 }
@@ -478,17 +494,22 @@ func (s *Service) serveRangeFromCache(
 	w.Header().Set(XCacheHeader, XCacheHit)
 	w.WriteHeader(http.StatusPartialContent)
 
-	// Stream range from cache
-	if err := s.cache.GetRangeStream(ctx, bucket, key, rng.start, rng.end, w); err != nil {
-		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).
+	// Stream range from cache using counting writer to track actual bytes
+	cw := &countingWriter{w: w}
+	streamErr := s.cache.GetRangeStream(ctx, bucket, key, rng.start, rng.end, cw)
+
+	// Track bytes out (even on error, some bytes may have been written)
+	if cw.written > 0 {
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+	}
+
+	if streamErr != nil {
+		log.Warn().Err(streamErr).Str("bucket", bucket).Str("key", key).
 			Int64("start", rng.start).Int64("end", rng.end).
 			Msg("Failed to stream range from cache")
 		// Headers already sent, can't return error to client
-		return err
+		return streamErr
 	}
-
-	// Track bytes out (range served from cache)
-	metrics.BytesTransferred.WithLabelValues("out").Add(float64(contentLength))
 
 	metrics.RecordRangeFromCacheHit()
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
