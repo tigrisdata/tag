@@ -1,0 +1,39 @@
+services:
+  tag:
+    image: tigrisdata/tag:latest
+    container_name: tag
+    ports:
+      - "8080:8080"
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - TAG_OCACHE_ENDPOINTS=ocache:9000
+      - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-info}
+    depends_on:
+      ocache:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - tag-network
+
+  ocache:
+    image: tigrisdata/ocache:latest
+    container_name: ocache
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ocache-data:/data
+    command:
+      - "-disk=/data"
+      - "-listen-addr=:9000"
+      - "-listen-http=:9001"
+    restart: unless-stopped
+    networks:
+      - tag-network
+
+networks:
+  tag-network:
+
+volumes:
+  ocache-data:

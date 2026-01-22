@@ -16,6 +16,18 @@ import (
 	"github.com/tigrisdata/tag/proxy/broadcast"
 )
 
+// countingWriter wraps an io.Writer to count bytes written.
+type countingWriter struct {
+	w       io.Writer
+	written int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.written += int64(n)
+	return n, err
+}
+
 // HandleGetObject handles GET requests for objects with cache-first logic.
 // Uses streaming broadcast for request coalescing to reduce upstream load.
 // Supports conditional requests (If-None-Match, If-Modified-Since).
@@ -94,7 +106,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			w.Header().Set(XCacheHeader, XCacheHit)
 			w.WriteHeader(meta.StatusCode)
 			if bodyReader != nil {
-				if _, copyErr := io.Copy(w, bodyReader); copyErr != nil {
+				n, copyErr := io.Copy(w, bodyReader)
+				metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+				if copyErr != nil {
 					log.Warn().Err(copyErr).Msg("Failed to copy cached content to response")
 				}
 			}
@@ -316,6 +330,14 @@ func (s *Service) writeChunksToResponse(
 	w.WriteHeader(status)
 
 	// Receive and write chunks
+	var totalBytesOut int64
+	defer func() {
+		// Track bytes out to client, even on error
+		if totalBytesOut > 0 {
+			metrics.BytesTransferred.WithLabelValues("out").Add(float64(totalBytesOut))
+		}
+	}()
+
 	for chunk := range listener.Chunks() {
 		if chunk.Err != nil {
 			if chunk.Err == broadcast.ErrSlowConsumer {
@@ -325,7 +347,9 @@ func (s *Service) writeChunksToResponse(
 		}
 
 		if len(chunk.Data) > 0 {
-			if _, writeErr := w.Write(chunk.Data); writeErr != nil {
+			n, writeErr := w.Write(chunk.Data)
+			totalBytesOut += int64(n)
+			if writeErr != nil {
 				return writeErr
 			}
 			// Flush if ResponseWriter supports it
@@ -470,13 +494,21 @@ func (s *Service) serveRangeFromCache(
 	w.Header().Set(XCacheHeader, XCacheHit)
 	w.WriteHeader(http.StatusPartialContent)
 
-	// Stream range from cache
-	if err := s.cache.GetRangeStream(ctx, bucket, key, rng.start, rng.end, w); err != nil {
-		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).
+	// Stream range from cache using counting writer to track actual bytes
+	cw := &countingWriter{w: w}
+	streamErr := s.cache.GetRangeStream(ctx, bucket, key, rng.start, rng.end, cw)
+
+	// Track bytes out (even on error, some bytes may have been written)
+	if cw.written > 0 {
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+	}
+
+	if streamErr != nil {
+		log.Warn().Err(streamErr).Str("bucket", bucket).Str("key", key).
 			Int64("start", rng.start).Int64("end", rng.end).
 			Msg("Failed to stream range from cache")
 		// Headers already sent, can't return error to client
-		return err
+		return streamErr
 	}
 
 	metrics.RecordRangeFromCacheHit()
@@ -525,7 +557,9 @@ func (s *Service) handleRangeWithBackgroundCache(
 	w.WriteHeader(resp.StatusCode)
 
 	// Stream Range response body to client
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	n, err := io.Copy(w, resp.Body)
+	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+	if err != nil {
 		log.Warn().Err(err).Msg("Failed to copy range response body")
 		return err
 	}

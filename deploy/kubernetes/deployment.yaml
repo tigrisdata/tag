@@ -21,11 +21,8 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
       - name: tag
-        image: ghcr.io/tigrisdata/tag:latest
+        image: tigrisdata/tag:latest
         imagePullPolicy: Always
-        args:
-        - "--config"
-        - "/etc/tag/config.yaml"
         env:
         - name: POD_NAME
           valueFrom:
@@ -35,26 +32,31 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: tag-credentials
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tag-credentials
+              key: AWS_SECRET_ACCESS_KEY
+        - name: TAG_OCACHE_ENDPOINTS
+          value: "ocache-headless:9000"
+        - name: TAG_LOG_LEVEL
+          value: "info"
         ports:
         - name: http
           containerPort: 8080
           protocol: TCP
-        volumeMounts:
-        - name: config
-          mountPath: /etc/tag/config.yaml
-          subPath: config.yaml
-          readOnly: true
-        - name: credentials
-          mountPath: /etc/tag/credentials.json
-          subPath: credentials.json
-          readOnly: true
         resources:
           requests:
-            memory: "128Mi"
-            cpu: "100m"
+            memory: "1Gi"
+            cpu: "1"
           limits:
-            memory: "512Mi"
-            cpu: "1000m"
+            memory: "4Gi"
+            cpu: "2"
         readinessProbe:
           httpGet:
             path: /health
@@ -79,13 +81,6 @@ spec:
           capabilities:
             drop:
             - ALL
-      volumes:
-      - name: config
-        configMap:
-          name: tag-config
-      - name: credentials
-        secret:
-          secretName: tag-credentials
       securityContext:
         fsGroup: 1000
       affinity:

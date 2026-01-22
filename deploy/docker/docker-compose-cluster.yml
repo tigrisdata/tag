@@ -1,0 +1,124 @@
+x-ocache-common: &ocache-common
+  image: tigrisdata/ocache:latest
+  restart: unless-stopped
+  networks:
+    - tag-cluster
+
+x-tag-common: &tag-common
+  image: tigrisdata/tag:latest
+  restart: unless-stopped
+  networks:
+    - tag-cluster
+
+services:
+  # TAG Node 1
+  tag-1:
+    <<: *tag-common
+    container_name: tag-1
+    hostname: tag-1
+    ports:
+      - "8081:8080"
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - TAG_OCACHE_ENDPOINTS=ocache-node1:9000,ocache-node2:9000,ocache-node3:9000
+      - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-info}
+    depends_on:
+      ocache-node1:
+        condition: service_healthy
+      ocache-node2:
+        condition: service_healthy
+      ocache-node3:
+        condition: service_healthy
+
+  # TAG Node 2
+  tag-2:
+    <<: *tag-common
+    container_name: tag-2
+    hostname: tag-2
+    ports:
+      - "8082:8080"
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - TAG_OCACHE_ENDPOINTS=ocache-node1:9000,ocache-node2:9000,ocache-node3:9000
+      - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-info}
+    depends_on:
+      ocache-node1:
+        condition: service_healthy
+      ocache-node2:
+        condition: service_healthy
+      ocache-node3:
+        condition: service_healthy
+
+  # OCache Node 1
+  ocache-node1:
+    <<: *ocache-common
+    container_name: ocache-node1
+    hostname: ocache-node1
+    ports:
+      - "9001:9000"
+      - "9101:9001"
+      - "7001:7000"
+    volumes:
+      - ocache-node1-data:/data
+    command:
+      - "-disk=/data"
+      - "-listen-addr=:9000"
+      - "-listen-http=:9001"
+      - "-cluster-enabled"
+      - "-node-id=node1"
+      - "-cluster-addr=:7000"
+      - "-seeds=ocache-node1:7000,ocache-node2:7000,ocache-node3:7000"
+
+  # OCache Node 2
+  ocache-node2:
+    <<: *ocache-common
+    container_name: ocache-node2
+    hostname: ocache-node2
+    ports:
+      - "9002:9000"
+      - "9102:9001"
+      - "7002:7000"
+    volumes:
+      - ocache-node2-data:/data
+    command:
+      - "-disk=/data"
+      - "-listen-addr=:9000"
+      - "-listen-http=:9001"
+      - "-cluster-enabled"
+      - "-node-id=node2"
+      - "-cluster-addr=:7000"
+      - "-seeds=ocache-node1:7000,ocache-node2:7000,ocache-node3:7000"
+    depends_on:
+      - ocache-node1
+
+  # OCache Node 3
+  ocache-node3:
+    <<: *ocache-common
+    container_name: ocache-node3
+    hostname: ocache-node3
+    ports:
+      - "9003:9000"
+      - "9103:9001"
+      - "7003:7000"
+    volumes:
+      - ocache-node3-data:/data
+    command:
+      - "-disk=/data"
+      - "-listen-addr=:9000"
+      - "-listen-http=:9001"
+      - "-cluster-enabled"
+      - "-node-id=node3"
+      - "-cluster-addr=:7000"
+      - "-seeds=ocache-node1:7000,ocache-node2:7000,ocache-node3:7000"
+    depends_on:
+      - ocache-node2
+
+networks:
+  tag-cluster:
+
+volumes:
+  ocache-node1-data:
+  ocache-node2-data:
+  ocache-node3-data:
