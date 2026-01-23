@@ -8,6 +8,7 @@ CMD_PATH := ./cmd/tag
 OCACHE_VERSION ?= v1.2.2
 OCACHE_BINARY := ocache
 OCACHE_BIN_DIR := .bin
+OCACHE_BIN_PATH := $(OCACHE_BIN_DIR)/$(OCACHE_BINARY)-$(OCACHE_VERSION)
 OCACHE_RELEASES_URL := https://ocache-releases.t3.storage.dev
 OCACHE_DATA_DIR := /tmp/ocache-bench-data
 
@@ -284,14 +285,14 @@ s3-bench-local: build
 		exit 1; \
 	fi
 	@mkdir -p $(OCACHE_BIN_DIR)
-	@if [ ! -x $(OCACHE_BIN_DIR)/$(OCACHE_BINARY) ]; then \
+	@if [ ! -x $(OCACHE_BIN_PATH) ]; then \
 		echo "Downloading ocache $(OCACHE_VERSION) for $(OCACHE_OS)-$(OCACHE_ARCH)..."; \
-		curl -fsSL "$(OCACHE_RELEASES_URL)/$(OCACHE_VERSION)/$(OCACHE_BINARY)-$(OCACHE_OS)-$(OCACHE_ARCH)" -o $(OCACHE_BIN_DIR)/$(OCACHE_BINARY) && \
-		chmod +x $(OCACHE_BIN_DIR)/$(OCACHE_BINARY); \
+		curl -fsSL "$(OCACHE_RELEASES_URL)/$(OCACHE_VERSION)/$(OCACHE_BINARY)-$(OCACHE_OS)-$(OCACHE_ARCH)" -o $(OCACHE_BIN_PATH) && \
+		chmod +x $(OCACHE_BIN_PATH); \
 	fi
 	@mkdir -p $(OCACHE_DATA_DIR)
 	@echo "Starting ocache locally..."
-	@$(OCACHE_BIN_DIR)/$(OCACHE_BINARY) -disk=$(OCACHE_DATA_DIR) -listen-addr=:9000 -listen-http=:9001 &
+	@$(OCACHE_BIN_PATH) -disk=$(OCACHE_DATA_DIR) -listen-addr=:9000 -listen-http=:9001 &
 	@echo "Waiting for ocache to be ready..."
 	@timeout 30 bash -c 'until curl -s http://localhost:9001/health > /dev/null 2>&1; do sleep 1; done' || \
 		(echo "ocache failed to start"; exit 1)
@@ -311,7 +312,7 @@ s3-bench-local: build
 s3-bench-local-down:
 	@echo "Stopping S3 bench infrastructure (local mode)..."
 	-@pkill -f "./$(BINARY_NAME)" 2>/dev/null || true
-	-@pkill -f "$(OCACHE_BIN_DIR)/$(OCACHE_BINARY)" 2>/dev/null || true
+	-@pkill -f "$(OCACHE_BIN_PATH)" 2>/dev/null || true
 	@echo "Cleaning up ocache data directory..."
 	-@rm -rf $(OCACHE_DATA_DIR)
 
