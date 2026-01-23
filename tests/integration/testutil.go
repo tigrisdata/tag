@@ -290,7 +290,7 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 	xCacheTracker := NewXCacheTracker()
 
 	// Create TAG server with X-Cache tracking middleware
-	server := handlers.NewServer(service, "127.0.0.1", 0)
+	server := handlers.NewServer(service, "127.0.0.1", 0, true)
 	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
 	tagServer := httptest.NewServer(wrappedRouter)
 
@@ -348,7 +348,7 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 	xCacheTracker := NewXCacheTracker()
 
 	// Create TAG server with X-Cache tracking middleware
-	server := handlers.NewServer(service, "127.0.0.1", 0)
+	server := handlers.NewServer(service, "127.0.0.1", 0, true)
 	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
 	tagServer := httptest.NewServer(wrappedRouter)
 

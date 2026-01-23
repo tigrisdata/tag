@@ -32,6 +32,10 @@ const (
 	// DefaultLogLevel is the default log level.
 	DefaultLogLevel = "info"
 
+	// DefaultLogFormat is the default log format.
+	// Use "json" for production (fast) or "console" for development (human-readable).
+	DefaultLogFormat = "json"
+
 	// DefaultBroadcastChunkSize is the default chunk size for streaming (64KB).
 	DefaultBroadcastChunkSize = 64 * 1024
 
@@ -51,8 +55,9 @@ type Config struct {
 
 // ServerConfig holds HTTP server configuration.
 type ServerConfig struct {
-	HTTPPort int    `yaml:"http_port"` // S3 API port (default: 8080)
-	BindIP   string `yaml:"bind_ip"`   // Bind address (default: 0.0.0.0)
+	HTTPPort     int    `yaml:"http_port"`     // S3 API port (default: 8080)
+	BindIP       string `yaml:"bind_ip"`       // Bind address (default: 0.0.0.0)
+	PprofEnabled bool   `yaml:"pprof_enabled"` // Enable pprof endpoints (default: true)
 }
 
 // UpstreamConfig holds Tigris endpoint configuration.
@@ -83,7 +88,8 @@ type BroadcastConfig struct {
 
 // LogConfig holds logging configuration.
 type LogConfig struct {
-	Level string `yaml:"level"` // Log level: debug, info, warn, error
+	Level  string `yaml:"level"`  // Log level: debug, info, warn, error
+	Format string `yaml:"format"` // Log format: json (default, fast) or console (human-readable)
 }
 
 // Load reads configuration from a YAML file.
@@ -124,6 +130,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Server.BindIP == "" {
 		cfg.Server.BindIP = DefaultBindIP
 	}
+	// PprofEnabled defaults to true (enabled)
+	// Use TAG_PPROF_ENABLED=false to disable
+	cfg.Server.PprofEnabled = true
 
 	// Upstream defaults
 	if cfg.Upstream.Endpoint == "" {
@@ -157,6 +166,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Log.Level == "" {
 		cfg.Log.Level = DefaultLogLevel
 	}
+	if cfg.Log.Format == "" {
+		cfg.Log.Format = DefaultLogFormat
+	}
 }
 
 // applyEnvOverrides applies environment variable overrides to configuration.
@@ -185,6 +197,16 @@ func applyEnvOverrides(cfg *Config) {
 	// Override log level from environment
 	if logLevel := os.Getenv("TAG_LOG_LEVEL"); logLevel != "" {
 		cfg.Log.Level = logLevel
+	}
+
+	// Override log format from environment (json or console)
+	if logFormat := os.Getenv("TAG_LOG_FORMAT"); logFormat != "" {
+		cfg.Log.Format = logFormat
+	}
+
+	// Disable pprof from environment (enabled by default)
+	if disabled := os.Getenv("TAG_PPROF_ENABLED"); disabled == "false" || disabled == "0" {
+		cfg.Server.PprofEnabled = false
 	}
 }
 

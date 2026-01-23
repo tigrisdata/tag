@@ -20,6 +20,15 @@ var (
 	// credentialRegex extracts the access key from AWS SigV4 Authorization header.
 	// Format: AWS4-HMAC-SHA256 Credential=<access_key>/<date>/<region>/<service>/aws4_request, ...
 	credentialRegex = regexp.MustCompile(`Credential=([^/]+)/`)
+
+	// scopeRegex extracts the full credential scope from Authorization header.
+	scopeRegex = regexp.MustCompile(`Credential=([^,]+)`)
+
+	// signedHeadersRegex extracts the SignedHeaders from Authorization header.
+	signedHeadersRegex = regexp.MustCompile(`SignedHeaders=([^,]+)`)
+
+	// signatureRegex extracts the Signature from Authorization header.
+	signatureRegex = regexp.MustCompile(`Signature=([a-f0-9]+)`)
 )
 
 // AuthInfo contains parsed authentication information from a request.
@@ -108,7 +117,6 @@ func parseFromHeader(auth string) (*AuthInfo, error) {
 	info.AccessKey = credMatch[1]
 
 	// Extract full credential scope to get region and date
-	scopeRegex := regexp.MustCompile(`Credential=([^,]+)`)
 	scopeMatch := scopeRegex.FindStringSubmatch(auth)
 	if len(scopeMatch) >= 2 {
 		parts := strings.Split(scopeMatch[1], "/")
@@ -119,15 +127,13 @@ func parseFromHeader(auth string) (*AuthInfo, error) {
 	}
 
 	// Extract SignedHeaders
-	headersRegex := regexp.MustCompile(`SignedHeaders=([^,]+)`)
-	headersMatch := headersRegex.FindStringSubmatch(auth)
+	headersMatch := signedHeadersRegex.FindStringSubmatch(auth)
 	if len(headersMatch) >= 2 {
 		info.SignedHeaders = strings.Split(headersMatch[1], ";")
 	}
 
 	// Extract Signature
-	sigRegex := regexp.MustCompile(`Signature=([a-f0-9]+)`)
-	sigMatch := sigRegex.FindStringSubmatch(auth)
+	sigMatch := signatureRegex.FindStringSubmatch(auth)
 	if len(sigMatch) >= 2 {
 		info.Signature = sigMatch[1]
 	}

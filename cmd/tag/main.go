@@ -26,23 +26,27 @@ func main() {
 	disableCache := flag.Bool("disable-cache", false, "Disable caching (pass-through mode)")
 	flag.Parse()
 
-	// Initialize logger
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
-
-	// Load configuration
+	// Load configuration first (before setting up logger, so we can use log format from config)
 	var cfg *config.Config
 	var err error
 
 	if *configPath != "" {
 		cfg, err = config.Load(*configPath)
 		if err != nil {
+			// Use console writer for startup errors since config isn't loaded yet
+			log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 			log.Fatal().Err(err).Str("path", *configPath).Msg("Failed to load configuration")
 		}
 	} else {
 		cfg = config.NewDefault()
-		log.Info().Msg("Using default configuration")
 	}
+
+	// Initialize logger based on configuration
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	if cfg.Log.Format == "console" {
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	}
+	// Default is JSON format (zerolog's default), which is much faster
 
 	// Set log level
 	switch cfg.Log.Level {
@@ -54,6 +58,10 @@ func main() {
 		zerolog.SetGlobalLevel(zerolog.ErrorLevel)
 	default:
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	}
+
+	if *configPath == "" {
+		log.Info().Msg("Using default configuration")
 	}
 
 	// Override cache enabled from command line flag
@@ -109,7 +117,7 @@ func main() {
 	service := proxy.NewService(forwarder, objectCache, cfg)
 
 	// 5. Initialize HTTP server
-	server := handlers.NewServer(service, cfg.Server.BindIP, cfg.Server.HTTPPort)
+	server := handlers.NewServer(service, cfg.Server.BindIP, cfg.Server.HTTPPort, cfg.Server.PprofEnabled)
 
 	// Start HTTP server in goroutine
 	go func() {
