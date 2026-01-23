@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/pprof"
 	"regexp"
 	"strconv"
 	"strings"
@@ -18,17 +19,19 @@ import (
 
 // Server is the HTTP server for S3-compatible API.
 type Server struct {
-	service    *proxy.Service
-	router     *mux.Router
-	httpServer *http.Server
-	bindAddr   string
+	service      *proxy.Service
+	router       *mux.Router
+	httpServer   *http.Server
+	bindAddr     string
+	pprofEnabled bool
 }
 
 // NewServer creates a new HTTP server.
-func NewServer(service *proxy.Service, bindIP string, port int) *Server {
+func NewServer(service *proxy.Service, bindIP string, port int, pprofEnabled bool) *Server {
 	s := &Server{
-		service:  service,
-		bindAddr: fmt.Sprintf("%s:%d", bindIP, port),
+		service:      service,
+		bindAddr:     fmt.Sprintf("%s:%d", bindIP, port),
+		pprofEnabled: pprofEnabled,
 	}
 
 	s.router = s.setupRouter()
@@ -57,6 +60,22 @@ func (s *Server) setupRouter() *mux.Router {
 
 	// Metrics endpoint for Prometheus
 	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
+
+	// pprof endpoints for profiling (if enabled)
+	if s.pprofEnabled {
+		r.HandleFunc("/debug/pprof/", pprof.Index)
+		r.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		r.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		r.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		r.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		r.Handle("/debug/pprof/heap", pprof.Handler("heap"))
+		r.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
+		r.Handle("/debug/pprof/allocs", pprof.Handler("allocs"))
+		r.Handle("/debug/pprof/block", pprof.Handler("block"))
+		r.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
+		r.Handle("/debug/pprof/threadcreate", pprof.Handler("threadcreate"))
+		log.Info().Msg("pprof endpoints enabled at /debug/pprof/")
+	}
 
 	// S3 API routes - path style
 	// The order matters - more specific routes should come first

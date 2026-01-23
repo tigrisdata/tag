@@ -12,6 +12,8 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_OCACHE_ENDPOINTS` | Comma-separated ocache endpoints | (none) |
 | `TAG_CACHE_DISABLED` | Disable caching (`true` or `1`) | `false` |
 | `TAG_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error` | `info` |
+| `TAG_LOG_FORMAT` | Log format: `json` or `console` | `json` |
+| `TAG_PPROF_ENABLED` | Enable pprof endpoints (`true` or `1`) | `false` |
 
 ## Configuration File
 
@@ -33,6 +35,10 @@ server:
   # IP address to bind to
   # Default: "0.0.0.0" (all interfaces)
   bind_ip: "0.0.0.0"
+
+  # Enable pprof profiling endpoints
+  # Default: false (disabled for security)
+  pprof_enabled: false
 
 # Upstream Tigris configuration
 upstream:
@@ -82,6 +88,10 @@ log:
   # Log level: debug, info, warn, error
   # Default: "info"
   level: "info"
+
+  # Log format: json (fast) or console (human-readable)
+  # Default: "json"
+  format: "json"
 ```
 
 ## Configuration Sections
@@ -94,6 +104,7 @@ Controls the HTTP server settings.
 |-------|------|---------|-------------|
 | `http_port` | int | `8080` | Port for the S3 API |
 | `bind_ip` | string | `"0.0.0.0"` | IP address to bind to |
+| `pprof_enabled` | bool | `false` | Enable pprof profiling endpoints |
 
 ### Upstream
 
@@ -153,12 +164,34 @@ Controls logging output.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `level` | string | `"info"` | Log level |
+| `format` | string | `"json"` | Log format: `json` or `console` |
 
 **Log Levels:**
 - `debug` - Verbose debugging information
 - `info` - Normal operation messages
 - `warn` - Warning conditions
 - `error` - Error conditions only
+
+### Profiling
+
+TAG exposes pprof endpoints for performance profiling when enabled. **Disabled by default** for security (exposes runtime internals).
+
+```bash
+# Enable pprof
+TAG_PPROF_ENABLED=true ./tag
+```
+
+**Endpoints** (when enabled):
+- `/debug/pprof/` - Index
+- `/debug/pprof/profile?seconds=30` - CPU profile
+- `/debug/pprof/heap` - Heap profile
+- `/debug/pprof/goroutine` - Goroutine stacks
+
+**Usage with go tool pprof:**
+```bash
+go tool pprof http://localhost:8080/debug/pprof/profile?seconds=30
+go tool pprof http://localhost:8080/debug/pprof/heap
+```
 
 ## Example Configurations
 
