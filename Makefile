@@ -247,6 +247,7 @@ s3-test-local: build
 	@TAG_UPSTREAM_ENDPOINT=$${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev} \
 		TAG_OCACHE_ENDPOINTS=localhost:9000 \
 		TAG_LOG_LEVEL=$${TAG_LOG_LEVEL:-debug} \
+		TAG_PPROF_ENABLED=true \
 		./$(BINARY_NAME) &
 	@echo "Waiting for TAG to be ready..."
 	@timeout 30 bash -c 'until curl -s http://localhost:8080/health > /dev/null 2>&1; do sleep 1; done' || \

@@ -57,7 +57,7 @@ type Config struct {
 type ServerConfig struct {
 	HTTPPort     int    `yaml:"http_port"`     // S3 API port (default: 8080)
 	BindIP       string `yaml:"bind_ip"`       // Bind address (default: 0.0.0.0)
-	PprofEnabled bool   `yaml:"pprof_enabled"` // Enable pprof endpoints (default: true)
+	PprofEnabled bool   `yaml:"pprof_enabled"` // Enable pprof endpoints (default: false)
 }
 
 // UpstreamConfig holds Tigris endpoint configuration.
@@ -130,9 +130,8 @@ func applyDefaults(cfg *Config) {
 	if cfg.Server.BindIP == "" {
 		cfg.Server.BindIP = DefaultBindIP
 	}
-	// PprofEnabled defaults to true (enabled)
-	// Use TAG_PPROF_ENABLED=false to disable
-	cfg.Server.PprofEnabled = true
+	// PprofEnabled defaults to false (disabled for security)
+	// Use TAG_PPROF_ENABLED=true to enable
 
 	// Upstream defaults
 	if cfg.Upstream.Endpoint == "" {
@@ -204,9 +203,9 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Log.Format = logFormat
 	}
 
-	// Disable pprof from environment (enabled by default)
-	if disabled := os.Getenv("TAG_PPROF_ENABLED"); disabled == "false" || disabled == "0" {
-		cfg.Server.PprofEnabled = false
+	// Enable pprof from environment (disabled by default for security)
+	if enabled := os.Getenv("TAG_PPROF_ENABLED"); enabled == "true" || enabled == "1" {
+		cfg.Server.PprofEnabled = true
 	}
 }
 

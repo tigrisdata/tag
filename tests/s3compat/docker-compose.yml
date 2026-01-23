@@ -31,6 +31,7 @@ services:
       - TAG_UPSTREAM_ENDPOINT=${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev}
       - TAG_OCACHE_ENDPOINTS=ocache:9000
       - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-debug}
+      - TAG_PPROF_ENABLED=true
     depends_on:
       ocache:
         condition: service_healthy
