@@ -284,6 +284,11 @@ s3-bench-local: build
 		echo "  export AWS_SECRET_ACCESS_KEY=<your-secret>"; \
 		exit 1; \
 	fi
+	@# Stop any existing processes on the required ports
+	-@lsof -ti:9000 | xargs kill 2>/dev/null || true
+	-@lsof -ti:9001 | xargs kill 2>/dev/null || true
+	-@lsof -ti:8080 | xargs kill 2>/dev/null || true
+	@sleep 1
 	@mkdir -p $(OCACHE_BIN_DIR)
 	@if [ ! -x $(OCACHE_BIN_PATH) ]; then \
 		echo "Downloading ocache $(OCACHE_VERSION) for $(OCACHE_OS)-$(OCACHE_ARCH)..."; \
@@ -311,8 +316,9 @@ s3-bench-local: build
 .PHONY: s3-bench-local-down
 s3-bench-local-down:
 	@echo "Stopping S3 bench infrastructure (local mode)..."
-	-@pkill -f "./$(BINARY_NAME)" 2>/dev/null || true
-	-@pkill -f "$(OCACHE_BIN_PATH)" 2>/dev/null || true
+	-@lsof -ti:8080 | xargs kill 2>/dev/null || true
+	-@lsof -ti:9000 | xargs kill 2>/dev/null || true
+	-@lsof -ti:9001 | xargs kill 2>/dev/null || true
 	@echo "Cleaning up ocache data directory..."
 	-@rm -rf $(OCACHE_DATA_DIR)
 

@@ -58,16 +58,10 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 
 	// 2. Check cache (fast path) - now also works for range requests!
 	// For range requests: check if full object is in cache, then serve range from it.
+	// Uses two-phase approach: GetMeta first, then GetBodyStream for direct streaming.
 	if !noCacheRead && s.cache.IsEnabled() {
-		meta, bodyReader, found, cacheErr := s.cache.GetWithMeta(ctx, bucket, key)
+		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
 		if cacheErr == nil && found && meta != nil {
-			// Close body reader if we got one (we may serve range instead)
-			if bodyReader != nil {
-				if closer, ok := bodyReader.(io.Closer); ok {
-					defer closer.Close()
-				}
-			}
-
 			// If this is a Range request and we have the full object cached,
 			// serve the range from the cached object
 			if rangeHeader != "" {
@@ -100,17 +94,21 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			}
 
 			// Serve full response from cache with proper headers
+			// Stream body directly to response writer - no intermediate buffer!
 			metrics.RecordCacheHit()
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving from cache with metadata")
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving from cache with metadata (direct stream)")
 			meta.WriteHeaders(w)
 			w.Header().Set(XCacheHeader, XCacheHit)
 			w.WriteHeader(meta.StatusCode)
-			if bodyReader != nil {
-				n, copyErr := io.Copy(w, bodyReader)
-				metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-				if copyErr != nil {
-					log.Warn().Err(copyErr).Msg("Failed to copy cached content to response")
-				}
+
+			// Use counting writer to track bytes transferred
+			cw := &countingWriter{w: w}
+			streamErr := s.cache.GetBodyStream(ctx, bucket, key, cw)
+			metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+
+			if streamErr != nil {
+				// Headers already sent, log warning but don't return error to client
+				log.Warn().Err(streamErr).Str("bucket", bucket).Str("key", key).Msg("Failed to stream cached content to response")
 			}
 			metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
 			return nil
