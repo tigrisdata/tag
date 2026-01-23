@@ -155,6 +155,17 @@ See [docs/deployment.md](docs/deployment.md) for complete deployment guide inclu
 
 TAG supports all S3 API endpoints supported by Tigris, including bucket operations, object operations, multipart uploads, and more. See the [Tigris S3 API documentation](https://www.tigrisdata.com/docs/api/s3/) for the complete list of supported operations.
 
+### S3 Addressing Style
+
+TAG supports **path-style** S3 access only. Virtual-hosted style requests are not supported.
+
+| Style | URL Format | Supported |
+|-------|------------|-----------|
+| Path-style | `http://localhost:8080/bucket/key` | Yes |
+| Virtual-hosted | `http://bucket.localhost:8080/key` | No |
+
+When configuring S3 clients, ensure path-style addressing is enabled. See [docs/usage.md](docs/usage.md) for SDK-specific configuration.
+
 ### Response Headers
 
 | Header | Description |

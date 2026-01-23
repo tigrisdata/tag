@@ -96,13 +96,15 @@ pip install boto3
 
 ```python
 import boto3
+from botocore.config import Config
 
-# Create S3 client with TAG endpoint
+# Create S3 client with TAG endpoint (path-style required)
 s3 = boto3.client(
     's3',
     endpoint_url='http://localhost:8080',
     aws_access_key_id='your_access_key',
     aws_secret_access_key='your_secret_key',
+    config=Config(s3={'addressing_style': 'path'}),
 )
 ```
 
@@ -110,6 +112,7 @@ s3 = boto3.client(
 
 ```python
 import boto3
+from botocore.config import Config
 import os
 
 # Credentials from environment variables
@@ -118,6 +121,7 @@ import os
 s3 = boto3.client(
     's3',
     endpoint_url=os.getenv('TAG_ENDPOINT', 'http://localhost:8080'),
+    config=Config(s3={'addressing_style': 'path'}),
 )
 ```
 
@@ -179,13 +183,15 @@ print(f"Last Modified: {response['LastModified']}")
 
 ```python
 import boto3
+from botocore.config import Config
 
-# Create S3 resource
+# Create S3 resource (path-style required)
 s3 = boto3.resource(
     's3',
     endpoint_url='http://localhost:8080',
     aws_access_key_id='your_access_key',
     aws_secret_access_key='your_secret_key',
+    config=Config(s3={'addressing_style': 'path'}),
 )
 
 # Get bucket
@@ -270,7 +276,21 @@ from botocore.config import Config
 config = Config(
     connect_timeout=30,
     read_timeout=300,
+    s3={'addressing_style': 'path'},
 )
 
 s3 = boto3.client('s3', endpoint_url='http://localhost:8080', config=config)
 ```
+
+### 405 Method Not Allowed on CreateBucket
+
+If you receive a 405 error when creating buckets, ensure path-style addressing is configured:
+
+```python
+from botocore.config import Config
+
+config = Config(s3={'addressing_style': 'path'})
+s3 = boto3.client('s3', endpoint_url='http://localhost:8080', config=config)
+```
+
+TAG does not support virtual-hosted style requests (e.g., `bucket.localhost:8080`).
