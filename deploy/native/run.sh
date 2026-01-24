@@ -251,19 +251,34 @@ cmd_stop() {
 
     if [ "${1:-}" = "--clean" ]; then
         echo "Cleaning up data directory..."
+
+        # Check if directory exists first
+        if [ ! -d "${DATA_DIR}" ]; then
+            echo "Data directory does not exist, nothing to clean"
+            return 0
+        fi
+
+        # Normalize DATA_DIR path (resolve symlinks, remove trailing slashes, handle ..)
+        local normalized_data_dir
+        normalized_data_dir="$(cd "${DATA_DIR}" 2>/dev/null && pwd -P)" || {
+            echo "Error: Cannot resolve DATA_DIR path: ${DATA_DIR}"
+            exit 1
+        }
+
         # Validate DATA_DIR before deletion to prevent catastrophic rm -rf
         # Use array to properly handle paths with spaces
         local protected_dirs=("/" "/usr" "/var" "/etc" "/bin" "/sbin" "/lib" "/lib64" "/opt" "/boot" "/dev" "/proc" "/sys" "/run" "/tmp" "/home" "${HOME}")
         local is_protected=false
         for dir in "${protected_dirs[@]}"; do
-            if [ "${DATA_DIR}" = "${dir}" ]; then
+            # Exact match or DATA_DIR is a subdirectory of a protected path
+            if [ "${normalized_data_dir}" = "${dir}" ] || [[ "${normalized_data_dir}" == "${dir}/"* ]]; then
                 is_protected=true
                 break
             fi
         done
 
-        if [ "${is_protected}" = "true" ] || [ ! -d "${DATA_DIR}" ]; then
-            echo "Refusing to delete DATA_DIR: ${DATA_DIR}"
+        if [ "${is_protected}" = "true" ]; then
+            echo "Refusing to delete DATA_DIR: ${DATA_DIR} (resolves to ${normalized_data_dir})"
             exit 1
         fi
 
