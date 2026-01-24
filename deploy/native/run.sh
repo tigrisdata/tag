@@ -252,13 +252,22 @@ cmd_stop() {
     if [ "${1:-}" = "--clean" ]; then
         echo "Cleaning up data directory..."
         # Validate DATA_DIR before deletion to prevent catastrophic rm -rf
-        if [ -d "${DATA_DIR}" ] && [ "${DATA_DIR}" != "/" ] && [ "${DATA_DIR}" != "${HOME}" ]; then
-            rm -rf "${DATA_DIR}"
-            echo "Data directory removed"
-        else
+        local protected_dirs="/ /usr /var /etc /bin /sbin /lib /lib64 /opt /boot /dev /proc /sys /run /tmp /home ${HOME}"
+        local is_protected=false
+        for dir in ${protected_dirs}; do
+            if [ "${DATA_DIR}" = "${dir}" ]; then
+                is_protected=true
+                break
+            fi
+        done
+
+        if [ "${is_protected}" = "true" ] || [ ! -d "${DATA_DIR}" ]; then
             echo "Refusing to delete DATA_DIR: ${DATA_DIR}"
             exit 1
         fi
+
+        rm -rf "${DATA_DIR}"
+        echo "Data directory removed"
     fi
 }
 
