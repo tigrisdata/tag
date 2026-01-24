@@ -5,6 +5,9 @@
 # Go build artifacts
 /tag
 
+# Downloaded binaries for local benchmarking
+.bin/
+
 # S3 compatibility tests (cloned repo, venv, and generated config with credentials)
 tests/s3compat/s3-tests/
 tests/s3compat/.venv/
