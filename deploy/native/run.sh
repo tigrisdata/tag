@@ -14,7 +14,9 @@ OCACHE_VERSION="${OCACHE_VERSION:-v1.2.2}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${BIN_DIR:-${SCRIPT_DIR}/.bin}"
 DATA_DIR="${DATA_DIR:-/tmp/native-data}"
-LOG_DIR="${LOG_DIR:-${DATA_DIR}/logs}"
+LOG_DIR="${DATA_DIR}/logs"
+# Well-defined subdirectory for ocache data - safe to delete on cleanup
+OCACHE_DATA_DIR="${DATA_DIR}/ocache-data"
 
 # Ports
 TAG_PORT="${TAG_PORT:-8080}"
@@ -192,6 +194,7 @@ cmd_start() {
     mkdir -p "${DATA_DIR}"
     mkdir -p "${LOG_DIR}"
     mkdir -p "${PID_DIR}"
+    mkdir -p "${OCACHE_DATA_DIR}"
 
     local ocache_bin="${BIN_DIR}/ocache-${OCACHE_VERSION}"
     local tag_bin="${BIN_DIR}/tag-${TAG_VERSION}"
@@ -199,7 +202,7 @@ cmd_start() {
     # Start OCache
     echo "Starting OCache..."
     "${ocache_bin}" \
-        -disk="${DATA_DIR}" \
+        -disk="${OCACHE_DATA_DIR}" \
         -listen-addr=":${OCACHE_PORT}" \
         -listen-http=":${OCACHE_HTTP_PORT}" \
         -max-disk-usage="${OCACHE_MAX_DISK_USAGE}" \
@@ -250,40 +253,16 @@ cmd_stop() {
     echo "Services stopped"
 
     if [ "${1:-}" = "--clean" ]; then
-        echo "Cleaning up data directory..."
+        echo "Cleaning up ocache data..."
 
-        # Check if directory exists first
-        if [ ! -d "${DATA_DIR}" ]; then
-            echo "Data directory does not exist, nothing to clean"
-            return 0
+        # Only delete the well-defined ocache data subdirectory
+        # This is safe because we created it with a known name
+        if [ -d "${OCACHE_DATA_DIR}" ]; then
+            rm -rf "${OCACHE_DATA_DIR}"
+            echo "OCache data directory removed: ${OCACHE_DATA_DIR}"
+        else
+            echo "OCache data directory does not exist, nothing to clean"
         fi
-
-        # Normalize DATA_DIR path (resolve symlinks, remove trailing slashes, handle ..)
-        local normalized_data_dir
-        normalized_data_dir="$(cd "${DATA_DIR}" 2>/dev/null && pwd -P)" || {
-            echo "Error: Cannot resolve DATA_DIR path: ${DATA_DIR}"
-            exit 1
-        }
-
-        # Validate DATA_DIR before deletion to prevent catastrophic rm -rf
-        # Use array to properly handle paths with spaces
-        local protected_dirs=("/" "/usr" "/var" "/etc" "/bin" "/sbin" "/lib" "/lib64" "/opt" "/boot" "/dev" "/proc" "/sys" "/run" "/tmp" "/home" "${HOME}")
-        local is_protected=false
-        for dir in "${protected_dirs[@]}"; do
-            # Exact match or DATA_DIR is a subdirectory of a protected path
-            if [ "${normalized_data_dir}" = "${dir}" ] || [[ "${normalized_data_dir}" == "${dir}/"* ]]; then
-                is_protected=true
-                break
-            fi
-        done
-
-        if [ "${is_protected}" = "true" ]; then
-            echo "Refusing to delete DATA_DIR: ${DATA_DIR} (resolves to ${normalized_data_dir})"
-            exit 1
-        fi
-
-        rm -rf "${DATA_DIR}"
-        echo "Data directory removed"
     fi
 }
 
@@ -371,7 +350,7 @@ cmd_help() {
     echo ""
     echo "Commands:"
     echo "  start           Start TAG and OCache services"
-    echo "  stop [--clean]  Stop services (--clean removes data directory)"
+    echo "  stop [--clean]  Stop services (--clean removes ocache data)"
     echo "  status          Check status of services"
     echo "  logs [service]  Show logs (service: tag, ocache, or all)"
     echo "  help            Show this help message"
