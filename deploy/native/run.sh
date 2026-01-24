@@ -141,7 +141,7 @@ wait_for_health() {
 
     echo "Waiting for ${name} to be ready..."
     local count=0
-    while ! curl -s "${url}" > /dev/null 2>&1; do
+    while ! curl -sf "${url}" > /dev/null 2>&1; do
         sleep 1
         count=$((count + 1))
         if [ ${count} -ge ${timeout} ]; then
@@ -252,9 +252,10 @@ cmd_stop() {
     if [ "${1:-}" = "--clean" ]; then
         echo "Cleaning up data directory..."
         # Validate DATA_DIR before deletion to prevent catastrophic rm -rf
-        local protected_dirs="/ /usr /var /etc /bin /sbin /lib /lib64 /opt /boot /dev /proc /sys /run /tmp /home ${HOME}"
+        # Use array to properly handle paths with spaces
+        local protected_dirs=("/" "/usr" "/var" "/etc" "/bin" "/sbin" "/lib" "/lib64" "/opt" "/boot" "/dev" "/proc" "/sys" "/run" "/tmp" "/home" "${HOME}")
         local is_protected=false
-        for dir in ${protected_dirs}; do
+        for dir in "${protected_dirs[@]}"; do
             if [ "${DATA_DIR}" = "${dir}" ]; then
                 is_protected=true
                 break
@@ -284,7 +285,7 @@ cmd_status() {
 
     if check_port "${TAG_PORT}"; then
         echo "  TAG (port ${TAG_PORT}): RUNNING${tag_pid:+ (PID: ${tag_pid})}"
-        if curl -s "http://localhost:${TAG_PORT}/health" > /dev/null 2>&1; then
+        if curl -sf "http://localhost:${TAG_PORT}/health" > /dev/null 2>&1; then
             echo "    Health: OK"
         else
             echo "    Health: UNHEALTHY"
@@ -301,7 +302,7 @@ cmd_status() {
 
     if check_port "${OCACHE_PORT}"; then
         echo "  OCache (port ${OCACHE_PORT}): RUNNING${ocache_pid:+ (PID: ${ocache_pid})}"
-        if curl -s "http://localhost:${OCACHE_HTTP_PORT}/health" > /dev/null 2>&1; then
+        if curl -sf "http://localhost:${OCACHE_HTTP_PORT}/health" > /dev/null 2>&1; then
             echo "    Health: OK"
         else
             echo "    Health: UNHEALTHY"
