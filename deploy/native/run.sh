@@ -14,9 +14,11 @@ OCACHE_VERSION="${OCACHE_VERSION:-v1.2.2}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${BIN_DIR:-${SCRIPT_DIR}/.bin}"
 DATA_DIR="${DATA_DIR:-/tmp/native-data}"
-LOG_DIR="${DATA_DIR}/logs"
-# Well-defined subdirectory for ocache data - safe to delete on cleanup
-OCACHE_DATA_DIR="${DATA_DIR}/ocache-data"
+# Well-defined subdirectory containing all runtime data - safe to delete on cleanup
+TAG_DATA_DIR="${DATA_DIR}/tag-data"
+LOG_DIR="${TAG_DATA_DIR}/logs"
+PID_DIR="${TAG_DATA_DIR}/pids"
+OCACHE_DATA_DIR="${TAG_DATA_DIR}/ocache-data"
 
 # Ports
 TAG_PORT="${TAG_PORT:-8080}"
@@ -34,7 +36,6 @@ TAG_RELEASES_URL="https://tag-releases.t3.storage.dev"
 OCACHE_RELEASES_URL="https://ocache-releases.t3.storage.dev"
 
 # PID files
-PID_DIR="${DATA_DIR}/pids"
 OCACHE_PID_FILE="${PID_DIR}/ocache.pid"
 TAG_PID_FILE="${PID_DIR}/tag.pid"
 
@@ -190,8 +191,7 @@ cmd_start() {
     download_binary "ocache" "${OCACHE_VERSION}" "${OCACHE_RELEASES_URL}"
     download_binary "tag" "${TAG_VERSION}" "${TAG_RELEASES_URL}"
 
-    # Create directories
-    mkdir -p "${DATA_DIR}"
+    # Create directories (all under TAG_DATA_DIR)
     mkdir -p "${LOG_DIR}"
     mkdir -p "${PID_DIR}"
     mkdir -p "${OCACHE_DATA_DIR}"
@@ -253,15 +253,15 @@ cmd_stop() {
     echo "Services stopped"
 
     if [ "${1:-}" = "--clean" ]; then
-        echo "Cleaning up ocache data..."
+        echo "Cleaning up tag data..."
 
-        # Only delete the well-defined ocache data subdirectory
+        # Delete the well-defined tag-data subdirectory (contains logs, pids, ocache-data)
         # This is safe because we created it with a known name
-        if [ -d "${OCACHE_DATA_DIR}" ]; then
-            rm -rf "${OCACHE_DATA_DIR}"
-            echo "OCache data directory removed: ${OCACHE_DATA_DIR}"
+        if [ -d "${TAG_DATA_DIR}" ]; then
+            rm -rf "${TAG_DATA_DIR}"
+            echo "Tag data directory removed: ${TAG_DATA_DIR}"
         else
-            echo "OCache data directory does not exist, nothing to clean"
+            echo "Tag data directory does not exist, nothing to clean"
         fi
     fi
 }
@@ -350,7 +350,7 @@ cmd_help() {
     echo ""
     echo "Commands:"
     echo "  start           Start TAG and OCache services"
-    echo "  stop [--clean]  Stop services (--clean removes ocache data)"
+    echo "  stop [--clean]  Stop services (--clean removes all tag data)"
     echo "  status          Check status of services"
     echo "  logs [service]  Show logs (service: tag, ocache, or all)"
     echo "  help            Show this help message"
