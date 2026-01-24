@@ -58,16 +58,10 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 
 	// 2. Check cache (fast path) - now also works for range requests!
 	// For range requests: check if full object is in cache, then serve range from it.
+	// Uses two-phase approach: GetMeta first, then GetBodyStream for direct streaming.
 	if !noCacheRead && s.cache.IsEnabled() {
-		meta, bodyReader, found, cacheErr := s.cache.GetWithMeta(ctx, bucket, key)
+		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
 		if cacheErr == nil && found && meta != nil {
-			// Close body reader if we got one (we may serve range instead)
-			if bodyReader != nil {
-				if closer, ok := bodyReader.(io.Closer); ok {
-					defer closer.Close()
-				}
-			}
-
 			// If this is a Range request and we have the full object cached,
 			// serve the range from the cached object
 			if rangeHeader != "" {
@@ -100,20 +94,54 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			}
 
 			// Serve full response from cache with proper headers
-			metrics.RecordCacheHit()
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving from cache with metadata")
-			meta.WriteHeaders(w)
-			w.Header().Set(XCacheHeader, XCacheHit)
-			w.WriteHeader(meta.StatusCode)
-			if bodyReader != nil {
-				n, copyErr := io.Copy(w, bodyReader)
-				metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-				if copyErr != nil {
-					log.Warn().Err(copyErr).Msg("Failed to copy cached content to response")
-				}
+			// Handle zero-byte objects directly (no body to verify)
+			if meta.ContentLength == 0 {
+				metrics.RecordCacheHit()
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving zero-byte object from cache")
+				meta.WriteHeaders(w)
+				w.Header().Set(XCacheHeader, XCacheHit)
+				w.WriteHeader(meta.StatusCode)
+				metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+				return nil
 			}
-			metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
-			return nil
+
+			// Non-zero object: use io.Pipe to verify body exists BEFORE writing headers
+			pr, pw := io.Pipe()
+			go func() {
+				err := s.cache.GetBodyStream(ctx, bucket, key, pw)
+				if err != nil {
+					pw.CloseWithError(err)
+				} else {
+					pw.Close()
+				}
+			}()
+
+			// Read first byte to verify body exists before committing headers
+			firstByte := make([]byte, 1)
+			n, readErr := pr.Read(firstByte)
+			if readErr != nil {
+				// Body missing or error - close pipe and fall through to upstream
+				pr.Close()
+				log.Debug().Err(readErr).Str("bucket", bucket).Str("key", key).Msg("Cache body missing, falling back to upstream")
+				// Fall through to cache miss handling below
+			} else {
+				// Body verified - safe to write headers and stream
+				metrics.RecordCacheHit()
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving from cache with metadata (verified stream)")
+				meta.WriteHeaders(w)
+				w.Header().Set(XCacheHeader, XCacheHit)
+				w.WriteHeader(meta.StatusCode)
+
+				// Write first byte and stream the rest
+				cw := &countingWriter{w: w}
+				cw.Write(firstByte[:n])
+				io.Copy(cw, pr)
+				pr.Close()
+
+				metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+				metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+				return nil
+			}
 		}
 		metrics.RecordCacheMiss()
 	}

@@ -267,6 +267,35 @@ func (c *Cache) GetMeta(ctx context.Context, bucket, key string) (*CachedObjectM
 	return meta, true, nil
 }
 
+// GetBodyStream streams the cached object body directly to the provided writer.
+// This avoids buffering the entire object in memory, which is critical for large objects.
+// Use this after GetMeta() to stream the body directly to the HTTP response.
+// Returns ErrNotFound if the body is not in cache.
+func (c *Cache) GetBodyStream(ctx context.Context, bucket, key string, w io.Writer) error {
+	if !c.IsEnabled() {
+		return ErrCacheDisabled
+	}
+
+	bodyKey := MakeBodyKey(bucket, key)
+
+	// Stream body directly to writer - no intermediate buffer
+	err := c.client.GetStream(ctx, bodyKey, w)
+	if err != nil {
+		if isNotFoundError(err) {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (body stream)")
+			return ErrNotFound
+		}
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body stream error")
+		return err
+	}
+
+	log.Debug().
+		Str("bucket", bucket).
+		Str("key", key).
+		Msg("Cache hit (body streamed)")
+	return nil
+}
+
 // DeleteWithMeta removes both metadata and body from cache.
 func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	if !c.IsEnabled() {

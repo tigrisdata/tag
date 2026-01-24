@@ -4,6 +4,18 @@
 BINARY_NAME := tag
 CMD_PATH := ./cmd/tag
 
+# ocache binary configuration for s3-bench-local
+OCACHE_VERSION ?= v1.2.2
+OCACHE_BINARY := ocache
+OCACHE_BIN_DIR := .bin
+OCACHE_BIN_PATH := $(OCACHE_BIN_DIR)/$(OCACHE_BINARY)-$(OCACHE_VERSION)
+OCACHE_RELEASES_URL := https://ocache-releases.t3.storage.dev
+OCACHE_DATA_DIR := /tmp/ocache-bench-data
+
+# Detect OS and architecture for ocache binary download
+OCACHE_OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
+OCACHE_ARCH := $(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
+
 # Allow specifying specific tests with TEST variable (e.g., make test TEST=TestMyFunction)
 # or with TESTRUN for pattern matching (e.g., make test TESTRUN=MyFunction)
 TEST ?=
@@ -189,6 +201,8 @@ help:
 	@echo "S3 compatibility test targets:"
 	@echo "  s3-test-local      - Start local S3 test env (TAG on host, ocache in Docker)"
 	@echo "  s3-test-local-down - Stop local S3 test environment"
+	@echo "  s3-bench-local     - Start local S3 bench env (TAG + ocache binaries on host)"
+	@echo "  s3-bench-local-down - Stop local S3 bench environment"
 	@echo "  s3-tests           - Run S3 compatibility tests (ceph s3-tests)"
 	@echo "  s3-tests-clean     - Remove cloned s3-tests repository"
 	@echo ""
@@ -259,6 +273,54 @@ s3-test-local-down:
 	@echo "Stopping S3 test infrastructure (local mode)..."
 	-@pkill -f "./$(BINARY_NAME)" 2>/dev/null || true
 	$(S3_TEST_COMPOSE) down -v
+
+# Local benchmarking: Run both TAG and ocache binaries on host (no Docker)
+.PHONY: s3-bench-local
+s3-bench-local: build
+	@echo "Starting S3 bench infrastructure (local mode, no Docker)..."
+	@if [ -z "$$AWS_ACCESS_KEY_ID" ] || [ -z "$$AWS_SECRET_ACCESS_KEY" ]; then \
+		echo "Error: AWS credentials not set."; \
+		echo "  export AWS_ACCESS_KEY_ID=<your-key>"; \
+		echo "  export AWS_SECRET_ACCESS_KEY=<your-secret>"; \
+		exit 1; \
+	fi
+	@# Stop any existing processes on the required ports
+	-@lsof -ti:9000 | xargs kill 2>/dev/null || true
+	-@lsof -ti:9001 | xargs kill 2>/dev/null || true
+	-@lsof -ti:8080 | xargs kill 2>/dev/null || true
+	@sleep 1
+	@mkdir -p $(OCACHE_BIN_DIR)
+	@if [ ! -x $(OCACHE_BIN_PATH) ]; then \
+		echo "Downloading ocache $(OCACHE_VERSION) for $(OCACHE_OS)-$(OCACHE_ARCH)..."; \
+		curl -fsSL "$(OCACHE_RELEASES_URL)/$(OCACHE_VERSION)/$(OCACHE_BINARY)-$(OCACHE_OS)-$(OCACHE_ARCH)" -o $(OCACHE_BIN_PATH) && \
+		chmod +x $(OCACHE_BIN_PATH); \
+	fi
+	@mkdir -p $(OCACHE_DATA_DIR)
+	@echo "Starting ocache locally..."
+	@$(OCACHE_BIN_PATH) -disk=$(OCACHE_DATA_DIR) -listen-addr=:9000 -listen-http=:9001 &
+	@echo "Waiting for ocache to be ready..."
+	@timeout 30 bash -c 'until curl -s http://localhost:9001/health > /dev/null 2>&1; do sleep 1; done' || \
+		(echo "ocache failed to start"; exit 1)
+	@echo "ocache is ready at http://localhost:9000"
+	@echo "Starting TAG locally..."
+	@TAG_UPSTREAM_ENDPOINT=$${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev} \
+		TAG_OCACHE_ENDPOINTS=localhost:9000 \
+		TAG_LOG_LEVEL=$${TAG_LOG_LEVEL:-info} \
+		TAG_PPROF_ENABLED=true \
+		./$(BINARY_NAME) &
+	@echo "Waiting for TAG to be ready..."
+	@timeout 30 bash -c 'until curl -s http://localhost:8080/health > /dev/null 2>&1; do sleep 1; done' || \
+		(echo "TAG failed to start"; exit 1)
+	@echo "TAG is ready at http://localhost:8080"
+
+.PHONY: s3-bench-local-down
+s3-bench-local-down:
+	@echo "Stopping S3 bench infrastructure (local mode)..."
+	-@lsof -ti:8080 | xargs kill 2>/dev/null || true
+	-@lsof -ti:9000 | xargs kill 2>/dev/null || true
+	-@lsof -ti:9001 | xargs kill 2>/dev/null || true
+	@echo "Cleaning up ocache data directory..."
+	-@rm -rf $(OCACHE_DATA_DIR)
 
 .PHONY: s3-tests
 s3-tests:
