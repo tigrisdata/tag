@@ -94,7 +94,18 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			}
 
 			// Serve full response from cache with proper headers
-			// Use io.Pipe to verify body exists BEFORE writing headers (avoid corrupt responses)
+			// Handle zero-byte objects directly (no body to verify)
+			if meta.ContentLength == 0 {
+				metrics.RecordCacheHit()
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving zero-byte object from cache")
+				meta.WriteHeaders(w)
+				w.Header().Set(XCacheHeader, XCacheHit)
+				w.WriteHeader(meta.StatusCode)
+				metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+				return nil
+			}
+
+			// Non-zero object: use io.Pipe to verify body exists BEFORE writing headers
 			pr, pw := io.Pipe()
 			go func() {
 				err := s.cache.GetBodyStream(ctx, bucket, key, pw)
