@@ -94,24 +94,43 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			}
 
 			// Serve full response from cache with proper headers
-			// Stream body directly to response writer - no intermediate buffer!
-			metrics.RecordCacheHit()
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving from cache with metadata (direct stream)")
-			meta.WriteHeaders(w)
-			w.Header().Set(XCacheHeader, XCacheHit)
-			w.WriteHeader(meta.StatusCode)
+			// Use io.Pipe to verify body exists BEFORE writing headers (avoid corrupt responses)
+			pr, pw := io.Pipe()
+			go func() {
+				err := s.cache.GetBodyStream(ctx, bucket, key, pw)
+				if err != nil {
+					pw.CloseWithError(err)
+				} else {
+					pw.Close()
+				}
+			}()
 
-			// Use counting writer to track bytes transferred
-			cw := &countingWriter{w: w}
-			streamErr := s.cache.GetBodyStream(ctx, bucket, key, cw)
-			metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+			// Read first byte to verify body exists before committing headers
+			firstByte := make([]byte, 1)
+			n, readErr := pr.Read(firstByte)
+			if readErr != nil {
+				// Body missing or error - close pipe and fall through to upstream
+				pr.Close()
+				log.Debug().Err(readErr).Str("bucket", bucket).Str("key", key).Msg("Cache body missing, falling back to upstream")
+				// Fall through to cache miss handling below
+			} else {
+				// Body verified - safe to write headers and stream
+				metrics.RecordCacheHit()
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving from cache with metadata (verified stream)")
+				meta.WriteHeaders(w)
+				w.Header().Set(XCacheHeader, XCacheHit)
+				w.WriteHeader(meta.StatusCode)
 
-			if streamErr != nil {
-				// Headers already sent, log warning but don't return error to client
-				log.Warn().Err(streamErr).Str("bucket", bucket).Str("key", key).Msg("Failed to stream cached content to response")
+				// Write first byte and stream the rest
+				cw := &countingWriter{w: w}
+				cw.Write(firstByte[:n])
+				io.Copy(cw, pr)
+				pr.Close()
+
+				metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+				metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+				return nil
 			}
-			metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
-			return nil
 		}
 		metrics.RecordCacheMiss()
 	}
