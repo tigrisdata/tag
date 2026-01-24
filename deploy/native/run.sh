@@ -4,7 +4,7 @@
 # Downloads pre-built binaries from Tigris and runs them as native processes
 #
 
-set -e
+set -euo pipefail
 
 # Configuration (can be overridden via environment variables)
 TAG_VERSION="${TAG_VERSION:-v1.2.0}"
@@ -30,6 +30,29 @@ TAG_LOG_LEVEL="${TAG_LOG_LEVEL:-info}"
 # Release URLs
 TAG_RELEASES_URL="https://tag-releases.t3.storage.dev"
 OCACHE_RELEASES_URL="https://ocache-releases.t3.storage.dev"
+
+# PID files
+PID_DIR="${DATA_DIR}/pids"
+OCACHE_PID_FILE="${PID_DIR}/ocache.pid"
+TAG_PID_FILE="${PID_DIR}/tag.pid"
+
+# Check required dependencies
+check_dependencies() {
+    local missing=()
+
+    if ! command -v lsof >/dev/null 2>&1; then
+        missing+=("lsof")
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        missing+=("curl")
+    fi
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "Error: Required dependencies not installed: ${missing[*]}"
+        exit 1
+    fi
+}
 
 # Detect OS and architecture
 detect_platform() {
@@ -70,14 +93,43 @@ download_binary() {
     echo "${name} ${version} downloaded successfully"
 }
 
-# Kill processes on a specific port
+# Kill processes on a specific port (graceful shutdown)
 kill_port() {
     local port="$1"
     local pids
     pids=$(lsof -ti:"${port}" 2>/dev/null || true)
     if [ -n "${pids}" ]; then
-        echo "Killing processes on port ${port}..."
-        echo "${pids}" | xargs kill 2>/dev/null || true
+        echo "Stopping processes on port ${port}..."
+        # Send SIGTERM first for graceful shutdown
+        echo "${pids}" | xargs kill -TERM 2>/dev/null || true
+        sleep 2
+        # Force kill if still running
+        pids=$(lsof -ti:"${port}" 2>/dev/null || true)
+        if [ -n "${pids}" ]; then
+            echo "Force killing processes on port ${port}..."
+            echo "${pids}" | xargs kill -9 2>/dev/null || true
+        fi
+    fi
+}
+
+# Kill process by PID file (graceful shutdown)
+kill_pid_file() {
+    local pid_file="$1"
+    local name="$2"
+
+    if [ -f "${pid_file}" ]; then
+        local pid
+        pid=$(cat "${pid_file}")
+        if kill -0 "${pid}" 2>/dev/null; then
+            echo "Stopping ${name} (PID: ${pid})..."
+            kill -TERM "${pid}" 2>/dev/null || true
+            sleep 2
+            if kill -0 "${pid}" 2>/dev/null; then
+                echo "Force killing ${name}..."
+                kill -9 "${pid}" 2>/dev/null || true
+            fi
+        fi
+        rm -f "${pid_file}"
     fi
 }
 
@@ -110,8 +162,11 @@ check_port() {
 cmd_start() {
     echo "Starting TAG and OCache (native mode)..."
 
+    # Check dependencies
+    check_dependencies
+
     # Check AWS credentials
-    if [ -z "${AWS_ACCESS_KEY_ID}" ] || [ -z "${AWS_SECRET_ACCESS_KEY}" ]; then
+    if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
         echo "Error: AWS credentials not set."
         echo "  export AWS_ACCESS_KEY_ID=<your-key>"
         echo "  export AWS_SECRET_ACCESS_KEY=<your-secret>"
@@ -122,6 +177,8 @@ cmd_start() {
     detect_platform
 
     # Stop any existing processes
+    kill_pid_file "${TAG_PID_FILE}" "TAG"
+    kill_pid_file "${OCACHE_PID_FILE}" "OCache"
     kill_port "${TAG_PORT}"
     kill_port "${OCACHE_PORT}"
     kill_port "${OCACHE_HTTP_PORT}"
@@ -134,6 +191,7 @@ cmd_start() {
     # Create directories
     mkdir -p "${DATA_DIR}"
     mkdir -p "${LOG_DIR}"
+    mkdir -p "${PID_DIR}"
 
     local ocache_bin="${BIN_DIR}/ocache-${OCACHE_VERSION}"
     local tag_bin="${BIN_DIR}/tag-${TAG_VERSION}"
@@ -146,6 +204,8 @@ cmd_start() {
         -listen-http=":${OCACHE_HTTP_PORT}" \
         -max-disk-usage="${OCACHE_MAX_DISK_USAGE}" \
         > "${LOG_DIR}/ocache.log" 2>&1 &
+    local ocache_pid=$!
+    echo "${ocache_pid}" > "${OCACHE_PID_FILE}"
 
     if ! wait_for_health "OCache" "http://localhost:${OCACHE_HTTP_PORT}/health"; then
         echo "OCache logs:"
@@ -159,6 +219,8 @@ cmd_start() {
     TAG_LOG_LEVEL="${TAG_LOG_LEVEL}" \
     "${tag_bin}" \
         > "${LOG_DIR}/tag.log" 2>&1 &
+    local tag_pid=$!
+    echo "${tag_pid}" > "${TAG_PID_FILE}"
 
     if ! wait_for_health "TAG" "http://localhost:${TAG_PORT}/health"; then
         echo "TAG logs:"
@@ -178,16 +240,25 @@ cmd_start() {
 cmd_stop() {
     echo "Stopping TAG and OCache..."
 
+    # Try PID files first, then fall back to port-based killing
+    kill_pid_file "${TAG_PID_FILE}" "TAG"
+    kill_pid_file "${OCACHE_PID_FILE}" "OCache"
     kill_port "${TAG_PORT}"
     kill_port "${OCACHE_PORT}"
     kill_port "${OCACHE_HTTP_PORT}"
 
     echo "Services stopped"
 
-    if [ "${1}" = "--clean" ]; then
+    if [ "${1:-}" = "--clean" ]; then
         echo "Cleaning up data directory..."
-        rm -rf "${DATA_DIR}"
-        echo "Data directory removed"
+        # Validate DATA_DIR before deletion to prevent catastrophic rm -rf
+        if [ -d "${DATA_DIR}" ] && [ "${DATA_DIR}" != "/" ] && [ "${DATA_DIR}" != "${HOME}" ]; then
+            rm -rf "${DATA_DIR}"
+            echo "Data directory removed"
+        else
+            echo "Refusing to delete DATA_DIR: ${DATA_DIR}"
+            exit 1
+        fi
     fi
 }
 
@@ -196,8 +267,14 @@ cmd_status() {
     echo "Service Status:"
     echo ""
 
+    # TAG status
+    local tag_pid=""
+    if [ -f "${TAG_PID_FILE}" ]; then
+        tag_pid=$(cat "${TAG_PID_FILE}")
+    fi
+
     if check_port "${TAG_PORT}"; then
-        echo "  TAG (port ${TAG_PORT}): RUNNING"
+        echo "  TAG (port ${TAG_PORT}): RUNNING${tag_pid:+ (PID: ${tag_pid})}"
         if curl -s "http://localhost:${TAG_PORT}/health" > /dev/null 2>&1; then
             echo "    Health: OK"
         else
@@ -207,8 +284,14 @@ cmd_status() {
         echo "  TAG (port ${TAG_PORT}): STOPPED"
     fi
 
+    # OCache status
+    local ocache_pid=""
+    if [ -f "${OCACHE_PID_FILE}" ]; then
+        ocache_pid=$(cat "${OCACHE_PID_FILE}")
+    fi
+
     if check_port "${OCACHE_PORT}"; then
-        echo "  OCache (port ${OCACHE_PORT}): RUNNING"
+        echo "  OCache (port ${OCACHE_PORT}): RUNNING${ocache_pid:+ (PID: ${ocache_pid})}"
         if curl -s "http://localhost:${OCACHE_HTTP_PORT}/health" > /dev/null 2>&1; then
             echo "    Health: OK"
         else
