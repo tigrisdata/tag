@@ -281,7 +281,7 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 	testCache := cache.NewCacheWithClient(memoryCache, &cfg.Cache)
 
 	// Create forwarder
-	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region)
+	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost)
 
 	// Create service
 	service := proxy.NewService(forwarder, testCache, cfg)
@@ -339,7 +339,7 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 	testCache, _ := cache.NewCache(&cfg.Cache)
 
 	// Create forwarder
-	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region)
+	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost)
 
 	// Create service
 	service := proxy.NewService(forwarder, testCache, cfg)

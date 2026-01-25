@@ -96,16 +96,20 @@ type Forwarder struct {
 	httpClient *http.Client
 }
 
-// NewForwarder creates a new forwarder.
-func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string) *Forwarder {
+// NewForwarder creates a new forwarder with configurable HTTP connection pool.
+func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string, maxIdleConnsPerHost int) *Forwarder {
+	if maxIdleConnsPerHost <= 0 {
+		maxIdleConnsPerHost = 100 // Default
+	}
+
 	return &Forwarder{
 		credStore: credStore,
 		validator: auth.NewRequestValidator(credStore),
 		signer:    auth.NewRequestSigner(tigrisEndpoint, region),
 		httpClient: &http.Client{
 			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
+				MaxIdleConns:        maxIdleConnsPerHost,
+				MaxIdleConnsPerHost: maxIdleConnsPerHost,
 				IdleConnTimeout:     90 * time.Second,
 			},
 			Timeout: 5 * time.Minute,
