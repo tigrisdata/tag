@@ -32,6 +32,16 @@ var bufferPool = sync.Pool{
 // allocation, and synchronization overhead for small objects.
 const smallObjectThreshold = 64 * 1024 // 64KB
 
+// putBuffer returns a buffer to the pool only if it hasn't grown too large.
+// This prevents memory bloat from oversized buffers (e.g., if cached body
+// exceeds metadata claims due to corruption/inconsistency).
+func putBuffer(buf *bytes.Buffer) {
+	if buf.Cap() <= smallObjectThreshold {
+		bufferPool.Put(buf)
+	}
+	// Otherwise let it be garbage collected
+}
+
 // countingWriter wraps an io.Writer to count bytes written.
 type countingWriter struct {
 	w       io.Writer
@@ -138,10 +148,10 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					n, _ := w.Write(bodyBuf.Bytes())
 					metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 					metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
-					bufferPool.Put(bodyBuf) // Return buffer to pool
+					putBuffer(bodyBuf) // Return buffer to pool
 					return nil
 				}
-				bufferPool.Put(bodyBuf) // Return buffer to pool even on error
+				putBuffer(bodyBuf) // Return buffer to pool even on error
 				// Fall through to streaming path or upstream on error
 				log.Debug().Err(bodyErr).Str("bucket", bucket).Str("key", key).Msg("GetBodyStream failed, falling back to streaming")
 			}
