@@ -11,7 +11,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_UPSTREAM_ENDPOINT` | Tigris S3 endpoint URL | `https://t3.storage.dev` |
 | `TAG_MAX_IDLE_CONNS_PER_HOST` | HTTP connection pool size per upstream host | `100` |
 | `TAG_OCACHE_ENDPOINTS` | Comma-separated ocache endpoints | (none) |
-| `TAG_OCACHE_CONNECTION_POOL_SIZE` | Number of gRPC connections per ocache node | `64` |
+| `TAG_OCACHE_CONNECTION_POOL_SIZE` | Number of gRPC connections per ocache node | `4` |
 | `TAG_CACHE_DISABLED` | Disable caching (`true` or `1`) | `false` |
 | `TAG_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error` | `info` |
 | `TAG_LOG_FORMAT` | Log format: `json` or `console` | `json` |
@@ -81,8 +81,8 @@ cache:
 
   # Number of gRPC connections per ocache node
   # Higher values improve throughput for high-concurrency workloads
-  # Default: 64
-  connection_pool_size: 64
+  # Default: 4
+  connection_pool_size: 4
 
 # Broadcast configuration (request coalescing)
 broadcast:
@@ -141,7 +141,7 @@ Controls the caching behavior and ocache cluster connection.
 | `endpoints` | []string | `[]` | ocache cluster endpoints |
 | `ttl` | duration | `60m` | Default TTL for cached objects |
 | `size_threshold` | int64 | `1073741824` | Max object size to cache (bytes) |
-| `connection_pool_size` | int | `64` | Number of gRPC connections per ocache node |
+| `connection_pool_size` | int | `4` | Number of gRPC connections per ocache node |
 
 **TTL Format:**
 - `60m` - 60 minutes (default)

@@ -32,7 +32,7 @@ const (
 
 	// DefaultCacheConnectionPoolSize is the default number of gRPC connections per ocache node.
 	// Higher values improve throughput for high-concurrency workloads.
-	DefaultCacheConnectionPoolSize = 64
+	DefaultCacheConnectionPoolSize = 4
 
 	// DefaultLogLevel is the default log level.
 	DefaultLogLevel = "info"
