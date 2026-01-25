@@ -9,7 +9,9 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `AWS_ACCESS_KEY_ID` | S3 access key for authentication | (required) |
 | `AWS_SECRET_ACCESS_KEY` | S3 secret key for authentication | (required) |
 | `TAG_UPSTREAM_ENDPOINT` | Tigris S3 endpoint URL | `https://t3.storage.dev` |
+| `TAG_MAX_IDLE_CONNS_PER_HOST` | HTTP connection pool size per upstream host | `100` |
 | `TAG_OCACHE_ENDPOINTS` | Comma-separated ocache endpoints | (none) |
+| `TAG_OCACHE_CONNECTION_POOL_SIZE` | Number of gRPC connections per ocache node | `4` |
 | `TAG_CACHE_DISABLED` | Disable caching (`true` or `1`) | `false` |
 | `TAG_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error` | `info` |
 | `TAG_LOG_FORMAT` | Log format: `json` or `console` | `json` |
@@ -50,6 +52,11 @@ upstream:
   # Default: "auto"
   region: "auto"
 
+  # HTTP connection pool size per upstream host
+  # Higher values improve throughput for cache miss scenarios
+  # Default: 100
+  max_idle_conns_per_host: 100
+
 # Cache configuration
 cache:
   # Enable caching
@@ -71,6 +78,11 @@ cache:
   # Objects larger than this are not cached
   # Default: 1073741824 (1GB)
   size_threshold: 1073741824
+
+  # Number of gRPC connections per ocache node
+  # Higher values improve throughput for high-concurrency workloads
+  # Default: 4
+  connection_pool_size: 4
 
 # Broadcast configuration (request coalescing)
 broadcast:
@@ -114,6 +126,7 @@ Configures the connection to upstream Tigris storage.
 |-------|------|---------|-------------|
 | `endpoint` | string | `"https://t3.storage.dev"` | Tigris S3 endpoint URL |
 | `region` | string | `"auto"` | AWS region for request signing |
+| `max_idle_conns_per_host` | int | `100` | HTTP connection pool size per host |
 
 **Endpoint Options:**
 - `https://t3.storage.dev` - Default Tigris endpoint
@@ -128,6 +141,7 @@ Controls the caching behavior and ocache cluster connection.
 | `endpoints` | []string | `[]` | ocache cluster endpoints |
 | `ttl` | duration | `60m` | Default TTL for cached objects |
 | `size_threshold` | int64 | `1073741824` | Max object size to cache (bytes) |
+| `connection_pool_size` | int | `4` | Number of gRPC connections per ocache node |
 
 **TTL Format:**
 - `60m` - 60 minutes (default)
@@ -238,13 +252,18 @@ log:
 server:
   http_port: 8080
 
+upstream:
+  endpoint: "https://t3.storage.dev"
+  max_idle_conns_per_host: 500  # Increase for high cache-miss concurrency
+
 cache:
   enabled: true
   endpoints:
     - "ocache-0:9000"
     - "ocache-1:9000"
   ttl: 1h
-  size_threshold: 1073741824  # 1GB
+  size_threshold: 1073741824    # 1GB
+  connection_pool_size: 128     # Increase for high cache-hit concurrency
 
 broadcast:
   chunk_size: 131072    # 128KB chunks
