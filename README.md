@@ -128,28 +128,9 @@ See [docs/metrics.md](docs/metrics.md) for complete metrics reference.
 
 ## Deployment
 
-### Docker
+TAG can be deployed to Kubernetes, Docker, or standalone mode.
 
-```bash
-# Single node (TAG + ocache)
-cd docker
-docker-compose up -d
-
-# Cluster mode (2 TAG + 3 ocache)
-docker-compose -f docker-compose-cluster.yml up -d
-```
-
-### Kubernetes
-
-```bash
-kubectl create secret generic tag-credentials \
-  --from-literal=AWS_ACCESS_KEY_ID=your_key \
-  --from-literal=AWS_SECRET_ACCESS_KEY=your_secret
-
-kubectl apply -f deploy/
-```
-
-See [docs/deployment.md](docs/deployment.md) for complete deployment guide including environment setup, cluster configuration, and production considerations.
+See [tigrisdata/tag-deploy](https://github.com/tigrisdata/tag-deploy) for complete deployment guide and manifests.
 
 ## API Reference
 

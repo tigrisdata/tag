@@ -1,0 +1,175 @@
+name: Upload Release to T3
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+    branches: [release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version tag (e.g., v1.0.0)"
+        required: true
+
+env:
+  S3_BUCKET: tag-releases
+  S3_ENDPOINT: https://t3.storage.dev
+
+jobs:
+  upload-to-t3:
+    runs-on: ubuntu-latest
+    # Only run if release workflow succeeded, or if manually triggered
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            echo "version=$INPUT_VERSION" >> $GITHUB_OUTPUT
+            echo "Using manual version: $INPUT_VERSION"
+          else
+            # Get the tag pointing to the workflow_run commit SHA
+            git fetch --tags
+            VERSION=$(git tag --points-at "$WORKFLOW_RUN_SHA" | grep '^v' | head -1)
+            if [ -z "$VERSION" ]; then
+              echo "Error: No version tag found for commit $WORKFLOW_RUN_SHA"
+              exit 1
+            fi
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "Using version from workflow_run: $VERSION"
+          fi
+
+      - name: Verify release exists
+        env:
+          GH_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          if ! gh release view "$VERSION" > /dev/null 2>&1; then
+            echo "Error: Release $VERSION not found"
+            exit 1
+          fi
+          echo "Verified release $VERSION exists"
+
+      - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          mkdir -p binaries
+
+          # Define all expected binaries
+          BINARIES=(
+            "tag-linux-amd64"
+            "tag-linux-arm64"
+            "tag-darwin-arm64"
+          )
+
+          # Download each binary
+          for binary in "${BINARIES[@]}"; do
+            echo "Downloading $binary..."
+            if ! gh release download "$VERSION" -p "$binary" -O "binaries/$binary"; then
+              echo "Error: Failed to download $binary"
+              exit 1
+            fi
+          done
+
+          echo "Downloaded binaries:"
+          ls -la binaries/
+
+      - name: Configure AWS CLI for S3-compatible endpoint
+        run: |
+          aws configure set default.s3.signature_version s3v4
+
+      - name: Upload binaries to T3 (versioned directory)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RELEASE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASE_AWS_SECRET_ACCESS_KEY }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          echo "Uploading binaries to s3://$S3_BUCKET/$VERSION/"
+
+          for binary in binaries/*; do
+            FILENAME=$(basename "$binary")
+            echo "Uploading $FILENAME..."
+            aws s3 cp "$binary" "s3://$S3_BUCKET/$VERSION/$FILENAME" \
+              --endpoint-url "$S3_ENDPOINT" \
+              --content-type "application/octet-stream"
+          done
+
+          echo "Versioned upload complete"
+
+      - name: Update latest directory
+        # Only update 'latest' when triggered by release workflow, not manual dispatch
+        if: github.event_name == 'workflow_run'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RELEASE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASE_AWS_SECRET_ACCESS_KEY }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          echo "Updating latest/ directory to $VERSION..."
+
+          for binary in binaries/*; do
+            FILENAME=$(basename "$binary")
+            echo "Updating latest/$FILENAME..."
+            aws s3 cp "$binary" "s3://$S3_BUCKET/latest/$FILENAME" \
+              --endpoint-url "$S3_ENDPOINT" \
+              --content-type "application/octet-stream"
+          done
+
+          echo "Latest directory updated"
+
+      - name: Verify upload
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RELEASE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASE_AWS_SECRET_ACCESS_KEY }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          echo "Verifying uploaded files..."
+          echo ""
+          echo "Files in $VERSION/:"
+          aws s3 ls "s3://$S3_BUCKET/$VERSION/" --endpoint-url "$S3_ENDPOINT"
+
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo ""
+            echo "Files in latest/:"
+            aws s3 ls "s3://$S3_BUCKET/latest/" --endpoint-url "$S3_ENDPOINT"
+          fi
+
+      - name: Create upload summary
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          echo "## T3 Upload Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** $VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "**Bucket:** $S3_BUCKET" >> $GITHUB_STEP_SUMMARY
+          echo "**Endpoint:** $S3_ENDPOINT" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Uploaded Binaries" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Binary | T3 Path |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          for binary in binaries/*; do
+            FILENAME=$(basename "$binary")
+            echo "| $FILENAME | s3://$S3_BUCKET/$VERSION/$FILENAME |" >> $GITHUB_STEP_SUMMARY
+          done
+
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Note:** \`latest/\` directory also updated" >> $GITHUB_STEP_SUMMARY
+          fi
