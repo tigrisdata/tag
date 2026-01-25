@@ -152,46 +152,46 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					return nil
 				}
 				putBuffer(bodyBuf) // Return buffer to pool even on error
-				// Fall through to streaming path or upstream on error
-				log.Debug().Err(bodyErr).Str("bucket", bucket).Str("key", key).Msg("GetBodyStream failed, falling back to streaming")
-			}
-
-			// Large objects: use io.Pipe for streaming (avoids buffering entire object)
-			pr, pw := io.Pipe()
-			go func() {
-				err := s.cache.GetBodyStream(ctx, bucket, key, pw)
-				if err != nil {
-					pw.CloseWithError(err)
-				} else {
-					pw.Close()
-				}
-			}()
-
-			// Read first byte to verify body exists before committing headers
-			firstByte := make([]byte, 1)
-			n, readErr := pr.Read(firstByte)
-			if readErr != nil {
-				// Body missing or error - close pipe and fall through to upstream
-				pr.Close()
-				log.Debug().Err(readErr).Str("bucket", bucket).Str("key", key).Msg("Cache body missing, falling back to upstream")
-				// Fall through to cache miss handling below
+				// Fall through to upstream (cache miss handling below)
+				log.Debug().Err(bodyErr).Str("bucket", bucket).Str("key", key).Msg("GetBodyStream failed for small object, falling back to upstream")
 			} else {
-				// Body verified - safe to write headers and stream
-				metrics.RecordCacheHit()
-				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving large object from cache (streaming)")
-				meta.WriteHeaders(w)
-				w.Header().Set(XCacheHeader, XCacheHit)
-				w.WriteHeader(meta.StatusCode)
+				// Large objects: use io.Pipe for streaming (avoids buffering entire object)
+				pr, pw := io.Pipe()
+				go func() {
+					err := s.cache.GetBodyStream(ctx, bucket, key, pw)
+					if err != nil {
+						pw.CloseWithError(err)
+					} else {
+						pw.Close()
+					}
+				}()
 
-				// Write first byte and stream the rest
-				cw := &countingWriter{w: w}
-				cw.Write(firstByte[:n])
-				io.Copy(cw, pr)
-				pr.Close()
+				// Read first byte to verify body exists before committing headers
+				firstByte := make([]byte, 1)
+				n, readErr := pr.Read(firstByte)
+				if readErr != nil {
+					// Body missing or error - close pipe and fall through to upstream
+					pr.Close()
+					log.Debug().Err(readErr).Str("bucket", bucket).Str("key", key).Msg("Cache body missing, falling back to upstream")
+					// Fall through to cache miss handling below
+				} else {
+					// Body verified - safe to write headers and stream
+					metrics.RecordCacheHit()
+					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving large object from cache (streaming)")
+					meta.WriteHeaders(w)
+					w.Header().Set(XCacheHeader, XCacheHit)
+					w.WriteHeader(meta.StatusCode)
 
-				metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-				metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
-				return nil
+					// Write first byte and stream the rest
+					cw := &countingWriter{w: w}
+					cw.Write(firstByte[:n])
+					io.Copy(cw, pr)
+					pr.Close()
+
+					metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+					metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+					return nil
+				}
 			}
 		}
 		metrics.RecordCacheMiss()
