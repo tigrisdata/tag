@@ -73,7 +73,7 @@ type ServerConfig struct {
 type UpstreamConfig struct {
 	Endpoint            string `yaml:"endpoint"`               // Tigris S3 endpoint (e.g., https://fly.storage.tigris.dev)
 	Region              string `yaml:"region"`                 // AWS region for signing (default: auto)
-	MaxIdleConnsPerHost int    `yaml:"max_idle_conns_per_host"` // HTTP connection pool size per host (default: 500)
+	MaxIdleConnsPerHost int    `yaml:"max_idle_conns_per_host"` // HTTP connection pool size per host (default: 100)
 }
 
 // CredentialsConfig holds credential store configuration.
@@ -88,7 +88,7 @@ type CacheConfig struct {
 	Endpoints          []string      `yaml:"endpoints"`            // ocache cluster endpoints (e.g., ["ocache-0:9000", "ocache-1:9000"])
 	TTL                time.Duration `yaml:"ttl"`                  // Default cache TTL (default: 60m)
 	SizeThreshold      int64         `yaml:"size_threshold"`       // Max object size to cache in bytes (default: 1GB)
-	ConnectionPoolSize int           `yaml:"connection_pool_size"` // Number of gRPC connections per ocache node (default: 64)
+	ConnectionPoolSize int           `yaml:"connection_pool_size"` // Number of gRPC connections per ocache node (default: 4)
 }
 
 // BroadcastConfig holds streaming broadcast configuration for request coalescing.
