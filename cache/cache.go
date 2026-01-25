@@ -41,10 +41,15 @@ func NewCache(cfg *config.CacheConfig) (*Cache, error) {
 	log.Info().
 		Strs("endpoints", cfg.Endpoints).
 		Dur("default_ttl", cfg.TTL).
+		Int("connection_pool_size", cfg.ConnectionPoolSize).
 		Msg("Connecting to ocache cluster")
 
-	// Create client connecting to ocache cluster
-	client, err := cacheclient.New(cfg.Endpoints...)
+	// Create client with custom connection pool size for high-throughput workloads
+	clientConfig := &cacheclient.ClientConfig{
+		Addrs:              cfg.Endpoints,
+		ConnectionPoolSize: cfg.ConnectionPoolSize,
+	}
+	client, err := cacheclient.NewWithConfig(clientConfig)
 	if err != nil {
 		return nil, err
 	}

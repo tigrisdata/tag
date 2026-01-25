@@ -111,7 +111,7 @@ func main() {
 	}
 
 	// 3. Initialize forwarder
-	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region)
+	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost)
 
 	// 4. Initialize proxy service
 	service := proxy.NewService(forwarder, objectCache, cfg)

@@ -3,6 +3,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +30,10 @@ const (
 	// DefaultCacheSizeThreshold is the max object size to cache (1GB).
 	DefaultCacheSizeThreshold = 1024 * 1024 * 1024
 
+	// DefaultCacheConnectionPoolSize is the default number of gRPC connections per ocache node.
+	// Higher values improve throughput for high-concurrency workloads.
+	DefaultCacheConnectionPoolSize = 64
+
 	// DefaultLogLevel is the default log level.
 	DefaultLogLevel = "info"
 
@@ -41,6 +46,10 @@ const (
 
 	// DefaultBroadcastChannelBuffer is the default buffer size per listener (32 chunks = ~2MB).
 	DefaultBroadcastChannelBuffer = 32
+
+	// DefaultMaxIdleConnsPerHost is the default HTTP connection pool size per upstream host.
+	// Higher values improve throughput for cache miss scenarios with high concurrency.
+	DefaultMaxIdleConnsPerHost = 100
 )
 
 // Config holds all configuration for TAG.
@@ -62,8 +71,9 @@ type ServerConfig struct {
 
 // UpstreamConfig holds Tigris endpoint configuration.
 type UpstreamConfig struct {
-	Endpoint string `yaml:"endpoint"` // Tigris S3 endpoint (e.g., https://fly.storage.tigris.dev)
-	Region   string `yaml:"region"`   // AWS region for signing (default: auto)
+	Endpoint            string `yaml:"endpoint"`               // Tigris S3 endpoint (e.g., https://fly.storage.tigris.dev)
+	Region              string `yaml:"region"`                 // AWS region for signing (default: auto)
+	MaxIdleConnsPerHost int    `yaml:"max_idle_conns_per_host"` // HTTP connection pool size per host (default: 500)
 }
 
 // CredentialsConfig holds credential store configuration.
@@ -74,10 +84,11 @@ type CredentialsConfig struct {
 
 // CacheConfig holds ocache client configuration.
 type CacheConfig struct {
-	Enabled       bool          `yaml:"enabled"`        // Enable caching (auto-enabled if endpoints configured)
-	Endpoints     []string      `yaml:"endpoints"`      // ocache cluster endpoints (e.g., ["ocache-0:9000", "ocache-1:9000"])
-	TTL           time.Duration `yaml:"ttl"`            // Default cache TTL (default: 60m)
-	SizeThreshold int64         `yaml:"size_threshold"` // Max object size to cache in bytes (default: 1GB)
+	Enabled            bool          `yaml:"enabled"`              // Enable caching (auto-enabled if endpoints configured)
+	Endpoints          []string      `yaml:"endpoints"`            // ocache cluster endpoints (e.g., ["ocache-0:9000", "ocache-1:9000"])
+	TTL                time.Duration `yaml:"ttl"`                  // Default cache TTL (default: 60m)
+	SizeThreshold      int64         `yaml:"size_threshold"`       // Max object size to cache in bytes (default: 1GB)
+	ConnectionPoolSize int           `yaml:"connection_pool_size"` // Number of gRPC connections per ocache node (default: 64)
 }
 
 // BroadcastConfig holds streaming broadcast configuration for request coalescing.
@@ -140,6 +151,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Upstream.Region == "" {
 		cfg.Upstream.Region = DefaultUpstreamRegion
 	}
+	if cfg.Upstream.MaxIdleConnsPerHost == 0 {
+		cfg.Upstream.MaxIdleConnsPerHost = DefaultMaxIdleConnsPerHost
+	}
 
 	// Cache defaults - auto-enabled when endpoints are configured.
 	// Use TAG_CACHE_DISABLED=true environment variable to disable.
@@ -151,6 +165,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Cache.SizeThreshold == 0 {
 		cfg.Cache.SizeThreshold = DefaultCacheSizeThreshold
+	}
+	if cfg.Cache.ConnectionPoolSize == 0 {
+		cfg.Cache.ConnectionPoolSize = DefaultCacheConnectionPoolSize
 	}
 
 	// Broadcast defaults
@@ -177,6 +194,13 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Upstream.Endpoint = endpoint
 	}
 
+	// Override upstream HTTP connection pool size from environment
+	if poolSize := os.Getenv("TAG_MAX_IDLE_CONNS_PER_HOST"); poolSize != "" {
+		if size, err := strconv.Atoi(poolSize); err == nil && size > 0 {
+			cfg.Upstream.MaxIdleConnsPerHost = size
+		}
+	}
+
 	// Override ocache endpoints from environment (comma-separated)
 	if endpoints := os.Getenv("TAG_OCACHE_ENDPOINTS"); endpoints != "" {
 		cfg.Cache.Endpoints = splitEndpoints(endpoints)
@@ -191,6 +215,13 @@ func applyEnvOverrides(cfg *Config) {
 	// Disable cache from environment (explicit disable takes precedence)
 	if disabled := os.Getenv("TAG_CACHE_DISABLED"); disabled == "true" || disabled == "1" {
 		cfg.Cache.Enabled = false
+	}
+
+	// Override ocache connection pool size from environment
+	if poolSize := os.Getenv("TAG_OCACHE_CONNECTION_POOL_SIZE"); poolSize != "" {
+		if size, err := strconv.Atoi(poolSize); err == nil && size > 0 {
+			cfg.Cache.ConnectionPoolSize = size
+		}
 	}
 
 	// Override log level from environment
