@@ -2,9 +2,9 @@ package cache
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 
+	json "github.com/goccy/go-json"
 	"github.com/rs/zerolog/log"
 )
 
