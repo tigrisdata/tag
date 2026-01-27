@@ -1,6 +1,6 @@
 # TAG Architecture
 
-This document describes the architecture of TAG (Tigris Access Gateway), a high-performance S3-compatible caching proxy.
+This document describes the architecture of TAG (Tigris Access Gateway), a high-performance S3-compatible caching proxy with an embedded distributed cache.
 
 ## System Overview
 
@@ -12,14 +12,19 @@ This document describes the architecture of TAG (Tigris Access Gateway), a high-
 │  │ Server  │  │ Validator│  │ Service │  │ Client  │  │   (Signer)  │  │
 │  └────┬────┘  └──────────┘  └────┬────┘  └────┬────┘  └──────┬──────┘  │
 │       │                          │            │               │         │
+│       │                          │     ┌──────┴──────┐        │         │
+│       │                          │     │  Embedded   │        │         │
+│       │                          │     │   Cache     │        │         │
+│       │                          │     │ (RocksDB)   │        │         │
+│       │                          │     └──────┬──────┘        │         │
 └───────┼──────────────────────────┼────────────┼───────────────┼─────────┘
         │                          │            │               │
         ▼                          │            ▼               ▼
    ┌─────────┐                     │       ┌─────────┐    ┌─────────┐
-   │ Clients │                     │       │ ocache  │    │ Tigris  │
-   │(S3 SDKs)│                     │       │ Cluster │    │ Storage │
-   └─────────┘                     │       └─────────┘    └─────────┘
-                                   │
+   │ Clients │                     │       │  Other  │    │ Tigris  │
+   │(S3 SDKs)│                     │       │  TAG    │    │ Storage │
+   └─────────┘                     │       │  Nodes  │    └─────────┘
+                                   │       └─────────┘
                               ┌────┴────┐
                               │Broadcast│
                               │ Manager │
@@ -71,10 +76,16 @@ Core proxy logic including caching and request coalescing.
 
 ### Cache Client (`cache/`)
 
-Interface to the external ocache cluster.
+Interface to the embedded OCache module with RocksDB storage.
 
-- **cache.go**: ocache client wrapper with TAG-specific methods
+- **cache.go**: OCache client wrapper with TAG-specific methods
 - **object.go**: Cached object metadata structure
+
+TAG embeds OCache directly, providing:
+- High-performance RocksDB-based storage
+- Optional clustering via gossip protocol (memberlist)
+- gRPC-based cache routing between nodes
+- Consistent hashing for key distribution
 
 **Two-Key Storage Pattern:**
 ```
@@ -94,12 +105,53 @@ Prometheus metrics for monitoring and alerting.
 
 - **metrics.go**: Metric definitions and recording functions
 
+## Cluster Architecture
+
+For multi-node deployments, TAG nodes form a distributed cache cluster:
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │            Gossip Protocol              │
+                    │         (Cluster Discovery)             │
+                    └─────────────────────────────────────────┘
+                              ▲           ▲           ▲
+                              │           │           │
+                    ┌─────────┴───┐ ┌─────┴─────┐ ┌───┴─────────┐
+                    │   TAG-1     │ │   TAG-2   │ │   TAG-3     │
+                    │ ┌─────────┐ │ │ ┌───────┐ │ │ ┌─────────┐ │
+                    │ │ Embedded│ │ │ │Embedded│ │ │ │ Embedded│ │
+                    │ │ Cache   │ │ │ │ Cache  │ │ │ │ Cache   │ │
+                    │ │(RocksDB)│ │ │ │(RocksDB)│ │ │ │(RocksDB)│ │
+                    │ └─────────┘ │ │ └───────┘ │ │ └─────────┘ │
+                    └──────┬──────┘ └─────┬─────┘ └──────┬──────┘
+                           │              │              │
+                    ┌──────┴──────────────┴──────────────┴──────┐
+                    │              gRPC Routing                  │
+                    │         (Cache Key Distribution)           │
+                    └───────────────────────────────────────────┘
+```
+
+**Cluster Components:**
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 8080 | HTTP | S3 API requests |
+| 7000 | TCP | Memberlist gossip (cluster discovery) |
+| 9000 | gRPC | Cache routing between nodes |
+
+**How Clustering Works:**
+
+1. **Discovery**: Nodes join the cluster via seed nodes using memberlist gossip
+2. **Key Routing**: Cache keys are distributed across nodes using consistent hashing
+3. **Local vs Remote**: Requests for keys owned by another node are forwarded via gRPC
+4. **Rebalancing**: When nodes join/leave, keys are automatically redistributed
+
 ## Request Flows
 
 ### GET Object (Cache Hit)
 
 ```
-Client                 TAG                    ocache
+Client                 TAG                    Embedded Cache
   │                     │                       │
   │ GET /bucket/key     │                       │
   │────────────────────▶│                       │
@@ -117,7 +169,7 @@ Client                 TAG                    ocache
 ### GET Object (Cache Miss)
 
 ```
-Client                 TAG                    ocache              Tigris
+Client                 TAG                    Embedded Cache         Tigris
   │                     │                       │                    │
   │ GET /bucket/key     │                       │                    │
   │────────────────────▶│                       │                    │
@@ -135,6 +187,25 @@ Client                 TAG                    ocache              Tigris
   │◀────────────────────│                       │                    │
   │  200 OK + body      │                       │                    │
   │  X-Cache: MISS      │                       │                    │
+```
+
+### GET Object (Cluster Mode - Remote Key)
+
+```
+Client                 TAG-1                   TAG-2 (owns key)       Tigris
+  │                     │                       │                       │
+  │ GET /bucket/key     │                       │                       │
+  │────────────────────▶│                       │                       │
+  │                     │ Hash(key) → TAG-2     │                       │
+  │                     │                       │                       │
+  │                     │ gRPC: Get(key)        │                       │
+  │                     │──────────────────────▶│                       │
+  │                     │                       │ Check local cache     │
+  │                     │                       │──────┐                │
+  │                     │                       │◀─────┘ HIT            │
+  │                     │◀──────────────────────│ Return data           │
+  │◀────────────────────│                       │                       │
+  │  200 OK + body      │                       │                       │
 ```
 
 ### Request Coalescing (Multiple Concurrent Requests)
@@ -183,7 +254,7 @@ Client3                 │                                  │
 Range requests use a background fetch pattern for optimal ML training workloads:
 
 ```
-Client                 TAG                    ocache              Tigris
+Client                 TAG                    Embedded Cache         Tigris
   │                     │                       │                    │
   │ GET /bucket/key     │                       │                    │
   │ Range: bytes=0-1023 │                       │                    │

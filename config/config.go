@@ -30,9 +30,17 @@ const (
 	// DefaultCacheSizeThreshold is the max object size to cache (1GB).
 	DefaultCacheSizeThreshold = 1024 * 1024 * 1024
 
-	// DefaultCacheConnectionPoolSize is the default number of gRPC connections per ocache node.
-	// Higher values improve throughput for high-concurrency workloads.
-	DefaultCacheConnectionPoolSize = 4
+	// DefaultCacheDiskPath is the default disk path for embedded cache storage.
+	DefaultCacheDiskPath = "/var/cache/tag"
+
+	// DefaultCacheMaxDiskUsage is the default max disk usage for embedded cache (0 = unlimited).
+	DefaultCacheMaxDiskUsage = 0
+
+	// DefaultCacheGRPCAddr is the default gRPC address for embedded cache cluster routing.
+	DefaultCacheGRPCAddr = ":9000"
+
+	// DefaultCacheClusterAddr is the default cluster gossip address for embedded cache.
+	DefaultCacheClusterAddr = ":7000"
 
 	// DefaultLogLevel is the default log level.
 	DefaultLogLevel = "info"
@@ -82,13 +90,21 @@ type CredentialsConfig struct {
 	// Reserved for future configuration options
 }
 
-// CacheConfig holds ocache client configuration.
+// CacheConfig holds cache configuration.
+// These fields map to github.com/tigrisdata/ocache/embedded.Config.
 type CacheConfig struct {
-	Enabled            bool          `yaml:"enabled"`              // Enable caching (auto-enabled if endpoints configured)
-	Endpoints          []string      `yaml:"endpoints"`            // ocache cluster endpoints (e.g., ["ocache-0:9000", "ocache-1:9000"])
-	TTL                time.Duration `yaml:"ttl"`                  // Default cache TTL (default: 60m)
-	SizeThreshold      int64         `yaml:"size_threshold"`       // Max object size to cache in bytes (default: 1GB)
-	ConnectionPoolSize int           `yaml:"connection_pool_size"` // Number of gRPC connections per ocache node (default: 4)
+	Enabled       bool          `yaml:"enabled"`        // Enable caching (default: true)
+	TTL           time.Duration `yaml:"ttl"`            // Default cache TTL (default: 60m)
+	SizeThreshold int64         `yaml:"size_threshold"` // Max object size to cache in bytes (default: 1GB)
+
+	// OCache embedded configuration (see github.com/tigrisdata/ocache/embedded)
+	DiskPath          string   `yaml:"disk_path"`            // Path to cache data directory (default: /var/cache/tag)
+	MaxDiskUsageBytes int64    `yaml:"max_disk_usage_bytes"` // Max disk usage in bytes (0 = unlimited)
+	NodeID            string   `yaml:"node_id"`              // Unique node identifier for cluster mode
+	ClusterAddr       string   `yaml:"cluster_addr"`         // Address for memberlist gossip (default: :7000)
+	GRPCAddr          string   `yaml:"grpc_addr"`            // Address for gRPC server (default: :9000)
+	AdvertiseAddr     string   `yaml:"advertise_addr"`       // Address advertised to other nodes (defaults to GRPCAddr)
+	SeedNodes         []string `yaml:"seed_nodes"`           // Seed nodes for cluster discovery
 }
 
 // BroadcastConfig holds streaming broadcast configuration for request coalescing.
@@ -155,19 +171,26 @@ func applyDefaults(cfg *Config) {
 		cfg.Upstream.MaxIdleConnsPerHost = DefaultMaxIdleConnsPerHost
 	}
 
-	// Cache defaults - auto-enabled when endpoints are configured.
+	// Cache defaults - enabled by default for embedded mode.
 	// Use TAG_CACHE_DISABLED=true environment variable to disable.
-	if len(cfg.Cache.Endpoints) > 0 {
-		cfg.Cache.Enabled = true
-	}
+	cfg.Cache.Enabled = true
 	if cfg.Cache.TTL == 0 {
 		cfg.Cache.TTL = DefaultCacheTTL
 	}
 	if cfg.Cache.SizeThreshold == 0 {
 		cfg.Cache.SizeThreshold = DefaultCacheSizeThreshold
 	}
-	if cfg.Cache.ConnectionPoolSize == 0 {
-		cfg.Cache.ConnectionPoolSize = DefaultCacheConnectionPoolSize
+	if cfg.Cache.DiskPath == "" {
+		cfg.Cache.DiskPath = DefaultCacheDiskPath
+	}
+	if cfg.Cache.MaxDiskUsageBytes == 0 {
+		cfg.Cache.MaxDiskUsageBytes = DefaultCacheMaxDiskUsage
+	}
+	if cfg.Cache.ClusterAddr == "" {
+		cfg.Cache.ClusterAddr = DefaultCacheClusterAddr
+	}
+	if cfg.Cache.GRPCAddr == "" {
+		cfg.Cache.GRPCAddr = DefaultCacheGRPCAddr
 	}
 
 	// Broadcast defaults
@@ -201,26 +224,35 @@ func applyEnvOverrides(cfg *Config) {
 		}
 	}
 
-	// Override ocache endpoints from environment (comma-separated)
-	if endpoints := os.Getenv("TAG_OCACHE_ENDPOINTS"); endpoints != "" {
-		cfg.Cache.Endpoints = splitEndpoints(endpoints)
-	}
-
-	// Auto-enable cache when endpoints are configured via environment
-	// This must run AFTER endpoints are set from environment
-	if len(cfg.Cache.Endpoints) > 0 && !cfg.Cache.Enabled {
-		cfg.Cache.Enabled = true
-	}
-
 	// Disable cache from environment (explicit disable takes precedence)
 	if disabled := os.Getenv("TAG_CACHE_DISABLED"); disabled == "true" || disabled == "1" {
 		cfg.Cache.Enabled = false
 	}
 
-	// Override ocache connection pool size from environment
-	if poolSize := os.Getenv("TAG_OCACHE_CONNECTION_POOL_SIZE"); poolSize != "" {
-		if size, err := strconv.Atoi(poolSize); err == nil && size > 0 {
-			cfg.Cache.ConnectionPoolSize = size
+	// Embedded cache configuration from environment (only if cache is enabled)
+	if cfg.Cache.Enabled {
+		if diskPath := os.Getenv("TAG_CACHE_DISK_PATH"); diskPath != "" {
+			cfg.Cache.DiskPath = diskPath
+		}
+		if maxDisk := os.Getenv("TAG_CACHE_MAX_DISK_USAGE"); maxDisk != "" {
+			if size, err := strconv.ParseInt(maxDisk, 10, 64); err == nil && size >= 0 {
+				cfg.Cache.MaxDiskUsageBytes = size
+			}
+		}
+		if nodeID := os.Getenv("TAG_CACHE_NODE_ID"); nodeID != "" {
+			cfg.Cache.NodeID = nodeID
+		}
+		if clusterAddr := os.Getenv("TAG_CACHE_CLUSTER_ADDR"); clusterAddr != "" {
+			cfg.Cache.ClusterAddr = clusterAddr
+		}
+		if grpcAddr := os.Getenv("TAG_CACHE_GRPC_ADDR"); grpcAddr != "" {
+			cfg.Cache.GRPCAddr = grpcAddr
+		}
+		if advertiseAddr := os.Getenv("TAG_CACHE_ADVERTISE_ADDR"); advertiseAddr != "" {
+			cfg.Cache.AdvertiseAddr = advertiseAddr
+		}
+		if seedNodes := os.Getenv("TAG_CACHE_SEED_NODES"); seedNodes != "" {
+			cfg.Cache.SeedNodes = splitEndpoints(seedNodes)
 		}
 	}
 

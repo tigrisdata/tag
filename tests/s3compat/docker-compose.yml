@@ -1,10 +1,12 @@
 # Docker Compose for S3 Compatibility Tests
 # This file sets up infrastructure for running Ceph s3-tests against TAG
 #
-# LOCAL DEVELOPMENT (recommended - no GH_TOKEN needed):
+# TAG uses embedded OCache - no separate cache server needed.
+#
+# LOCAL DEVELOPMENT (recommended - no Docker needed):
 #   export AWS_ACCESS_KEY_ID=<your-key>
 #   export AWS_SECRET_ACCESS_KEY=<your-secret>
-#   make s3-test-local      # Starts ocache in Docker + TAG on host
+#   make s3-test-local      # Starts TAG on host with embedded cache
 #   make s3-tests           # Run tests
 #   make s3-test-local-down # Cleanup
 #
@@ -29,12 +31,12 @@ services:
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - TAG_UPSTREAM_ENDPOINT=${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev}
-      - TAG_OCACHE_ENDPOINTS=ocache:9000
+      - TAG_CACHE_NODE_ID=tag-s3test
+      - TAG_CACHE_DISK_PATH=/data/cache
       - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-debug}
       - TAG_PPROF_ENABLED=true
-    depends_on:
-      ocache:
-        condition: service_healthy
+    volumes:
+      - tag-s3test-cache:/data/cache
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
       interval: 5s
@@ -46,32 +48,12 @@ services:
     profiles:
       - full
 
-  ocache:
-    image: tigrisdata/ocache:latest
-    container_name: ocache-s3test
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - ocache-s3test-data:/data
-    command:
-      - "-disk=/data"
-      - "-listen-addr=:9000"
-      - "-listen-http=:9001"
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9001/health"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    networks:
-      - s3test-network
-
 networks:
   s3test-network:
     driver: bridge
 
 volumes:
-  ocache-s3test-data:
+  tag-s3test-cache:
 
 secrets:
   git_auth_token:

@@ -2,8 +2,6 @@ package cache
 
 import (
 	"testing"
-
-	"github.com/tigrisdata/tag/config"
 )
 
 func TestIsNotFoundError(t *testing.T) {
@@ -64,34 +62,18 @@ func (e *testError) Error() string {
 }
 
 func TestCache_IsEnabled_Disabled(t *testing.T) {
-	cfg := &config.CacheConfig{
-		Enabled:   false,
-		Endpoints: []string{},
-	}
-
-	cache, err := NewCache(cfg)
-	if err != nil {
-		t.Fatalf("NewCache() error = %v", err)
-	}
+	cache := &Cache{enabled: false}
 
 	if cache.IsEnabled() {
 		t.Error("IsEnabled() = true, want false for disabled cache")
 	}
 }
 
-func TestCache_IsEnabled_NoEndpoints(t *testing.T) {
-	cfg := &config.CacheConfig{
-		Enabled:   true,
-		Endpoints: []string{}, // No endpoints configured
-	}
+func TestCache_IsEnabled_Enabled(t *testing.T) {
+	cache := &Cache{enabled: true}
 
-	cache, err := NewCache(cfg)
-	if err != nil {
-		t.Fatalf("NewCache() error = %v", err)
-	}
-
-	if cache.IsEnabled() {
-		t.Error("IsEnabled() = true, want false when no endpoints configured")
+	if !cache.IsEnabled() {
+		t.Error("IsEnabled() = false, want true for enabled cache")
 	}
 }
 

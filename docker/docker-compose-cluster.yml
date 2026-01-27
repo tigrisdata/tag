@@ -1,8 +1,12 @@
-x-ocache-common: &ocache-common
-  image: tigrisdata/ocache:latest
-  restart: unless-stopped
-  networks:
-    - tag-cluster
+# Docker Compose for TAG Cluster
+#
+# TAG uses embedded OCache - each TAG node has its own embedded cache that
+# forms a distributed cluster via gossip protocol and gRPC for routing.
+#
+# Usage:
+#   export AWS_ACCESS_KEY_ID=<your-key>
+#   export AWS_SECRET_ACCESS_KEY=<your-secret>
+#   docker compose -f docker-compose-cluster.yml up -d
 
 x-tag-common: &tag-common
   build:
@@ -14,116 +18,101 @@ x-tag-common: &tag-common
     - tag-cluster
 
 services:
-  # TAG Node 1
+  # TAG Node 1 (with embedded cache)
   tag-1:
     <<: *tag-common
     container_name: tag-1
     hostname: tag-1
     ports:
       - "8081:8080"
+      - "9001:9000"  # gRPC for cache routing
+      - "7001:7000"  # Cluster gossip
     environment:
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - TAG_UPSTREAM_ENDPOINT=${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev}
-      - TAG_OCACHE_ENDPOINTS=ocache-node1:9000,ocache-node2:9000,ocache-node3:9000
+      - TAG_CACHE_NODE_ID=tag-1
+      - TAG_CACHE_DISK_PATH=/data/cache
+      - TAG_CACHE_CLUSTER_ADDR=:7000
+      - TAG_CACHE_GRPC_ADDR=:9000
+      - TAG_CACHE_ADVERTISE_ADDR=tag-1:9000
+      - TAG_CACHE_SEED_NODES=tag-1:7000,tag-2:7000,tag-3:7000
       - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-info}
-    depends_on:
-      ocache-node1:
-        condition: service_healthy
-      ocache-node2:
-        condition: service_healthy
-      ocache-node3:
-        condition: service_healthy
+    volumes:
+      - tag-1-cache:/data/cache
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
-  # TAG Node 2
+  # TAG Node 2 (with embedded cache)
   tag-2:
     <<: *tag-common
     container_name: tag-2
     hostname: tag-2
     ports:
       - "8082:8080"
+      - "9002:9000"  # gRPC for cache routing
+      - "7002:7000"  # Cluster gossip
     environment:
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - TAG_UPSTREAM_ENDPOINT=${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev}
-      - TAG_OCACHE_ENDPOINTS=ocache-node1:9000,ocache-node2:9000,ocache-node3:9000
+      - TAG_CACHE_NODE_ID=tag-2
+      - TAG_CACHE_DISK_PATH=/data/cache
+      - TAG_CACHE_CLUSTER_ADDR=:7000
+      - TAG_CACHE_GRPC_ADDR=:9000
+      - TAG_CACHE_ADVERTISE_ADDR=tag-2:9000
+      - TAG_CACHE_SEED_NODES=tag-1:7000,tag-2:7000,tag-3:7000
       - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-info}
-    depends_on:
-      ocache-node1:
-        condition: service_healthy
-      ocache-node2:
-        condition: service_healthy
-      ocache-node3:
-        condition: service_healthy
-
-  # OCache Node 1
-  ocache-node1:
-    <<: *ocache-common
-    container_name: ocache-node1
-    hostname: ocache-node1
-    ports:
-      - "9001:9000"
-      - "9101:9001"
-      - "7001:7000"
     volumes:
-      - ocache-node1-data:/data
-    command:
-      - "-disk=/data"
-      - "-listen-addr=:9000"
-      - "-listen-http=:9001"
-      - "-cluster-enabled"
-      - "-node-id=node1"
-      - "-cluster-addr=:7000"
-      - "-seeds=ocache-node1:7000,ocache-node2:7000,ocache-node3:7000"
-
-  # OCache Node 2
-  ocache-node2:
-    <<: *ocache-common
-    container_name: ocache-node2
-    hostname: ocache-node2
-    ports:
-      - "9002:9000"
-      - "9102:9001"
-      - "7002:7000"
-    volumes:
-      - ocache-node2-data:/data
-    command:
-      - "-disk=/data"
-      - "-listen-addr=:9000"
-      - "-listen-http=:9001"
-      - "-cluster-enabled"
-      - "-node-id=node2"
-      - "-cluster-addr=:7000"
-      - "-seeds=ocache-node1:7000,ocache-node2:7000,ocache-node3:7000"
+      - tag-2-cache:/data/cache
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
     depends_on:
-      - ocache-node1
+      - tag-1
 
-  # OCache Node 3
-  ocache-node3:
-    <<: *ocache-common
-    container_name: ocache-node3
-    hostname: ocache-node3
+  # TAG Node 3 (with embedded cache)
+  tag-3:
+    <<: *tag-common
+    container_name: tag-3
+    hostname: tag-3
     ports:
-      - "9003:9000"
-      - "9103:9001"
-      - "7003:7000"
+      - "8083:8080"
+      - "9003:9000"  # gRPC for cache routing
+      - "7003:7000"  # Cluster gossip
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - TAG_UPSTREAM_ENDPOINT=${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev}
+      - TAG_CACHE_NODE_ID=tag-3
+      - TAG_CACHE_DISK_PATH=/data/cache
+      - TAG_CACHE_CLUSTER_ADDR=:7000
+      - TAG_CACHE_GRPC_ADDR=:9000
+      - TAG_CACHE_ADVERTISE_ADDR=tag-3:9000
+      - TAG_CACHE_SEED_NODES=tag-1:7000,tag-2:7000,tag-3:7000
+      - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-info}
     volumes:
-      - ocache-node3-data:/data
-    command:
-      - "-disk=/data"
-      - "-listen-addr=:9000"
-      - "-listen-http=:9001"
-      - "-cluster-enabled"
-      - "-node-id=node3"
-      - "-cluster-addr=:7000"
-      - "-seeds=ocache-node1:7000,ocache-node2:7000,ocache-node3:7000"
+      - tag-3-cache:/data/cache
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
     depends_on:
-      - ocache-node2
+      - tag-2
 
 networks:
   tag-cluster:
 
 volumes:
-  ocache-node1-data:
-  ocache-node2-data:
-  ocache-node3-data:
+  tag-1-cache:
+  tag-2-cache:
+  tag-3-cache:

@@ -336,7 +336,7 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 	}
 
 	// Create disabled cache
-	testCache, _ := cache.NewCache(&cfg.Cache)
+	testCache := cache.NewDisabledCache()
 
 	// Create forwarder
 	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost)

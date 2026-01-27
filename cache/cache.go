@@ -27,46 +27,7 @@ type Cache struct {
 	closed     bool
 }
 
-// NewCache creates a new cache instance that connects to an external ocache cluster.
-func NewCache(cfg *config.CacheConfig) (*Cache, error) {
-	// If not enabled or no endpoints, return a disabled cache
-	if !cfg.Enabled || len(cfg.Endpoints) == 0 {
-		log.Info().Msg("Cache disabled - no ocache endpoints configured")
-		return &Cache{
-			enabled:    false,
-			defaultTTL: int64(cfg.TTL.Seconds()),
-		}, nil
-	}
-
-	log.Info().
-		Strs("endpoints", cfg.Endpoints).
-		Dur("default_ttl", cfg.TTL).
-		Int("connection_pool_size", cfg.ConnectionPoolSize).
-		Msg("Connecting to ocache cluster")
-
-	// Create client with custom connection pool size for high-throughput workloads
-	clientConfig := &cacheclient.ClientConfig{
-		Addrs:              cfg.Endpoints,
-		ConnectionPoolSize: cfg.ConnectionPoolSize,
-	}
-	client, err := cacheclient.NewWithConfig(clientConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	log.Info().
-		Str("mode", string(client.GetMode())).
-		Strs("connected_nodes", client.GetConnectedNodes()).
-		Msg("Connected to ocache cluster")
-
-	return &Cache{
-		client:     client,
-		defaultTTL: int64(cfg.TTL.Seconds()),
-		enabled:    true,
-	}, nil
-}
-
-// NewCacheWithClient creates a cache with an injected client (for testing).
+// NewCacheWithClient creates a cache with an injected client.
 // This allows tests to use an in-memory cache implementation like cacheclient.NewMemoryCache().
 func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig) *Cache {
 	ttl := int64(3600) // Default 1 hour
@@ -77,6 +38,14 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 		client:     client,
 		defaultTTL: ttl,
 		enabled:    true,
+	}
+}
+
+// NewDisabledCache creates a cache that is disabled.
+// All operations return successfully with "not found" or nil results.
+func NewDisabledCache() *Cache {
+	return &Cache{
+		enabled: false,
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/tigrisdata/ocache/embedded"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
@@ -73,7 +74,7 @@ func main() {
 		Int("http_port", cfg.Server.HTTPPort).
 		Str("upstream", cfg.Upstream.Endpoint).
 		Bool("cache_enabled", cfg.Cache.Enabled).
-		Strs("ocache_endpoints", cfg.Cache.Endpoints).
+		Str("node_id", cfg.Cache.NodeID).
 		Msg("Starting TAG (Tigris Access Gateway)")
 
 	// Create context for graceful shutdown
@@ -92,23 +93,48 @@ func main() {
 		log.Warn().Msg("No credentials loaded - TAG will reject all requests")
 	}
 
-	// 2. Initialize cache (connects to external ocache cluster)
-	objectCache, err := cache.NewCache(&cfg.Cache)
+	// 2. Initialize embedded cache using OCache's embedded module
+	log.Info().
+		Str("node_id", cfg.Cache.NodeID).
+		Str("disk_path", cfg.Cache.DiskPath).
+		Strs("seed_nodes", cfg.Cache.SeedNodes).
+		Msg("Initializing embedded cache")
+
+	embeddedCache, err := embedded.New(&embedded.Config{
+		DiskPath:      cfg.Cache.DiskPath,
+		TTL:           cfg.Cache.TTL,
+		MaxDiskUsage:  cfg.Cache.MaxDiskUsageBytes,
+		NodeID:        cfg.Cache.NodeID,
+		ClusterAddr:   cfg.Cache.ClusterAddr,
+		GRPCAddr:      cfg.Cache.GRPCAddr,
+		AdvertiseAddr: cfg.Cache.AdvertiseAddr,
+		SeedNodes:     cfg.Cache.SeedNodes,
+	})
 	if err != nil {
-		log.Warn().Err(err).Msg("Failed to connect to ocache cluster - running in pass-through mode")
-		// Create a disabled cache
-		objectCache = &cache.Cache{}
-	} else {
-		defer objectCache.Close()
-		if objectCache.IsEnabled() {
-			log.Info().
-				Str("mode", objectCache.GetMode()).
-				Strs("nodes", objectCache.GetConnectedNodes()).
-				Msg("Connected to ocache cluster")
-		} else {
-			log.Info().Msg("Cache disabled - running in pass-through mode")
-		}
+		log.Fatal().Err(err).Msg("Failed to initialize embedded cache")
 	}
+	defer embeddedCache.Close()
+
+	// Start gRPC server for cluster routing
+	if err := embeddedCache.StartGRPCServer(); err != nil {
+		log.Fatal().Err(err).Msg("Failed to start embedded cache gRPC server")
+	}
+
+	// Wait for cluster to be ready
+	readyCtx, readyCancel := context.WithTimeout(ctx, 30*time.Second)
+	if err := embeddedCache.WaitReady(readyCtx); err != nil {
+		readyCancel()
+		log.Warn().Err(err).Msg("Embedded cache not fully ready, continuing anyway")
+	}
+	readyCancel()
+
+	// Wrap embedded cache with the cache.Cache interface
+	objectCache := cache.NewCacheWithClient(embeddedCache, &cfg.Cache)
+
+	log.Info().
+		Str("node_id", cfg.Cache.NodeID).
+		Strs("nodes", embeddedCache.GetConnectedNodes()).
+		Msg("Embedded cache ready")
 
 	// 3. Initialize forwarder
 	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost)

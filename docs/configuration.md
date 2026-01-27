@@ -10,9 +10,14 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `AWS_SECRET_ACCESS_KEY` | S3 secret key for authentication | (required) |
 | `TAG_UPSTREAM_ENDPOINT` | Tigris S3 endpoint URL | `https://t3.storage.dev` |
 | `TAG_MAX_IDLE_CONNS_PER_HOST` | HTTP connection pool size per upstream host | `100` |
-| `TAG_OCACHE_ENDPOINTS` | Comma-separated ocache endpoints | (none) |
-| `TAG_OCACHE_CONNECTION_POOL_SIZE` | Number of gRPC connections per ocache node | `4` |
 | `TAG_CACHE_DISABLED` | Disable caching (`true` or `1`) | `false` |
+| `TAG_CACHE_DISK_PATH` | Path to cache data directory | `/var/cache/tag` |
+| `TAG_CACHE_MAX_DISK_USAGE` | Max disk usage in bytes (0 = unlimited) | `0` |
+| `TAG_CACHE_NODE_ID` | Unique node identifier for cluster mode | (none) |
+| `TAG_CACHE_CLUSTER_ADDR` | Address for memberlist gossip | `:7000` |
+| `TAG_CACHE_GRPC_ADDR` | Address for gRPC server | `:9000` |
+| `TAG_CACHE_ADVERTISE_ADDR` | Address advertised to other nodes | (defaults to GRPC addr) |
+| `TAG_CACHE_SEED_NODES` | Comma-separated seed nodes for cluster discovery | (none) |
 | `TAG_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error` | `info` |
 | `TAG_LOG_FORMAT` | Log format: `json` or `console` | `json` |
 | `TAG_PPROF_ENABLED` | Enable pprof endpoints (`true` or `1`) | `false` |
@@ -57,18 +62,11 @@ upstream:
   # Default: 100
   max_idle_conns_per_host: 100
 
-# Cache configuration
+# Cache configuration (embedded OCache)
 cache:
   # Enable caching
-  # Default: true if endpoints are configured
+  # Default: true
   enabled: true
-
-  # ocache cluster endpoints
-  # If empty, caching is disabled
-  endpoints:
-    - "ocache-0:9000"
-    - "ocache-1:9000"
-    - "ocache-2:9000"
 
   # Default TTL for cached objects
   # Default: 60m
@@ -79,10 +77,36 @@ cache:
   # Default: 1073741824 (1GB)
   size_threshold: 1073741824
 
-  # Number of gRPC connections per ocache node
-  # Higher values improve throughput for high-concurrency workloads
-  # Default: 4
-  connection_pool_size: 4
+  # Path to cache data directory
+  # Default: /var/cache/tag
+  disk_path: "/var/cache/tag"
+
+  # Max disk usage in bytes (0 = unlimited)
+  # Default: 0
+  max_disk_usage_bytes: 0
+
+  # Unique node identifier for cluster mode
+  # Required for multi-node deployments
+  node_id: "tag-node-1"
+
+  # Address for memberlist gossip protocol
+  # Default: :7000
+  cluster_addr: ":7000"
+
+  # Address for gRPC server (cache routing)
+  # Default: :9000
+  grpc_addr: ":9000"
+
+  # Address advertised to other nodes
+  # Defaults to grpc_addr if not specified
+  advertise_addr: "tag-node-1:9000"
+
+  # Seed nodes for cluster discovery
+  # List of cluster addresses for other nodes
+  seed_nodes:
+    - "tag-node-1:7000"
+    - "tag-node-2:7000"
+    - "tag-node-3:7000"
 
 # Broadcast configuration (request coalescing)
 broadcast:
@@ -133,15 +157,20 @@ Configures the connection to upstream Tigris storage.
 
 ### Cache
 
-Controls the caching behavior and ocache cluster connection.
+Controls the embedded cache behavior. TAG uses an embedded OCache instance with RocksDB storage.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true`* | Enable caching (*auto-enabled if endpoints configured) |
-| `endpoints` | []string | `[]` | ocache cluster endpoints |
+| `enabled` | bool | `true` | Enable caching |
 | `ttl` | duration | `60m` | Default TTL for cached objects |
 | `size_threshold` | int64 | `1073741824` | Max object size to cache (bytes) |
-| `connection_pool_size` | int | `4` | Number of gRPC connections per ocache node |
+| `disk_path` | string | `/var/cache/tag` | Path to cache data directory |
+| `max_disk_usage_bytes` | int64 | `0` | Max disk usage (0 = unlimited) |
+| `node_id` | string | `""` | Unique node identifier for cluster mode |
+| `cluster_addr` | string | `:7000` | Address for memberlist gossip |
+| `grpc_addr` | string | `:9000` | Address for gRPC server |
+| `advertise_addr` | string | `""` | Address advertised to other nodes |
+| `seed_nodes` | []string | `[]` | Seed nodes for cluster discovery |
 
 **TTL Format:**
 - `60m` - 60 minutes (default)
@@ -152,6 +181,13 @@ Controls the caching behavior and ocache cluster connection.
 - `1073741824` - 1GB (default)
 - `104857600` - 100MB
 - `536870912` - 512MB
+
+**Cluster Mode:**
+
+For multi-node deployments, configure each node with:
+- A unique `node_id`
+- The same `seed_nodes` list (all nodes in the cluster)
+- Appropriate `advertise_addr` (reachable from other nodes)
 
 ### Broadcast
 
@@ -209,7 +245,7 @@ go tool pprof http://localhost:8080/debug/pprof/heap
 
 ## Example Configurations
 
-### Development (No Caching)
+### Development (Standalone)
 
 ```yaml
 server:
@@ -218,11 +254,16 @@ server:
 upstream:
   endpoint: "https://t3.storage.dev"
 
+cache:
+  enabled: true
+  disk_path: "/tmp/tag-cache"
+  node_id: "dev-node"
+
 log:
   level: "debug"
 ```
 
-### Production (With Caching)
+### Production (Single Node)
 
 ```yaml
 server:
@@ -231,12 +272,11 @@ server:
 
 cache:
   enabled: true
-  endpoints:
-    - "ocache-0.ocache.svc.cluster.local:9000"
-    - "ocache-1.ocache.svc.cluster.local:9000"
-    - "ocache-2.ocache.svc.cluster.local:9000"
+  disk_path: "/var/cache/tag"
+  max_disk_usage_bytes: 107374182400  # 100GB
   ttl: 60m
   size_threshold: 1073741824
+  node_id: "tag-prod"
 
 broadcast:
   chunk_size: 65536
@@ -246,24 +286,28 @@ log:
   level: "info"
 ```
 
-### High-Throughput (Large Objects)
+### Production (Cluster Mode)
 
 ```yaml
 server:
   http_port: 8080
 
-upstream:
-  endpoint: "https://t3.storage.dev"
-  max_idle_conns_per_host: 500  # Increase for high cache-miss concurrency
-
 cache:
   enabled: true
-  endpoints:
-    - "ocache-0:9000"
-    - "ocache-1:9000"
+  disk_path: "/var/cache/tag"
+  max_disk_usage_bytes: 107374182400  # 100GB per node
   ttl: 1h
-  size_threshold: 1073741824    # 1GB
-  connection_pool_size: 128     # Increase for high cache-hit concurrency
+  size_threshold: 1073741824
+
+  # Cluster configuration
+  node_id: "tag-1"  # Unique per node
+  cluster_addr: ":7000"
+  grpc_addr: ":9000"
+  advertise_addr: "tag-1.tag-svc.default.svc.cluster.local:9000"
+  seed_nodes:
+    - "tag-1.tag-svc.default.svc.cluster.local:7000"
+    - "tag-2.tag-svc.default.svc.cluster.local:7000"
+    - "tag-3.tag-svc.default.svc.cluster.local:7000"
 
 broadcast:
   chunk_size: 131072    # 128KB chunks

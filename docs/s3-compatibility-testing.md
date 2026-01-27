@@ -20,22 +20,22 @@ The S3 compatibility tests validate that TAG correctly implements the S3 API by 
    export AWS_SECRET_ACCESS_KEY=<your-tigris-secret-key>
    ```
 
-2. **Docker** - Required for running ocache
+2. **Python 3** - Required for running the ceph/s3-tests suite
 
-3. **Python 3** - Required for running the ceph/s3-tests suite
+3. **Go 1.21+** - Required for building TAG (local mode only)
 
-4. **Go 1.21+** - Required for building TAG (local mode only)
+4. **Docker** - Required for containerized testing (CI mode)
 
 ## Running Tests Locally (Recommended)
 
-The recommended approach runs TAG on your host machine with ocache in Docker. This avoids needing a GitHub token for private module access.
+The recommended approach runs TAG on your host machine with its embedded cache. This avoids needing a GitHub token for private module access.
 
 ```bash
 # 1. Set credentials
 export AWS_ACCESS_KEY_ID=<your-key>
 export AWS_SECRET_ACCESS_KEY=<your-secret>
 
-# 2. Start test infrastructure (builds TAG, starts ocache)
+# 2. Start test infrastructure (builds and runs TAG with embedded cache)
 make s3-test-local
 
 # 3. Run S3 compatibility tests
@@ -56,7 +56,7 @@ cd tests/s3compat
 
 ## Running Tests in Docker (CI Mode)
 
-For CI or fully containerized testing, both TAG and ocache run in Docker. This requires a GitHub token for private Go module access.
+For CI or fully containerized testing, TAG runs in Docker with its embedded cache. This requires a GitHub token for private Go module access.
 
 ```bash
 # 1. Set credentials and GitHub token
@@ -64,7 +64,7 @@ export AWS_ACCESS_KEY_ID=<your-key>
 export AWS_SECRET_ACCESS_KEY=<your-secret>
 export GH_TOKEN=<your-github-pat>
 
-# 2. Start infrastructure (builds and runs TAG + ocache in Docker)
+# 2. Start infrastructure (builds and runs TAG in Docker)
 make s3-test-infra
 
 # 3. Run tests
@@ -90,18 +90,13 @@ The test suite is organized into categories matching the curated test list from 
 ## Architecture
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   s3-tests      │────▶│      TAG        │────▶│     Tigris      │
-│  (ceph/pytest)  │     │  (localhost:    │     │ (t3.storage.dev)│
-│                 │     │      8080)      │     │                 │
-└─────────────────┘     └────────┬────────┘     └─────────────────┘
-                                 │
-                                 ▼
-                        ┌─────────────────┐
-                        │     ocache      │
-                        │  (localhost:    │
-                        │      9000)      │
-                        └─────────────────┘
+┌─────────────────┐     ┌─────────────────────────────┐     ┌─────────────────┐
+│   s3-tests      │────▶│            TAG              │────▶│     Tigris      │
+│  (ceph/pytest)  │     │   ┌─────────────────────┐   │     │ (t3.storage.dev)│
+│                 │     │   │  Embedded Cache     │   │     │                 │
+└─────────────────┘     │   │  (RocksDB)          │   │     └─────────────────┘
+                        │   └─────────────────────┘   │
+                        └─────────────────────────────┘
 ```
 
 ## Configuration
@@ -126,10 +121,9 @@ export AWS_SECRET_ACCESS_KEY=<your-secret>
 
 ### Tests fail with connection errors
 
-Verify TAG and ocache are running:
+Verify TAG is running:
 ```bash
-curl http://localhost:8080/health  # TAG health
-curl http://localhost:9001/health  # ocache health
+curl http://localhost:8080/health  # TAG health check
 ```
 
 ### Cleaning up test artifacts
@@ -145,4 +139,4 @@ make s3-tests-clean
 |------|-------------|
 | `tests/s3compat/run-tests.sh` | Test runner script (clones s3-tests, runs pytest via tox) |
 | `tests/s3compat/s3tests.conf` | Test configuration template |
-| `tests/s3compat/docker-compose.yml` | Docker setup for TAG + ocache |
+| `tests/s3compat/docker-compose.yml` | Docker setup for TAG |

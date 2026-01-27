@@ -5,7 +5,7 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 ## Features
 
 - **S3-Compatible API**: Supports all S3 API endpoints supported by Tigris
-- **Transparent Caching**: Automatic caching of objects with configurable TTL and size thresholds
+- **Embedded Cache**: High-performance RocksDB-based cache with automatic cluster discovery
 - **Request Coalescing**: Streaming broadcast pattern reduces duplicate upstream requests under concurrent load
 - **Range Request Caching**: Background fetch of full objects on range cache miss for optimal ML training workloads
 - **Conditional Requests**: Supports If-None-Match and If-Modified-Since for efficient cache validation
@@ -18,7 +18,6 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 ### Prerequisites
 
 - Go 1.24 or later
-- Access to an [ocache](https://github.com/tigrisdata/ocache) cluster (for caching)
 - Tigris account with access credentials
 
 ### Developer Setup (One-Time)
@@ -51,9 +50,6 @@ export AWS_SECRET_ACCESS_KEY=your_secret_key
 # Run with default configuration
 ./tag
 
-# Run with custom configuration
-./tag --config /path/to/config.yaml
-
 # Run with debug logging
 TAG_LOG_LEVEL=debug ./tag
 ```
@@ -83,7 +79,8 @@ See [docs/s3-compatibility-testing.md](docs/s3-compatibility-testing.md) for det
 TAG can be configured via YAML file or environment variables. Key settings:
 
 - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` - Tigris credentials (required)
-- `TAG_OCACHE_ENDPOINTS` - Comma-separated ocache endpoints for caching
+- `TAG_CACHE_NODE_ID` - Unique node identifier for cluster mode
+- `TAG_CACHE_DISK_PATH` - Path to cache data directory
 - `TAG_LOG_LEVEL` - Log level: debug, info, warn, error
 
 See [docs/configuration.md](docs/configuration.md) for full configuration reference.
@@ -91,21 +88,18 @@ See [docs/configuration.md](docs/configuration.md) for full configuration refere
 ## Architecture
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Client    │────▶│    TAG      │────▶│   Tigris    │
-│  (S3 SDK)   │◀────│   Proxy     │◀────│   Storage   │
-└─────────────┘     └──────┬──────┘     └─────────────┘
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │   ocache    │
-                    │   Cluster   │
-                    └─────────────┘
+┌─────────────┐     ┌─────────────────────────────┐     ┌─────────────┐
+│   Client    │────▶│           TAG               │────▶│   Tigris    │
+│  (S3 SDK)   │◀────│  ┌─────────────────────┐    │◀────│   Storage   │
+└─────────────┘     │  │  Embedded Cache     │    │     └─────────────┘
+                    │  │  (RocksDB + Gossip) │    │
+                    │  └─────────────────────┘    │
+                    └─────────────────────────────┘
 ```
 
 ### Request Flow
 
-1. **Cache Check**: TAG first checks if the object exists in the ocache cluster
+1. **Cache Check**: TAG first checks if the object exists in its embedded cache
 2. **Cache Hit**: Returns cached object with `X-Cache: HIT` header
 3. **Cache Miss**: Forwards request to upstream Tigris, caches response, returns with `X-Cache: MISS`
 
@@ -140,17 +134,17 @@ TAG supports all S3 API endpoints supported by Tigris, including bucket operatio
 
 TAG supports **path-style** S3 access only. Virtual-hosted style requests are not supported.
 
-| Style | URL Format | Supported |
-|-------|------------|-----------|
-| Path-style | `http://localhost:8080/bucket/key` | Yes |
-| Virtual-hosted | `http://bucket.localhost:8080/key` | No |
+| Style          | URL Format                         | Supported |
+| -------------- | ---------------------------------- | --------- |
+| Path-style     | `http://localhost:8080/bucket/key` | Yes       |
+| Virtual-hosted | `http://bucket.localhost:8080/key` | No        |
 
 When configuring S3 clients, ensure path-style addressing is enabled. See [docs/usage.md](docs/usage.md) for SDK-specific configuration.
 
 ### Response Headers
 
-| Header | Description |
-|--------|-------------|
+| Header    | Description                                          |
+| --------- | ---------------------------------------------------- |
 | `X-Cache` | Cache status: `HIT`, `MISS`, `BYPASS`, or `DISABLED` |
 
 ### Cache Behavior
