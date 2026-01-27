@@ -1,65 +1,22 @@
-# Build stage - use Debian for CGO/RocksDB support
-FROM golang:1.24-bookworm AS builder
+FROM alpine:3.21
 
-# Install build dependencies for RocksDB and make
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    ca-certificates \
-    curl \
-    make \
-    libsnappy-dev \
-    liblz4-dev \
-    libzstd-dev \
-    libbz2-dev \
-    zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/*
+ARG TARGETARCH
 
-# Configure GOPRIVATE for tigrisdata modules
-ENV GOPRIVATE=github.com/tigrisdata
-
-WORKDIR /app
-
-# Copy go mod files first for better layer caching
-COPY go.mod go.sum ./
-
-# Download dependencies with git auth for private modules
-RUN --mount=type=secret,id=git_auth_token \
-    if [ -f /run/secrets/git_auth_token ]; then \
-      git config --global url."https://x-access-token:$(cat /run/secrets/git_auth_token)@github.com/".insteadOf "https://github.com/"; \
-    fi && \
-    go mod download
-
-# Copy source code and Makefile
-COPY . .
-
-# Build using Makefile (handles RocksDB download and CGO flags)
-RUN make build && cp tag /tag
-
-# Runtime stage - use Debian slim for glibc compatibility
-FROM debian:bookworm-slim
-
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libsnappy1v5 \
-    liblz4-1 \
-    libzstd1 \
-    libbz2-1.0 \
-    zlib1g \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
+# Install minimal runtime dependencies
+RUN apk add --no-cache ca-certificates tzdata wget
 
 # Create non-root user
-RUN useradd -r -u 1000 -m tag
+RUN addgroup -g 1000 tag && \
+    adduser -u 1000 -G tag -h /home/tag -D tag
+
+# Copy pre-built binary (downloaded by workflow)
+COPY --chmod=755 bin/${TARGETARCH}/tag /usr/local/bin/tag
 
 # Create cache directory
-RUN mkdir -p /var/cache/tag && chown tag:tag /var/cache/tag
+RUN mkdir -p /var/cache/tag && chown -R tag:tag /var/cache/tag
 
-# Copy binary
-COPY --from=builder /tag /usr/local/bin/tag
-
-# Switch to non-root user
 USER tag
+VOLUME ["/var/cache/tag"]
 
 # Expose ports:
 # 8080 - HTTP (S3 API)
@@ -67,8 +24,7 @@ USER tag
 # 9000 - gRPC (cache routing)
 EXPOSE 8080 7000 9000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD wget -q --spider http://localhost:8080/health || exit 1
 
 ENTRYPOINT ["tag"]
