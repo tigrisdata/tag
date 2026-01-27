@@ -1,11 +1,12 @@
 # Build stage - use Debian for CGO/RocksDB support
 FROM golang:1.24-bookworm AS builder
 
-# Install build dependencies for RocksDB
+# Install build dependencies for RocksDB and make
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ca-certificates \
     curl \
+    make \
     libsnappy-dev \
     liblz4-dev \
     libzstd-dev \
@@ -18,18 +19,7 @@ ENV GOPRIVATE=github.com/tigrisdata
 
 WORKDIR /app
 
-# RocksDB static build configuration
-ARG ROCKSDB_VERSION=10.4.2
-ARG TARGETARCH
-
-# Download RocksDB static artifacts
-RUN ROCKSDB_PLATFORM=$(if [ "$TARGETARCH" = "arm64" ]; then echo "Linux-aarch64"; else echo "Linux-x86_64"; fi) && \
-    mkdir -p /rocksdb-static && \
-    curl -fsSL "https://ocache-releases.t3.storage.dev/rocksdb/${ROCKSDB_VERSION}/rocksdb-static-${ROCKSDB_VERSION}-${ROCKSDB_PLATFORM}.tar.gz" \
-    -o /rocksdb-static/rocksdb.tar.gz && \
-    cd /rocksdb-static && tar -xzf rocksdb.tar.gz && rm rocksdb.tar.gz
-
-# Copy go mod files
+# Copy go mod files first for better layer caching
 COPY go.mod go.sum ./
 
 # Download dependencies with git auth for private modules
@@ -39,14 +29,11 @@ RUN --mount=type=secret,id=git_auth_token \
     fi && \
     go mod download
 
-# Copy source code
+# Copy source code and Makefile
 COPY . .
 
-# Build with CGO enabled for embedded RocksDB cache
-RUN CGO_ENABLED=1 \
-    CGO_CFLAGS="-I/rocksdb-static/include" \
-    CGO_LDFLAGS="-L/rocksdb-static/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread" \
-    go build -ldflags="-s -w" -o /tag ./cmd/tag
+# Build using Makefile (handles RocksDB download and CGO flags)
+RUN make build && cp tag /tag
 
 # Runtime stage - use Debian slim for glibc compatibility
 FROM debian:bookworm-slim
