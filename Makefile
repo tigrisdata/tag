@@ -77,6 +77,15 @@ else
 	go build $(LDFLAGS) -o $(BINARY_NAME) $(CMD_PATH)
 endif
 
+# Build for Docker (dynamically linked - no static flag due to glibc version mismatch)
+.PHONY: build-docker
+build-docker: rocksdb-static
+	@echo "Building $(BINARY_NAME) for Docker (dynamically linked)..."
+	CGO_ENABLED=1 \
+	CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" \
+	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
+	go build -ldflags "-s -w -X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME) -X main.GitCommit=$(GIT_COMMIT)" -o $(BINARY_NAME) $(CMD_PATH)
+
 # Download and extract RocksDB static artifacts
 .PHONY: rocksdb-static
 rocksdb-static:

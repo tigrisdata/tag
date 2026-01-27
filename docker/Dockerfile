@@ -33,7 +33,8 @@ RUN --mount=type=secret,id=git_auth_token \
 COPY . .
 
 # Build using Makefile (handles RocksDB download and CGO flags)
-RUN make build && cp tag /tag
+# Uses build-docker target for dynamic linking (avoids glibc version mismatch)
+RUN make build-docker && cp tag /tag
 
 # Runtime stage - use Debian slim for glibc compatibility
 FROM debian:bookworm-slim
