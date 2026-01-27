@@ -24,7 +24,7 @@ The S3 compatibility tests validate that TAG correctly implements the S3 API by 
 
 3. **Go 1.21+** - Required for building TAG (local mode only)
 
-4. **Docker** - Required for containerized testing (CI mode)
+4. **System dependencies** - RocksDB compression libraries (run `make install-deps`)
 
 ## Running Tests Locally (Recommended)
 
@@ -52,26 +52,6 @@ To run a specific test, pass the test path as an argument:
 ```bash
 cd tests/s3compat
 ./run-tests.sh test_s3.py::test_bucket_list_empty
-```
-
-## Running Tests in Docker (CI Mode)
-
-For CI or fully containerized testing, TAG runs in Docker with its embedded cache. This requires a GitHub token for private Go module access.
-
-```bash
-# 1. Set credentials and GitHub token
-export AWS_ACCESS_KEY_ID=<your-key>
-export AWS_SECRET_ACCESS_KEY=<your-secret>
-export GH_TOKEN=<your-github-pat>
-
-# 2. Start infrastructure (builds and runs TAG in Docker)
-make s3-test-infra
-
-# 3. Run tests
-make s3-tests
-
-# 4. Cleanup
-make s3-test-infra-down
 ```
 
 ## Test Categories

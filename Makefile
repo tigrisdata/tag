@@ -304,20 +304,12 @@ help:
 	@echo "  s3-tests           - Run S3 compatibility tests (ceph s3-tests)"
 	@echo "  s3-tests-clean     - Remove cloned s3-tests repository"
 	@echo ""
-	@echo "  LOCAL DEVELOPMENT (recommended - no Docker/GH_TOKEN needed):"
+	@echo "  Usage:"
 	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
 	@echo "    export AWS_SECRET_ACCESS_KEY=<your-secret>"
 	@echo "    make s3-test-local      # Starts TAG with embedded cache"
 	@echo "    make s3-tests           # Run tests"
 	@echo "    make s3-test-local-down # Cleanup"
-	@echo ""
-	@echo "  CI/DOCKER BUILD (requires GH_TOKEN for private repos):"
-	@echo "  s3-test-infra      - Start S3 test infrastructure (TAG in Docker)"
-	@echo "  s3-test-infra-down - Stop S3 test infrastructure"
-	@echo "    export GH_TOKEN=<your-github-pat>"
-	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
-	@echo "    export AWS_SECRET_ACCESS_KEY=<your-secret>"
-	@echo "    make s3-test-infra && make s3-tests"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  clean              - Remove built binary and generated files"
@@ -325,28 +317,7 @@ help:
 	@echo "  rocksdb-static-clean - Remove downloaded RocksDB static artifacts"
 	@echo "  help               - Show this help message"
 
-# S3 compatibility tests
-S3_TEST_COMPOSE := docker compose -f tests/s3compat/docker-compose.yml
-
-.PHONY: s3-test-infra
-s3-test-infra:
-	@echo "Starting S3 test infrastructure..."
-	@if [ -z "$$GH_TOKEN" ]; then \
-		echo "Error: GH_TOKEN environment variable is not set."; \
-		echo "Set it to a GitHub Personal Access Token with repo access:"; \
-		echo "  export GH_TOKEN=<your-github-pat>"; \
-		echo "Create a PAT at: https://github.com/settings/tokens"; \
-		exit 1; \
-	fi
-	$(S3_TEST_COMPOSE) --profile full build
-	$(S3_TEST_COMPOSE) --profile full up -d --wait
-
-.PHONY: s3-test-infra-down
-s3-test-infra-down:
-	@echo "Stopping S3 test infrastructure..."
-	$(S3_TEST_COMPOSE) --profile full down -v
-
-# Local development: Run TAG on host with embedded cache (no Docker/GH_TOKEN needed)
+# Local development: Run TAG on host with embedded cache
 # Uses non-default ports to avoid macOS conflicts (AirPlay uses 7000)
 .PHONY: s3-test-local
 s3-test-local: build

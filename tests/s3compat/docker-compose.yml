@@ -1,20 +1,14 @@
 # Docker Compose for S3 Compatibility Tests
-# This file sets up infrastructure for running Ceph s3-tests against TAG
+# This file sets up infrastructure for running Ceph s3-tests against TAG in Docker.
 #
 # TAG uses embedded OCache - no separate cache server needed.
 #
-# LOCAL DEVELOPMENT (recommended - no Docker needed):
+# RECOMMENDED: Use `make s3-test-local` instead (no Docker needed):
 #   export AWS_ACCESS_KEY_ID=<your-key>
 #   export AWS_SECRET_ACCESS_KEY=<your-secret>
 #   make s3-test-local      # Starts TAG on host with embedded cache
 #   make s3-tests           # Run tests
 #   make s3-test-local-down # Cleanup
-#
-# CI/DOCKER BUILD (requires GH_TOKEN for private repo access):
-#   export GH_TOKEN=<your-github-pat>
-#   export AWS_ACCESS_KEY_ID=<your-key>
-#   export AWS_SECRET_ACCESS_KEY=<your-secret>
-#   make s3-test-infra && make s3-tests
 
 services:
   tag:
