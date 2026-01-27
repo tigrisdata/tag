@@ -1,13 +1,33 @@
-# Build stage
-FROM golang:1.24-alpine AS builder
+# Build stage - use Debian for CGO/RocksDB support
+FROM golang:1.24-bookworm AS builder
 
-# Install git and ca-certificates (needed for go mod download)
-RUN apk add --no-cache git ca-certificates
+# Install build dependencies for RocksDB
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    curl \
+    libsnappy-dev \
+    liblz4-dev \
+    libzstd-dev \
+    libbz2-dev \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Configure GOPRIVATE for tigrisdata modules
 ENV GOPRIVATE=github.com/tigrisdata
 
 WORKDIR /app
+
+# RocksDB static build configuration
+ARG ROCKSDB_VERSION=10.4.2
+ARG TARGETARCH
+
+# Download RocksDB static artifacts
+RUN ROCKSDB_PLATFORM=$(if [ "$TARGETARCH" = "arm64" ]; then echo "Linux-aarch64"; else echo "Linux-x86_64"; fi) && \
+    mkdir -p /rocksdb-static && \
+    curl -fsSL "https://ocache-releases.t3.storage.dev/rocksdb/${ROCKSDB_VERSION}/rocksdb-static-${ROCKSDB_VERSION}-${ROCKSDB_PLATFORM}.tar.gz" \
+    -o /rocksdb-static/rocksdb.tar.gz && \
+    cd /rocksdb-static && tar -xzf rocksdb.tar.gz && rm rocksdb.tar.gz
 
 # Copy go mod files
 COPY go.mod go.sum ./
@@ -22,17 +42,31 @@ RUN --mount=type=secret,id=git_auth_token \
 # Copy source code
 COPY . .
 
-# Build statically linked binary (no CGO needed - TAG is stateless)
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /tag ./cmd/tag
+# Build with CGO enabled for embedded RocksDB cache
+RUN CGO_ENABLED=1 \
+    CGO_CFLAGS="-I/rocksdb-static/include" \
+    CGO_LDFLAGS="-L/rocksdb-static/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread" \
+    go build -ldflags="-s -w" -o /tag ./cmd/tag
 
-# Runtime stage - minimal image
-FROM alpine:3.21
+# Runtime stage - use Debian slim for glibc compatibility
+FROM debian:bookworm-slim
 
-# Install ca-certificates for HTTPS upstream connections
-RUN apk add --no-cache ca-certificates
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libsnappy1v5 \
+    liblz4-1 \
+    libzstd1 \
+    libbz2-1.0 \
+    zlib1g \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
-RUN adduser -D -u 1000 tag
+RUN useradd -r -u 1000 -m tag
+
+# Create cache directory
+RUN mkdir -p /var/cache/tag && chown tag:tag /var/cache/tag
 
 # Copy binary
 COPY --from=builder /tag /usr/local/bin/tag
@@ -40,9 +74,11 @@ COPY --from=builder /tag /usr/local/bin/tag
 # Switch to non-root user
 USER tag
 
-# Expose HTTP port only (TAG is stateless - connects to external ocache)
+# Expose ports:
 # 8080 - HTTP (S3 API)
-EXPOSE 8080
+# 7000 - Memberlist gossip (cluster discovery)
+# 9000 - gRPC (cache routing)
+EXPOSE 8080 7000 9000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
