@@ -97,6 +97,19 @@ rocksdb-static-clean:
 	@echo "Removing RocksDB static artifacts..."
 	rm -rf $(ROCKSDB_STATIC_DIR)
 
+# Install system dependencies for RocksDB compression libraries
+.PHONY: install-deps
+install-deps:
+	@echo "Installing system dependencies for RocksDB..."
+ifeq ($(UNAME_S),Darwin)
+	@echo "Detected macOS - using Homebrew..."
+	brew install snappy lz4 zstd bzip2 zlib
+else
+	@echo "Detected Linux - using apt-get..."
+	sudo apt-get update
+	sudo apt-get install -y libsnappy-dev liblz4-dev libzstd-dev libbz2-dev zlib1g-dev
+endif
+	@echo "System dependencies installed successfully."
 
 # Testing targets
 .PHONY: test
