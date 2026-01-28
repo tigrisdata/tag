@@ -31,13 +31,17 @@ type Cache struct {
 // This allows tests to use an in-memory cache implementation like cacheclient.NewMemoryCache().
 func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig) *Cache {
 	ttl := int64(3600) // Default 1 hour
-	if cfg != nil && cfg.TTL > 0 {
-		ttl = int64(cfg.TTL.Seconds())
+	enabled := true    // Default to enabled
+	if cfg != nil {
+		if cfg.TTL > 0 {
+			ttl = int64(cfg.TTL.Seconds())
+		}
+		enabled = cfg.Enabled
 	}
 	return &Cache{
 		client:     client,
 		defaultTTL: ttl,
-		enabled:    true,
+		enabled:    enabled,
 	}
 }
 
