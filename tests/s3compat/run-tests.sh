@@ -2,7 +2,9 @@
 # S3 Compatibility Tests Runner for TAG
 # Modeled after tigris-os gateway/tests/tests.sh
 
-set -ex
+# Track test failures
+FAILED_TESTS=()
+PASSED_COUNT=0
 
 # Handle Ctrl+C to exit the entire script
 trap 'echo -e "\nInterrupted. Exiting..."; exit 130' INT
@@ -72,6 +74,18 @@ if [ $# -ge 1 ]; then
     tox -- "s3tests/functional/$1"
     exit
 fi
+
+# Helper function to run a test and track failures
+run_test() {
+    local test_file="$1"
+    local test_name="$2"
+    echo "  Running: $test_name"
+    if tox -- "s3tests/functional/${test_file}::${test_name}"; then
+        ((PASSED_COUNT++))
+    else
+        FAILED_TESTS+=("${test_file}::${test_name}")
+    fi
+}
 
 # Test arrays - curated list of tests relevant for TAG
 # Based on tigris-os gateway/tests/tests.sh
@@ -220,43 +234,55 @@ test_copy=(
 # Run header validation tests
 echo "Running header validation tests..."
 for test in "${test_headers[@]}"; do
-    echo "  Running: $test"
-    tox -- "s3tests/functional/test_headers.py::$test" || true
+    run_test "test_headers.py" "$test"
 done
 
 # Run core S3 operations tests
 echo "Running core S3 operations tests..."
 for test in "${test_s3[@]}"; do
-    echo "  Running: $test"
-    tox -- "s3tests/functional/test_s3.py::$test" || true
+    run_test "test_s3.py" "$test"
 done
 
 # Run object operations tests
 echo "Running object operations tests..."
 for test in "${test_objects[@]}"; do
-    echo "  Running: $test"
-    tox -- "s3tests/functional/test_s3.py::$test" || true
+    run_test "test_s3.py" "$test"
 done
 
 # Run bucket operations tests
 echo "Running bucket operations tests..."
 for test in "${test_buckets[@]}"; do
-    echo "  Running: $test"
-    tox -- "s3tests/functional/test_s3.py::$test" || true
+    run_test "test_s3.py" "$test"
 done
 
 # Run multipart upload tests
 echo "Running multipart upload tests..."
 for test in "${test_multipart[@]}"; do
-    echo "  Running: $test"
-    tox -- "s3tests/functional/test_s3.py::$test" || true
+    run_test "test_s3.py" "$test"
 done
 
 # Run copy object tests
 echo "Running copy object tests..."
 for test in "${test_copy[@]}"; do
-    echo "  Running: $test"
-    tox -- "s3tests/functional/test_s3.py::$test" || true
+    run_test "test_s3.py" "$test"
 done
 
-echo "S3 compatibility tests completed!"
+# Report results
+echo ""
+echo "========================================="
+echo "S3 Compatibility Tests Summary"
+echo "========================================="
+TOTAL_TESTS=$((PASSED_COUNT + ${#FAILED_TESTS[@]}))
+echo "Total: $TOTAL_TESTS | Passed: $PASSED_COUNT | Failed: ${#FAILED_TESTS[@]}"
+echo ""
+
+if [ ${#FAILED_TESTS[@]} -eq 0 ]; then
+    echo "All tests passed!"
+    exit 0
+else
+    echo "FAILED TESTS:"
+    for failed in "${FAILED_TESTS[@]}"; do
+        echo "  - $failed"
+    done
+    exit 1
+fi

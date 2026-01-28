@@ -342,7 +342,7 @@ s3-test-local: build
 		TAG_CACHE_DISK_PATH=$(TAG_CACHE_DATA_DIR) \
 		TAG_CACHE_CLUSTER_ADDR=:$(TAG_LOCAL_CLUSTER_PORT) \
 		TAG_CACHE_GRPC_ADDR=:$(TAG_LOCAL_GRPC_PORT) \
-		TAG_LOG_LEVEL=$${TAG_LOG_LEVEL:-debug} \
+		TAG_LOG_LEVEL=$${TAG_LOG_LEVEL:-info} \
 		TAG_PPROF_ENABLED=true \
 		./$(BINARY_NAME) &
 	@echo "Waiting for TAG to be ready..."
