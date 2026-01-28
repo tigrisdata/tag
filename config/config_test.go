@@ -56,8 +56,8 @@ log:
 	}
 
 	// Verify cache config
-	if !cfg.Cache.Enabled {
-		t.Error("Cache.Enabled = false, want true")
+	if !cfg.Cache.IsEnabled() {
+		t.Error("Cache.IsEnabled() = false, want true")
 	}
 	if cfg.Cache.TTL != 10*time.Minute {
 		t.Errorf("Cache.TTL = %v, want 10m", cfg.Cache.TTL)
@@ -185,8 +185,8 @@ cache:
 	}
 
 	// Verify cache is disabled
-	if cfg.Cache.Enabled {
-		t.Error("Cache.Enabled = true, want false (disabled by env)")
+	if cfg.Cache.IsEnabled() {
+		t.Error("Cache.IsEnabled() = true, want false (disabled by env)")
 	}
 }
 
@@ -294,8 +294,31 @@ server:
 	}
 
 	// Verify cache is enabled by default (embedded mode)
-	if !cfg.Cache.Enabled {
-		t.Error("Cache.Enabled = false, want true (enabled by default)")
+	if !cfg.Cache.IsEnabled() {
+		t.Error("Cache.IsEnabled() = false, want true (enabled by default)")
+	}
+}
+
+func TestCacheDisabledByConfig(t *testing.T) {
+	// Create a config file with cache explicitly disabled
+	content := `
+cache:
+  enabled: false
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Verify cache is disabled when explicitly set to false in config
+	if cfg.Cache.IsEnabled() {
+		t.Error("Cache.IsEnabled() = true, want false (explicitly disabled in config)")
 	}
 }
 
@@ -303,8 +326,8 @@ func TestCacheDefaultValues(t *testing.T) {
 	cfg := NewDefault()
 
 	// Verify cache is enabled by default
-	if !cfg.Cache.Enabled {
-		t.Error("Cache.Enabled = false, want true (enabled by default)")
+	if !cfg.Cache.IsEnabled() {
+		t.Error("Cache.IsEnabled() = false, want true (enabled by default)")
 	}
 
 	// Verify default disk path

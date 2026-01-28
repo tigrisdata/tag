@@ -93,7 +93,7 @@ type CredentialsConfig struct {
 // CacheConfig holds cache configuration.
 // These fields map to github.com/tigrisdata/ocache/embedded.Config.
 type CacheConfig struct {
-	Enabled       bool          `yaml:"enabled"`        // Enable caching (default: true)
+	Enabled       *bool         `yaml:"enabled"`        // Enable caching (default: true when nil)
 	TTL           time.Duration `yaml:"ttl"`            // Default cache TTL (default: 60m)
 	SizeThreshold int64         `yaml:"size_threshold"` // Max object size to cache in bytes (default: 1GB)
 
@@ -105,6 +105,20 @@ type CacheConfig struct {
 	GRPCAddr          string   `yaml:"grpc_addr"`            // Address for gRPC server (default: :9000)
 	AdvertiseAddr     string   `yaml:"advertise_addr"`       // Address advertised to other nodes (defaults to GRPCAddr)
 	SeedNodes         []string `yaml:"seed_nodes"`           // Seed nodes for cluster discovery
+}
+
+// IsEnabled returns whether caching is enabled.
+// Returns true by default if not explicitly set.
+func (c *CacheConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true // Default to enabled
+	}
+	return *c.Enabled
+}
+
+// SetEnabled sets the Enabled field to the given value.
+func (c *CacheConfig) SetEnabled(enabled bool) {
+	c.Enabled = &enabled
 }
 
 // BroadcastConfig holds streaming broadcast configuration for request coalescing.
@@ -172,8 +186,8 @@ func applyDefaults(cfg *Config) {
 	}
 
 	// Cache defaults - enabled by default for embedded mode.
-	// Use TAG_CACHE_DISABLED=true environment variable to disable.
-	cfg.Cache.Enabled = true
+	// Can be disabled via config file (cache.enabled: false) or TAG_CACHE_DISABLED=true env var.
+	// Note: cfg.Cache.IsEnabled() returns true by default if Enabled is nil.
 	if cfg.Cache.TTL == 0 {
 		cfg.Cache.TTL = DefaultCacheTTL
 	}
@@ -226,11 +240,11 @@ func applyEnvOverrides(cfg *Config) {
 
 	// Disable cache from environment (explicit disable takes precedence)
 	if disabled := os.Getenv("TAG_CACHE_DISABLED"); disabled == "true" || disabled == "1" {
-		cfg.Cache.Enabled = false
+		cfg.Cache.SetEnabled(false)
 	}
 
 	// Embedded cache configuration from environment (only if cache is enabled)
-	if cfg.Cache.Enabled {
+	if cfg.Cache.IsEnabled() {
 		if diskPath := os.Getenv("TAG_CACHE_DISK_PATH"); diskPath != "" {
 			cfg.Cache.DiskPath = diskPath
 		}

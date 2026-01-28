@@ -36,7 +36,7 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 		if cfg.TTL > 0 {
 			ttl = int64(cfg.TTL.Seconds())
 		}
-		enabled = cfg.Enabled
+		enabled = cfg.IsEnabled()
 	}
 	return &Cache{
 		client:     client,

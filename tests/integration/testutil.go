@@ -270,9 +270,9 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 			Region:   TestRegion,
 		},
 		Cache: config.CacheConfig{
-			Enabled:       true, // Cache enabled for these tests
 			TTL:           config.DefaultCacheTTL,
 			SizeThreshold: config.DefaultCacheSizeThreshold,
+			// Enabled defaults to true via IsEnabled() when nil
 		},
 	}
 
@@ -329,11 +329,11 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 			Region:   TestRegion,
 		},
 		Cache: config.CacheConfig{
-			Enabled:       false, // Cache disabled for integration tests
 			TTL:           config.DefaultCacheTTL,
 			SizeThreshold: config.DefaultCacheSizeThreshold,
 		},
 	}
+	cfg.Cache.SetEnabled(false) // Cache disabled for integration tests
 
 	// Create disabled cache
 	testCache := cache.NewDisabledCache()

@@ -67,13 +67,13 @@ func main() {
 
 	// Override cache enabled from command line flag
 	if *disableCache {
-		cfg.Cache.Enabled = false
+		cfg.Cache.SetEnabled(false)
 	}
 
 	log.Info().
 		Int("http_port", cfg.Server.HTTPPort).
 		Str("upstream", cfg.Upstream.Endpoint).
-		Bool("cache_enabled", cfg.Cache.Enabled).
+		Bool("cache_enabled", cfg.Cache.IsEnabled()).
 		Str("node_id", cfg.Cache.NodeID).
 		Msg("Starting TAG (Tigris Access Gateway)")
 
@@ -96,7 +96,7 @@ func main() {
 	// 2. Initialize cache (embedded or disabled based on config)
 	var objectCache *cache.Cache
 
-	if cfg.Cache.Enabled {
+	if cfg.Cache.IsEnabled() {
 		log.Info().
 			Str("node_id", cfg.Cache.NodeID).
 			Str("disk_path", cfg.Cache.DiskPath).
