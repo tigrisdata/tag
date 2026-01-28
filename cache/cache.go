@@ -64,6 +64,9 @@ func (c *Cache) IsEnabled() bool {
 
 // PutWithMeta stores object metadata and body in separate cache entries.
 // This follows the gateway's LiteCache pattern for proper S3 caching.
+// IMPORTANT: Body is written BEFORE metadata to ensure metadata presence
+// guarantees body availability. This prevents race conditions where a reader
+// finds metadata but body hasn't been written yet.
 func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *CachedObjectMeta, body []byte, ttl int) error {
 	if !c.IsEnabled() {
 		return nil
@@ -83,17 +86,18 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 		return err
 	}
 
-	// Store metadata
-	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
+	// Store body FIRST (can be empty for zero-byte objects)
+	// This ensures metadata presence guarantees body availability
+	if err := c.client.Put(ctx, bodyKey, body, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
 		return err
 	}
 
-	// Store body (can be empty for zero-byte objects)
-	if err := c.client.Put(ctx, bodyKey, body, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
-		// Try to clean up metadata on body failure
-		_ = c.client.Delete(ctx, metaKey)
+	// Store metadata AFTER body is complete
+	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
+		// Try to clean up body on metadata failure
+		_ = c.client.Delete(ctx, bodyKey)
 		return err
 	}
 
@@ -109,6 +113,9 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 
 // PutWithMetaStream stores object metadata and streams body to cache.
 // Use this for large objects to avoid buffering the entire body in memory.
+// IMPORTANT: Body is written BEFORE metadata to ensure metadata presence
+// guarantees body availability. This prevents race conditions where a reader
+// finds metadata but body hasn't been fully written yet.
 func (c *Cache) PutWithMetaStream(ctx context.Context, bucket, key string, meta *CachedObjectMeta, body io.Reader, ttl int) error {
 	if !c.IsEnabled() {
 		return nil
@@ -121,24 +128,25 @@ func (c *Cache) PutWithMetaStream(ctx context.Context, bucket, key string, meta 
 	metaKey := MakeMetaKey(bucket, key)
 	bodyKey := MakeBodyKey(bucket, key)
 
-	// Encode metadata as JSON
+	// Encode metadata as JSON (do this first so we fail fast if encoding fails)
 	metaBytes, err := meta.Encode()
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta encode error")
 		return err
 	}
 
-	// Store metadata first
-	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
+	// Stream body to cache FIRST
+	// This ensures metadata presence guarantees body availability
+	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
 		return err
 	}
 
-	// Stream body to cache
-	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
-		// Try to clean up metadata on body failure
-		_ = c.client.Delete(ctx, metaKey)
+	// Store metadata AFTER body is complete
+	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
+		// Try to clean up body on metadata failure
+		_ = c.client.Delete(ctx, bodyKey)
 		return err
 	}
 
