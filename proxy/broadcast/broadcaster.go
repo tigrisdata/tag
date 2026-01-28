@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 )
@@ -16,8 +17,10 @@ const (
 	// DefaultChunkSize is the default size of chunks for streaming (64 KB).
 	DefaultChunkSize = 64 * 1024
 	// DefaultChannelBuffer is the default number of chunks to buffer per listener.
-	// With 64KB chunks, this is ~2MB buffer per listener.
-	DefaultChannelBuffer = 32
+	// With 64KB chunks, this is ~4MB buffer per listener.
+	DefaultChannelBuffer = 64
+	// SlowConsumerGracePeriod is how long to wait for a slow consumer before disconnecting.
+	SlowConsumerGracePeriod = 5 * time.Second
 )
 
 // ErrSlowConsumer indicates a listener was disconnected for being too slow.
@@ -138,7 +141,7 @@ func (b *Broadcaster) SetHeaders(status int, headers http.Header) {
 }
 
 // Broadcast sends a chunk to all listeners.
-// Slow consumers (channel full) are disconnected to prevent blocking fast consumers.
+// Slow consumers (channel full) are given a grace period before being disconnected.
 func (b *Broadcaster) Broadcast(data []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -158,21 +161,33 @@ func (b *Broadcaster) Broadcast(data []byte) {
 		chunk := Chunk{Data: make([]byte, len(data))}
 		copy(chunk.Data, data)
 
+		// Try non-blocking send first (fast path)
 		select {
 		case l.ch <- chunk:
 			// Sent successfully - keep this listener
 			activeListeners = append(activeListeners, l)
 		default:
-			// Channel full - disconnect slow consumer
-			l.disconnected = true
-			// Try to send error, but don't block
+			// Channel full - give grace period before disconnecting
+			// Release lock during blocking wait to avoid blocking other operations
+			b.mu.Unlock()
 			select {
-			case l.ch <- Chunk{Err: ErrSlowConsumer}:
-			default:
+			case l.ch <- chunk:
+				// Sent after waiting - keep this listener
+				b.mu.Lock()
+				activeListeners = append(activeListeners, l)
+			case <-time.After(SlowConsumerGracePeriod):
+				// Still can't send after grace period - disconnect
+				b.mu.Lock()
+				l.disconnected = true
+				// Try to send error, but don't block
+				select {
+				case l.ch <- Chunk{Err: ErrSlowConsumer}:
+				default:
+				}
+				close(l.ch)
+				// Don't add to activeListeners - listener is removed
+				log.Warn().Msg("Disconnecting slow consumer from broadcast after timeout")
 			}
-			close(l.ch)
-			// Don't add to activeListeners - listener is removed
-			log.Warn().Msg("Disconnecting slow consumer from broadcast")
 		}
 	}
 	b.listeners = activeListeners
