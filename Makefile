@@ -65,17 +65,10 @@ all: build
 .PHONY: build
 build: rocksdb-static
 	@echo "Building $(BINARY_NAME) with embedded cache..."
-ifeq ($(UNAME_S),Darwin)
 	CGO_ENABLED=1 \
 	CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" \
 	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 	go build $(LDFLAGS) -o $(BINARY_NAME) $(CMD_PATH)
-else
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	go build $(LDFLAGS) -o $(BINARY_NAME) $(CMD_PATH)
-endif
 
 # Download and extract RocksDB static artifacts
 .PHONY: rocksdb-static

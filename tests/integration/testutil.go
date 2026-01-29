@@ -669,12 +669,12 @@ func (e *TestEnvironment) AssertXCacheStatusFor(t *testing.T, bucket, key string
 	}
 }
 
-// WaitForCached waits for an object to appear in cache with polling and timeout.
-// Returns true if the object is cached within the timeout, false otherwise.
-func (e *TestEnvironment) WaitForCached(bucket, key string, timeout time.Duration) bool {
+// waitForCondition polls until condition returns true or timeout expires.
+// Returns true if condition became true, false if timeout expired.
+func waitForCondition(condition func() bool, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if e.IsCached(bucket, key) {
+		if condition() {
 			return true
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -682,17 +682,16 @@ func (e *TestEnvironment) WaitForCached(bucket, key string, timeout time.Duratio
 	return false
 }
 
+// WaitForCached waits for an object to appear in cache with polling and timeout.
+// Returns true if the object is cached within the timeout, false otherwise.
+func (e *TestEnvironment) WaitForCached(bucket, key string, timeout time.Duration) bool {
+	return waitForCondition(func() bool { return e.IsCached(bucket, key) }, timeout)
+}
+
 // WaitForNotCached waits for an object to be removed from cache with polling and timeout.
 // Returns true if the object is NOT in cache within the timeout, false otherwise.
 func (e *TestEnvironment) WaitForNotCached(bucket, key string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !e.IsCached(bucket, key) {
-			return true
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return false
+	return waitForCondition(func() bool { return !e.IsCached(bucket, key) }, timeout)
 }
 
 // setupSharedCache initializes the shared embedded cache instance.

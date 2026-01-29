@@ -164,28 +164,20 @@ func (b *Broadcaster) Broadcast(data []byte) {
 		// Try non-blocking send first (fast path)
 		select {
 		case l.ch <- chunk:
-			// Sent successfully - keep this listener
 			activeListeners = append(activeListeners, l)
 		default:
 			// Channel full - give grace period before disconnecting
-			// Release lock during blocking wait to avoid blocking other operations
-			b.mu.Unlock()
 			select {
 			case l.ch <- chunk:
-				// Sent after waiting - keep this listener
-				b.mu.Lock()
 				activeListeners = append(activeListeners, l)
 			case <-time.After(SlowConsumerGracePeriod):
-				// Still can't send after grace period - disconnect
-				b.mu.Lock()
+				// Timed out - disconnect slow consumer
 				l.disconnected = true
-				// Try to send error, but don't block
 				select {
 				case l.ch <- Chunk{Err: ErrSlowConsumer}:
 				default:
 				}
 				close(l.ch)
-				// Don't add to activeListeners - listener is removed
 				log.Warn().Msg("Disconnecting slow consumer from broadcast after timeout")
 			}
 		}
@@ -204,16 +196,18 @@ func (b *Broadcaster) Complete(err error) {
 
 	b.done = true
 	b.err = err
+	close(b.doneCh)
 
-	// Send final chunk with error status and close channels
+	// Send final chunk and close all listener channels
 	for _, l := range b.listeners {
 		if !l.disconnected {
-			l.ch <- Chunk{Err: err}
+			select {
+			case l.ch <- Chunk{Err: err}:
+			default:
+			}
 			close(l.ch)
 		}
 	}
-
-	close(b.doneCh)
 }
 
 // Done returns a channel that's closed when broadcast is complete.

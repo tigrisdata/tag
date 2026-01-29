@@ -52,8 +52,8 @@ const (
 	// DefaultBroadcastChunkSize is the default chunk size for streaming (64KB).
 	DefaultBroadcastChunkSize = 64 * 1024
 
-	// DefaultBroadcastChannelBuffer is the default buffer size per listener (32 chunks = ~2MB).
-	DefaultBroadcastChannelBuffer = 32
+	// DefaultBroadcastChannelBuffer is the default buffer size per listener (64 chunks = ~4MB).
+	DefaultBroadcastChannelBuffer = 64
 
 	// DefaultMaxIdleConnsPerHost is the default HTTP connection pool size per upstream host.
 	// Higher values improve throughput for cache miss scenarios with high concurrency.
@@ -197,9 +197,7 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cache.DiskPath == "" {
 		cfg.Cache.DiskPath = DefaultCacheDiskPath
 	}
-	if cfg.Cache.MaxDiskUsageBytes == 0 {
-		cfg.Cache.MaxDiskUsageBytes = DefaultCacheMaxDiskUsage
-	}
+	// Note: MaxDiskUsageBytes defaults to 0 (unlimited), so no default assignment needed
 	if cfg.Cache.ClusterAddr == "" {
 		cfg.Cache.ClusterAddr = DefaultCacheClusterAddr
 	}
