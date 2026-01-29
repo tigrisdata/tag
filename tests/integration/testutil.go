@@ -207,8 +207,6 @@ type TestEnvironment struct {
 	S3Backend *s3mem.Backend
 	// EmbeddedCache is the embedded RocksDB cache for cache-enabled tests (nil for non-cache tests).
 	EmbeddedCache *embedded.Client
-	// CacheTempDir is the temp directory for embedded cache storage (cleaned up on Close).
-	CacheTempDir string
 	// UpstreamRequestCount tracks the number of requests made to upstream (for coalescing tests).
 	UpstreamRequestCount *int32
 	// XCacheTracker tracks X-Cache headers from TAG server responses.
@@ -323,7 +321,6 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 		Signer:               signer,
 		S3Backend:            backend,
 		EmbeddedCache:        sharedEmbeddedCache,
-		CacheTempDir:         "", // Shared cache - temp dir managed by TestMain
 		UpstreamRequestCount: &requestCount,
 		XCacheTracker:        xCacheTracker,
 	}
@@ -397,10 +394,6 @@ func (e *TestEnvironment) Close() {
 	// The shared cache is managed by TestMain
 	if e.Cache != nil && e.EmbeddedCache != sharedEmbeddedCache {
 		e.Cache.Close()
-	}
-	// Clean up embedded cache temp directory (only for non-shared caches)
-	if e.CacheTempDir != "" {
-		os.RemoveAll(e.CacheTempDir)
 	}
 }
 

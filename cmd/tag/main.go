@@ -21,6 +21,13 @@ import (
 	"github.com/tigrisdata/tag/proxy"
 )
 
+// Build-time variables set via ldflags.
+var (
+	Version   = "dev"
+	BuildTime = "unknown"
+	GitCommit = "unknown"
+)
+
 func main() {
 	// Parse command line flags
 	configPath := flag.String("config", "", "Path to configuration file")
@@ -71,6 +78,9 @@ func main() {
 	}
 
 	log.Info().
+		Str("version", Version).
+		Str("build_time", BuildTime).
+		Str("git_commit", GitCommit).
 		Int("http_port", cfg.Server.HTTPPort).
 		Str("upstream", cfg.Upstream.Endpoint).
 		Bool("cache_enabled", cfg.Cache.IsEnabled()).
