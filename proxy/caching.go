@@ -18,11 +18,15 @@ import (
 // setupCacheListener creates a listener that streams chunks directly to cache via io.Pipe.
 // This avoids buffering the entire response in memory.
 // Stores both metadata (from headers) and body in separate cache entries.
+// Uses tombstone-aware writes to prevent stale cache after invalidation.
 func (s *Service) setupCacheListener(
 	ctx context.Context,
 	bucket, key string,
 	broadcaster *broadcast.Broadcaster,
 ) (*io.PipeWriter, chan error) {
+	// Record when this write started - used to check against tombstones
+	writeStartTime := time.Now().UnixNano()
+
 	listener := broadcaster.Subscribe()
 	if listener == nil {
 		return nil, nil
@@ -76,9 +80,10 @@ func (s *Service) setupCacheListener(
 		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cacheCancel()
 
-		// Write to cache with metadata (streaming)
+		// Write to cache with metadata (streaming, tombstone-aware)
+		// Tombstone-aware write will skip metadata if key was invalidated after writeStartTime
 		ttl := int(s.config.Cache.TTL.Seconds())
-		cacheErr := s.cache.PutWithMetaStream(cacheCtx, bucket, key, meta, pipeReader, ttl)
+		cacheErr := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, pipeReader, ttl, writeStartTime)
 		if cacheErr != nil {
 			log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")
 		}

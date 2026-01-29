@@ -152,3 +152,26 @@ func TestCache_DisabledOperationsReturnNil(t *testing.T) {
 		t.Error("Has() = true, want false")
 	}
 }
+
+func TestMakeTombstoneKey(t *testing.T) {
+	key := MakeTombstoneKey("my-bucket", "my-key")
+	expected := "tomb|my-bucket|my-key"
+	if key != expected {
+		t.Errorf("MakeTombstoneKey() = %q, want %q", key, expected)
+	}
+}
+
+func TestCache_Tombstone_DisabledCache(t *testing.T) {
+	cache := &Cache{enabled: false}
+
+	// WriteTombstone should succeed silently
+	if err := cache.WriteTombstone(t.Context(), "bucket", "key"); err != nil {
+		t.Errorf("WriteTombstone() error = %v, want nil", err)
+	}
+
+	// GetTombstoneTimestamp should return 0
+	ts := cache.GetTombstoneTimestamp(t.Context(), "bucket", "key")
+	if ts != 0 {
+		t.Errorf("GetTombstoneTimestamp() = %d, want 0", ts)
+	}
+}

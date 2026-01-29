@@ -3,6 +3,7 @@ package cache
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"strings"
@@ -159,6 +160,71 @@ func (c *Cache) PutWithMetaStream(ctx context.Context, bucket, key string, meta 
 	return nil
 }
 
+// PutWithMetaStreamTombstoneAware is like PutWithMetaStream but checks for
+// tombstones before writing metadata. If a tombstone exists that's newer than
+// writeStartTime, the metadata write is skipped (preventing stale cache).
+// This is used by async cache writers to avoid caching stale data after invalidation.
+func (c *Cache) PutWithMetaStreamTombstoneAware(
+	ctx context.Context,
+	bucket, key string,
+	meta *CachedObjectMeta,
+	body io.Reader,
+	ttl int,
+	writeStartTime int64, // Unix nano timestamp when write started
+) error {
+	if !c.IsEnabled() {
+		return nil
+	}
+
+	if ttl == 0 {
+		ttl = int(c.defaultTTL)
+	}
+
+	metaKey := MakeMetaKey(bucket, key)
+	bodyKey := MakeBodyKey(bucket, key)
+
+	// Encode metadata first (fail fast if encoding fails)
+	metaBytes, err := meta.Encode()
+	if err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta encode error")
+		return err
+	}
+
+	// Stream body to cache FIRST
+	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
+		return err
+	}
+
+	// CHECK TOMBSTONE before writing metadata
+	// If a tombstone exists with timestamp > writeStartTime, the key was invalidated
+	// after this write started, so we should NOT write metadata (keeps entry invisible)
+	tombTs := c.GetTombstoneTimestamp(ctx, bucket, key)
+	if tombTs > writeStartTime {
+		log.Debug().Str("bucket", bucket).Str("key", key).
+			Int64("tombstone_ts", tombTs).
+			Int64("write_start", writeStartTime).
+			Msg("Skipping metadata write - tombstone detected (key was invalidated)")
+		// Body is orphaned but will be overwritten by next write or expire via TTL
+		return nil
+	}
+
+	// Write metadata AFTER body (makes entry visible)
+	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
+		_ = c.client.Delete(ctx, bodyKey)
+		return err
+	}
+
+	log.Debug().
+		Str("bucket", bucket).
+		Str("key", key).
+		Int("ttl", ttl).
+		Int("meta_size", len(metaBytes)).
+		Msg("Cached object with metadata (streamed, tombstone-aware)")
+	return nil
+}
+
 // GetWithMeta retrieves object metadata and body from cache.
 // Returns metadata, body reader, found flag, and any error.
 func (c *Cache) GetWithMeta(ctx context.Context, bucket, key string) (*CachedObjectMeta, io.Reader, bool, error) {
@@ -283,9 +349,16 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key string, w io.Writ
 }
 
 // DeleteWithMeta removes both metadata and body from cache.
+// Writes a tombstone first to prevent in-flight cache writes from completing.
 func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	if !c.IsEnabled() {
 		return nil
+	}
+
+	// Write tombstone FIRST - prevents in-flight writes from completing
+	if err := c.WriteTombstone(ctx, bucket, key); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).
+			Msg("Failed to write tombstone (continuing with delete)")
 	}
 
 	metaKey := MakeMetaKey(bucket, key)
@@ -373,6 +446,42 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key string, start, e
 		Int64("length", end-start+1).
 		Msg("Cache hit (range)")
 	return nil
+}
+
+// ============================================================================
+// Tombstone methods for cache invalidation
+// ============================================================================
+
+// tombstoneTTL is the TTL for tombstone entries (60 seconds).
+// Tombstones only need to outlive in-flight cache writes.
+const tombstoneTTL = 60
+
+// WriteTombstone writes an invalidation marker for a key.
+// The value is the timestamp as 8 bytes (int64 big-endian).
+// This is used to prevent stale cache writes from completing after invalidation.
+func (c *Cache) WriteTombstone(ctx context.Context, bucket, key string) error {
+	if !c.IsEnabled() {
+		return nil
+	}
+	tombKey := MakeTombstoneKey(bucket, key)
+	ts := time.Now().UnixNano()
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, uint64(ts))
+	return c.client.Put(ctx, tombKey, data, tombstoneTTL)
+}
+
+// GetTombstoneTimestamp retrieves the tombstone timestamp for a key.
+// Returns 0 if no tombstone exists.
+func (c *Cache) GetTombstoneTimestamp(ctx context.Context, bucket, key string) int64 {
+	if !c.IsEnabled() {
+		return 0
+	}
+	tombKey := MakeTombstoneKey(bucket, key)
+	data, err := c.client.Get(ctx, tombKey)
+	if err != nil || len(data) != 8 {
+		return 0 // No tombstone or invalid data
+	}
+	return int64(binary.BigEndian.Uint64(data))
 }
 
 // ============================================================================
