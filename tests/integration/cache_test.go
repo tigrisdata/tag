@@ -51,11 +51,8 @@ func TestCache_HitWithMetadata(t *testing.T) {
 	// Save the ETag for comparison
 	etag1 := aws.ToString(resp1.ETag)
 
-	// Wait for async cache write to complete
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify object IS now in cache (metadata exists)
-	assert.True(t, env.IsCached(bucket, key), "Object should be cached after first GET")
+	// Wait for async cache write to complete (use polling with timeout for real cache)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after first GET")
 
 	// Second GET - should be cache hit, no upstream request
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -98,7 +95,7 @@ func TestCache_IfNoneMatch304(t *testing.T) {
 	require.NotEmpty(t, etag, "ETag should not be empty")
 
 	// Wait for cache to be populated
-	time.Sleep(100 * time.Millisecond)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after first GET")
 
 	// GET with If-None-Match matching the ETag - should return 304
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -156,7 +153,7 @@ func TestCache_IfModifiedSince304(t *testing.T) {
 	}
 
 	// Wait for cache to be populated
-	time.Sleep(100 * time.Millisecond)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after first GET")
 
 	// Use a time in the future to ensure 304 response
 	futureTime := lastModified.Add(1 * time.Hour)
@@ -209,7 +206,7 @@ func TestCache_HeadFromCache(t *testing.T) {
 	contentLength := aws.ToInt64(resp1.ContentLength)
 
 	// Wait for cache to be populated
-	time.Sleep(100 * time.Millisecond)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after first GET")
 
 	// HEAD request - should be served from cache
 	resp2, err := client.HeadObject(ctx, &s3.HeadObjectInput{
@@ -249,11 +246,8 @@ func TestCache_InvalidateOnPut(t *testing.T) {
 	assert.Equal(t, originalContent, body1)
 	env.AssertXCacheMiss(t) // First GET should be cache miss
 
-	// Wait for async cache write to complete
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify original content is in cache (metadata exists)
-	assert.True(t, env.IsCached(bucket, key), "Object should be cached after first GET")
+	// Wait for async cache write to complete (use polling with timeout for real cache)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after first GET")
 
 	// PUT new content - should invalidate cache
 	_, err = client.PutObject(ctx, &s3.PutObjectInput{
@@ -263,8 +257,8 @@ func TestCache_InvalidateOnPut(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Verify cache is invalidated (object removed from cache)
-	assert.False(t, env.IsCached(bucket, key), "Object should NOT be in cache after PUT (cache invalidated)")
+	// Verify cache is invalidated (object removed from cache) - use polling since invalidation is async
+	require.True(t, env.WaitForNotCached(bucket, key, 2*time.Second), "Object should NOT be in cache after PUT (cache invalidated)")
 
 	// GET should return new content (cache was invalidated)
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -278,11 +272,8 @@ func TestCache_InvalidateOnPut(t *testing.T) {
 	assert.Equal(t, newContent, body2, "GET after PUT should return new content")
 	env.AssertXCacheMiss(t) // GET after PUT should be cache miss (cache invalidated)
 
-	// Wait for async cache write to complete
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify new content is now cached (metadata exists)
-	assert.True(t, env.IsCached(bucket, key), "Object should be cached again after GET")
+	// Wait for async cache write to complete (use polling with timeout for real cache)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached again after GET")
 }
 
 // TestCache_InvalidateOnDelete verifies DELETE invalidates the cache.
@@ -309,11 +300,8 @@ func TestCache_InvalidateOnDelete(t *testing.T) {
 	resp1.Body.Close()
 	env.AssertXCacheMiss(t) // First GET should be cache miss
 
-	// Wait for async cache write to complete
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify content is in cache (metadata exists)
-	assert.True(t, env.IsCached(bucket, key), "Object should be cached after first GET")
+	// Wait for async cache write to complete (use polling with timeout for real cache)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after first GET")
 
 	// Verify it's cached (via X-Cache status)
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -332,8 +320,8 @@ func TestCache_InvalidateOnDelete(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Verify cache is invalidated (object removed from cache)
-	assert.False(t, env.IsCached(bucket, key), "Object should NOT be in cache after DELETE")
+	// Verify cache is invalidated (object removed from cache) - use polling since invalidation is async
+	require.True(t, env.WaitForNotCached(bucket, key, 2*time.Second), "Object should NOT be in cache after DELETE")
 
 	// GET should now return 404
 	_, err = client.GetObject(ctx, &s3.GetObjectInput{
@@ -370,7 +358,7 @@ func TestCache_RangeServedFromCache(t *testing.T) {
 	env.AssertXCacheMiss(t) // First GET should be cache miss
 
 	// Wait for cache to be populated
-	time.Sleep(100 * time.Millisecond)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after first GET")
 
 	// Verify full object is cached
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -437,7 +425,7 @@ func TestCache_RangeSingleByteAtZero(t *testing.T) {
 	env.AssertXCacheMiss(t) // First GET should be cache miss
 
 	// Wait for cache to be populated
-	time.Sleep(100 * time.Millisecond)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after first GET")
 
 	// Second: Full GET to verify cache hit
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -523,8 +511,8 @@ func TestCache_LargeObjectStreaming(t *testing.T) {
 	assert.Equal(t, content, body1, "First GET should return correct content")
 	env.AssertXCacheMiss(t) // First GET should be cache miss
 
-	// Wait for cache to be populated (large objects may take longer)
-	time.Sleep(200 * time.Millisecond)
+	// Wait for cache to be populated (large objects may take longer - use longer timeout)
+	require.True(t, env.WaitForCached(bucket, key, 5*time.Second), "Large object should be cached after first GET")
 
 	// Second GET - cache hit
 	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -573,8 +561,10 @@ func TestCache_MultipleObjectsIndependent(t *testing.T) {
 		env.AssertXCacheMiss(t) // First GET of each object should be cache miss
 	}
 
-	// Wait for cache to be populated
-	time.Sleep(100 * time.Millisecond)
+	// Wait for cache to be populated (check all objects)
+	for key := range objects {
+		require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object %s should be cached after GET", key)
+	}
 
 	// Verify all are cached
 	for key, expectedContent := range objects {
@@ -621,7 +611,7 @@ func TestCache_CacheHitHeaders(t *testing.T) {
 	io.Copy(io.Discard, resp1.Body)
 
 	// Wait for async cache write
-	time.Sleep(100 * time.Millisecond)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after first GET")
 
 	// Second request - cache hit
 	resp2, err := env.DoSignedRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
@@ -671,6 +661,9 @@ func TestCache_XCacheForRangeRequests(t *testing.T) {
 	require.NoError(t, err)
 	io.Copy(io.Discard, resp2.Body)
 	resp2.Body.Close()
+
+	// Wait for cache to be populated
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after full GET")
 
 	// Now range request should return X-Cache: HIT (served from cached full object)
 	req3, err := env.SignedRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
@@ -731,7 +724,7 @@ func TestCache_XCacheHitOn304(t *testing.T) {
 	assert.Equal(t, "MISS", resp1.Header.Get("X-Cache"), "First request should be cache MISS")
 
 	// Wait for async cache write
-	time.Sleep(100 * time.Millisecond)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after first GET")
 
 	// Conditional request with If-None-Match should return 304 with X-Cache: HIT
 	req, err := env.SignedRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
@@ -766,7 +759,7 @@ func TestCache_XCacheHitOnHead(t *testing.T) {
 	assert.Equal(t, "MISS", resp1.Header.Get("X-Cache"), "First GET should be cache MISS")
 
 	// Wait for async cache write
-	time.Sleep(100 * time.Millisecond)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after first GET")
 
 	// HEAD request should be served from cache with X-Cache: HIT
 	resp2, err := env.DoSignedRequest(http.MethodHead, "/"+bucket+"/"+key, nil)
@@ -807,7 +800,7 @@ func TestCache_HeaderPreservation(t *testing.T) {
 	require.NotEmpty(t, upstreamContentLength, "Upstream response should have Content-Length")
 
 	// Wait for async cache write
-	time.Sleep(100 * time.Millisecond)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object should be cached after first GET")
 
 	// Second GET - cache hit, verify headers match
 	resp2, err := env.DoSignedRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
@@ -862,12 +855,9 @@ func TestCache_InvalidateOnDeleteObjects(t *testing.T) {
 		resp.Body.Close()
 	}
 
-	// Wait for cache to be populated
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify all objects ARE now in cache (metadata exists)
+	// Wait for cache to be populated (check all objects)
 	for _, key := range keys {
-		assert.True(t, env.IsCached(bucket, key), "Object %s should be cached after GET", key)
+		require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "Object %s should be cached after GET", key)
 	}
 
 	// Verify all are cached (via X-Cache status)
@@ -898,9 +888,9 @@ func TestCache_InvalidateOnDeleteObjects(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, result.Deleted, len(keys))
 
-	// Verify all objects are removed from cache
+	// Verify all objects are removed from cache - use polling since invalidation is async
 	for _, key := range keys {
-		assert.False(t, env.IsCached(bucket, key), "Object %s should NOT be in cache after DeleteObjects", key)
+		require.True(t, env.WaitForNotCached(bucket, key, 2*time.Second), "Object %s should NOT be in cache after DeleteObjects", key)
 	}
 
 	// Verify objects no longer exist in upstream (404 returned)
