@@ -52,6 +52,9 @@ else
     LDFLAGS := -ldflags "-linkmode external -extldflags '-static' -X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME) -X main.GitCommit=$(GIT_COMMIT)"
 endif
 
+# CGO environment for RocksDB (used across multiple targets)
+CGO_ENV := CGO_ENABLED=1 CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" CGO_LDFLAGS="$(CGO_LDFLAGS)"
+
 # Allow specifying specific tests with TEST variable (e.g., make test TEST=TestMyFunction)
 # or with TESTRUN for pattern matching (e.g., make test TESTRUN=MyFunction)
 TEST ?=
@@ -65,10 +68,7 @@ all: build
 .PHONY: build
 build: rocksdb-static
 	@echo "Building $(BINARY_NAME) with embedded cache..."
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	go build $(LDFLAGS) -o $(BINARY_NAME) $(CMD_PATH)
+	$(CGO_ENV) go build $(LDFLAGS) -o $(BINARY_NAME) $(CMD_PATH)
 
 # Download and extract RocksDB static artifacts
 .PHONY: rocksdb-static
@@ -109,10 +109,7 @@ endif
 test: rocksdb-static
 	@echo "Running unit tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	go test -v -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
+	$(CGO_ENV) go test -v -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
 
 .PHONY: test-all
 test-all: test test-integration
@@ -128,10 +125,7 @@ test-auth:
 test-cache: rocksdb-static
 	@echo "Running cache tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	go test -v -timeout 30s $(TESTFLAGS) ./cache/...
+	$(CGO_ENV) go test -v -timeout 30s $(TESTFLAGS) ./cache/...
 
 .PHONY: test-proxy
 test-proxy:
@@ -143,19 +137,13 @@ test-proxy:
 test-race: rocksdb-static
 	@echo "Running unit tests with race detector..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	go test -race -v -timeout 120s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
+	$(CGO_ENV) go test -race -v -timeout 120s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
 
 .PHONY: test-coverage
 test-coverage: rocksdb-static
 	@echo "Running unit tests with coverage..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	go test -coverprofile=coverage.out -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
+	$(CGO_ENV) go test -coverprofile=coverage.out -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated at coverage.html"
 
@@ -164,37 +152,25 @@ test-coverage: rocksdb-static
 test-integration: rocksdb-static
 	@echo "Running integration tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	go test -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
+	$(CGO_ENV) go test -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
 
 .PHONY: test-integration-short
 test-integration-short: rocksdb-static
 	@echo "Running integration tests (short mode)..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	go test -v -short -timeout 30s $(TESTFLAGS) ./tests/integration/...
+	$(CGO_ENV) go test -v -short -timeout 30s $(TESTFLAGS) ./tests/integration/...
 
 .PHONY: test-integration-race
 test-integration-race: rocksdb-static
 	@echo "Running integration tests with race detector..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	go test -race -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
+	$(CGO_ENV) go test -race -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
 
 .PHONY: test-integration-coverage
 test-integration-coverage: rocksdb-static
 	@echo "Running integration tests with coverage..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	go test -coverprofile=coverage-integration.out -timeout 300s $(TESTFLAGS) ./tests/integration/...
+	$(CGO_ENV) go test -coverprofile=coverage-integration.out -timeout 300s $(TESTFLAGS) ./tests/integration/...
 	go tool cover -html=coverage-integration.out -o coverage-integration.html
 	@echo "Integration coverage report generated at coverage-integration.html"
 

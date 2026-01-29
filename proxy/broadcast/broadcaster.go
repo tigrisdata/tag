@@ -190,7 +190,10 @@ func (b *Broadcaster) Complete(err error) {
 	b.err = err
 	close(b.doneCh)
 
-	// Send final chunk and close all listener channels
+	// Send final chunk and close all listener channels.
+	// Non-blocking send: if buffer is full, skip the error chunk.
+	// Correctness is guaranteed by the tombstone mechanism in cache writes,
+	// which prevents stale data from being cached even if error delivery fails.
 	for _, l := range b.listeners {
 		if !l.disconnected {
 			select {
