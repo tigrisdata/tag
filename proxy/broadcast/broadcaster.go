@@ -8,7 +8,6 @@ import (
 	"errors"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/rs/zerolog/log"
 )
@@ -17,10 +16,9 @@ const (
 	// DefaultChunkSize is the default size of chunks for streaming (64 KB).
 	DefaultChunkSize = 64 * 1024
 	// DefaultChannelBuffer is the default number of chunks to buffer per listener.
-	// With 64KB chunks, this is ~4MB buffer per listener.
+	// With 64KB chunks, this is ~4MB buffer per listener, providing sufficient
+	// tolerance for temporary slowdowns before disconnecting slow consumers.
 	DefaultChannelBuffer = 64
-	// SlowConsumerGracePeriod is how long to wait for a slow consumer before disconnecting.
-	SlowConsumerGracePeriod = 5 * time.Second
 )
 
 // ErrSlowConsumer indicates a listener was disconnected for being too slow.
@@ -141,7 +139,7 @@ func (b *Broadcaster) SetHeaders(status int, headers http.Header) {
 }
 
 // Broadcast sends a chunk to all listeners.
-// Slow consumers (channel full) are given a grace period before being disconnected.
+// Slow consumers (buffer full) are disconnected immediately.
 func (b *Broadcaster) Broadcast(data []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -161,25 +159,19 @@ func (b *Broadcaster) Broadcast(data []byte) {
 		chunk := Chunk{Data: make([]byte, len(data))}
 		copy(chunk.Data, data)
 
-		// Try non-blocking send first (fast path)
+		// Non-blocking send - disconnect immediately if buffer is full
 		select {
 		case l.ch <- chunk:
 			activeListeners = append(activeListeners, l)
 		default:
-			// Channel full - give grace period before disconnecting
+			// Buffer full - disconnect slow consumer
+			l.disconnected = true
 			select {
-			case l.ch <- chunk:
-				activeListeners = append(activeListeners, l)
-			case <-time.After(SlowConsumerGracePeriod):
-				// Timed out - disconnect slow consumer
-				l.disconnected = true
-				select {
-				case l.ch <- Chunk{Err: ErrSlowConsumer}:
-				default:
-				}
-				close(l.ch)
-				log.Warn().Msg("Disconnecting slow consumer from broadcast after timeout")
+			case l.ch <- Chunk{Err: ErrSlowConsumer}:
+			default:
 			}
+			close(l.ch)
+			log.Warn().Msg("Disconnecting slow consumer from broadcast (buffer full)")
 		}
 	}
 	b.listeners = activeListeners

@@ -33,9 +33,6 @@ const (
 	// DefaultCacheDiskPath is the default disk path for embedded cache storage.
 	DefaultCacheDiskPath = "/var/cache/tag"
 
-	// DefaultCacheMaxDiskUsage is the default max disk usage for embedded cache (0 = unlimited).
-	DefaultCacheMaxDiskUsage = 0
-
 	// DefaultCacheGRPCAddr is the default gRPC address for embedded cache cluster routing.
 	DefaultCacheGRPCAddr = ":9000"
 

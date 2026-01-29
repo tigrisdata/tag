@@ -325,12 +325,10 @@ func TestManagerActiveCount(t *testing.T) {
 	}
 }
 
-// TestBroadcasterCompleteWhileWaitingOnSlowConsumer tests that Complete() can be called
-// safely while Broadcast() is blocked waiting on a slow consumer's grace period.
-// This was a race condition where Complete() would close the channel while Broadcast()
-// was about to send to it, causing a panic.
-func TestBroadcasterCompleteWhileWaitingOnSlowConsumer(t *testing.T) {
-	// Use small buffer to easily trigger slow consumer path
+// TestBroadcasterCompleteWithSlowConsumer tests that Complete() and Broadcast()
+// work correctly when there are slow consumers that get disconnected.
+func TestBroadcasterCompleteWithSlowConsumer(t *testing.T) {
+	// Use small buffer to easily trigger slow consumer disconnect
 	b := NewBroadcaster(1)
 
 	// Subscribe a slow listener that never reads
@@ -339,30 +337,18 @@ func TestBroadcasterCompleteWhileWaitingOnSlowConsumer(t *testing.T) {
 
 	b.SetHeaders(http.StatusOK, http.Header{})
 
-	// Fill the buffer so next send will block
+	// Fill the buffer
 	b.Broadcast([]byte("chunk1"))
 
-	// Start a goroutine that will broadcast and get stuck waiting
-	broadcastDone := make(chan struct{})
-	go func() {
-		defer close(broadcastDone)
-		// This will block on the slow consumer's grace period
-		b.Broadcast([]byte("chunk2"))
-	}()
+	// This should disconnect the slow consumer immediately (buffer full)
+	b.Broadcast([]byte("chunk2"))
 
-	// Give Broadcast() time to release the lock and start waiting
-	time.Sleep(100 * time.Millisecond)
-
-	// Call Complete() while Broadcast() is waiting
-	// This should NOT cause a panic
+	// Complete should work fine even with disconnected consumers
 	b.Complete(nil)
 
-	// Wait for Broadcast() to finish
-	select {
-	case <-broadcastDone:
-		// Success - no panic
-	case <-time.After(SlowConsumerGracePeriod + 2*time.Second):
-		t.Error("Timeout waiting for Broadcast() to complete")
+	// Verify slow consumer was disconnected
+	if b.ListenerCount() != 0 {
+		t.Errorf("Expected 0 listeners after slow consumer disconnect, got %d", b.ListenerCount())
 	}
 }
 
