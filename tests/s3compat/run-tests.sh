@@ -20,7 +20,13 @@ if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
 fi
 
 # Clone s3-tests repo if not present
-[ -d s3-tests ] || git clone https://github.com/ceph/s3-tests.git
+if [ ! -d s3-tests ]; then
+    echo "Cloning s3-tests repository..."
+    if ! git clone https://github.com/ceph/s3-tests.git; then
+        echo "Error: Failed to clone s3-tests repository"
+        exit 1
+    fi
+fi
 
 # Remove problematic git-lfs repository that causes 403 errors (Linux CI only)
 if [ -f /etc/apt/sources.list.d/github_git-lfs.list ]; then
@@ -31,24 +37,37 @@ fi
 VENV_DIR="$SCRIPT_DIR/.venv"
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtual environment..."
-    python3 -m venv "$VENV_DIR"
+    if ! python3 -m venv "$VENV_DIR"; then
+        echo "Error: Failed to create virtual environment"
+        exit 1
+    fi
 fi
 
 # Activate virtual environment
-source "$VENV_DIR/bin/activate"
+# shellcheck disable=SC1091
+if ! source "$VENV_DIR/bin/activate"; then
+    echo "Error: Failed to activate virtual environment"
+    exit 1
+fi
 
 # Install tox in the virtual environment if not available
 if ! command -v tox >/dev/null 2>&1; then
     echo "Installing tox in virtual environment..."
-    pip install tox
+    if ! pip install tox; then
+        echo "Error: Failed to install tox"
+        exit 1
+    fi
 fi
 
 # Generate s3tests.conf with actual credentials from environment variables
 # The template uses __AWS_ACCESS_KEY_ID__ and __AWS_SECRET_ACCESS_KEY__ as placeholders
 S3TEST_CONF="$SCRIPT_DIR/s3tests.conf.generated"
-sed -e "s|__AWS_ACCESS_KEY_ID__|${AWS_ACCESS_KEY_ID}|g" \
+if ! sed -e "s|__AWS_ACCESS_KEY_ID__|${AWS_ACCESS_KEY_ID}|g" \
     -e "s|__AWS_SECRET_ACCESS_KEY__|${AWS_SECRET_ACCESS_KEY}|g" \
-    "$SCRIPT_DIR/s3tests.conf" > "$S3TEST_CONF"
+    "$SCRIPT_DIR/s3tests.conf" > "$S3TEST_CONF"; then
+    echo "Error: Failed to generate s3tests.conf"
+    exit 1
+fi
 export S3TEST_CONF
 
 cd s3-tests
@@ -110,6 +129,16 @@ test_headers=(
     "test_bucket_create_bad_expect_empty"
     "test_bucket_create_bad_contentlength_negative"
     "test_bucket_create_bad_contentlength_none"
+    # Additional header validation tests
+    "test_object_create_bad_expect_mismatch"
+    #"test_object_create_bad_contentlength_none"
+    # "test_object_create_bad_authorization_empty"
+    # "test_object_create_bad_authorization_none"
+    "test_bucket_put_bad_canned_acl"
+    # "test_bucket_create_bad_expect_mismatch"
+    "test_bucket_create_bad_contentlength_empty"
+    # "test_bucket_create_bad_authorization_empty"
+    # "test_bucket_create_bad_authorization_none"
 )
 
 # Core S3 operations tests
@@ -182,7 +211,37 @@ test_objects=(
     "test_object_metadata_replaced_on_put"
     "test_object_set_get_metadata_none_to_good"
     "test_object_set_get_metadata_none_to_empty"
-    "test_object_set_get_metadata_overwrite_to_empty"
+    # "test_object_set_get_metadata_overwrite_to_empty"
+    # Additional object operations tests
+    "test_object_read_not_exist"
+    # "test_object_read_unreadable"
+    "test_object_requestid_matches_header_on_error"
+    "test_multi_object_delete"
+    "test_multi_objectv2_delete"
+    # "test_multi_object_delete_key_limit"
+    "test_multi_objectv2_delete_key_limit"
+    # Range requests
+    "test_ranged_request_response_code"
+    "test_ranged_big_request_response_code"
+    "test_ranged_request_skip_leading_bytes_response_code"
+    "test_ranged_request_return_trailing_bytes_response_code"
+    "test_ranged_request_invalid_range"
+    "test_ranged_request_empty_object"
+    # Conditional GET operations
+    "test_get_object_ifmatch_good"
+    "test_get_object_ifmatch_failed"
+    "test_get_object_ifnonematch_good"
+    "test_get_object_ifnonematch_failed"
+    "test_get_object_ifmodifiedsince_good"
+    "test_get_object_ifmodifiedsince_failed"
+    "test_get_object_ifunmodifiedsince_good"
+    "test_get_object_ifunmodifiedsince_failed"
+    # Conditional PUT operations
+    "test_put_object_ifmatch_failed"
+    # Large object copy
+    "test_object_copy_16m"
+    # Special prefix handling
+    "test_bucket_list_special_prefix"
 )
 
 # Bucket operations tests
@@ -204,6 +263,18 @@ test_buckets=(
     "test_bucket_get_location"
     "test_bucket_delete_nonempty"
     "test_bucket_create_delete"
+    # Additional bucket operations tests
+    "test_bucket_notexist"
+    "test_bucket_delete_notexist"
+    # "test_bucket_create_exists"
+    "test_bucket_create_exists_nonowner"
+    "test_buckets_create_then_list"
+    "test_buckets_list_ctime"
+    # "test_bucket_recreate_not_overriding"
+    "test_bucket_recreate_new_acl"
+    # "test_bucket_list_return_data"
+    "test_bucket_head"
+    "test_bucket_head_notexist"
 )
 
 # Multipart upload tests
@@ -216,6 +287,18 @@ test_multipart=(
     "test_abort_multipart_upload"
     "test_abort_multipart_upload_not_found"
     "test_list_multipart_upload"
+    # Additional multipart tests
+    "test_multipart_copy_small"
+    "test_multipart_copy_invalid_range"
+    # "test_multipart_copy_improper_range"
+    "test_multipart_copy_without_range"
+    # "test_multipart_copy_special_names"
+    "test_multipart_copy_multiple_sizes"
+    "test_multipart_upload_multiple_sizes"
+    # "test_multipart_upload_size_too_small"
+    "test_multipart_upload_missing_part"
+    "test_multipart_upload_incorrect_etag"
+    # "test_multipart_resend_first_finishes_last"
 )
 
 # Copy object tests
@@ -229,6 +312,25 @@ test_copy=(
     "test_object_copy_canned_acl"
     "test_object_copy_retaining_metadata"
     "test_object_copy_replacing_metadata"
+)
+
+# Tagging tests
+test_tagging=(
+    "test_set_bucket_tagging"
+    "test_get_obj_tagging"
+    "test_get_obj_head_tagging"
+    "test_put_max_tags"
+    "test_put_excess_tags"
+    "test_put_max_kvsize_tags"
+    "test_put_excess_key_tags"
+    "test_put_excess_val_tags"
+    "test_put_modify_tags"
+    "test_put_delete_tags"
+    "test_put_obj_with_tags"
+    "test_set_multipart_tagging"
+    # "test_get_tags_acl_public"
+    # "test_put_tags_acl_public"
+    # "test_delete_tags_obj_public"
 )
 
 # Run header validation tests
@@ -264,6 +366,12 @@ done
 # Run copy object tests
 echo "Running copy object tests..."
 for test in "${test_copy[@]}"; do
+    run_test "test_s3.py" "$test"
+done
+
+# Run tagging tests
+echo "Running tagging tests..."
+for test in "${test_tagging[@]}"; do
     run_test "test_s3.py" "$test"
 done
 

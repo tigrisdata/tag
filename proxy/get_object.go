@@ -100,6 +100,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				metrics.RecordCacheHit()
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified")
 				w.Header().Set(XCacheHeader, XCacheHit)
+				w.Header().Set("ETag", meta.ETag)
 				w.WriteHeader(http.StatusNotModified)
 				metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
 				return nil
@@ -112,6 +113,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 						metrics.RecordCacheHit()
 						log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified (time)")
 						w.Header().Set(XCacheHeader, XCacheHit)
+						w.Header().Set("ETag", meta.ETag)
 						w.WriteHeader(http.StatusNotModified)
 						metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
 						return nil
