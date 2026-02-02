@@ -5,9 +5,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,7 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
-	cacheclient "github.com/tigrisdata/ocache/client"
+	"github.com/tigrisdata/ocache/embedded"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
@@ -35,6 +38,13 @@ const (
 	// TestRegion is the region used for testing.
 	TestRegion = "us-east-1"
 )
+
+// sharedEmbeddedCache is a singleton embedded cache instance shared across all cache tests.
+// This avoids Prometheus metrics registration conflicts between tests.
+var sharedEmbeddedCache *embedded.Client
+
+// sharedCacheTempDir is the temp directory for the shared embedded cache.
+var sharedCacheTempDir string
 
 // XCacheStatus represents the possible X-Cache header values.
 type XCacheStatus string
@@ -195,8 +205,8 @@ type TestEnvironment struct {
 	Signer *auth.RequestSigner
 	// S3Backend is the in-memory S3 backend (nil if using custom handler).
 	S3Backend *s3mem.Backend
-	// MemoryCache is the in-memory cache client for cache-enabled tests (nil for non-cache tests).
-	MemoryCache *cacheclient.MemoryCache
+	// EmbeddedCache is the embedded RocksDB cache for cache-enabled tests (nil for non-cache tests).
+	EmbeddedCache *embedded.Client
 	// UpstreamRequestCount tracks the number of requests made to upstream (for coalescing tests).
 	UpstreamRequestCount *int32
 	// XCacheTracker tracks X-Cache headers from TAG server responses.
@@ -236,9 +246,14 @@ func NewTestEnvironmentWithHandler(upstreamHandler http.HandlerFunc) *TestEnviro
 	return newTestEnvironmentWithUpstream(upstream, nil)
 }
 
-// NewTestEnvironmentWithCache creates a test environment with caching enabled using an in-memory cache.
-// This uses cacheclient.NewMemoryCache() from ocache for integration testing cache behavior.
+// NewTestEnvironmentWithCache creates a test environment with caching enabled using embedded RocksDB cache.
+// This uses a shared embedded cache instance (initialized in TestMain) for realistic integration testing.
+// The shared cache avoids Prometheus metrics registration conflicts between tests.
 func NewTestEnvironmentWithCache() *TestEnvironment {
+	if sharedEmbeddedCache == nil {
+		panic("Shared embedded cache not initialized - TestMain must run first")
+	}
+
 	// Create in-memory S3 backend
 	backend := s3mem.New()
 	faker := gofakes3.New(backend)
@@ -270,15 +285,14 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 			Region:   TestRegion,
 		},
 		Cache: config.CacheConfig{
-			Enabled:       true, // Cache enabled for these tests
 			TTL:           config.DefaultCacheTTL,
 			SizeThreshold: config.DefaultCacheSizeThreshold,
+			// Enabled defaults to true via IsEnabled() when nil
 		},
 	}
 
-	// Create in-memory cache using ocache's MemoryCache
-	memoryCache := cacheclient.NewMemoryCache()
-	testCache := cache.NewCacheWithClient(memoryCache, &cfg.Cache)
+	// Wrap shared embedded cache with cache.Cache interface
+	testCache := cache.NewCacheWithClient(sharedEmbeddedCache, &cfg.Cache)
 
 	// Create forwarder
 	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost)
@@ -306,7 +320,7 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 		Service:              service,
 		Signer:               signer,
 		S3Backend:            backend,
-		MemoryCache:          memoryCache,
+		EmbeddedCache:        sharedEmbeddedCache,
 		UpstreamRequestCount: &requestCount,
 		XCacheTracker:        xCacheTracker,
 	}
@@ -329,14 +343,14 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 			Region:   TestRegion,
 		},
 		Cache: config.CacheConfig{
-			Enabled:       false, // Cache disabled for integration tests
 			TTL:           config.DefaultCacheTTL,
 			SizeThreshold: config.DefaultCacheSizeThreshold,
 		},
 	}
+	cfg.Cache.SetEnabled(false) // Cache disabled for integration tests
 
 	// Create disabled cache
-	testCache, _ := cache.NewCache(&cfg.Cache)
+	testCache := cache.NewDisabledCache()
 
 	// Create forwarder
 	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost)
@@ -376,7 +390,9 @@ func (e *TestEnvironment) Close() {
 	if e.UpstreamServer != nil {
 		e.UpstreamServer.Close()
 	}
-	if e.Cache != nil {
+	// Only close cache if it's NOT using the shared embedded cache
+	// The shared cache is managed by TestMain
+	if e.Cache != nil && e.EmbeddedCache != sharedEmbeddedCache {
 		e.Cache.Close()
 	}
 }
@@ -550,7 +566,7 @@ func (e *TestEnvironment) ResetUpstreamRequestCount() {
 // GetCachedObject reads an object directly from the cache for test verification.
 // Returns (body, found). If not found or cache is disabled, returns (nil, false).
 func (e *TestEnvironment) GetCachedObject(bucket, key string) ([]byte, bool) {
-	if e.MemoryCache == nil {
+	if e.EmbeddedCache == nil {
 		return nil, false
 	}
 
@@ -558,7 +574,7 @@ func (e *TestEnvironment) GetCachedObject(bucket, key string) ([]byte, bool) {
 	bodyKey := "body|" + bucket + "|" + key
 	// Body is stored via PutStream, so we need to use GetStream to retrieve it
 	var buf bytes.Buffer
-	err := e.MemoryCache.GetStream(context.Background(), bodyKey, &buf)
+	err := e.EmbeddedCache.GetStream(context.Background(), bodyKey, &buf)
 	if err != nil {
 		return nil, false
 	}
@@ -568,13 +584,13 @@ func (e *TestEnvironment) GetCachedObject(bucket, key string) ([]byte, bool) {
 // GetCachedMeta reads object metadata directly from the cache for test verification.
 // Returns (metadata bytes, found). If not found or cache is disabled, returns (nil, false).
 func (e *TestEnvironment) GetCachedMeta(bucket, key string) ([]byte, bool) {
-	if e.MemoryCache == nil {
+	if e.EmbeddedCache == nil {
 		return nil, false
 	}
 
 	// Use the same key format as the cache package
 	metaKey := "meta|" + bucket + "|" + key
-	meta, err := e.MemoryCache.Get(context.Background(), metaKey)
+	meta, err := e.EmbeddedCache.Get(context.Background(), metaKey)
 	if err != nil || meta == nil {
 		return nil, false
 	}
@@ -644,4 +660,105 @@ func (e *TestEnvironment) AssertXCacheStatusFor(t *testing.T, bucket, key string
 	if status != expected {
 		t.Errorf("Expected X-Cache: %s for %s/%s, got: %s", expected, bucket, key, status)
 	}
+}
+
+// waitForCondition polls until condition returns true or timeout expires.
+// Returns true if condition became true, false if timeout expired.
+func waitForCondition(condition func() bool, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// WaitForCached waits for an object to appear in cache with polling and timeout.
+// Returns true if the object is cached within the timeout, false otherwise.
+func (e *TestEnvironment) WaitForCached(bucket, key string, timeout time.Duration) bool {
+	return waitForCondition(func() bool { return e.IsCached(bucket, key) }, timeout)
+}
+
+// WaitForNotCached waits for an object to be removed from cache with polling and timeout.
+// Returns true if the object is NOT in cache within the timeout, false otherwise.
+func (e *TestEnvironment) WaitForNotCached(bucket, key string, timeout time.Duration) bool {
+	return waitForCondition(func() bool { return !e.IsCached(bucket, key) }, timeout)
+}
+
+// setupSharedCache initializes the shared embedded cache instance.
+func setupSharedCache() error {
+	// Create temp directory for embedded cache
+	tempDir, err := os.MkdirTemp("", "tag-test-cache-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp dir for cache: %w", err)
+	}
+	sharedCacheTempDir = tempDir
+
+	// Get free ports for embedded cache cluster and gRPC
+	clusterPort, err := getFreePortForMain()
+	if err != nil {
+		os.RemoveAll(tempDir)
+		return fmt.Errorf("failed to get free port for cluster: %w", err)
+	}
+	grpcPort, err := getFreePortForMain()
+	if err != nil {
+		os.RemoveAll(tempDir)
+		return fmt.Errorf("failed to get free port for gRPC: %w", err)
+	}
+
+	// Initialize embedded cache
+	embeddedCache, err := embedded.New(&embedded.Config{
+		DiskPath:    tempDir,
+		TTL:         config.DefaultCacheTTL,
+		NodeID:      "test-node",
+		ClusterAddr: fmt.Sprintf(":%d", clusterPort),
+		GRPCAddr:    fmt.Sprintf(":%d", grpcPort),
+	})
+	if err != nil {
+		os.RemoveAll(tempDir)
+		return fmt.Errorf("failed to initialize embedded cache: %w", err)
+	}
+
+	// Start gRPC server
+	if err := embeddedCache.StartGRPCServer(); err != nil {
+		embeddedCache.Close()
+		os.RemoveAll(tempDir)
+		return fmt.Errorf("failed to start embedded cache gRPC: %w", err)
+	}
+
+	// Wait for ready
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := embeddedCache.WaitReady(ctx); err != nil {
+		cancel()
+		// Continue anyway - single node should be ready
+	}
+	cancel()
+
+	sharedEmbeddedCache = embeddedCache
+	return nil
+}
+
+// teardownSharedCache cleans up the shared embedded cache.
+func teardownSharedCache() {
+	if sharedEmbeddedCache != nil {
+		sharedEmbeddedCache.Close()
+		sharedEmbeddedCache = nil
+	}
+	if sharedCacheTempDir != "" {
+		os.RemoveAll(sharedCacheTempDir)
+		sharedCacheTempDir = ""
+	}
+}
+
+// getFreePortForMain returns a free TCP port (used in TestMain before tests run).
+func getFreePortForMain() (int, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	return port, nil
 }

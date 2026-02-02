@@ -16,8 +16,11 @@ const (
 	// DefaultChunkSize is the default size of chunks for streaming (64 KB).
 	DefaultChunkSize = 64 * 1024
 	// DefaultChannelBuffer is the default number of chunks to buffer per listener.
-	// With 64KB chunks, this is ~2MB buffer per listener.
-	DefaultChannelBuffer = 32
+	// With 64KB chunks, this is ~64MB buffer per listener, providing sufficient
+	// tolerance for temporary slowdowns before disconnecting slow consumers.
+	// Increased from 64 to 1024 to handle large objects (64MB+) where cache writes
+	// are slower than origin streaming.
+	DefaultChannelBuffer = 1024
 )
 
 // ErrSlowConsumer indicates a listener was disconnected for being too slow.
@@ -138,7 +141,7 @@ func (b *Broadcaster) SetHeaders(status int, headers http.Header) {
 }
 
 // Broadcast sends a chunk to all listeners.
-// Slow consumers (channel full) are disconnected to prevent blocking fast consumers.
+// Slow consumers (buffer full) are disconnected immediately.
 func (b *Broadcaster) Broadcast(data []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -158,21 +161,19 @@ func (b *Broadcaster) Broadcast(data []byte) {
 		chunk := Chunk{Data: make([]byte, len(data))}
 		copy(chunk.Data, data)
 
+		// Non-blocking send - disconnect immediately if buffer is full
 		select {
 		case l.ch <- chunk:
-			// Sent successfully - keep this listener
 			activeListeners = append(activeListeners, l)
 		default:
-			// Channel full - disconnect slow consumer
+			// Buffer full - disconnect slow consumer
 			l.disconnected = true
-			// Try to send error, but don't block
 			select {
 			case l.ch <- Chunk{Err: ErrSlowConsumer}:
 			default:
 			}
 			close(l.ch)
-			// Don't add to activeListeners - listener is removed
-			log.Warn().Msg("Disconnecting slow consumer from broadcast")
+			log.Warn().Msg("Disconnecting slow consumer from broadcast (buffer full)")
 		}
 	}
 	b.listeners = activeListeners
@@ -189,16 +190,21 @@ func (b *Broadcaster) Complete(err error) {
 
 	b.done = true
 	b.err = err
+	close(b.doneCh)
 
-	// Send final chunk with error status and close channels
+	// Send final chunk and close all listener channels.
+	// Non-blocking send: if buffer is full, skip the error chunk.
+	// Correctness is guaranteed by the tombstone mechanism in cache writes,
+	// which prevents stale data from being cached even if error delivery fails.
 	for _, l := range b.listeners {
 		if !l.disconnected {
-			l.ch <- Chunk{Err: err}
+			select {
+			case l.ch <- Chunk{Err: err}:
+			default:
+			}
 			close(l.ch)
 		}
 	}
-
-	close(b.doneCh)
 }
 
 // Done returns a channel that's closed when broadcast is complete.

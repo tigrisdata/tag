@@ -325,6 +325,33 @@ func TestManagerActiveCount(t *testing.T) {
 	}
 }
 
+// TestBroadcasterCompleteWithSlowConsumer tests that Complete() and Broadcast()
+// work correctly when there are slow consumers that get disconnected.
+func TestBroadcasterCompleteWithSlowConsumer(t *testing.T) {
+	// Use small buffer to easily trigger slow consumer disconnect
+	b := NewBroadcaster(1)
+
+	// Subscribe a slow listener that never reads
+	slowListener := b.Subscribe()
+	_ = slowListener // We won't read from this one
+
+	b.SetHeaders(http.StatusOK, http.Header{})
+
+	// Fill the buffer
+	b.Broadcast([]byte("chunk1"))
+
+	// This should disconnect the slow consumer immediately (buffer full)
+	b.Broadcast([]byte("chunk2"))
+
+	// Complete should work fine even with disconnected consumers
+	b.Complete(nil)
+
+	// Verify slow consumer was disconnected
+	if b.ListenerCount() != 0 {
+		t.Errorf("Expected 0 listeners after slow consumer disconnect, got %d", b.ListenerCount())
+	}
+}
+
 func TestConcurrentRequestsCoalescing(t *testing.T) {
 	m := NewManager(DefaultChannelBuffer)
 

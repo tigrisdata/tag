@@ -3,6 +3,7 @@ package cache
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"strings"
@@ -27,56 +28,29 @@ type Cache struct {
 	closed     bool
 }
 
-// NewCache creates a new cache instance that connects to an external ocache cluster.
-func NewCache(cfg *config.CacheConfig) (*Cache, error) {
-	// If not enabled or no endpoints, return a disabled cache
-	if !cfg.Enabled || len(cfg.Endpoints) == 0 {
-		log.Info().Msg("Cache disabled - no ocache endpoints configured")
-		return &Cache{
-			enabled:    false,
-			defaultTTL: int64(cfg.TTL.Seconds()),
-		}, nil
-	}
-
-	log.Info().
-		Strs("endpoints", cfg.Endpoints).
-		Dur("default_ttl", cfg.TTL).
-		Int("connection_pool_size", cfg.ConnectionPoolSize).
-		Msg("Connecting to ocache cluster")
-
-	// Create client with custom connection pool size for high-throughput workloads
-	clientConfig := &cacheclient.ClientConfig{
-		Addrs:              cfg.Endpoints,
-		ConnectionPoolSize: cfg.ConnectionPoolSize,
-	}
-	client, err := cacheclient.NewWithConfig(clientConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	log.Info().
-		Str("mode", string(client.GetMode())).
-		Strs("connected_nodes", client.GetConnectedNodes()).
-		Msg("Connected to ocache cluster")
-
-	return &Cache{
-		client:     client,
-		defaultTTL: int64(cfg.TTL.Seconds()),
-		enabled:    true,
-	}, nil
-}
-
-// NewCacheWithClient creates a cache with an injected client (for testing).
+// NewCacheWithClient creates a cache with an injected client.
 // This allows tests to use an in-memory cache implementation like cacheclient.NewMemoryCache().
 func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig) *Cache {
 	ttl := int64(3600) // Default 1 hour
-	if cfg != nil && cfg.TTL > 0 {
-		ttl = int64(cfg.TTL.Seconds())
+	enabled := true    // Default to enabled
+	if cfg != nil {
+		if cfg.TTL > 0 {
+			ttl = int64(cfg.TTL.Seconds())
+		}
+		enabled = cfg.IsEnabled()
 	}
 	return &Cache{
 		client:     client,
 		defaultTTL: ttl,
-		enabled:    true,
+		enabled:    enabled,
+	}
+}
+
+// NewDisabledCache creates a cache that is disabled.
+// All operations return successfully with "not found" or nil results.
+func NewDisabledCache() *Cache {
+	return &Cache{
+		enabled: false,
 	}
 }
 
@@ -91,6 +65,9 @@ func (c *Cache) IsEnabled() bool {
 
 // PutWithMeta stores object metadata and body in separate cache entries.
 // This follows the gateway's LiteCache pattern for proper S3 caching.
+// IMPORTANT: Body is written BEFORE metadata to ensure metadata presence
+// guarantees body availability. This prevents race conditions where a reader
+// finds metadata but body hasn't been written yet.
 func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *CachedObjectMeta, body []byte, ttl int) error {
 	if !c.IsEnabled() {
 		return nil
@@ -110,17 +87,18 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 		return err
 	}
 
-	// Store metadata
-	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
+	// Store body FIRST (can be empty for zero-byte objects)
+	// This ensures metadata presence guarantees body availability
+	if err := c.client.Put(ctx, bodyKey, body, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
 		return err
 	}
 
-	// Store body (can be empty for zero-byte objects)
-	if err := c.client.Put(ctx, bodyKey, body, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
-		// Try to clean up metadata on body failure
-		_ = c.client.Delete(ctx, metaKey)
+	// Store metadata AFTER body is complete
+	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
+		// Try to clean up body on metadata failure
+		_ = c.client.Delete(ctx, bodyKey)
 		return err
 	}
 
@@ -134,9 +112,18 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 	return nil
 }
 
-// PutWithMetaStream stores object metadata and streams body to cache.
-// Use this for large objects to avoid buffering the entire body in memory.
-func (c *Cache) PutWithMetaStream(ctx context.Context, bucket, key string, meta *CachedObjectMeta, body io.Reader, ttl int) error {
+// PutWithMetaStreamTombstoneAware is like PutWithMetaStream but checks for
+// tombstones before writing metadata. If a tombstone exists that's newer than
+// writeStartTime, the metadata write is skipped (preventing stale cache).
+// This is used by async cache writers to avoid caching stale data after invalidation.
+func (c *Cache) PutWithMetaStreamTombstoneAware(
+	ctx context.Context,
+	bucket, key string,
+	meta *CachedObjectMeta,
+	body io.Reader,
+	ttl int,
+	writeStartTime int64, // Unix nano timestamp when write started
+) error {
 	if !c.IsEnabled() {
 		return nil
 	}
@@ -148,24 +135,36 @@ func (c *Cache) PutWithMetaStream(ctx context.Context, bucket, key string, meta 
 	metaKey := MakeMetaKey(bucket, key)
 	bodyKey := MakeBodyKey(bucket, key)
 
-	// Encode metadata as JSON
+	// Encode metadata first (fail fast if encoding fails)
 	metaBytes, err := meta.Encode()
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta encode error")
 		return err
 	}
 
-	// Store metadata first
-	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
+	// Stream body to cache FIRST
+	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
 		return err
 	}
 
-	// Stream body to cache
-	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
-		// Try to clean up metadata on body failure
-		_ = c.client.Delete(ctx, metaKey)
+	// CHECK TOMBSTONE before writing metadata
+	// If a tombstone exists with timestamp > writeStartTime, the key was invalidated
+	// after this write started, so we should NOT write metadata (keeps entry invisible)
+	tombTs := c.GetTombstoneTimestamp(ctx, bucket, key)
+	if tombTs > writeStartTime {
+		log.Debug().Str("bucket", bucket).Str("key", key).
+			Int64("tombstone_ts", tombTs).
+			Int64("write_start", writeStartTime).
+			Msg("Skipping metadata write - tombstone detected (key was invalidated)")
+		// Body is orphaned but will be overwritten by next write or expire via TTL
+		return nil
+	}
+
+	// Write metadata AFTER body (makes entry visible)
+	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
+		_ = c.client.Delete(ctx, bodyKey)
 		return err
 	}
 
@@ -174,7 +173,7 @@ func (c *Cache) PutWithMetaStream(ctx context.Context, bucket, key string, meta 
 		Str("key", key).
 		Int("ttl", ttl).
 		Int("meta_size", len(metaBytes)).
-		Msg("Cached object with metadata (streamed)")
+		Msg("Cached object with metadata (streamed, tombstone-aware)")
 	return nil
 }
 
@@ -302,9 +301,16 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key string, w io.Writ
 }
 
 // DeleteWithMeta removes both metadata and body from cache.
+// Writes a tombstone first to prevent in-flight cache writes from completing.
 func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	if !c.IsEnabled() {
 		return nil
+	}
+
+	// Write tombstone FIRST - prevents in-flight writes from completing
+	if err := c.WriteTombstone(ctx, bucket, key); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).
+			Msg("Failed to write tombstone (continuing with delete)")
 	}
 
 	metaKey := MakeMetaKey(bucket, key)
@@ -392,6 +398,42 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key string, start, e
 		Int64("length", end-start+1).
 		Msg("Cache hit (range)")
 	return nil
+}
+
+// ============================================================================
+// Tombstone methods for cache invalidation
+// ============================================================================
+
+// tombstoneTTL is the TTL for tombstone entries (60 seconds).
+// Tombstones only need to outlive in-flight cache writes.
+const tombstoneTTL = 60
+
+// WriteTombstone writes an invalidation marker for a key.
+// The value is the timestamp as 8 bytes (int64 big-endian).
+// This is used to prevent stale cache writes from completing after invalidation.
+func (c *Cache) WriteTombstone(ctx context.Context, bucket, key string) error {
+	if !c.IsEnabled() {
+		return nil
+	}
+	tombKey := MakeTombstoneKey(bucket, key)
+	ts := time.Now().UnixNano()
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, uint64(ts))
+	return c.client.Put(ctx, tombKey, data, tombstoneTTL)
+}
+
+// GetTombstoneTimestamp retrieves the tombstone timestamp for a key.
+// Returns 0 if no tombstone exists.
+func (c *Cache) GetTombstoneTimestamp(ctx context.Context, bucket, key string) int64 {
+	if !c.IsEnabled() {
+		return 0
+	}
+	tombKey := MakeTombstoneKey(bucket, key)
+	data, err := c.client.Get(ctx, tombKey)
+	if err != nil || len(data) != 8 {
+		return 0 // No tombstone or invalid data
+	}
+	return int64(binary.BigEndian.Uint64(data))
 }
 
 // ============================================================================
