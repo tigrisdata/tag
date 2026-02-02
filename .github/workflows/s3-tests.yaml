@@ -46,18 +46,14 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
-      - name: Start test infrastructure
+      - name: Install system dependencies
+        run: make install-deps
+
+      - name: Start TAG (local mode)
         env:
-          GH_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: make s3-test-infra
-
-      - name: Wait for services to be ready
-        run: |
-          echo "Waiting for TAG to be ready..."
-          timeout 60 bash -c 'until curl -s http://localhost:8080/health > /dev/null 2>&1; do sleep 2; done'
-          echo "TAG is ready!"
+        run: make s3-test-local
 
       - name: Run S3 compatibility tests
         env:
@@ -65,10 +61,6 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: make s3-tests
 
-      - name: Show TAG logs on failure
-        if: failure()
-        run: docker compose -f tests/s3compat/docker-compose.yml logs tag
-
       - name: Cleanup
         if: always()
-        run: make s3-test-infra-down
+        run: make s3-test-local-down

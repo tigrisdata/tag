@@ -14,6 +14,7 @@ const (
 	// Cache key prefixes for separate metadata and body storage
 	metaKeyPrefix = "meta|"
 	bodyKeyPrefix = "body|"
+	tombKeyPrefix = "tomb|"
 )
 
 // CachedObjectMeta represents cached S3 object metadata.
@@ -169,4 +170,9 @@ func MakeMetaKey(bucket, key string) string {
 // MakeBodyKey creates the cache key for object body.
 func MakeBodyKey(bucket, key string) string {
 	return bodyKeyPrefix + bucket + "|" + key
+}
+
+// MakeTombstoneKey creates the cache key for invalidation tombstones.
+func MakeTombstoneKey(bucket, key string) string {
+	return tombKeyPrefix + bucket + "|" + key
 }

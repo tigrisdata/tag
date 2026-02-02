@@ -1,51 +1,30 @@
-# Build stage
-FROM golang:1.24-alpine AS builder
-
-# Install git and ca-certificates (needed for go mod download)
-RUN apk add --no-cache git ca-certificates
-
-# Configure GOPRIVATE for tigrisdata modules
-ENV GOPRIVATE=github.com/tigrisdata
-
-WORKDIR /app
-
-# Copy go mod files
-COPY go.mod go.sum ./
-
-# Download dependencies with git auth for private modules
-RUN --mount=type=secret,id=git_auth_token \
-    if [ -f /run/secrets/git_auth_token ]; then \
-      git config --global url."https://x-access-token:$(cat /run/secrets/git_auth_token)@github.com/".insteadOf "https://github.com/"; \
-    fi && \
-    go mod download
-
-# Copy source code
-COPY . .
-
-# Build statically linked binary (no CGO needed - TAG is stateless)
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /tag ./cmd/tag
-
-# Runtime stage - minimal image
 FROM alpine:3.21
 
-# Install ca-certificates for HTTPS upstream connections
-RUN apk add --no-cache ca-certificates
+ARG TARGETARCH
+
+# Install minimal runtime dependencies
+RUN apk add --no-cache ca-certificates tzdata wget
 
 # Create non-root user
-RUN adduser -D -u 1000 tag
+RUN addgroup -g 1000 tag && \
+    adduser -u 1000 -G tag -h /home/tag -D tag
 
-# Copy binary
-COPY --from=builder /tag /usr/local/bin/tag
+# Copy pre-built binary (downloaded by workflow)
+COPY --chmod=755 bin/${TARGETARCH}/tag /usr/local/bin/tag
 
-# Switch to non-root user
+# Create cache directory
+RUN mkdir -p /var/cache/tag && chown -R tag:tag /var/cache/tag
+
 USER tag
+VOLUME ["/var/cache/tag"]
 
-# Expose HTTP port only (TAG is stateless - connects to external ocache)
+# Expose ports:
 # 8080 - HTTP (S3 API)
-EXPOSE 8080
+# 7000 - Memberlist gossip (cluster discovery)
+# 9000 - gRPC (cache routing)
+EXPOSE 8080 7000 9000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD wget -q --spider http://localhost:8080/health || exit 1
 
 ENTRYPOINT ["tag"]

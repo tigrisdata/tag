@@ -100,6 +100,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				metrics.RecordCacheHit()
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified")
 				w.Header().Set(XCacheHeader, XCacheHit)
+				w.Header().Set("ETag", meta.ETag)
 				w.WriteHeader(http.StatusNotModified)
 				metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
 				return nil
@@ -112,6 +113,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 						metrics.RecordCacheHit()
 						log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified (time)")
 						w.Header().Set(XCacheHeader, XCacheHit)
+						w.Header().Set("ETag", meta.ETag)
 						w.WriteHeader(http.StatusNotModified)
 						metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
 						return nil
@@ -617,7 +619,24 @@ func (s *Service) handleRangeWithBackgroundCache(
 	// Format: "bytes 0-499/1234" where 1234 is total size
 	totalSize := extractTotalSizeFromContentRange(resp.Header.Get("Content-Range"))
 
-	// Trigger background fetch if:
+	// Write response headers
+	copyHeaders(w.Header(), resp.Header)
+	w.Header().Set(XCacheHeader, XCacheMiss)
+	w.WriteHeader(resp.StatusCode)
+
+	// Stream Range response body to client FIRST (before background fetch)
+	// This ensures the client request completes without resource contention
+	n, err := io.Copy(w, resp.Body)
+	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to copy range response body")
+		return err
+	}
+
+	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+
+	// Trigger background fetch AFTER streaming completes to avoid resource contention.
+	// Conditions:
 	// - Response is 206 Partial Content (successful range response)
 	// - Total size is known and within cache threshold
 	// - Cache is enabled
@@ -630,19 +649,5 @@ func (s *Service) handleRangeWithBackgroundCache(
 		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey)
 	}
 
-	// Write response headers
-	copyHeaders(w.Header(), resp.Header)
-	w.Header().Set(XCacheHeader, XCacheMiss)
-	w.WriteHeader(resp.StatusCode)
-
-	// Stream Range response body to client
-	n, err := io.Copy(w, resp.Body)
-	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to copy range response body")
-		return err
-	}
-
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
 	return nil
 }

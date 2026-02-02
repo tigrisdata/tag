@@ -12,7 +12,8 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
-	github.com/tigrisdata/ocache/client v1.2.0
+	github.com/tigrisdata/ocache/client v1.2.3
+	github.com/tigrisdata/ocache/embedded v1.2.3
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -42,6 +43,7 @@ require (
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/btree v1.0.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/grafana/dskit v0.0.0-20240104111617-ea101a3b86eb // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.26.3 // indirect
 	github.com/hashicorp/consul/api v1.15.3 // indirect
@@ -54,8 +56,10 @@ require (
 	github.com/hashicorp/go-rootcerts v1.0.2 // indirect
 	github.com/hashicorp/go-sockaddr v1.0.2 // indirect
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
+	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/hashicorp/memberlist v0.3.1 // indirect
 	github.com/hashicorp/serf v0.9.7 // indirect
+	github.com/linxGnu/grocksdb v1.10.1 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect
 	github.com/miekg/dns v1.1.50 // indirect
@@ -70,10 +74,12 @@ require (
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46 // indirect
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
-	github.com/tigrisdata/ocache/common v1.2.0 // indirect
-	github.com/tigrisdata/ocache/coordinator v1.2.0 // indirect
-	github.com/tigrisdata/ocache/coordinator/proto v1.2.0 // indirect
-	github.com/tigrisdata/ocache/proto v1.2.0 // indirect
+	github.com/tigrisdata/ocache/common v1.2.3 // indirect
+	github.com/tigrisdata/ocache/coordinator v1.2.3 // indirect
+	github.com/tigrisdata/ocache/coordinator/proto v1.2.3 // indirect
+	github.com/tigrisdata/ocache/proto v1.2.3 // indirect
+	github.com/tigrisdata/ocache/server v1.2.3 // indirect
+	github.com/tigrisdata/ocache/storage v1.2.3 // indirect
 	github.com/uber/jaeger-client-go v2.28.0+incompatible // indirect
 	github.com/uber/jaeger-lib v2.2.0+incompatible // indirect
 	go.etcd.io/etcd/api/v3 v3.5.0 // indirect

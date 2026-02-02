@@ -18,11 +18,13 @@ upstream:
   region: "us-west-2"
 cache:
   enabled: true
-  endpoints:
-    - "cache-0:9000"
-    - "cache-1:9000"
   ttl: 10m
   size_threshold: 104857600
+  disk_path: "/var/cache/custom"
+  node_id: "test-node-1"
+  seed_nodes:
+    - "node-0:7000"
+    - "node-1:7000"
 log:
   level: "debug"
 `
@@ -54,17 +56,23 @@ log:
 	}
 
 	// Verify cache config
-	if !cfg.Cache.Enabled {
-		t.Error("Cache.Enabled = false, want true")
-	}
-	if len(cfg.Cache.Endpoints) != 2 {
-		t.Errorf("Cache.Endpoints length = %d, want 2", len(cfg.Cache.Endpoints))
+	if !cfg.Cache.IsEnabled() {
+		t.Error("Cache.IsEnabled() = false, want true")
 	}
 	if cfg.Cache.TTL != 10*time.Minute {
 		t.Errorf("Cache.TTL = %v, want 10m", cfg.Cache.TTL)
 	}
 	if cfg.Cache.SizeThreshold != 104857600 {
 		t.Errorf("Cache.SizeThreshold = %d, want 104857600", cfg.Cache.SizeThreshold)
+	}
+	if cfg.Cache.DiskPath != "/var/cache/custom" {
+		t.Errorf("Cache.DiskPath = %q, want /var/cache/custom", cfg.Cache.DiskPath)
+	}
+	if cfg.Cache.NodeID != "test-node-1" {
+		t.Errorf("Cache.NodeID = %q, want test-node-1", cfg.Cache.NodeID)
+	}
+	if len(cfg.Cache.SeedNodes) != 2 {
+		t.Errorf("Cache.SeedNodes length = %d, want 2", len(cfg.Cache.SeedNodes))
 	}
 
 	// Verify log config
@@ -127,7 +135,9 @@ log:
 
 	// Set environment variables
 	t.Setenv("TAG_UPSTREAM_ENDPOINT", "https://env.endpoint.com")
-	t.Setenv("TAG_OCACHE_ENDPOINTS", "env-cache-0:9000,env-cache-1:9000")
+	t.Setenv("TAG_CACHE_NODE_ID", "env-node-1")
+	t.Setenv("TAG_CACHE_DISK_PATH", "/env/cache/path")
+	t.Setenv("TAG_CACHE_SEED_NODES", "env-node-0:7000,env-node-1:7000")
 	t.Setenv("TAG_LOG_LEVEL", "warn")
 
 	cfg, err := Load(tmpFile)
@@ -139,11 +149,14 @@ log:
 	if cfg.Upstream.Endpoint != "https://env.endpoint.com" {
 		t.Errorf("Upstream.Endpoint = %q, want https://env.endpoint.com", cfg.Upstream.Endpoint)
 	}
-	if len(cfg.Cache.Endpoints) != 2 {
-		t.Errorf("Cache.Endpoints length = %d, want 2", len(cfg.Cache.Endpoints))
+	if cfg.Cache.NodeID != "env-node-1" {
+		t.Errorf("Cache.NodeID = %q, want env-node-1", cfg.Cache.NodeID)
 	}
-	if cfg.Cache.Endpoints[0] != "env-cache-0:9000" {
-		t.Errorf("Cache.Endpoints[0] = %q, want env-cache-0:9000", cfg.Cache.Endpoints[0])
+	if cfg.Cache.DiskPath != "/env/cache/path" {
+		t.Errorf("Cache.DiskPath = %q, want /env/cache/path", cfg.Cache.DiskPath)
+	}
+	if len(cfg.Cache.SeedNodes) != 2 {
+		t.Errorf("Cache.SeedNodes length = %d, want 2", len(cfg.Cache.SeedNodes))
 	}
 	if cfg.Log.Level != "warn" {
 		t.Errorf("Log.Level = %q, want warn", cfg.Log.Level)
@@ -155,8 +168,7 @@ func TestLoad_CacheDisabledByEnv(t *testing.T) {
 	content := `
 cache:
   enabled: true
-  endpoints:
-    - "cache-0:9000"
+  node_id: "test-node"
 `
 
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
@@ -173,8 +185,8 @@ cache:
 	}
 
 	// Verify cache is disabled
-	if cfg.Cache.Enabled {
-		t.Error("Cache.Enabled = true, want false (disabled by env)")
+	if cfg.Cache.IsEnabled() {
+		t.Error("Cache.IsEnabled() = true, want false (disabled by env)")
 	}
 }
 
@@ -264,33 +276,8 @@ func TestSplitEndpoints(t *testing.T) {
 	}
 }
 
-func TestCacheAutoEnabled(t *testing.T) {
-	// Create a config file with cache endpoints but enabled not explicitly set
-	content := `
-cache:
-  endpoints:
-    - "cache-0:9000"
-    - "cache-1:9000"
-`
-
-	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
-		t.Fatalf("Failed to create temp file: %v", err)
-	}
-
-	cfg, err := Load(tmpFile)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-
-	// Verify cache is auto-enabled when endpoints are configured
-	if !cfg.Cache.Enabled {
-		t.Error("Cache.Enabled = false, want true (auto-enabled with endpoints)")
-	}
-}
-
-func TestCacheAutoEnabledFromEnv(t *testing.T) {
-	// Create a config file WITHOUT cache endpoints
+func TestCacheEnabledByDefault(t *testing.T) {
+	// Create a minimal config file
 	content := `
 server:
   http_port: 8080
@@ -301,37 +288,58 @@ server:
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
-	// Set cache endpoints via environment variable
-	t.Setenv("TAG_OCACHE_ENDPOINTS", "localhost:9000")
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Verify cache is enabled by default (embedded mode)
+	if !cfg.Cache.IsEnabled() {
+		t.Error("Cache.IsEnabled() = false, want true (enabled by default)")
+	}
+}
+
+func TestCacheDisabledByConfig(t *testing.T) {
+	// Create a config file with cache explicitly disabled
+	content := `
+cache:
+  enabled: false
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
 
 	cfg, err := Load(tmpFile)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	// Verify cache is auto-enabled when endpoints are configured via environment
-	if !cfg.Cache.Enabled {
-		t.Error("Cache.Enabled = false, want true (auto-enabled with endpoints from env)")
-	}
-	if len(cfg.Cache.Endpoints) != 1 {
-		t.Errorf("Cache.Endpoints length = %d, want 1", len(cfg.Cache.Endpoints))
-	}
-	if cfg.Cache.Endpoints[0] != "localhost:9000" {
-		t.Errorf("Cache.Endpoints[0] = %q, want localhost:9000", cfg.Cache.Endpoints[0])
+	// Verify cache is disabled when explicitly set to false in config
+	if cfg.Cache.IsEnabled() {
+		t.Error("Cache.IsEnabled() = true, want false (explicitly disabled in config)")
 	}
 }
 
-func TestNewDefaultCacheAutoEnabledFromEnv(t *testing.T) {
-	// Set cache endpoints via environment variable
-	t.Setenv("TAG_OCACHE_ENDPOINTS", "localhost:9000")
-
+func TestCacheDefaultValues(t *testing.T) {
 	cfg := NewDefault()
 
-	// Verify cache is auto-enabled when endpoints are configured via environment
-	if !cfg.Cache.Enabled {
-		t.Error("Cache.Enabled = false, want true (auto-enabled with endpoints from env)")
+	// Verify cache is enabled by default
+	if !cfg.Cache.IsEnabled() {
+		t.Error("Cache.IsEnabled() = false, want true (enabled by default)")
 	}
-	if len(cfg.Cache.Endpoints) != 1 {
-		t.Errorf("Cache.Endpoints length = %d, want 1", len(cfg.Cache.Endpoints))
+
+	// Verify default disk path
+	if cfg.Cache.DiskPath != DefaultCacheDiskPath {
+		t.Errorf("Cache.DiskPath = %q, want %q", cfg.Cache.DiskPath, DefaultCacheDiskPath)
+	}
+
+	// Verify default cluster and gRPC addresses
+	if cfg.Cache.ClusterAddr != DefaultCacheClusterAddr {
+		t.Errorf("Cache.ClusterAddr = %q, want %q", cfg.Cache.ClusterAddr, DefaultCacheClusterAddr)
+	}
+	if cfg.Cache.GRPCAddr != DefaultCacheGRPCAddr {
+		t.Errorf("Cache.GRPCAddr = %q, want %q", cfg.Cache.GRPCAddr, DefaultCacheGRPCAddr)
 	}
 }

@@ -46,6 +46,9 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Install system dependencies
+        run: make install-deps
+
       - name: Run linting
         run: make lint-ci
 

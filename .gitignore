@@ -18,3 +18,6 @@ coverage.out
 coverage.html
 coverage-integration.out
 coverage-integration.html
+
+# RocksDB static artifacts
+rocksdb-static/

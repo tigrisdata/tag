@@ -49,6 +49,18 @@ jobs:
       - name: Checkout release tag
         run: git checkout ${{ steps.version.outputs.version }}
 
+      - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          mkdir -p docker/bin/amd64 docker/bin/arm64
+
+          gh release download "$VERSION" -p "tag-linux-amd64" -O docker/bin/amd64/tag
+          gh release download "$VERSION" -p "tag-linux-arm64" -O docker/bin/arm64/tag
+
+          chmod +x docker/bin/*/tag
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -74,12 +86,8 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: docker
           file: docker/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
-          build-args: |
-            GOPRIVATE=github.com/tigrisdata
-          secrets: |
-            "git_auth_token=${{ secrets.GH_BOT_ACCESS_TOKEN }}"

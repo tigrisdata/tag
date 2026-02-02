@@ -59,12 +59,12 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Install system dependencies
+        run: make install-deps
+
       - name: Build binary
         run: |
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o tag ./cmd/tag
-
-      - name: Rename binary with platform suffix
-        run: |
+          make build
           mv tag tag-${{ matrix.suffix }}
 
       - name: Upload binary artifact
