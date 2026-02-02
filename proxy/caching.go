@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -14,6 +15,36 @@ import (
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy/broadcast"
 )
+
+// signalingReader wraps an io.Reader and signals when the first Read() is called.
+// This is used to synchronize the cache writer startup with the chunk consumer:
+// we wait until the cache reader is actually blocked on Read() before starting
+// to write chunks, ensuring the pipe never blocks.
+type signalingReader struct {
+	r       io.Reader
+	ready   chan struct{}
+	once    sync.Once
+	readErr error // Store any error from signaling
+}
+
+// newSignalingReader creates a new signaling reader.
+func newSignalingReader(r io.Reader) *signalingReader {
+	return &signalingReader{
+		r:     r,
+		ready: make(chan struct{}),
+	}
+}
+
+// Read implements io.Reader. On first call, it signals that the reader is ready.
+func (s *signalingReader) Read(p []byte) (n int, err error) {
+	s.once.Do(func() { close(s.ready) })
+	return s.r.Read(p)
+}
+
+// Ready returns a channel that is closed when Read() is first called.
+func (s *signalingReader) Ready() <-chan struct{} {
+	return s.ready
+}
 
 const (
 	// cacheWriteTimeout is the timeout for cache writes.
@@ -27,6 +58,14 @@ const (
 // This avoids buffering the entire response in memory.
 // Stores both metadata (from headers) and body in separate cache entries.
 // Uses tombstone-aware writes to prevent stale cache after invalidation.
+//
+// Uses a hybrid signaling reader + intermediate buffer pattern:
+// - io.Pipe has zero buffer, so writes block until reads occur
+// - We start the cache reader FIRST and wait for it to call Read()
+// - Chunks are consumed into an intermediate buffer immediately (non-blocking)
+// - A separate goroutine drains the buffer to the pipe after Ready() signals
+// - The 4MB intermediate buffer absorbs chunks during cache writer initialization
+// - This provides true streaming with O(chunk_size + buffer_size) memory
 func (s *Service) setupCacheListener(
 	ctx context.Context,
 	bucket, key string,
@@ -66,36 +105,108 @@ func (s *Service) setupCacheListener(
 			return
 		}
 
-		// Start a goroutine to stream chunks to the pipe
-		go func() {
-			for chunk := range listener.Chunks() {
-				if chunk.Err != nil {
-					pipeWriter.CloseWithError(chunk.Err)
-					return
-				}
-				if len(chunk.Data) > 0 {
-					if _, writeErr := pipeWriter.Write(chunk.Data); writeErr != nil {
-						pipeWriter.CloseWithError(writeErr)
-						return
-					}
-				}
-			}
-			pipeWriter.Close()
-		}()
-
 		// Use a detached context for cache writes to avoid cancellation when HTTP request completes.
-		// The cache write should continue even after the client has received the response.
 		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
 		defer cacheCancel()
 
-		// Write to cache with metadata (streaming, tombstone-aware)
-		// Tombstone-aware write will skip metadata if key was invalidated after writeStartTime
 		ttl := int(s.config.Cache.TTL.Seconds())
-		cacheErr := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, pipeReader, ttl, writeStartTime)
-		if cacheErr != nil {
-			log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")
+
+		// Wrap pipeReader with signaling reader to know when cache reader is ready
+		sigReader := newSignalingReader(pipeReader)
+
+		// Intermediate buffer absorbs chunks while cache writer initializes.
+		// 1024 chunks × 64KB = 64MB headroom, matching listener buffer size.
+		// This provides ~128ms at 1GB/s for cache initialization before slow consumer.
+		const cacheQueueSize = 1024
+		chunkQueue := make(chan []byte, cacheQueueSize)
+
+		// Start cache writer goroutine - will call Read() when ready
+		cacheErrCh := make(chan error, 1)
+		go func() {
+			cacheErr := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+			if cacheErr != nil {
+				log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")
+			}
+			cacheErrCh <- cacheErr
+		}()
+
+		// Pipe writer goroutine: waits for Ready(), then drains queue to pipe
+		pipeErrCh := make(chan error, 1)
+		go func() {
+			// Wait for cache reader to be ready before writing to pipe
+			select {
+			case <-sigReader.Ready():
+				// Reader is ready, safe to write
+			case <-cacheCtx.Done():
+				pipeErrCh <- cacheCtx.Err()
+				// Drain queue to unblock producer
+				for range chunkQueue {
+				}
+				return
+			}
+
+			// Drain queue to pipe - blocks on writes, which is fine since reader is ready
+			var writeErr error
+			for chunk := range chunkQueue {
+				if _, err := pipeWriter.Write(chunk); err != nil {
+					writeErr = err
+					// Drain remaining to unblock producer
+					for range chunkQueue {
+					}
+					break
+				}
+			}
+			pipeErrCh <- writeErr
+		}()
+
+		// Consume chunks from listener into queue immediately.
+		// This runs in parallel with cache writer initialization,
+		// with the intermediate buffer absorbing chunks during the startup window.
+		var chunkErr error
+	chunkLoop:
+		for chunk := range listener.Chunks() {
+			if chunk.Err != nil {
+				chunkErr = chunk.Err
+				break
+			}
+			if len(chunk.Data) > 0 {
+				// Copy chunk data since broadcaster may reuse the slice
+				data := make([]byte, len(chunk.Data))
+				copy(data, chunk.Data)
+
+				select {
+				case chunkQueue <- data:
+				case <-cacheCtx.Done():
+					chunkErr = cacheCtx.Err()
+					break chunkLoop
+				}
+			}
 		}
-		errCh <- cacheErr
+
+		// Close queue to signal pipe writer to finish
+		close(chunkQueue)
+
+		// Wait for pipe writer to finish
+		pipeWriteErr := <-pipeErrCh
+
+		// Close the pipe to signal EOF to the reader
+		if chunkErr != nil {
+			pipeWriter.CloseWithError(chunkErr)
+		} else if pipeWriteErr != nil {
+			pipeWriter.CloseWithError(pipeWriteErr)
+		} else {
+			pipeWriter.Close()
+		}
+
+		// Wait for cache write to complete and return its error
+		cacheErr := <-cacheErrCh
+		if chunkErr != nil {
+			errCh <- chunkErr
+		} else if pipeWriteErr != nil {
+			errCh <- pipeWriteErr
+		} else {
+			errCh <- cacheErr
+		}
 	}()
 
 	return pipeWriter, errCh
@@ -149,6 +260,7 @@ func (s *Service) fetchFullObjectToCache(
 	}
 	buf := make([]byte, chunkSize)
 
+	var streamErr error
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
@@ -159,15 +271,25 @@ func (s *Service) fetchFullObjectToCache(
 			break
 		}
 		if readErr != nil {
-			return readErr
+			streamErr = readErr
+			break
 		}
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			streamErr = ctx.Err()
+			break
 		default:
 		}
 	}
+
+	// Signal broadcast completion BEFORE waiting for cache write.
+	// This is critical: the cache listener's chunk loop blocks until the channel closes,
+	// which only happens when Complete() is called. Without this, we'd have a deadlock:
+	// - fetchFullObjectToCache waits for cacheErrCh
+	// - setupCacheListener waits for listener.Chunks() to close
+	// - listener.Chunks() only closes when Complete() is called
+	broadcaster.Complete(streamErr)
 
 	// Wait for cache write to complete
 	if cacheErrCh != nil {
@@ -175,6 +297,10 @@ func (s *Service) fetchFullObjectToCache(
 		case err := <-cacheErrCh:
 			if err != nil {
 				log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background cache write failed")
+			}
+			// Return stream error if that's what caused the failure
+			if streamErr != nil {
+				return streamErr
 			}
 			return err
 		case <-time.After(cacheWriteTimeout):
@@ -184,7 +310,7 @@ func (s *Service) fetchFullObjectToCache(
 	}
 
 	_ = cachePipeWriter // managed by cache listener goroutine
-	return nil
+	return streamErr
 }
 
 // triggerBackgroundCacheFetch starts a background fetch of the full object.
@@ -212,8 +338,9 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
 
+		// Note: fetchFullObjectToCache calls broadcaster.Complete() internally
+		// before waiting for cache write, to avoid deadlock.
 		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, broadcaster)
-		broadcaster.Complete(err)
 
 		if err != nil {
 			log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background cache fetch failed")
