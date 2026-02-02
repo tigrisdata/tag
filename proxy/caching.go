@@ -261,6 +261,7 @@ func (s *Service) fetchFullObjectToCache(
 	buf := make([]byte, chunkSize)
 
 	var streamErr error
+streamLoop:
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
@@ -278,7 +279,7 @@ func (s *Service) fetchFullObjectToCache(
 		select {
 		case <-ctx.Done():
 			streamErr = ctx.Err()
-			break
+			break streamLoop
 		default:
 		}
 	}
