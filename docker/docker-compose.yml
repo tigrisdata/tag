@@ -10,8 +10,8 @@
 services:
   tag:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     image: tigrisdata/tag:latest
     container_name: tag
     ports:
