@@ -112,54 +112,6 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 	return nil
 }
 
-// PutWithMetaStream stores object metadata and streams body to cache.
-// Use this for large objects to avoid buffering the entire body in memory.
-// IMPORTANT: Body is written BEFORE metadata to ensure metadata presence
-// guarantees body availability. This prevents race conditions where a reader
-// finds metadata but body hasn't been fully written yet.
-func (c *Cache) PutWithMetaStream(ctx context.Context, bucket, key string, meta *CachedObjectMeta, body io.Reader, ttl int) error {
-	if !c.IsEnabled() {
-		return nil
-	}
-
-	if ttl == 0 {
-		ttl = int(c.defaultTTL)
-	}
-
-	metaKey := MakeMetaKey(bucket, key)
-	bodyKey := MakeBodyKey(bucket, key)
-
-	// Encode metadata as JSON (do this first so we fail fast if encoding fails)
-	metaBytes, err := meta.Encode()
-	if err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta encode error")
-		return err
-	}
-
-	// Stream body to cache FIRST
-	// This ensures metadata presence guarantees body availability
-	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
-		return err
-	}
-
-	// Store metadata AFTER body is complete
-	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
-		// Try to clean up body on metadata failure
-		_ = c.client.Delete(ctx, bodyKey)
-		return err
-	}
-
-	log.Debug().
-		Str("bucket", bucket).
-		Str("key", key).
-		Int("ttl", ttl).
-		Int("meta_size", len(metaBytes)).
-		Msg("Cached object with metadata (streamed)")
-	return nil
-}
-
 // PutWithMetaStreamTombstoneAware is like PutWithMetaStream but checks for
 // tombstones before writing metadata. If a tombstone exists that's newer than
 // writeStartTime, the metadata write is skipped (preventing stale cache).

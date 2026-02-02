@@ -28,6 +28,14 @@ var (
 	GitCommit = "unknown"
 )
 
+const (
+	// Cluster ready timeout for embedded cache
+	clusterReadyTimeout = 30 * time.Second
+
+	// Shutdown timeout for graceful shutdown
+	shutdownTimeout = 30 * time.Second
+)
+
 func main() {
 	// Parse command line flags
 	configPath := flag.String("config", "", "Path to configuration file")
@@ -134,7 +142,7 @@ func main() {
 		}
 
 		// Wait for cluster to be ready
-		readyCtx, readyCancel := context.WithTimeout(ctx, 30*time.Second)
+		readyCtx, readyCancel := context.WithTimeout(ctx, clusterReadyTimeout)
 		if err := embeddedCache.WaitReady(readyCtx); err != nil {
 			readyCancel()
 			log.Warn().Err(err).Msg("Embedded cache not fully ready, continuing anyway")
@@ -187,7 +195,7 @@ func main() {
 	}
 
 	// Graceful shutdown
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 
 	if err := server.Stop(shutdownCtx); err != nil {

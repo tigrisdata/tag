@@ -15,6 +15,14 @@ import (
 	"github.com/tigrisdata/tag/proxy/broadcast"
 )
 
+const (
+	// cacheWriteTimeout is the timeout for cache writes.
+	cacheWriteTimeout = 60 * time.Second
+
+	// backgroundFetchTimeout is the timeout for background fetches.
+	backgroundFetchTimeout = 5 * time.Minute
+)
+
 // setupCacheListener creates a listener that streams chunks directly to cache via io.Pipe.
 // This avoids buffering the entire response in memory.
 // Stores both metadata (from headers) and body in separate cache entries.
@@ -77,7 +85,7 @@ func (s *Service) setupCacheListener(
 
 		// Use a detached context for cache writes to avoid cancellation when HTTP request completes.
 		// The cache write should continue even after the client has received the response.
-		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
 		defer cacheCancel()
 
 		// Write to cache with metadata (streaming, tombstone-aware)
@@ -169,7 +177,7 @@ func (s *Service) fetchFullObjectToCache(
 				log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background cache write failed")
 			}
 			return err
-		case <-time.After(30 * time.Second):
+		case <-time.After(cacheWriteTimeout):
 			log.Warn().Str("bucket", bucket).Str("key", key).Msg("Background cache write timeout")
 			return errors.New("cache write timeout")
 		}
@@ -201,7 +209,7 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 			metrics.SetActiveBackgroundFetches(s.backgroundFetchManager.ActiveCount())
 		}()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
 
 		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, broadcaster)

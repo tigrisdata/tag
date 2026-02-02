@@ -49,8 +49,8 @@ const (
 	// DefaultBroadcastChunkSize is the default chunk size for streaming (64KB).
 	DefaultBroadcastChunkSize = 64 * 1024
 
-	// DefaultBroadcastChannelBuffer is the default buffer size per listener (64 chunks = ~4MB).
-	DefaultBroadcastChannelBuffer = 64
+	// DefaultBroadcastChannelBuffer is the default buffer size per listener (1024 chunks = ~64MB).
+	DefaultBroadcastChannelBuffer = 1024
 
 	// DefaultMaxIdleConnsPerHost is the default HTTP connection pool size per upstream host.
 	// Higher values improve throughput for cache miss scenarios with high concurrency.
@@ -76,8 +76,8 @@ type ServerConfig struct {
 
 // UpstreamConfig holds Tigris endpoint configuration.
 type UpstreamConfig struct {
-	Endpoint            string `yaml:"endpoint"`               // Tigris S3 endpoint (e.g., https://fly.storage.tigris.dev)
-	Region              string `yaml:"region"`                 // AWS region for signing (default: auto)
+	Endpoint            string `yaml:"endpoint"`                // Tigris S3 endpoint (e.g., https://fly.storage.tigris.dev)
+	Region              string `yaml:"region"`                  // AWS region for signing (default: auto)
 	MaxIdleConnsPerHost int    `yaml:"max_idle_conns_per_host"` // HTTP connection pool size per host (default: 100)
 }
 
