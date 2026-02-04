@@ -189,3 +189,114 @@ func TestAWSChunkedReader_InvalidTrailer(t *testing.T) {
 		t.Errorf("error = %q, want it to mention expected CRLF", err.Error())
 	}
 }
+
+func TestAWSChunkedReader_InvalidChunkSize(t *testing.T) {
+	input := "ZZZZ;chunk-signature=sig1\r\n"
+	reader := newAWSChunkedReader(strings.NewReader(input))
+
+	_, err := io.ReadAll(reader)
+	if err == nil {
+		t.Fatal("expected error for invalid hex chunk size")
+	}
+	if !strings.Contains(err.Error(), "parsing chunk size") {
+		t.Errorf("error = %q, want it to mention parsing chunk size", err.Error())
+	}
+}
+
+func TestDecodeChunkedIfNeeded_ZeroByteChunked(t *testing.T) {
+	// Zero-byte upload via chunked encoding: only a terminal chunk
+	chunkedBody := "0;chunk-signature=sig1\r\n\r\n"
+	body := io.NopCloser(strings.NewReader(chunkedBody))
+	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", body)
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	req.Header.Set("X-Amz-Decoded-Content-Length", "0")
+	req.ContentLength = int64(len(chunkedBody))
+
+	gotBody, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req)
+
+	if !gotChunked {
+		t.Error("chunked = false, want true")
+	}
+	if gotHash != "UNSIGNED-PAYLOAD" {
+		t.Errorf("bodyHash = %q, want %q", gotHash, "UNSIGNED-PAYLOAD")
+	}
+	if gotLen != 0 {
+		t.Errorf("contentLength = %d, want 0", gotLen)
+	}
+
+	data, err := io.ReadAll(gotBody)
+	if err != nil {
+		t.Fatalf("reading decoded body: %v", err)
+	}
+	if len(data) != 0 {
+		t.Errorf("body length = %d, want 0", len(data))
+	}
+}
+
+func TestPrepareForwardedRequest_Chunked(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
+	req.Header.Set("X-Amz-Decoded-Content-Length", "1024")
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.ContentLength = 2000 // wire size
+
+	prepareForwardedRequest(req, 1024, true)
+
+	if req.ContentLength != 1024 {
+		t.Errorf("ContentLength = %d, want 1024", req.ContentLength)
+	}
+	if req.Header.Get("X-Amz-Decoded-Content-Length") != "" {
+		t.Error("X-Amz-Decoded-Content-Length should be removed")
+	}
+	if req.Header.Get("Content-Encoding") != "" {
+		t.Error("Content-Encoding: aws-chunked should be removed")
+	}
+}
+
+func TestPrepareForwardedRequest_ChunkedZeroByte(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
+	req.Header.Set("X-Amz-Decoded-Content-Length", "0")
+	req.ContentLength = 100 // wire size with chunk framing
+
+	prepareForwardedRequest(req, 0, true)
+
+	if req.ContentLength != 0 {
+		t.Errorf("ContentLength = %d, want 0", req.ContentLength)
+	}
+	if req.Header.Get("X-Amz-Decoded-Content-Length") != "" {
+		t.Error("X-Amz-Decoded-Content-Length should be removed")
+	}
+}
+
+func TestPrepareForwardedRequest_NonChunked(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
+	req.ContentLength = 0
+
+	prepareForwardedRequest(req, 512, false)
+
+	if req.ContentLength != 512 {
+		t.Errorf("ContentLength = %d, want 512", req.ContentLength)
+	}
+}
+
+func TestPrepareForwardedRequest_NonChunkedNoBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/bucket/key", nil)
+	req.ContentLength = 0
+
+	prepareForwardedRequest(req, 0, false)
+
+	// Should not change ContentLength for non-chunked with 0/negative length
+	if req.ContentLength != 0 {
+		t.Errorf("ContentLength = %d, want 0", req.ContentLength)
+	}
+}
+
+func TestPrepareForwardedRequest_PreservesNonAWSContentEncoding(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
+	req.Header.Set("Content-Encoding", "gzip")
+
+	prepareForwardedRequest(req, 1024, true)
+
+	if req.Header.Get("Content-Encoding") != "gzip" {
+		t.Errorf("Content-Encoding = %q, want %q", req.Header.Get("Content-Encoding"), "gzip")
+	}
+}
