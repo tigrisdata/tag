@@ -9,7 +9,9 @@ import (
 	"strings"
 )
 
-const streamingPayloadHash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+// StreamingPayloadHash is the X-Amz-Content-Sha256 value used by AWS SDKs
+// to indicate AWS chunked transfer encoding (streaming SigV4).
+const StreamingPayloadHash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
 
 // awsChunkedReader decodes AWS S3 chunked transfer encoding.
 //
@@ -123,7 +125,7 @@ func (r *awsChunkedReader) readTrailingCRLF() error {
 func decodeChunkedIfNeeded(r *http.Request) (body io.ReadCloser, bodyHash string, contentLength int64, chunked bool) {
 	bodyHash = r.Header.Get("X-Amz-Content-Sha256")
 
-	if bodyHash != streamingPayloadHash {
+	if bodyHash != StreamingPayloadHash {
 		return r.Body, bodyHash, r.ContentLength, false
 	}
 
