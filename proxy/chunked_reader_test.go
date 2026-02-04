@@ -265,6 +265,12 @@ func TestPrepareForwardedRequest_ChunkedZeroByte(t *testing.T) {
 	if req.Header.Get("X-Amz-Decoded-Content-Length") != "" {
 		t.Error("X-Amz-Decoded-Content-Length should be removed")
 	}
+	// Body must be http.NoBody so Go's HTTP transport sends "Content-Length: 0"
+	// instead of "Transfer-Encoding: chunked" (which happens when ContentLength == 0
+	// but Body is a non-nil reader).
+	if req.Body != http.NoBody {
+		t.Error("Body should be http.NoBody for zero-byte chunked request")
+	}
 }
 
 func TestPrepareForwardedRequest_NonChunked(t *testing.T) {

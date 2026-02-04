@@ -124,6 +124,13 @@ func prepareForwardedRequest(fwdReq *http.Request, contentLength int64, chunked 
 		fwdReq.ContentLength = contentLength
 		fwdReq.Header.Del("X-Amz-Decoded-Content-Length")
 		stripAWSChunkedEncoding(fwdReq)
+		// When decoded content length is 0, set Body to http.NoBody so Go's
+		// HTTP transport sends "Content-Length: 0" instead of using
+		// "Transfer-Encoding: chunked" (which happens when ContentLength == 0
+		// but Body is a non-nil reader — Go's outgoingLength returns -1).
+		if contentLength == 0 {
+			fwdReq.Body = http.NoBody
+		}
 	} else if contentLength > 0 {
 		fwdReq.ContentLength = contentLength
 	}
