@@ -103,24 +103,28 @@ func (r *awsChunkedReader) readChunkHeader() error {
 	return nil
 }
 
-// readTrailingCRLF consumes the \r\n after chunk data.
+// readTrailingCRLF consumes and validates the \r\n after chunk data.
 func (r *awsChunkedReader) readTrailingCRLF() error {
 	var buf [2]byte
 	_, err := io.ReadFull(r.reader, buf[:])
 	if err != nil {
 		return fmt.Errorf("reading chunk trailer: %w", err)
 	}
+	if buf[0] != '\r' || buf[1] != '\n' {
+		return fmt.Errorf("invalid chunk trailer: expected CRLF, got %q", buf)
+	}
 	return nil
 }
 
 // decodeChunkedIfNeeded checks if the request uses AWS chunked transfer encoding.
-// If so, returns a decoded body reader, UNSIGNED-PAYLOAD as the body hash, and
-// the decoded content length. Otherwise returns the original values unchanged.
-func decodeChunkedIfNeeded(r *http.Request) (body io.ReadCloser, bodyHash string, contentLength int64) {
+// If so, returns a decoded body reader, UNSIGNED-PAYLOAD as the body hash, the
+// decoded content length, and chunked=true. Otherwise returns the original values
+// unchanged with chunked=false.
+func decodeChunkedIfNeeded(r *http.Request) (body io.ReadCloser, bodyHash string, contentLength int64, chunked bool) {
 	bodyHash = r.Header.Get("X-Amz-Content-Sha256")
 
 	if bodyHash != streamingPayloadHash {
-		return r.Body, bodyHash, r.ContentLength
+		return r.Body, bodyHash, r.ContentLength, false
 	}
 
 	// Parse decoded content length from header
@@ -132,5 +136,5 @@ func decodeChunkedIfNeeded(r *http.Request) (body io.ReadCloser, bodyHash string
 	}
 
 	decoded := newAWSChunkedReader(r.Body)
-	return io.NopCloser(decoded), "UNSIGNED-PAYLOAD", contentLength
+	return io.NopCloser(decoded), "UNSIGNED-PAYLOAD", contentLength, true
 }

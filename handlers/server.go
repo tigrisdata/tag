@@ -295,9 +295,17 @@ func validateContentLength(w http.ResponseWriter, r *http.Request) bool {
 	// AWS chunked encoding: Content-Length reflects wire size (with chunk framing),
 	// and the actual payload size is in X-Amz-Decoded-Content-Length.
 	if r.Header.Get("X-Amz-Content-Sha256") == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
-		if r.Header.Get("X-Amz-Decoded-Content-Length") != "" {
-			return true
+		v := r.Header.Get("X-Amz-Decoded-Content-Length")
+		if v == "" {
+			WriteError(w, r, ErrMissingContentLength)
+			return false
 		}
+		decodedLen, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || decodedLen < 0 {
+			WriteError(w, r, ErrBadContentLength)
+			return false
+		}
+		return true
 	}
 
 	v := r.Header.Get("Content-Length")

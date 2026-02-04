@@ -123,7 +123,7 @@ func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string
 // is decoded on-the-fly and forwarded as UNSIGNED-PAYLOAD.
 func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
 	// Decode AWS chunked encoding if present, otherwise pass through unchanged
-	body, bodyHash, contentLength := decodeChunkedIfNeeded(r)
+	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
 	// Validate incoming request signature
 	accessKey, err := f.validator.ValidateRequest(r)
@@ -150,15 +150,17 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.
 		return err
 	}
 
-	// Set content length for the forwarded request
-	if contentLength > 0 {
+	// For chunked requests, always override Content-Length with decoded size
+	// (the original Content-Length reflects wire size including chunk framing).
+	// For non-chunked requests, set Content-Length if known.
+	if chunked {
 		fwdReq.ContentLength = contentLength
-	}
-
-	// Strip chunked-encoding headers that don't apply to the decoded body
-	fwdReq.Header.Del("X-Amz-Decoded-Content-Length")
-	if fwdReq.Header.Get("Content-Encoding") == "aws-chunked" {
-		fwdReq.Header.Del("Content-Encoding")
+		fwdReq.Header.Del("X-Amz-Decoded-Content-Length")
+		if fwdReq.Header.Get("Content-Encoding") == "aws-chunked" {
+			fwdReq.Header.Del("Content-Encoding")
+		}
+	} else if contentLength > 0 {
+		fwdReq.ContentLength = contentLength
 	}
 
 	// Track bytes in from request body
@@ -195,7 +197,7 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.
 // If the request uses AWS chunked transfer encoding, the body is decoded on-the-fly.
 func (f *Forwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
 	// Decode AWS chunked encoding if present, otherwise pass through unchanged
-	body, bodyHash, contentLength := decodeChunkedIfNeeded(r)
+	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
 	// Validate incoming request signature
 	accessKey, err := f.validator.ValidateRequest(r)
@@ -222,15 +224,17 @@ func (f *Forwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWrite
 		return nil, err
 	}
 
-	// Set content length for the forwarded request
-	if contentLength > 0 {
+	// For chunked requests, always override Content-Length with decoded size
+	// (the original Content-Length reflects wire size including chunk framing).
+	// For non-chunked requests, set Content-Length if known.
+	if chunked {
 		fwdReq.ContentLength = contentLength
-	}
-
-	// Strip chunked-encoding headers that don't apply to the decoded body
-	fwdReq.Header.Del("X-Amz-Decoded-Content-Length")
-	if fwdReq.Header.Get("Content-Encoding") == "aws-chunked" {
-		fwdReq.Header.Del("Content-Encoding")
+		fwdReq.Header.Del("X-Amz-Decoded-Content-Length")
+		if fwdReq.Header.Get("Content-Encoding") == "aws-chunked" {
+			fwdReq.Header.Del("Content-Encoding")
+		}
+	} else if contentLength > 0 {
+		fwdReq.ContentLength = contentLength
 	}
 
 	// Track bytes in from request body
@@ -324,7 +328,7 @@ func (f *Forwarder) ValidateAndGetCredentials(r *http.Request) (accessKey, secre
 // If the request uses AWS chunked transfer encoding, the body is decoded on-the-fly.
 func (f *Forwarder) DoRequestWithCreds(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error) {
 	// Decode AWS chunked encoding if present, otherwise pass through unchanged
-	body, bodyHash, contentLength := decodeChunkedIfNeeded(r)
+	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
 	path := r.URL.Path
 	if r.URL.RawQuery != "" {
@@ -336,14 +340,17 @@ func (f *Forwarder) DoRequestWithCreds(ctx context.Context, r *http.Request, acc
 		return nil, err
 	}
 
-	if contentLength > 0 {
+	// For chunked requests, always override Content-Length with decoded size
+	// (the original Content-Length reflects wire size including chunk framing).
+	// For non-chunked requests, set Content-Length if known.
+	if chunked {
 		fwdReq.ContentLength = contentLength
-	}
-
-	// Strip chunked-encoding headers that don't apply to the decoded body
-	fwdReq.Header.Del("X-Amz-Decoded-Content-Length")
-	if fwdReq.Header.Get("Content-Encoding") == "aws-chunked" {
-		fwdReq.Header.Del("Content-Encoding")
+		fwdReq.Header.Del("X-Amz-Decoded-Content-Length")
+		if fwdReq.Header.Get("Content-Encoding") == "aws-chunked" {
+			fwdReq.Header.Del("Content-Encoding")
+		}
+	} else if contentLength > 0 {
+		fwdReq.ContentLength = contentLength
 	}
 
 	// Track bytes in from request body

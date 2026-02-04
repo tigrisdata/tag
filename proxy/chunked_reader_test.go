@@ -109,8 +109,11 @@ func TestDecodeChunkedIfNeeded_NotChunked(t *testing.T) {
 	req.Header.Set("X-Amz-Content-Sha256", "abc123hash")
 	req.ContentLength = 5
 
-	gotBody, gotHash, gotLen := decodeChunkedIfNeeded(req)
+	gotBody, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req)
 
+	if gotChunked {
+		t.Error("chunked = true, want false")
+	}
 	if gotHash != "abc123hash" {
 		t.Errorf("bodyHash = %q, want %q", gotHash, "abc123hash")
 	}
@@ -132,8 +135,11 @@ func TestDecodeChunkedIfNeeded_Chunked(t *testing.T) {
 	req.Header.Set("X-Amz-Decoded-Content-Length", "4")
 	req.ContentLength = int64(len(chunkedBody))
 
-	gotBody, gotHash, gotLen := decodeChunkedIfNeeded(req)
+	gotBody, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req)
 
+	if !gotChunked {
+		t.Error("chunked = false, want true")
+	}
 	if gotHash != "UNSIGNED-PAYLOAD" {
 		t.Errorf("bodyHash = %q, want %q", gotHash, "UNSIGNED-PAYLOAD")
 	}
@@ -157,12 +163,29 @@ func TestDecodeChunkedIfNeeded_MissingDecodedLength(t *testing.T) {
 	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
 	// No X-Amz-Decoded-Content-Length header
 
-	_, gotHash, gotLen := decodeChunkedIfNeeded(req)
+	_, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req)
 
+	if !gotChunked {
+		t.Error("chunked = false, want true")
+	}
 	if gotHash != "UNSIGNED-PAYLOAD" {
 		t.Errorf("bodyHash = %q, want %q", gotHash, "UNSIGNED-PAYLOAD")
 	}
 	if gotLen != -1 {
 		t.Errorf("contentLength = %d, want -1", gotLen)
+	}
+}
+
+func TestAWSChunkedReader_InvalidTrailer(t *testing.T) {
+	// Chunk data followed by invalid trailer (not \r\n)
+	input := "3;chunk-signature=sig1\r\nfooXX"
+	reader := newAWSChunkedReader(strings.NewReader(input))
+
+	_, err := io.ReadAll(reader)
+	if err == nil {
+		t.Fatal("expected error for invalid chunk trailer")
+	}
+	if !strings.Contains(err.Error(), "expected CRLF") {
+		t.Errorf("error = %q, want it to mention expected CRLF", err.Error())
 	}
 }
