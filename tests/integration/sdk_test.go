@@ -1461,74 +1461,30 @@ func TestSDK_DeleteObjects_WithCache(t *testing.T) {
 	t.Logf("DeleteObjects with cache verified: %d objects deleted and cache invalidated", len(result.Deleted))
 }
 
-// buildAWSChunkedBody encodes raw data into AWS chunked transfer encoding format.
-// Each chunk is: <hex-size>;chunk-signature=<dummy>\r\n<data>\r\n
-// Terminal chunk: 0;chunk-signature=<dummy>\r\n\r\n
-func buildAWSChunkedBody(data []byte, chunkSize int) []byte {
-	var buf bytes.Buffer
-	for i := 0; i < len(data); i += chunkSize {
-		end := i + chunkSize
-		if end > len(data) {
-			end = len(data)
-		}
-		chunk := data[i:end]
-		fmt.Fprintf(&buf, "%x;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n", len(chunk))
-		buf.Write(chunk)
-		buf.WriteString("\r\n")
-	}
-	// Terminal chunk
-	buf.WriteString("0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\r\n")
-	return buf.Bytes()
-}
-
 // TestSDK_PutObject_ChunkedEncoding verifies that AWS chunked transfer encoding
-// (streaming SigV4) is correctly decoded by TAG. The request body uses the
-// <hex-size>;chunk-signature=<sig>\r\n<data>\r\n framing format.
+// is correctly decoded by TAG. Over TLS, the AWS Go SDK v2 automatically uses
+// aws-chunked encoding with trailing checksums (STREAMING-UNSIGNED-PAYLOAD-TRAILER).
 func TestSDK_PutObject_ChunkedEncoding(t *testing.T) {
-	env := NewTestEnvironment()
+	env := NewTestEnvironmentWithTLS()
 	defer env.Close()
 
 	env.CreateTestBucket("test-bucket")
 
+	client := env.GetS3ClientTLS()
+	ctx := context.Background()
+
 	objectData := []byte("hello from chunked encoding test!")
-	chunkedBody := buildAWSChunkedBody(objectData, 10) // 10-byte chunks
-
-	// Build request with chunked encoding headers.
-	// Sign first, then add X-Amz-Decoded-Content-Length after signing.
-	// The signer doesn't copy this header, but the validator only checks
-	// headers listed in SignedHeaders, so adding it post-sign is safe.
-	req, err := env.Signer.SignRequest(
-		context.Background(),
-		http.MethodPut,
-		"/test-bucket/chunked-key",
-		bytes.NewReader(chunkedBody),
-		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-		TestAccessKey,
-		TestSecretKey,
-		http.Header{
-			"Content-Encoding": []string{"aws-chunked"},
-		},
-	)
+	_, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String("test-bucket"),
+		Key:    aws.String("chunked-key"),
+		Body:   bytes.NewReader(objectData),
+	})
 	if err != nil {
-		t.Fatalf("Failed to sign chunked request: %v", err)
-	}
-	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprintf("%d", len(objectData)))
-	req.ContentLength = int64(len(chunkedBody))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Chunked PUT request failed: %v", err)
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("Chunked PUT returned status %d, want 200", resp.StatusCode)
+		t.Fatalf("PutObject failed: %v", err)
 	}
 
-	// Verify object was stored correctly via standard SDK GET
-	client := env.GetS3Client()
-	result, err := client.GetObject(context.Background(), &s3.GetObjectInput{
+	// Verify object was stored correctly via GET
+	result, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String("test-bucket"),
 		Key:    aws.String("chunked-key"),
 	})
@@ -1544,50 +1500,31 @@ func TestSDK_PutObject_ChunkedEncoding(t *testing.T) {
 }
 
 // TestSDK_PutObject_ChunkedEncoding_LargeObject verifies chunked encoding with a
-// larger object that spans many chunks.
+// larger object that spans multiple 64KB chunks.
 func TestSDK_PutObject_ChunkedEncoding_LargeObject(t *testing.T) {
-	env := NewTestEnvironment()
+	env := NewTestEnvironmentWithTLS()
 	defer env.Close()
 
 	env.CreateTestBucket("test-bucket")
 
-	// 128KB object, split into 64KB chunks (matches DefaultChunkSize)
+	client := env.GetS3ClientTLS()
+	ctx := context.Background()
+
+	// 128KB object — the SDK will split this into multiple 64KB aws-chunked chunks
 	objectData := make([]byte, 128*1024)
 	rand.Read(objectData)
-	chunkedBody := buildAWSChunkedBody(objectData, 64*1024)
 
-	req, err := env.Signer.SignRequest(
-		context.Background(),
-		http.MethodPut,
-		"/test-bucket/chunked-large-key",
-		bytes.NewReader(chunkedBody),
-		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-		TestAccessKey,
-		TestSecretKey,
-		http.Header{
-			"Content-Encoding": []string{"aws-chunked"},
-		},
-	)
+	_, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String("test-bucket"),
+		Key:    aws.String("chunked-large-key"),
+		Body:   bytes.NewReader(objectData),
+	})
 	if err != nil {
-		t.Fatalf("Failed to sign chunked request: %v", err)
-	}
-	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprintf("%d", len(objectData)))
-	req.ContentLength = int64(len(chunkedBody))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Chunked PUT request failed: %v", err)
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("Chunked PUT returned status %d, want 200", resp.StatusCode)
+		t.Fatalf("PutObject failed: %v", err)
 	}
 
 	// Verify via GET
-	client := env.GetS3Client()
-	result, err := client.GetObject(context.Background(), &s3.GetObjectInput{
+	result, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String("test-bucket"),
 		Key:    aws.String("chunked-large-key"),
 	})
@@ -1601,55 +1538,33 @@ func TestSDK_PutObject_ChunkedEncoding_LargeObject(t *testing.T) {
 		t.Error("Large chunked PUT: downloaded content does not match original")
 	}
 
-	t.Logf("Chunked encoding verified: %d bytes uploaded in 64KB chunks, content matches", len(objectData))
+	t.Logf("Chunked encoding verified: %d bytes uploaded via SDK over TLS, content matches", len(objectData))
 }
 
-// TestSDK_PutObject_ChunkedEncoding_ZeroByte verifies chunked encoding with an
-// empty body (terminal chunk only).
+// TestSDK_PutObject_ChunkedEncoding_ZeroByte verifies that zero-byte PutObject
+// works correctly over TLS (where the SDK uses aws-chunked encoding).
 func TestSDK_PutObject_ChunkedEncoding_ZeroByte(t *testing.T) {
-	env := NewTestEnvironment()
+	env := NewTestEnvironmentWithTLS()
 	defer env.Close()
 
 	env.CreateTestBucket("test-bucket")
 
-	// Now test zero-byte via chunked encoding
-	objectData := []byte{}
-	chunkedBody := buildAWSChunkedBody(objectData, 64*1024) // Only terminal chunk
+	client := env.GetS3ClientTLS()
+	ctx := context.Background()
 
-	req, err := env.Signer.SignRequest(
-		context.Background(),
-		http.MethodPut,
-		"/test-bucket/chunked-empty-key2",
-		bytes.NewReader(chunkedBody),
-		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-		TestAccessKey,
-		TestSecretKey,
-		http.Header{
-			"Content-Encoding": []string{"aws-chunked"},
-		},
-	)
+	_, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String("test-bucket"),
+		Key:    aws.String("chunked-empty-key"),
+		Body:   bytes.NewReader([]byte{}),
+	})
 	if err != nil {
-		t.Fatalf("Failed to sign chunked request: %v", err)
-	}
-	req.Header.Set("X-Amz-Decoded-Content-Length", "0")
-	req.ContentLength = int64(len(chunkedBody))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Chunked PUT request failed: %v", err)
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("Chunked PUT returned status %d, want 200", resp.StatusCode)
+		t.Fatalf("PutObject failed: %v", err)
 	}
 
 	// Verify via GET
-	client := env.GetS3Client()
-	result, err := client.GetObject(context.Background(), &s3.GetObjectInput{
+	result, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String("test-bucket"),
-		Key:    aws.String("chunked-empty-key2"),
+		Key:    aws.String("chunked-empty-key"),
 	})
 	if err != nil {
 		t.Fatalf("GetObject verification failed: %v", err)

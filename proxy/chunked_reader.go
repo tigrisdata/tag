@@ -13,21 +13,35 @@ import (
 // to indicate AWS chunked transfer encoding (streaming SigV4).
 const StreamingPayloadHash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
 
+// StreamingUnsignedTrailerHash is the X-Amz-Content-Sha256 value used by
+// AWS SDK v2 for unsigned chunked encoding with trailing checksums.
+const StreamingUnsignedTrailerHash = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+
+// IsStreamingPayload returns true if the given body hash indicates
+// AWS chunked transfer encoding (either signed or unsigned variant).
+func IsStreamingPayload(bodyHash string) bool {
+	return bodyHash == StreamingPayloadHash || bodyHash == StreamingUnsignedTrailerHash
+}
+
 // awsChunkedReader decodes AWS S3 chunked transfer encoding.
 //
-// Wire format per chunk:
+// Signed wire format per chunk (STREAMING-AWS4-HMAC-SHA256-PAYLOAD):
 //
 //	<hex-chunk-size>;chunk-signature=<signature>\r\n
 //	<chunk-data>\r\n
 //
-// Terminal chunk:
+// Unsigned wire format per chunk (STREAMING-UNSIGNED-PAYLOAD-TRAILER):
 //
-//	0;chunk-signature=<signature>\r\n
-//	\r\n
+//	<hex-chunk-size>\r\n
+//	<chunk-data>\r\n
+//
+// Terminal chunk (both formats):
+//
+//	0[;chunk-signature=<signature>]\r\n
 //
 // The reader strips the framing and returns only the raw chunk data.
-// Chunk signatures are not validated (the request-level signature was
-// already verified by the auth validator).
+// Chunk signatures and trailing checksums are not validated (the
+// request-level signature was already verified by the auth validator).
 type awsChunkedReader struct {
 	reader    *bufio.Reader
 	remaining int
@@ -144,10 +158,13 @@ func (r *awsChunkedReader) readTrailingCRLF() error {
 // If so, returns a decoded body reader, UNSIGNED-PAYLOAD as the body hash, the
 // decoded content length, and chunked=true. Otherwise returns the original values
 // unchanged with chunked=false.
+//
+// Supports both signed (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) and unsigned
+// (STREAMING-UNSIGNED-PAYLOAD-TRAILER) chunked formats.
 func decodeChunkedIfNeeded(r *http.Request) (body io.ReadCloser, bodyHash string, contentLength int64, chunked bool) {
 	bodyHash = r.Header.Get("X-Amz-Content-Sha256")
 
-	if bodyHash != StreamingPayloadHash {
+	if !IsStreamingPayload(bodyHash) {
 		return r.Body, bodyHash, r.ContentLength, false
 	}
 

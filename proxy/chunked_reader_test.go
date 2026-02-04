@@ -324,6 +324,54 @@ func TestAWSChunkedReader_UnboundedHeaderLine(t *testing.T) {
 	}
 }
 
+func TestDecodeChunkedIfNeeded_UnsignedTrailer(t *testing.T) {
+	// Unsigned chunked format used by AWS SDK v2 (no per-chunk signatures)
+	chunkedBody := "4\r\ntest\r\n0\r\n\r\n"
+	body := io.NopCloser(strings.NewReader(chunkedBody))
+	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", body)
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	req.Header.Set("X-Amz-Decoded-Content-Length", "4")
+	req.ContentLength = int64(len(chunkedBody))
+
+	gotBody, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req)
+
+	if !gotChunked {
+		t.Error("chunked = false, want true")
+	}
+	if gotHash != "UNSIGNED-PAYLOAD" {
+		t.Errorf("bodyHash = %q, want %q", gotHash, "UNSIGNED-PAYLOAD")
+	}
+	if gotLen != 4 {
+		t.Errorf("contentLength = %d, want 4", gotLen)
+	}
+
+	data, err := io.ReadAll(gotBody)
+	if err != nil {
+		t.Fatalf("reading decoded body: %v", err)
+	}
+	if string(data) != "test" {
+		t.Errorf("body = %q, want %q", string(data), "test")
+	}
+}
+
+func TestIsStreamingPayload(t *testing.T) {
+	tests := []struct {
+		hash string
+		want bool
+	}{
+		{"STREAMING-AWS4-HMAC-SHA256-PAYLOAD", true},
+		{"STREAMING-UNSIGNED-PAYLOAD-TRAILER", true},
+		{"UNSIGNED-PAYLOAD", false},
+		{"e3b0c44298fc1c149afbf4c8996fb924", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := IsStreamingPayload(tt.hash); got != tt.want {
+			t.Errorf("IsStreamingPayload(%q) = %v, want %v", tt.hash, got, tt.want)
+		}
+	}
+}
+
 func TestPrepareForwardedRequest_PreservesNonAWSContentEncoding(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
 	req.Header.Set("Content-Encoding", "gzip")

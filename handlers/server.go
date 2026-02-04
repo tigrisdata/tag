@@ -294,7 +294,7 @@ func validateBucketName(w http.ResponseWriter, r *http.Request) bool {
 func validateContentLength(w http.ResponseWriter, r *http.Request) bool {
 	// AWS chunked encoding: Content-Length reflects wire size (with chunk framing),
 	// and the actual payload size is in X-Amz-Decoded-Content-Length.
-	if r.Header.Get("X-Amz-Content-Sha256") == proxy.StreamingPayloadHash {
+	if proxy.IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) {
 		v := r.Header.Get("X-Amz-Decoded-Content-Length")
 		if v == "" {
 			WriteError(w, r, ErrMissingContentLength)
