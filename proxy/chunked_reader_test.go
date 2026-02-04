@@ -328,3 +328,29 @@ func TestPrepareForwardedRequest_PreservesNonAWSContentEncoding(t *testing.T) {
 		t.Errorf("Content-Encoding = %q, want %q", req.Header.Get("Content-Encoding"), "gzip")
 	}
 }
+
+func TestPrepareForwardedRequest_CombinedContentEncoding(t *testing.T) {
+	// AWS S3 allows "aws-chunked,gzip" — strip aws-chunked, keep gzip.
+	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
+	req.Header.Set("X-Amz-Decoded-Content-Length", "1024")
+	req.Header.Set("Content-Encoding", "aws-chunked,gzip")
+	req.ContentLength = 2000
+
+	prepareForwardedRequest(req, 1024, true)
+
+	if got := req.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("Content-Encoding = %q, want %q", got, "gzip")
+	}
+}
+
+func TestPrepareForwardedRequest_CombinedContentEncodingWithSpaces(t *testing.T) {
+	// Handle whitespace around tokens.
+	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
+	req.Header.Set("Content-Encoding", "aws-chunked , gzip")
+
+	prepareForwardedRequest(req, 1024, true)
+
+	if got := req.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("Content-Encoding = %q, want %q", got, "gzip")
+	}
+}
