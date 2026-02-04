@@ -63,6 +63,10 @@ TESTRUN="TestBroadcast" make test-proxy
 - `github.com/goccy/go-json` - Fast JSON (replaces encoding/json)
 - `github.com/aws/aws-sdk-go-v2` - AWS SigV4 signing
 
+## Commit & PR Conventions
+
+PR titles and commit messages must use [Conventional Commits](https://www.conventionalcommits.org/) format with one of these prefixes: `feat`, `fix`, `perf`, `docs`, `style`, `refactor`, `test`, `build`, `ci`, `chore`, `revert`. Example: `feat: add chunked transfer encoding support`.
+
 ## User Preferences
 
 - **Prioritize impact over complexity**: Focus on significant improvements without over-engineering
