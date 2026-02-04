@@ -290,6 +290,34 @@ func TestPrepareForwardedRequest_NonChunkedNoBody(t *testing.T) {
 	}
 }
 
+func TestAWSChunkedReader_NegativeChunkSize(t *testing.T) {
+	// Negative hex size should be treated as terminal (size <= 0), not panic.
+	input := "-1;chunk-signature=sig1\r\n"
+	reader := newAWSChunkedReader(strings.NewReader(input))
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(data) != 0 {
+		t.Errorf("got %d bytes, want 0", len(data))
+	}
+}
+
+func TestAWSChunkedReader_UnboundedHeaderLine(t *testing.T) {
+	// A body with no newline should hit the max header length limit, not OOM.
+	input := strings.Repeat("A", maxChunkHeaderLen+10)
+	reader := newAWSChunkedReader(strings.NewReader(input))
+
+	_, err := io.ReadAll(reader)
+	if err == nil {
+		t.Fatal("expected error for oversized chunk header")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum length") {
+		t.Errorf("error = %q, want it to mention exceeds maximum length", err.Error())
+	}
+}
+
 func TestPrepareForwardedRequest_PreservesNonAWSContentEncoding(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
 	req.Header.Set("Content-Encoding", "gzip")

@@ -74,16 +74,19 @@ func (r *awsChunkedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// maxChunkHeaderLen is the maximum allowed length of a chunk header line.
+// AWS chunk headers contain a hex size and a signature (~88 chars for the
+// signature), so 256 bytes is generous. This prevents memory exhaustion
+// from a malicious request body containing no newlines.
+const maxChunkHeaderLen = 256
+
 // readChunkHeader reads a line like "<hex-size>;chunk-signature=<sig>\r\n"
 // and sets r.remaining to the chunk data size. Sets r.done if size is 0.
 func (r *awsChunkedReader) readChunkHeader() error {
-	line, err := r.reader.ReadString('\n')
+	line, err := r.readLine()
 	if err != nil {
 		return fmt.Errorf("reading chunk header: %w", err)
 	}
-
-	// Trim \r\n
-	line = strings.TrimRight(line, "\r\n")
 
 	// Extract hex size before the semicolon
 	sizeStr := line
@@ -96,13 +99,32 @@ func (r *awsChunkedReader) readChunkHeader() error {
 		return fmt.Errorf("parsing chunk size %q: %w", sizeStr, err)
 	}
 
-	if size == 0 {
+	if size <= 0 {
 		r.done = true
 		return nil
 	}
 
 	r.remaining = int(size)
 	return nil
+}
+
+// readLine reads a single \n-terminated line from the reader, enforcing
+// maxChunkHeaderLen to prevent unbounded memory allocation.
+func (r *awsChunkedReader) readLine() (string, error) {
+	var line []byte
+	for {
+		b, err := r.reader.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if b == '\n' {
+			return strings.TrimRight(string(line), "\r"), nil
+		}
+		line = append(line, b)
+		if len(line) > maxChunkHeaderLen {
+			return "", fmt.Errorf("chunk header exceeds maximum length (%d bytes)", maxChunkHeaderLen)
+		}
+	}
 }
 
 // readTrailingCRLF consumes and validates the \r\n after chunk data.
