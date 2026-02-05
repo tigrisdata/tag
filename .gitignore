@@ -21,3 +21,6 @@ coverage-integration.html
 
 # RocksDB static artifacts
 rocksdb-static/
+
+# Environment variables
+.env
