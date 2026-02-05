@@ -117,11 +117,55 @@ func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string
 	}
 }
 
+// prepareForwardedRequest sets Content-Length on the forwarded request and strips
+// AWS chunked-encoding headers when the request body was decoded from chunked format.
+func prepareForwardedRequest(fwdReq *http.Request, contentLength int64, chunked bool) {
+	if chunked {
+		fwdReq.ContentLength = contentLength
+		fwdReq.Header.Del("X-Amz-Decoded-Content-Length")
+		stripAWSChunkedEncoding(fwdReq)
+		// When decoded content length is 0, set Body to http.NoBody so Go's
+		// HTTP transport sends "Content-Length: 0" instead of using
+		// "Transfer-Encoding: chunked" (which happens when ContentLength == 0
+		// but Body is a non-nil reader — Go's outgoingLength returns -1).
+		if contentLength == 0 {
+			fwdReq.Body = http.NoBody
+		}
+	} else if contentLength > 0 {
+		fwdReq.ContentLength = contentLength
+	}
+}
+
+// stripAWSChunkedEncoding removes "aws-chunked" from the Content-Encoding header.
+// AWS S3 allows combined values like "aws-chunked,gzip". After decoding the chunked
+// layer, we strip only the aws-chunked token and preserve any remaining encodings.
+func stripAWSChunkedEncoding(req *http.Request) {
+	ce := req.Header.Get("Content-Encoding")
+	if ce == "" {
+		return
+	}
+
+	var remaining []string
+	for _, part := range strings.Split(ce, ",") {
+		if strings.TrimSpace(part) != "aws-chunked" {
+			remaining = append(remaining, strings.TrimSpace(part))
+		}
+	}
+
+	if len(remaining) == 0 {
+		req.Header.Del("Content-Encoding")
+	} else {
+		req.Header.Set("Content-Encoding", strings.Join(remaining, ","))
+	}
+}
+
 // Forward forwards a request to Tigris and writes the response to the client.
 // Uses zero-copy streaming - the X-Amz-Content-Sha256 header is required (all AWS SDKs set this).
+// If the request uses AWS chunked transfer encoding (streaming SigV4), the body
+// is decoded on-the-fly and forwarded as UNSIGNED-PAYLOAD.
 func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
-	// Get body hash from request header (required for all AWS SDK clients)
-	bodyHash := r.Header.Get("X-Amz-Content-Sha256")
+	// Decode AWS chunked encoding if present, otherwise pass through unchanged
+	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
 	// Validate incoming request signature
 	accessKey, err := f.validator.ValidateRequest(r)
@@ -143,19 +187,15 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.
 	}
 
 	// Create signed request (passes body hash, streams body directly)
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, r.Body, bodyHash, accessKey, secretKey, r.Header)
+	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, r.Header)
 	if err != nil {
 		return err
 	}
-
-	// Set content length if known (needed for streaming)
-	if r.ContentLength > 0 {
-		fwdReq.ContentLength = r.ContentLength
-	}
+	prepareForwardedRequest(fwdReq, contentLength, chunked)
 
 	// Track bytes in from request body
-	if r.ContentLength > 0 {
-		metrics.BytesTransferred.WithLabelValues("in").Add(float64(r.ContentLength))
+	if contentLength > 0 {
+		metrics.BytesTransferred.WithLabelValues("in").Add(float64(contentLength))
 	}
 
 	// Forward to Tigris
@@ -184,9 +224,10 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.
 // ForwardWithCapture forwards request and captures response for caching.
 // Uses zero-copy streaming for the request body (X-Amz-Content-Sha256 header is required).
 // The response body is captured for caching while streaming to the client.
+// If the request uses AWS chunked transfer encoding, the body is decoded on-the-fly.
 func (f *Forwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
-	// Get body hash from request header (required for all AWS SDK clients)
-	bodyHash := r.Header.Get("X-Amz-Content-Sha256")
+	// Decode AWS chunked encoding if present, otherwise pass through unchanged
+	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
 	// Validate incoming request signature
 	accessKey, err := f.validator.ValidateRequest(r)
@@ -208,19 +249,15 @@ func (f *Forwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWrite
 	}
 
 	// Create signed request (passes body hash, streams body directly)
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, r.Body, bodyHash, accessKey, secretKey, r.Header)
+	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, r.Header)
 	if err != nil {
 		return nil, err
 	}
-
-	// Set content length if known
-	if r.ContentLength > 0 {
-		fwdReq.ContentLength = r.ContentLength
-	}
+	prepareForwardedRequest(fwdReq, contentLength, chunked)
 
 	// Track bytes in from request body
-	if r.ContentLength > 0 {
-		metrics.BytesTransferred.WithLabelValues("in").Add(float64(r.ContentLength))
+	if contentLength > 0 {
+		metrics.BytesTransferred.WithLabelValues("in").Add(float64(contentLength))
 	}
 
 	// Forward to Tigris
@@ -306,26 +343,25 @@ func (f *Forwarder) ValidateAndGetCredentials(r *http.Request) (accessKey, secre
 
 // DoRequestWithCreds executes a request with pre-validated credentials.
 // Returns the raw response for streaming. Caller is responsible for closing the response body.
+// If the request uses AWS chunked transfer encoding, the body is decoded on-the-fly.
 func (f *Forwarder) DoRequestWithCreds(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error) {
-	bodyHash := r.Header.Get("X-Amz-Content-Sha256")
+	// Decode AWS chunked encoding if present, otherwise pass through unchanged
+	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
 	path := r.URL.Path
 	if r.URL.RawQuery != "" {
 		path = path + "?" + r.URL.RawQuery
 	}
 
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, r.Body, bodyHash, accessKey, secretKey, r.Header)
+	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, r.Header)
 	if err != nil {
 		return nil, err
 	}
-
-	if r.ContentLength > 0 {
-		fwdReq.ContentLength = r.ContentLength
-	}
+	prepareForwardedRequest(fwdReq, contentLength, chunked)
 
 	// Track bytes in from request body
-	if r.ContentLength > 0 {
-		metrics.BytesTransferred.WithLabelValues("in").Add(float64(r.ContentLength))
+	if contentLength > 0 {
+		metrics.BytesTransferred.WithLabelValues("in").Add(float64(contentLength))
 	}
 
 	upstreamStart := time.Now()
