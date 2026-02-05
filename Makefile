@@ -370,6 +370,6 @@ test-sdk: rocksdb-static
 		echo "  Start TAG with: make s3-test-local"; \
 		exit 1; \
 	fi
-	$(CGO_ENV) go test -v -timeout 300s $(TESTFLAGS) ./tests/integration/sdk/...
+	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) $(CGO_ENV) go test -v -timeout 300s $(TESTFLAGS) ./tests/integration/sdk/...
 
 .DEFAULT_GOAL := help
