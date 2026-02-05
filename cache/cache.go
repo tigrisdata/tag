@@ -151,8 +151,10 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 	// CHECK TOMBSTONE before writing metadata
 	// If a tombstone exists with timestamp > writeStartTime, the key was invalidated
 	// after this write started, so we should NOT write metadata (keeps entry invisible)
+	// NOTE: To avoid race conditions, we use >= instead of > to handle the case where
+	// the tombstone is written at the same time as the write started
 	tombTs := c.GetTombstoneTimestamp(ctx, bucket, key)
-	if tombTs > writeStartTime {
+	if tombTs >= writeStartTime {
 		log.Debug().Str("bucket", bucket).Str("key", key).
 			Int64("tombstone_ts", tombTs).
 			Int64("write_start", writeStartTime).
