@@ -225,7 +225,7 @@ func NewTestEnvironment() *TestEnvironment {
 	// Start fake S3 server
 	upstream := httptest.NewServer(faker.Server())
 
-	return newTestEnvironmentWithUpstream(upstream, backend)
+	return newTestEnvironmentWithUpstream(upstream, backend, false)
 }
 
 // NewTestEnvironmentWithMiddleware creates a test environment with middleware wrapping gofakes3.
@@ -239,14 +239,14 @@ func NewTestEnvironmentWithMiddleware(middleware func(http.Handler) http.Handler
 	handler := middleware(faker.Server())
 	upstream := httptest.NewServer(handler)
 
-	return newTestEnvironmentWithUpstream(upstream, backend)
+	return newTestEnvironmentWithUpstream(upstream, backend, false)
 }
 
 // NewTestEnvironmentWithHandler creates a test environment with a custom HTTP handler.
 // This is useful for auth tests that don't need a real S3 backend.
 func NewTestEnvironmentWithHandler(upstreamHandler http.HandlerFunc) *TestEnvironment {
 	upstream := httptest.NewServer(upstreamHandler)
-	return newTestEnvironmentWithUpstream(upstream, nil)
+	return newTestEnvironmentWithUpstream(upstream, nil, false)
 }
 
 // NewTestEnvironmentWithTLS creates a test environment with a TLS-enabled TAG server.
@@ -260,59 +260,7 @@ func NewTestEnvironmentWithTLS() *TestEnvironment {
 	// Start fake S3 server (plain HTTP is fine for upstream)
 	upstream := httptest.NewServer(faker.Server())
 
-	// Create credential store with test credentials
-	credStore := auth.NewCredentialStore()
-	credStore.AddCredential(TestAccessKey, TestSecretKey)
-
-	// Create config with cache disabled
-	cfg := &config.Config{
-		Server: config.ServerConfig{
-			HTTPPort: 8080,
-			BindIP:   "127.0.0.1",
-		},
-		Upstream: config.UpstreamConfig{
-			Endpoint: upstream.URL,
-			Region:   TestRegion,
-		},
-		Cache: config.CacheConfig{
-			TTL:           config.DefaultCacheTTL,
-			SizeThreshold: config.DefaultCacheSizeThreshold,
-		},
-	}
-	cfg.Cache.SetEnabled(false)
-
-	// Create disabled cache
-	testCache := cache.NewDisabledCache()
-
-	// Create forwarder
-	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost)
-
-	// Create service
-	service := proxy.NewService(forwarder, testCache, cfg)
-
-	// Create X-Cache tracker
-	xCacheTracker := NewXCacheTracker()
-
-	// Create TAG server with TLS
-	server := handlers.NewServer(service, "127.0.0.1", 0, true)
-	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
-	tagServer := httptest.NewTLSServer(wrappedRouter)
-
-	// Create signer for test requests (pointing to TAG server)
-	signer := auth.NewRequestSigner(tagServer.URL, TestRegion)
-
-	return &TestEnvironment{
-		UpstreamServer: upstream,
-		TAGServer:      tagServer,
-		CredStore:      credStore,
-		Cache:          testCache,
-		Config:         cfg,
-		Service:        service,
-		Signer:         signer,
-		S3Backend:      backend,
-		XCacheTracker:  xCacheTracker,
-		TLSHTTPClient:  tagServer.Client(),
-	}
+	return newTestEnvironmentWithUpstream(upstream, backend, true)
 }
 
 // NewTestEnvironmentWithCache creates a test environment with caching enabled using embedded RocksDB cache.
@@ -396,7 +344,8 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 }
 
 // newTestEnvironmentWithUpstream creates a test environment with the given upstream server.
-func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Backend) *TestEnvironment {
+// If useTLS is true, the TAG server uses HTTPS (required for SDK chunked encoding tests).
+func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Backend, useTLS bool) *TestEnvironment {
 	// Create credential store with test credentials
 	credStore := auth.NewCredentialStore()
 	credStore.AddCredential(TestAccessKey, TestSecretKey)
@@ -433,12 +382,18 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 	// Create TAG server with X-Cache tracking middleware
 	server := handlers.NewServer(service, "127.0.0.1", 0, true)
 	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
-	tagServer := httptest.NewServer(wrappedRouter)
+
+	var tagServer *httptest.Server
+	if useTLS {
+		tagServer = httptest.NewTLSServer(wrappedRouter)
+	} else {
+		tagServer = httptest.NewServer(wrappedRouter)
+	}
 
 	// Create signer for test requests (pointing to TAG server)
 	signer := auth.NewRequestSigner(tagServer.URL, TestRegion)
 
-	return &TestEnvironment{
+	env := &TestEnvironment{
 		UpstreamServer: upstream,
 		TAGServer:      tagServer,
 		CredStore:      credStore,
@@ -449,6 +404,12 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 		S3Backend:      backend,
 		XCacheTracker:  xCacheTracker,
 	}
+
+	if useTLS {
+		env.TLSHTTPClient = tagServer.Client()
+	}
+
+	return env
 }
 
 // Close cleans up the test environment.
