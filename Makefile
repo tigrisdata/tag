@@ -365,11 +365,11 @@ test-sdk: rocksdb-static
 		echo "  export AWS_SECRET_ACCESS_KEY=<your-secret>"; \
 		exit 1; \
 	fi
-	@if ! curl -s http://localhost:8080/health > /dev/null 2>&1; then \
-		echo "Error: TAG not running at localhost:8080"; \
+	@if ! curl -s http://localhost:$(TAG_LOCAL_HTTP_PORT)/health > /dev/null 2>&1; then \
+		echo "Error: TAG not running at localhost:$(TAG_LOCAL_HTTP_PORT)"; \
 		echo "  Start TAG with: make s3-test-local"; \
 		exit 1; \
 	fi
-	$(CGO_ENV) go test -v -timeout 300s $(TESTFLAGS) ./tests/integration/sdk/...
+	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) $(CGO_ENV) go test -v -timeout 300s $(TESTFLAGS) ./tests/integration/sdk/...
 
 .DEFAULT_GOAL := help

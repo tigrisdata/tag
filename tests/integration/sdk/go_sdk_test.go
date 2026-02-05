@@ -197,9 +197,15 @@ func TestSDK_ListObjectsV2(t *testing.T) {
 	}
 
 	// Create test objects with prefix structure
-	globalEnv.PutTestObject(bucket, "test/object1.txt", []byte("content1"))
-	globalEnv.PutTestObject(bucket, "test/object2.txt", []byte("content2"))
-	globalEnv.PutTestObject(bucket, "other/object3.txt", []byte("content3"))
+	if err := globalEnv.PutTestObject(bucket, "test/object1.txt", []byte("content1")); err != nil {
+		t.Fatalf("Failed to put test object: %v", err)
+	}
+	if err := globalEnv.PutTestObject(bucket, "test/object2.txt", []byte("content2")); err != nil {
+		t.Fatalf("Failed to put test object: %v", err)
+	}
+	if err := globalEnv.PutTestObject(bucket, "other/object3.txt", []byte("content3")); err != nil {
+		t.Fatalf("Failed to put test object: %v", err)
+	}
 
 	client := globalEnv.GetS3Client()
 	ctx := context.Background()
@@ -239,7 +245,9 @@ func TestSDK_CopyObject(t *testing.T) {
 	}
 
 	sourceContent := []byte("source object content to copy")
-	globalEnv.PutTestObject(sourceBucket, "source-key", sourceContent)
+	if err := globalEnv.PutTestObject(sourceBucket, "source-key", sourceContent); err != nil {
+		t.Fatalf("Failed to put test object: %v", err)
+	}
 
 	client := globalEnv.GetS3Client()
 	ctx := context.Background()
@@ -277,7 +285,9 @@ func TestSDK_GetObjectRange(t *testing.T) {
 	}
 
 	fullContent := []byte("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij") // 46 bytes
-	globalEnv.PutTestObject(bucket, "range-key", fullContent)
+	if err := globalEnv.PutTestObject(bucket, "range-key", fullContent); err != nil {
+		t.Fatalf("Failed to put test object: %v", err)
+	}
 
 	client := globalEnv.GetS3Client()
 	ctx := context.Background()
@@ -484,7 +494,9 @@ func TestSDK_EmptyObject(t *testing.T) {
 		t.Fatalf("Failed to create test bucket: %v", err)
 	}
 
-	globalEnv.PutTestObject(bucket, "empty-key", []byte{})
+	if err := globalEnv.PutTestObject(bucket, "empty-key", []byte{}); err != nil {
+		t.Fatalf("Failed to put test object: %v", err)
+	}
 
 	client := globalEnv.GetS3Client()
 	ctx := context.Background()
