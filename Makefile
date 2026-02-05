@@ -281,16 +281,20 @@ help:
 	@echo ""
 	@echo "S3 compatibility test targets:"
 	@echo "  s3-test-local      - Start TAG locally with embedded cache"
-	@echo "  s3-test-local-down - Stop local TAG and cleanup"
 	@echo "  s3-tests           - Run S3 compatibility tests (ceph s3-tests)"
 	@echo "  s3-tests-clean     - Remove cloned s3-tests repository"
+	@echo "  s3-test-local-down - Stop local TAG and cleanup"
+	@echo ""
+	@echo "SDK test targets (Go SDK tests):"
+	@echo "  test-sdk           - Run SDK tests (requires running TAG + AWS creds)"
 	@echo ""
 	@echo "  Usage:"
 	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
 	@echo "    export AWS_SECRET_ACCESS_KEY=<your-secret>"
-	@echo "    make s3-test-local      # Starts TAG with embedded cache"
-	@echo "    make s3-tests           # Run tests"
-	@echo "    make s3-test-local-down # Cleanup"
+	@echo "    make s3-test-local      # Start TAG with embedded cache"
+	@echo "    make s3-tests           # Run S3 compatibility tests"
+	@echo "    make test-sdk           # Run Go SDK tests"
+	@echo "    make s3-test-local-down # Stop local TAG and cleanup"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  clean              - Remove built binary and generated files"
@@ -350,5 +354,22 @@ s3-tests:
 s3-tests-clean:
 	@echo "Cleaning up S3 test artifacts..."
 	rm -rf tests/s3compat/s3-tests
+
+# SDK tests against external TAG (requires running TAG instance)
+.PHONY: test-sdk
+test-sdk: rocksdb-static
+	@echo "Running SDK tests against external TAG..."
+	@if [ -z "$$AWS_ACCESS_KEY_ID" ] || [ -z "$$AWS_SECRET_ACCESS_KEY" ]; then \
+		echo "Error: AWS credentials not set."; \
+		echo "  export AWS_ACCESS_KEY_ID=<your-key>"; \
+		echo "  export AWS_SECRET_ACCESS_KEY=<your-secret>"; \
+		exit 1; \
+	fi
+	@if ! curl -s http://localhost:8080/health > /dev/null 2>&1; then \
+		echo "Error: TAG not running at localhost:8080"; \
+		echo "  Start TAG with: make s3-test-local"; \
+		exit 1; \
+	fi
+	$(CGO_ENV) go test -v -timeout 300s $(TESTFLAGS) ./tests/integration/sdk/...
 
 .DEFAULT_GOAL := help
