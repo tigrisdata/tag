@@ -393,6 +393,10 @@ func (s *Service) receiveFromBroadcastListener(
 
 // writeChunksToResponse writes received chunks to the HTTP response.
 // xCache specifies the X-Cache header value (MISS, BYPASS, DISABLED).
+//
+// Header commitment is deferred until the first data chunk arrives. This prevents
+// committing a 200 OK with Content-Length when the upstream fetch may still fail.
+// If an error arrives before any data, the caller can write a proper error response.
 func (s *Service) writeChunksToResponse(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -405,12 +409,7 @@ func (s *Service) writeChunksToResponse(
 		return err
 	}
 
-	// Write headers to response
-	copyHeaders(w.Header(), headers)
-	w.Header().Set(XCacheHeader, xCache)
-	w.WriteHeader(status)
-
-	// Receive and write chunks
+	var headersWritten bool
 	var totalBytesOut int64
 	defer func() {
 		// Track bytes out to client, even on error
@@ -428,6 +427,12 @@ func (s *Service) writeChunksToResponse(
 		}
 
 		if len(chunk.Data) > 0 {
+			if !headersWritten {
+				copyHeaders(w.Header(), headers)
+				w.Header().Set(XCacheHeader, xCache)
+				w.WriteHeader(status)
+				headersWritten = true
+			}
 			n, writeErr := w.Write(chunk.Data)
 			totalBytesOut += int64(n)
 			if writeErr != nil {
@@ -438,6 +443,13 @@ func (s *Service) writeChunksToResponse(
 				flusher.Flush()
 			}
 		}
+	}
+
+	// Zero-byte response or all-empty chunks: commit headers now
+	if !headersWritten {
+		copyHeaders(w.Header(), headers)
+		w.Header().Set(XCacheHeader, xCache)
+		w.WriteHeader(status)
 	}
 
 	return nil

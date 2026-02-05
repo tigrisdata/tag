@@ -142,23 +142,22 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		return err
 	}
 
-	// Stream body to cache FIRST
-	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
-		return err
-	}
-
-	// CHECK TOMBSTONE before writing metadata
-	// If a tombstone exists with timestamp > writeStartTime, the key was invalidated
-	// after this write started, so we should NOT write metadata (keeps entry invisible)
+	// CHECK TOMBSTONE BEFORE writing anything to cache
+	// If a tombstone exists with timestamp >= writeStartTime, the key was invalidated
+	// after this write started, so we should NOT write at all (prevents orphaned bodies)
 	tombTs := c.GetTombstoneTimestamp(ctx, bucket, key)
-	if tombTs > writeStartTime {
+	if tombTs >= writeStartTime {
 		log.Debug().Str("bucket", bucket).Str("key", key).
 			Int64("tombstone_ts", tombTs).
 			Int64("write_start", writeStartTime).
-			Msg("Skipping metadata write - tombstone detected (key was invalidated)")
-		// Body is orphaned but will be overwritten by next write or expire via TTL
+			Msg("Skipping cache write - tombstone detected (key was invalidated)")
 		return nil
+	}
+
+	// Stream body to cache
+	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
+		return err
 	}
 
 	// Write metadata AFTER body (makes entry visible)

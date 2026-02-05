@@ -211,6 +211,9 @@ type TestEnvironment struct {
 	UpstreamRequestCount *int32
 	// XCacheTracker tracks X-Cache headers from TAG server responses.
 	XCacheTracker *XCacheTracker
+	// TLSHTTPClient is the HTTP client configured to trust the TLS test server certificate.
+	// Non-nil only for TLS test environments.
+	TLSHTTPClient *http.Client
 }
 
 // NewTestEnvironment creates a new test environment with gofakes3 in-memory backend.
@@ -222,7 +225,7 @@ func NewTestEnvironment() *TestEnvironment {
 	// Start fake S3 server
 	upstream := httptest.NewServer(faker.Server())
 
-	return newTestEnvironmentWithUpstream(upstream, backend)
+	return newTestEnvironmentWithUpstream(upstream, backend, false)
 }
 
 // NewTestEnvironmentWithMiddleware creates a test environment with middleware wrapping gofakes3.
@@ -236,14 +239,28 @@ func NewTestEnvironmentWithMiddleware(middleware func(http.Handler) http.Handler
 	handler := middleware(faker.Server())
 	upstream := httptest.NewServer(handler)
 
-	return newTestEnvironmentWithUpstream(upstream, backend)
+	return newTestEnvironmentWithUpstream(upstream, backend, false)
 }
 
 // NewTestEnvironmentWithHandler creates a test environment with a custom HTTP handler.
 // This is useful for auth tests that don't need a real S3 backend.
 func NewTestEnvironmentWithHandler(upstreamHandler http.HandlerFunc) *TestEnvironment {
 	upstream := httptest.NewServer(upstreamHandler)
-	return newTestEnvironmentWithUpstream(upstream, nil)
+	return newTestEnvironmentWithUpstream(upstream, nil, false)
+}
+
+// NewTestEnvironmentWithTLS creates a test environment with a TLS-enabled TAG server.
+// Over HTTPS, the AWS Go SDK v2 uses aws-chunked encoding with trailing checksums,
+// which exercises TAG's chunked decoding path.
+func NewTestEnvironmentWithTLS() *TestEnvironment {
+	// Create in-memory S3 backend
+	backend := s3mem.New()
+	faker := gofakes3.New(backend)
+
+	// Start fake S3 server (plain HTTP is fine for upstream)
+	upstream := httptest.NewServer(faker.Server())
+
+	return newTestEnvironmentWithUpstream(upstream, backend, true)
 }
 
 // NewTestEnvironmentWithCache creates a test environment with caching enabled using embedded RocksDB cache.
@@ -327,7 +344,8 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 }
 
 // newTestEnvironmentWithUpstream creates a test environment with the given upstream server.
-func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Backend) *TestEnvironment {
+// If useTLS is true, the TAG server uses HTTPS (required for SDK chunked encoding tests).
+func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Backend, useTLS bool) *TestEnvironment {
 	// Create credential store with test credentials
 	credStore := auth.NewCredentialStore()
 	credStore.AddCredential(TestAccessKey, TestSecretKey)
@@ -364,12 +382,18 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 	// Create TAG server with X-Cache tracking middleware
 	server := handlers.NewServer(service, "127.0.0.1", 0, true)
 	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
-	tagServer := httptest.NewServer(wrappedRouter)
+
+	var tagServer *httptest.Server
+	if useTLS {
+		tagServer = httptest.NewTLSServer(wrappedRouter)
+	} else {
+		tagServer = httptest.NewServer(wrappedRouter)
+	}
 
 	// Create signer for test requests (pointing to TAG server)
 	signer := auth.NewRequestSigner(tagServer.URL, TestRegion)
 
-	return &TestEnvironment{
+	env := &TestEnvironment{
 		UpstreamServer: upstream,
 		TAGServer:      tagServer,
 		CredStore:      credStore,
@@ -380,6 +404,12 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 		S3Backend:      backend,
 		XCacheTracker:  xCacheTracker,
 	}
+
+	if useTLS {
+		env.TLSHTTPClient = tagServer.Client()
+	}
+
+	return env
 }
 
 // Close cleans up the test environment.
@@ -438,6 +468,22 @@ func (e *TestEnvironment) GetS3Client() *s3.Client {
 		o.BaseEndpoint = aws.String(e.TAGServer.URL)
 		o.Region = TestRegion
 		o.EndpointOptions.DisableHTTPS = true
+		o.UsePathStyle = true
+		o.Credentials = credentials.NewStaticCredentialsProvider(
+			TestAccessKey, TestSecretKey, "")
+	})
+}
+
+// GetS3ClientTLS returns an AWS SDK S3 client configured for a TLS TAG server.
+// The client uses the test server's HTTP client which trusts the test certificate.
+// Unlike GetS3Client, this does NOT disable HTTPS, allowing the SDK to use
+// aws-chunked encoding with trailing checksums.
+func (e *TestEnvironment) GetS3ClientTLS() *s3.Client {
+	return s3.NewFromConfig(aws.Config{
+		HTTPClient: e.TLSHTTPClient,
+	}, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(e.TAGServer.URL)
+		o.Region = TestRegion
 		o.UsePathStyle = true
 		o.Credentials = credentials.NewStaticCredentialsProvider(
 			TestAccessKey, TestSecretKey, "")

@@ -118,49 +118,55 @@ func (s *Server) setupRouter() *mux.Router {
 	// Handled in handleObject based on header presence
 
 	// Bucket operations with query parameters
-	r.HandleFunc("/{bucket}", s.handleBucketMultipartUploads).
-		Queries("uploads", "").
-		Methods("GET")
+	// Each route is registered for both /{bucket} and /{bucket}/ because S3 clients
+	// like warp send bucket-level requests with trailing slashes. We cannot strip
+	// trailing slashes via middleware because that would break SigV4 signature
+	// validation (the client signs the request with the original path).
+	for _, prefix := range []string{"/{bucket}", "/{bucket}/"} {
+		r.HandleFunc(prefix, s.handleBucketMultipartUploads).
+			Queries("uploads", "").
+			Methods("GET")
 
-	r.HandleFunc("/{bucket}", s.handleListObjectsV2).
-		Queries("list-type", "2").
-		Methods("GET")
+		r.HandleFunc(prefix, s.handleListObjectsV2).
+			Queries("list-type", "2").
+			Methods("GET")
 
-	r.HandleFunc("/{bucket}", s.handleBucketVersioning).
-		Queries("versioning", "").
-		Methods("GET", "PUT")
+		r.HandleFunc(prefix, s.handleBucketVersioning).
+			Queries("versioning", "").
+			Methods("GET", "PUT")
 
-	r.HandleFunc("/{bucket}", s.handleBucketACL).
-		Queries("acl", "").
-		Methods("GET", "PUT")
+		r.HandleFunc(prefix, s.handleBucketACL).
+			Queries("acl", "").
+			Methods("GET", "PUT")
 
-	r.HandleFunc("/{bucket}", s.handleBucketLifecycle).
-		Queries("lifecycle", "").
-		Methods("GET", "PUT", "DELETE")
+		r.HandleFunc(prefix, s.handleBucketLifecycle).
+			Queries("lifecycle", "").
+			Methods("GET", "PUT", "DELETE")
 
-	r.HandleFunc("/{bucket}", s.handleBucketPolicy).
-		Queries("policy", "").
-		Methods("GET", "PUT", "DELETE")
+		r.HandleFunc(prefix, s.handleBucketPolicy).
+			Queries("policy", "").
+			Methods("GET", "PUT", "DELETE")
 
-	r.HandleFunc("/{bucket}", s.handleBucketCORS).
-		Queries("cors", "").
-		Methods("GET", "PUT", "DELETE")
+		r.HandleFunc(prefix, s.handleBucketCORS).
+			Queries("cors", "").
+			Methods("GET", "PUT", "DELETE")
 
-	r.HandleFunc("/{bucket}", s.handleBucketTagging).
-		Queries("tagging", "").
-		Methods("GET", "PUT", "DELETE")
+		r.HandleFunc(prefix, s.handleBucketTagging).
+			Queries("tagging", "").
+			Methods("GET", "PUT", "DELETE")
 
-	r.HandleFunc("/{bucket}", s.handleBucketLocation).
-		Queries("location", "").
-		Methods("GET")
+		r.HandleFunc(prefix, s.handleBucketLocation).
+			Queries("location", "").
+			Methods("GET")
 
-	// DeleteObjects (multi-object delete)
-	r.HandleFunc("/{bucket}", s.handleDeleteObjects).
-		Queries("delete", "").
-		Methods("POST")
+		// DeleteObjects (multi-object delete)
+		r.HandleFunc(prefix, s.handleDeleteObjects).
+			Queries("delete", "").
+			Methods("POST")
 
-	// Basic bucket operations (ListObjects V1, CreateBucket, DeleteBucket, HeadBucket)
-	r.HandleFunc("/{bucket}", s.handleBucket).Methods("GET", "HEAD", "PUT", "DELETE")
+		// Basic bucket operations (ListObjects V1, CreateBucket, DeleteBucket, HeadBucket)
+		r.HandleFunc(prefix, s.handleBucket).Methods("GET", "HEAD", "PUT", "DELETE")
+	}
 
 	// List buckets (service level)
 	r.HandleFunc("/", s.handleListBuckets).Methods("GET")
@@ -283,7 +289,25 @@ func validateBucketName(w http.ResponseWriter, r *http.Request) bool {
 
 // validateContentLength validates the Content-Length header for PUT requests.
 // Returns true if valid, false if invalid (error already written to response).
+// For AWS chunked transfer encoding (streaming SigV4), the decoded content length
+// is provided in X-Amz-Decoded-Content-Length instead of Content-Length.
 func validateContentLength(w http.ResponseWriter, r *http.Request) bool {
+	// AWS chunked encoding: Content-Length reflects wire size (with chunk framing),
+	// and the actual payload size is in X-Amz-Decoded-Content-Length.
+	if proxy.IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) {
+		v := r.Header.Get("X-Amz-Decoded-Content-Length")
+		if v == "" {
+			WriteError(w, r, ErrMissingContentLength)
+			return false
+		}
+		decodedLen, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || decodedLen < 0 {
+			WriteError(w, r, ErrBadContentLength)
+			return false
+		}
+		return true
+	}
+
 	v := r.Header.Get("Content-Length")
 	if v == "" {
 		WriteError(w, r, ErrMissingContentLength)
