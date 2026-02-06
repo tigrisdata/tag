@@ -115,9 +115,13 @@ func (s *Service) setupCacheListener(
 		sigReader := newSignalingReader(pipeReader)
 
 		// Intermediate buffer absorbs chunks while cache writer initializes.
-		// 1024 chunks × 64KB = 64MB headroom, matching listener buffer size.
-		// This provides ~128ms at 1GB/s for cache initialization before slow consumer.
-		const cacheQueueSize = 1024
+		// Sized as 1/4 of the broadcaster's channel buffer to balance memory savings
+		// with sufficient headroom. Total buffering (listener channel + queue) stays
+		// well above typical object sizes while reducing per-listener memory.
+		cacheQueueSize := s.config.Broadcast.ChannelBuffer / 4
+		if cacheQueueSize < 64 {
+			cacheQueueSize = 64
+		}
 		chunkQueue := make(chan []byte, cacheQueueSize)
 
 		// Start cache writer goroutine - will call Read() when ready
@@ -139,22 +143,27 @@ func (s *Service) setupCacheListener(
 				// Reader is ready, safe to write
 			case <-cacheCtx.Done():
 				pipeErrCh <- cacheCtx.Err()
-				// Drain queue to unblock producer
-				for range chunkQueue {
+				// Drain queue to unblock producer, returning pooled buffers
+				for chunk := range chunkQueue {
+					broadcast.PutChunkBuf(chunk)
 				}
 				return
 			}
 
-			// Drain queue to pipe - blocks on writes, which is fine since reader is ready
+			// Drain queue to pipe - blocks on writes, which is fine since reader is ready.
+			// Returns pooled buffers after each write.
 			var writeErr error
 			for chunk := range chunkQueue {
 				if _, err := pipeWriter.Write(chunk); err != nil {
 					writeErr = err
-					// Drain remaining to unblock producer
-					for range chunkQueue {
+					broadcast.PutChunkBuf(chunk) // Return current buffer
+					// Drain remaining to unblock producer, returning buffers
+					for remaining := range chunkQueue {
+						broadcast.PutChunkBuf(remaining)
 					}
 					break
 				}
+				broadcast.PutChunkBuf(chunk) // Return buffer after successful write
 			}
 			pipeErrCh <- writeErr
 		}()
@@ -170,13 +179,14 @@ func (s *Service) setupCacheListener(
 				break
 			}
 			if len(chunk.Data) > 0 {
-				// Copy chunk data since broadcaster may reuse the slice
-				data := make([]byte, len(chunk.Data))
-				copy(data, chunk.Data)
-
+				// Transfer ownership of pooled buffer directly to queue.
+				// No copy needed - broadcaster gives each listener its own buffer.
+				// The pipe writer goroutine returns buffers to the pool after writing.
 				select {
-				case chunkQueue <- data:
+				case chunkQueue <- chunk.Data:
+					// Ownership transferred - don't Release()
 				case <-cacheCtx.Done():
+					broadcast.PutChunkBuf(chunk.Data) // Return unused buffer
 					chunkErr = cacheCtx.Err()
 					break chunkLoop
 				}

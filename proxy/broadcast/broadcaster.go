@@ -12,6 +12,36 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// chunkPool provides reusable byte buffers for broadcast chunk data.
+// Eliminates per-chunk allocations (make+copy) that cause GC pressure
+// with large objects (e.g., 4MB object = 64 chunks × 64KB = 192+ allocs).
+var chunkPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, DefaultChunkSize)
+		return &b
+	},
+}
+
+// GetChunkBuf returns a byte slice of exactly the given size from the pool.
+// If size exceeds DefaultChunkSize, a fresh allocation is returned (not pooled).
+func GetChunkBuf(size int) []byte {
+	if size > DefaultChunkSize {
+		return make([]byte, size)
+	}
+	bp := chunkPool.Get().(*[]byte)
+	return (*bp)[:size]
+}
+
+// PutChunkBuf returns a byte slice to the pool for reuse.
+// Only slices with cap == DefaultChunkSize are pooled; others are left for GC.
+func PutChunkBuf(b []byte) {
+	if cap(b) != DefaultChunkSize {
+		return
+	}
+	b = b[:cap(b)]
+	chunkPool.Put(&b)
+}
+
 const (
 	// DefaultChunkSize is the default size of chunks for streaming (64 KB).
 	DefaultChunkSize = 64 * 1024
@@ -29,9 +59,21 @@ const (
 var ErrSlowConsumer = errors.New("slow consumer")
 
 // Chunk represents a piece of streamed data.
+// Consumers should call Release() after processing Data to return the
+// underlying buffer to the pool. If Release() is not called, the buffer
+// is garbage collected normally (safe, but less efficient).
 type Chunk struct {
 	Data []byte
 	Err  error // Non-nil on final chunk if error occurred
+}
+
+// Release returns the chunk's data buffer to the pool for reuse.
+// Safe to call multiple times or on chunks with nil Data.
+func (c *Chunk) Release() {
+	if c.Data != nil {
+		PutChunkBuf(c.Data)
+		c.Data = nil
+	}
 }
 
 // Listener receives chunks from a broadcast.
@@ -158,7 +200,7 @@ func (b *Broadcaster) Broadcast(data []byte) {
 			continue
 		}
 
-		chunk := Chunk{Data: make([]byte, len(data))}
+		chunk := Chunk{Data: GetChunkBuf(len(data))}
 		copy(chunk.Data, data)
 
 		// Non-blocking send - disconnect immediately if buffer is full
@@ -166,7 +208,9 @@ func (b *Broadcaster) Broadcast(data []byte) {
 		case l.ch <- chunk:
 			activeListeners = append(activeListeners, l)
 		default:
-			// Buffer full - disconnect slow consumer
+			// Buffer full - disconnect slow consumer.
+			// Return pooled buffer since this chunk won't be consumed.
+			chunk.Release()
 			l.disconnected = true
 			select {
 			case l.ch <- Chunk{Err: ErrSlowConsumer}:

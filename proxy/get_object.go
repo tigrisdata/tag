@@ -435,6 +435,7 @@ func (s *Service) writeChunksToResponse(
 			}
 			n, writeErr := w.Write(chunk.Data)
 			totalBytesOut += int64(n)
+			chunk.Release() // Return pooled buffer after write copies data
 			if writeErr != nil {
 				return writeErr
 			}
