@@ -69,6 +69,11 @@ type Chunk struct {
 
 // Release returns the chunk's data buffer to the pool for reuse.
 // Safe to call multiple times or on chunks with nil Data.
+//
+// Thread safety: Release is not synchronized with a mutex because chunks flow
+// through channels, which guarantee exclusive ownership — only one goroutine
+// holds a given Chunk value at any time. DrainAndRelease only processes chunks
+// still in the channel, never ones already received by a consumer.
 func (c *Chunk) Release() {
 	if c.Data != nil {
 		PutChunkBuf(c.Data)
@@ -198,6 +203,10 @@ func (b *Broadcaster) SetHeaders(status int, headers http.Header) {
 // Broadcast sends a chunk to all listeners.
 // Slow consumers (buffer full) are disconnected immediately.
 func (b *Broadcaster) Broadcast(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

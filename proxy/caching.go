@@ -193,6 +193,8 @@ func (s *Service) setupCacheListener(
 					earlyExit = true
 					break chunkLoop
 				}
+			} else {
+				chunk.Release() // Return zero-length pooled buffers
 			}
 		}
 

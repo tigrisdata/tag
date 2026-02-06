@@ -451,6 +451,8 @@ func (s *Service) writeChunksToResponse(
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
 			}
+		} else {
+			chunk.Release() // Return zero-length pooled buffers
 		}
 	}
 
