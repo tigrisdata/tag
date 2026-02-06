@@ -91,6 +91,7 @@ func (s *Service) setupCacheListener(
 		statusCode, headers, err := listener.WaitForHeaders(ctx)
 		if err != nil {
 			pipeWriter.CloseWithError(err)
+			listener.DrainAndRelease() // Return any buffered pooled chunks
 			errCh <- err
 			return
 		}
@@ -101,6 +102,7 @@ func (s *Service) setupCacheListener(
 		// Check if still cacheable based on metadata
 		if !meta.IsCacheable(s.config.Cache.SizeThreshold) {
 			pipeWriter.CloseWithError(nil)
+			listener.DrainAndRelease() // Return any buffered pooled chunks
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping cache - not cacheable")
 			return
 		}
