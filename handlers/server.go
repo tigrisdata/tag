@@ -240,7 +240,7 @@ func handleWithError(w http.ResponseWriter, r *http.Request, handler func(http.R
 			log.Warn().Err(err).Str("path", r.URL.Path).
 				Msg("Error after response headers committed, cannot send error response")
 		} else {
-			handleError(w, r, err)
+			handleError(rt, r, err)
 		}
 	}
 }
