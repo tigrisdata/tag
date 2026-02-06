@@ -172,10 +172,12 @@ func (s *Service) setupCacheListener(
 		// This runs in parallel with cache writer initialization,
 		// with the intermediate buffer absorbing chunks during the startup window.
 		var chunkErr error
+		var earlyExit bool
 	chunkLoop:
 		for chunk := range listener.Chunks() {
 			if chunk.Err != nil {
 				chunkErr = chunk.Err
+				earlyExit = true
 				break
 			}
 			if len(chunk.Data) > 0 {
@@ -188,9 +190,16 @@ func (s *Service) setupCacheListener(
 				case <-cacheCtx.Done():
 					broadcast.PutChunkBuf(chunk.Data) // Return unused buffer
 					chunkErr = cacheCtx.Err()
+					earlyExit = true
 					break chunkLoop
 				}
 			}
+		}
+
+		// Drain remaining listener chunks to return pooled buffers on early exit.
+		// Runs async since the broadcaster may still be streaming (channel not closed yet).
+		if earlyExit {
+			listener.DrainAndRelease()
 		}
 
 		// Close queue to signal pipe writer to finish

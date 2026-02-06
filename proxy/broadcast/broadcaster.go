@@ -100,6 +100,19 @@ func (l *Listener) Chunks() <-chan Chunk {
 	return l.ch
 }
 
+// DrainAndRelease drains remaining chunks from the listener channel,
+// returning pooled buffers. Runs in a background goroutine since the
+// channel may not yet be closed (broadcaster still streaming).
+// Call this after breaking out of a Chunks() range loop early.
+// Safe to call on normal completion (no-op if channel is already drained/closed).
+func (l *Listener) DrainAndRelease() {
+	go func() {
+		for chunk := range l.ch {
+			chunk.Release()
+		}
+	}()
+}
+
 // Broadcaster streams data to multiple listeners simultaneously.
 type Broadcaster struct {
 	mu         sync.RWMutex

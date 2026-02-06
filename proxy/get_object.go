@@ -406,15 +406,21 @@ func (s *Service) writeChunksToResponse(
 	// Wait for headers first
 	status, headers, err := listener.WaitForHeaders(ctx)
 	if err != nil {
+		listener.DrainAndRelease() // Return any buffered pooled chunks
 		return err
 	}
 
 	var headersWritten bool
 	var totalBytesOut int64
+	var earlyExit bool
 	defer func() {
 		// Track bytes out to client, even on error
 		if totalBytesOut > 0 {
 			metrics.BytesTransferred.WithLabelValues("out").Add(float64(totalBytesOut))
+		}
+		// Drain remaining pooled chunks on early exit (error, slow consumer, write failure)
+		if earlyExit {
+			listener.DrainAndRelease()
 		}
 	}()
 
@@ -423,6 +429,7 @@ func (s *Service) writeChunksToResponse(
 			if chunk.Err == broadcast.ErrSlowConsumer {
 				metrics.RecordBroadcastSlowConsumer()
 			}
+			earlyExit = true
 			return chunk.Err
 		}
 
@@ -437,6 +444,7 @@ func (s *Service) writeChunksToResponse(
 			totalBytesOut += int64(n)
 			chunk.Release() // Return pooled buffer after write copies data
 			if writeErr != nil {
+				earlyExit = true
 				return writeErr
 			}
 			// Flush if ResponseWriter supports it
