@@ -24,7 +24,11 @@ var chunkPool = sync.Pool{
 
 // GetChunkBuf returns a byte slice of exactly the given size from the pool.
 // If size exceeds DefaultChunkSize, a fresh allocation is returned (not pooled).
+// Returns nil for zero or negative sizes.
 func GetChunkBuf(size int) []byte {
+	if size <= 0 {
+		return nil
+	}
 	if size > DefaultChunkSize {
 		return make([]byte, size)
 	}

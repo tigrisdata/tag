@@ -203,6 +203,48 @@ func (s *Server) Stop(ctx context.Context) error {
 	return s.httpServer.Shutdown(ctx)
 }
 
+// responseTracker wraps http.ResponseWriter to track whether headers have been
+// committed. This prevents handleError from writing error XML after a handler
+// has already started writing a response (which would corrupt the HTTP stream
+// and break keep-alive connections).
+type responseTracker struct {
+	http.ResponseWriter
+	committed bool
+}
+
+func (rt *responseTracker) WriteHeader(code int) {
+	rt.committed = true
+	rt.ResponseWriter.WriteHeader(code)
+}
+
+func (rt *responseTracker) Write(b []byte) (int, error) {
+	rt.committed = true // implicit 200 if WriteHeader not called
+	return rt.ResponseWriter.Write(b)
+}
+
+func (rt *responseTracker) Flush() {
+	if f, ok := rt.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// handleWithError calls a handler function and handles any returned error.
+// If headers have already been committed (e.g., the handler started streaming
+// a response before encountering an error), the error is logged but no error
+// response is written to avoid corrupting the HTTP stream.
+func handleWithError(w http.ResponseWriter, r *http.Request, handler func(http.ResponseWriter, *http.Request) error) {
+	rt := &responseTracker{ResponseWriter: w}
+	err := handler(rt, r)
+	if err != nil {
+		if rt.committed {
+			log.Warn().Err(err).Str("path", r.URL.Path).
+				Msg("Error after response headers committed, cannot send error response")
+		} else {
+			handleError(w, r, err)
+		}
+	}
+}
+
 // handleHealth handles health check requests.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
@@ -334,9 +376,7 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request) {
 
 	// Check for copy operation (PUT with X-Amz-Copy-Source header)
 	if r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") != "" {
-		if err := s.service.HandleCopyObject(w, r); err != nil {
-			handleError(w, r, err)
-		}
+		handleWithError(w, r, s.service.HandleCopyObject)
 		return
 	}
 
@@ -347,24 +387,22 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var err error
+	var handler func(http.ResponseWriter, *http.Request) error
 	switch r.Method {
 	case http.MethodGet:
-		err = s.service.HandleGetObject(w, r)
+		handler = s.service.HandleGetObject
 	case http.MethodHead:
-		err = s.service.HandleHeadObject(w, r)
+		handler = s.service.HandleHeadObject
 	case http.MethodPut:
-		err = s.service.HandlePutObject(w, r)
+		handler = s.service.HandlePutObject
 	case http.MethodDelete:
-		err = s.service.HandleDeleteObject(w, r)
+		handler = s.service.HandleDeleteObject
 	default:
 		WriteError(w, r, ErrMethodNotAllowed)
 		return
 	}
 
-	if err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, handler)
 }
 
 // handleBucket handles basic bucket operations.
@@ -373,35 +411,17 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var err error
 	switch r.Method {
-	case http.MethodGet:
-		// ListObjects V1
-		err = s.service.HandlePassthrough(w, r)
-	case http.MethodHead:
-		// HeadBucket
-		err = s.service.HandlePassthrough(w, r)
-	case http.MethodPut:
-		// CreateBucket
-		err = s.service.HandlePassthrough(w, r)
-	case http.MethodDelete:
-		// DeleteBucket
-		err = s.service.HandlePassthrough(w, r)
+	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete:
+		handleWithError(w, r, s.service.HandlePassthrough)
 	default:
 		WriteError(w, r, ErrMethodNotAllowed)
-		return
-	}
-
-	if err != nil {
-		handleError(w, r, err)
 	}
 }
 
 // handleListBuckets handles ListBuckets operation.
 func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleListObjectsV2 handles ListObjectsV2 operation.
@@ -409,9 +429,7 @@ func (s *Server) handleListObjectsV2(w http.ResponseWriter, r *http.Request) {
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleCompleteMultipartUpload handles CompleteMultipartUpload with idempotency caching.
@@ -421,9 +439,7 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandleCompleteMultipartUpload(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandleCompleteMultipartUpload)
 }
 
 // handleObjectWithQuery handles object operations with query parameters (multipart).
@@ -431,9 +447,7 @@ func (s *Server) handleObjectWithQuery(w http.ResponseWriter, r *http.Request) {
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleInitiateMultipart handles InitiateMultipartUpload.
@@ -441,9 +455,7 @@ func (s *Server) handleInitiateMultipart(w http.ResponseWriter, r *http.Request)
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleBucketMultipartUploads handles ListMultipartUploads.
@@ -451,9 +463,7 @@ func (s *Server) handleBucketMultipartUploads(w http.ResponseWriter, r *http.Req
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleObjectTagging handles object tagging operations.
@@ -461,9 +471,7 @@ func (s *Server) handleObjectTagging(w http.ResponseWriter, r *http.Request) {
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleObjectACL handles object ACL operations.
@@ -471,9 +479,7 @@ func (s *Server) handleObjectACL(w http.ResponseWriter, r *http.Request) {
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleBucketVersioning handles bucket versioning operations.
@@ -481,9 +487,7 @@ func (s *Server) handleBucketVersioning(w http.ResponseWriter, r *http.Request) 
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleBucketACL handles bucket ACL operations.
@@ -491,9 +495,7 @@ func (s *Server) handleBucketACL(w http.ResponseWriter, r *http.Request) {
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleBucketLifecycle handles bucket lifecycle operations.
@@ -501,9 +503,7 @@ func (s *Server) handleBucketLifecycle(w http.ResponseWriter, r *http.Request) {
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleBucketPolicy handles bucket policy operations.
@@ -511,9 +511,7 @@ func (s *Server) handleBucketPolicy(w http.ResponseWriter, r *http.Request) {
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleBucketCORS handles bucket CORS operations.
@@ -521,9 +519,7 @@ func (s *Server) handleBucketCORS(w http.ResponseWriter, r *http.Request) {
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleBucketTagging handles bucket tagging operations.
@@ -531,9 +527,7 @@ func (s *Server) handleBucketTagging(w http.ResponseWriter, r *http.Request) {
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandlePassthrough(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandlePassthrough)
 }
 
 // handleBucketLocation handles GetBucketLocation operation.
@@ -555,7 +549,5 @@ func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request) {
 	if !validateBucketName(w, r) {
 		return
 	}
-	if err := s.service.HandleDeleteObjects(w, r); err != nil {
-		handleError(w, r, err)
-	}
+	handleWithError(w, r, s.service.HandleDeleteObjects)
 }

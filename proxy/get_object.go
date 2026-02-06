@@ -141,7 +141,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				bodyBuf.Reset()
 
 				bodyErr := s.cache.GetBodyStream(ctx, bucket, key, bodyBuf)
-				if bodyErr == nil {
+				// Verify body was actually retrieved: ocache GetStream returns nil
+				// for not-found keys (by design), so we must check bytes written.
+				if bodyErr == nil && bodyBuf.Len() > 0 {
 					metrics.RecordCacheHit()
 					log.Debug().Str("bucket", bucket).Str("key", key).Int64("size", meta.ContentLength).Msg("Serving small object from cache (fast path)")
 					meta.WriteHeaders(w)
@@ -153,9 +155,13 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					putBuffer(bodyBuf) // Return buffer to pool
 					return nil
 				}
-				putBuffer(bodyBuf) // Return buffer to pool even on error
+				putBuffer(bodyBuf) // Return buffer to pool even on error/miss
 				// Fall through to upstream (cache miss handling below)
-				log.Debug().Err(bodyErr).Str("bucket", bucket).Str("key", key).Msg("GetBodyStream failed for small object, falling back to upstream")
+				if bodyErr != nil {
+					log.Debug().Err(bodyErr).Str("bucket", bucket).Str("key", key).Msg("GetBodyStream failed for small object, falling back to upstream")
+				} else {
+					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache body empty despite meta hit, falling back to upstream")
+				}
 			} else {
 				// Large objects: use io.Pipe for streaming (avoids buffering entire object)
 				pr, pw := io.Pipe()
