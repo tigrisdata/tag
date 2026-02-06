@@ -70,7 +70,7 @@ if ! sed -e "s|__AWS_ACCESS_KEY_ID__|${AWS_ACCESS_KEY_ID}|g" \
 fi
 export S3TEST_CONF
 
-cd s3-tests
+cd s3-tests || exit
 
 # Create tox.ini for running tests
 cat <<EOF >tox.ini

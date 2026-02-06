@@ -113,9 +113,11 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 }
 
 // PutWithMetaStreamTombstoneAware is like PutWithMetaStream but checks for
-// tombstones before writing metadata. If a tombstone exists that's newer than
-// writeStartTime, the metadata write is skipped (preventing stale cache).
-// This is used by async cache writers to avoid caching stale data after invalidation.
+// tombstones after body streaming and before writing metadata. If a tombstone
+// exists that's newer than writeStartTime, the metadata write is skipped and
+// the orphaned body is cleaned up. Checking after body stream (rather than
+// before) closes the TOCTOU window where an invalidation during streaming
+// could be missed, causing resurrected metadata without a body.
 func (c *Cache) PutWithMetaStreamTombstoneAware(
 	ctx context.Context,
 	bucket, key string,
@@ -142,22 +144,25 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		return err
 	}
 
-	// CHECK TOMBSTONE BEFORE writing anything to cache
-	// If a tombstone exists with timestamp >= writeStartTime, the key was invalidated
-	// after this write started, so we should NOT write at all (prevents orphaned bodies)
+	// Stream body to cache
+	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
+		return err
+	}
+
+	// Check tombstone AFTER body stream, right before meta write.
+	// This closes the TOCTOU window: if the key was invalidated during body streaming
+	// (e.g., a PUT/DELETE arrived while we were writing), we skip the meta write.
+	// Without this, a slow body stream could allow meta to be written after a
+	// concurrent invalidation deletes meta+body, resurrecting stale metadata.
 	tombTs := c.GetTombstoneTimestamp(ctx, bucket, key)
 	if tombTs >= writeStartTime {
 		log.Debug().Str("bucket", bucket).Str("key", key).
 			Int64("tombstone_ts", tombTs).
 			Int64("write_start", writeStartTime).
-			Msg("Skipping cache write - tombstone detected (key was invalidated)")
+			Msg("Skipping meta write - tombstone detected after body stream")
+		_ = c.client.Delete(ctx, bodyKey) // Clean up orphaned body
 		return nil
-	}
-
-	// Stream body to cache
-	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
-		return err
 	}
 
 	// Write metadata AFTER body (makes entry visible)

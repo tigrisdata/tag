@@ -141,7 +141,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				bodyBuf.Reset()
 
 				bodyErr := s.cache.GetBodyStream(ctx, bucket, key, bodyBuf)
-				if bodyErr == nil {
+				// Verify body was actually retrieved: ocache GetStream returns nil
+				// for not-found keys (by design), so we must check bytes written.
+				if bodyErr == nil && bodyBuf.Len() > 0 {
 					metrics.RecordCacheHit()
 					log.Debug().Str("bucket", bucket).Str("key", key).Int64("size", meta.ContentLength).Msg("Serving small object from cache (fast path)")
 					meta.WriteHeaders(w)
@@ -153,9 +155,13 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					putBuffer(bodyBuf) // Return buffer to pool
 					return nil
 				}
-				putBuffer(bodyBuf) // Return buffer to pool even on error
+				putBuffer(bodyBuf) // Return buffer to pool even on error/miss
 				// Fall through to upstream (cache miss handling below)
-				log.Debug().Err(bodyErr).Str("bucket", bucket).Str("key", key).Msg("GetBodyStream failed for small object, falling back to upstream")
+				if bodyErr != nil {
+					log.Debug().Err(bodyErr).Str("bucket", bucket).Str("key", key).Msg("GetBodyStream failed for small object, falling back to upstream")
+				} else {
+					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache body empty despite meta hit, falling back to upstream")
+				}
 			} else {
 				// Large objects: use io.Pipe for streaming (avoids buffering entire object)
 				pr, pw := io.Pipe()
@@ -406,15 +412,21 @@ func (s *Service) writeChunksToResponse(
 	// Wait for headers first
 	status, headers, err := listener.WaitForHeaders(ctx)
 	if err != nil {
+		listener.DrainAndRelease() // Return any buffered pooled chunks
 		return err
 	}
 
 	var headersWritten bool
 	var totalBytesOut int64
+	var earlyExit bool
 	defer func() {
 		// Track bytes out to client, even on error
 		if totalBytesOut > 0 {
 			metrics.BytesTransferred.WithLabelValues("out").Add(float64(totalBytesOut))
+		}
+		// Drain remaining pooled chunks on early exit (error, slow consumer, write failure)
+		if earlyExit {
+			listener.DrainAndRelease()
 		}
 	}()
 
@@ -423,6 +435,7 @@ func (s *Service) writeChunksToResponse(
 			if chunk.Err == broadcast.ErrSlowConsumer {
 				metrics.RecordBroadcastSlowConsumer()
 			}
+			earlyExit = true
 			return chunk.Err
 		}
 
@@ -435,13 +448,17 @@ func (s *Service) writeChunksToResponse(
 			}
 			n, writeErr := w.Write(chunk.Data)
 			totalBytesOut += int64(n)
+			chunk.Release() // Return pooled buffer after write copies data
 			if writeErr != nil {
+				earlyExit = true
 				return writeErr
 			}
 			// Flush if ResponseWriter supports it
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
 			}
+		} else {
+			chunk.Release() // Return zero-length pooled buffers
 		}
 	}
 

@@ -24,3 +24,6 @@ rocksdb-static/
 
 # Environment variables
 .env
+
+# IDE files
+.vscode/
