@@ -184,6 +184,7 @@ func TestShouldCopyHeader(t *testing.T) {
 		header   string
 		expected bool
 	}{
+		// Content headers
 		{"Content-Type", true},
 		{"Content-Length", true},
 		{"Content-Encoding", true},
@@ -191,10 +192,21 @@ func TestShouldCopyHeader(t *testing.T) {
 		{"Cache-Control", true},
 		{"Expires", true},
 		{"Content-MD5", true},
+		// All x-amz-* headers are allowed (signer overwrites X-Amz-Date etc.)
 		{"X-Amz-Meta-Custom", true},
 		{"X-Amz-Meta-Another-Header", true},
+		{"X-Amz-Date", true},
+		{"X-Amz-Content-Sha256", true},
+		{"X-Amz-Copy-Source", true},
+		{"X-Amz-Tagging", true},
+		// Tigris-specific headers (tigris-* and x-tigris-*)
+		{"Tigris-Force-Delete", true},
+		{"X-Tigris-Custom", true},
+		// Conditional request headers
+		{"If-None-Match", true},
+		{"If-Modified-Since", true},
+		// Not copied
 		{"Authorization", false},
-		{"X-Amz-Date", false},
 		{"Host", false},
 		{"Random-Header", false},
 	}

@@ -6,11 +6,11 @@ This document describes the architecture of TAG (Tigris Access Gateway), a high-
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                              TAG Proxy                                   │
-│  ┌─────────┐  ┌──────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────┐  │
-│  │ Handler │──│   Auth   │──│  Proxy  │──│  Cache  │──│  Forwarder  │  │
-│  │ Server  │  │ Validator│  │ Service │  │ Client  │  │   (Signer)  │  │
-│  └────┬────┘  └──────────┘  └────┬────┘  └────┬────┘  └──────┬──────┘  │
+│                              TAG Proxy                                  │
+│  ┌─────────┐  ┌──────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────┐   │
+│  │ Handler │──│   Auth   │──│  Proxy  │──│  Cache  │──│  Forwarder  │   │
+│  │ Server  │  │ Validator│  │ Service │  │ Client  │  │   (Signer)  │   │
+│  └────┬────┘  └──────────┘  └────┬────┘  └────┬────┘  └──────┬──────┘   │
 │       │                          │            │               │         │
 │       │                          │     ┌──────┴──────┐        │         │
 │       │                          │     │  Embedded   │        │         │
@@ -41,6 +41,7 @@ The HTTP server that receives incoming S3 requests.
 - **errors.go**: S3-compatible error responses
 
 Routes requests to appropriate handlers based on HTTP method and path:
+
 - `GET /{bucket}/{key}` → GetObject
 - `PUT /{bucket}/{key}` → PutObject
 - `DELETE /{bucket}/{key}` → DeleteObject
@@ -58,6 +59,7 @@ AWS Signature Version 4 authentication and request signing.
 - **parser.go**: Parses Authorization headers and presigned URLs
 
 **Authentication Flow:**
+
 ```
 1. Extract access key from Authorization header or query params
 2. Look up secret key from credential store
@@ -82,12 +84,14 @@ Interface to the embedded OCache module with RocksDB storage.
 - **object.go**: Cached object metadata structure
 
 TAG embeds OCache directly, providing:
+
 - High-performance RocksDB-based storage
 - Optional clustering via gossip protocol (memberlist)
 - gRPC-based cache routing between nodes
 - Consistent hashing for key distribution
 
 **Two-Key Storage Pattern:**
+
 ```
 Object "bucket/key" is stored as:
   - Metadata key: "meta:bucket/key" → JSON with headers, size, etag, etc.
@@ -95,6 +99,7 @@ Object "bucket/key" is stored as:
 ```
 
 This pattern enables:
+
 - Efficient HEAD requests (metadata only)
 - Conditional request support (If-None-Match, If-Modified-Since)
 - Range requests from cached full objects
@@ -116,28 +121,28 @@ For multi-node deployments, TAG nodes form a distributed cache cluster:
                     └─────────────────────────────────────────┘
                               ▲           ▲           ▲
                               │           │           │
-                    ┌─────────┴───┐ ┌─────┴─────┐ ┌───┴─────────┐
-                    │   TAG-1     │ │   TAG-2   │ │   TAG-3     │
-                    │ ┌─────────┐ │ │ ┌───────┐ │ │ ┌─────────┐ │
-                    │ │ Embedded│ │ │ │Embedded│ │ │ │ Embedded│ │
-                    │ │ Cache   │ │ │ │ Cache  │ │ │ │ Cache   │ │
+                    ┌─────────┴───┐ ┌─────┴───────┐ ┌───┴─────────┐
+                    │   TAG-1     │ │   TAG-2     │ │   TAG-3     │
+                    │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │
+                    │ │ Embedded│ │ │ │ Embedded│ │ │ │ Embedded│ │
+                    │ │ Cache   │ │ │ │ Cache   │ │ │ │ Cache   │ │
                     │ │(RocksDB)│ │ │ │(RocksDB)│ │ │ │(RocksDB)│ │
-                    │ └─────────┘ │ │ └───────┘ │ │ └─────────┘ │
-                    └──────┬──────┘ └─────┬─────┘ └──────┬──────┘
-                           │              │              │
-                    ┌──────┴──────────────┴──────────────┴──────┐
-                    │              gRPC Routing                  │
-                    │         (Cache Key Distribution)           │
-                    └───────────────────────────────────────────┘
+                    │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │
+                    └──────┬──────┘ └─────┬───────┘ └──────┬──────┘
+                           │              │                │
+                    ┌──────┴──────────────┴────────────────┴──────┐
+                    │              gRPC Routing                   │
+                    │         (Cache Key Distribution)            │
+                    └─────────────────────────────────────────────┘
 ```
 
 **Cluster Components:**
 
-| Port | Protocol | Purpose |
-|------|----------|---------|
-| 8080 | HTTP | S3 API requests |
-| 7000 | TCP | Memberlist gossip (cluster discovery) |
-| 9000 | gRPC | Cache routing between nodes |
+| Port | Protocol | Purpose                               |
+| ---- | -------- | ------------------------------------- |
+| 8080 | HTTP     | S3 API requests                       |
+| 7000 | TCP      | Memberlist gossip (cluster discovery) |
+| 9000 | gRPC     | Cache routing between nodes           |
 
 **How Clustering Works:**
 
@@ -243,6 +248,7 @@ Client3                 │                                  │
 ```
 
 **Key Points:**
+
 - First request becomes the "fetcher" and initiates upstream request
 - Subsequent requests before streaming starts join as "listeners"
 - All clients receive data simultaneously as chunks arrive
@@ -278,6 +284,7 @@ Client                 TAG                    Embedded Cache         Tigris
 ```
 
 **Benefits:**
+
 - Low latency: Client gets range immediately
 - Future ranges served from cache
 - Background fetches are coalesced (multiple range requests = single fetch)
@@ -310,11 +317,13 @@ Body key:               "body|bucket|key"
 ### Cacheability Rules
 
 Objects are cached when:
+
 - Response status is 200 OK
 - Size is within `size_threshold` (default 1GB)
 - No `Cache-Control: no-store` or `private` headers
 
 Objects are NOT cached when:
+
 - Response is not 200 (errors, redirects)
 - Size exceeds threshold
 - Cache-Control prevents caching
@@ -344,6 +353,7 @@ type Listener struct {
 ```
 
 **Policies:**
+
 - **No Late Joiners**: Once streaming starts, new requests start their own broadcast
 - **Slow Consumer Handling**: Listeners with full channels are disconnected
 - **Memory Bounded**: `chunkSize × channelBuffer × numListeners` per broadcast
@@ -365,10 +375,10 @@ TAG returns S3-compatible XML error responses:
 
 ### Error Mapping
 
-| Internal Error | S3 Error Code | HTTP Status |
-|----------------|---------------|-------------|
-| Invalid signature | SignatureDoesNotMatch | 403 |
-| Unknown access key | InvalidAccessKeyId | 403 |
-| Request expired | RequestTimeTooSkewed | 403 |
-| Slow consumer | InternalError | 500 |
-| Upstream error | InternalError | 502 |
+| Internal Error     | S3 Error Code         | HTTP Status |
+| ------------------ | --------------------- | ----------- |
+| Invalid signature  | SignatureDoesNotMatch | 403         |
+| Unknown access key | InvalidAccessKeyId    | 403         |
+| Request expired    | RequestTimeTooSkewed  | 403         |
+| Slow consumer      | InternalError         | 500         |
+| Upstream error     | InternalError         | 502         |

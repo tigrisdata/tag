@@ -14,12 +14,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 const (
 	// DefaultTAGEndpoint is the default TAG endpoint when running via make s3-test-local.
-	DefaultTAGEndpoint = "http://localhost:8080"
+	DefaultTAGEndpoint = "http://127-0-0-1.sslip.io"
 	// DefaultRegion is the default AWS region for signing.
 	DefaultRegion = "auto"
 	// BucketPrefixBase is the base prefix for test buckets.
@@ -174,51 +174,12 @@ func (e *TestEnvironment) DeleteTestObject(bucket, key string) error {
 	return err
 }
 
-// deleteAllObjects deletes all objects in a bucket.
-func (e *TestEnvironment) deleteAllObjects(bucket string) error {
-	ctx := context.Background()
-
-	// List all objects
-	paginator := s3.NewListObjectsV2Paginator(e.S3Client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-	})
-
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to list objects in %s: %w", bucket, err)
-		}
-
-		if len(page.Contents) == 0 {
-			continue
-		}
-
-		// Build delete request
-		objects := make([]types.ObjectIdentifier, len(page.Contents))
-		for i, obj := range page.Contents {
-			objects[i] = types.ObjectIdentifier{Key: obj.Key}
-		}
-
-		// Delete objects
-		_, err = e.S3Client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-			Bucket: aws.String(bucket),
-			Delete: &types.Delete{
-				Objects: objects,
-				Quiet:   aws.Bool(true),
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("failed to delete objects in %s: %w", bucket, err)
-		}
-	}
-
-	return nil
-}
-
-// deleteBucket deletes a bucket (must be empty).
+// deleteBucket force-deletes a bucket and all its objects using Tigris-Force-Delete header.
 func (e *TestEnvironment) deleteBucket(bucket string) error {
 	_, err := e.S3Client.DeleteBucket(context.Background(), &s3.DeleteBucketInput{
 		Bucket: aws.String(bucket),
+	}, func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, smithyhttp.AddHeaderValue("Tigris-Force-Delete", "true"))
 	})
 	return err
 }
@@ -232,13 +193,6 @@ func (e *TestEnvironment) Cleanup() error {
 
 	var errs []error
 	for _, bucket := range buckets {
-		// Delete all objects first
-		if err := e.deleteAllObjects(bucket); err != nil {
-			errs = append(errs, fmt.Errorf("failed to empty bucket %s: %w", bucket, err))
-			continue
-		}
-
-		// Delete bucket
 		if err := e.deleteBucket(bucket); err != nil {
 			errs = append(errs, fmt.Errorf("failed to delete bucket %s: %w", bucket, err))
 		}

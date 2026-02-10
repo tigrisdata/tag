@@ -11,7 +11,7 @@ GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 TAG_CACHE_DATA_DIR := /tmp/tag-cache-data
 
 # Local test ports (avoid macOS conflicts: 7000 is used by AirPlay Receiver)
-TAG_LOCAL_HTTP_PORT := 8080
+TAG_LOCAL_HTTP_PORT := 80
 TAG_LOCAL_GRPC_PORT := 9090
 TAG_LOCAL_CLUSTER_PORT := 7070
 
@@ -370,6 +370,6 @@ test-sdk: rocksdb-static
 		echo "  Start TAG with: make s3-test-local"; \
 		exit 1; \
 	fi
-	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) $(CGO_ENV) go test -v -timeout 300s $(TESTFLAGS) ./tests/integration/sdk/...
+	TAG_ENDPOINT=http://127-0-0-1.sslip.io $(CGO_ENV) go test -v -timeout 300s $(TESTFLAGS) ./tests/integration/sdk/...
 
 .DEFAULT_GOAL := help

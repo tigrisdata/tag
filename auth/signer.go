@@ -266,25 +266,16 @@ func shouldCopyHeader(key string) bool {
 	// Range requests
 	case "range":
 		return true
-	// S3-specific headers for operations
-	case "x-amz-copy-source", "x-amz-copy-source-range",
-		"x-amz-copy-source-if-match", "x-amz-copy-source-if-none-match",
-		"x-amz-copy-source-if-modified-since", "x-amz-copy-source-if-unmodified-since",
-		"x-amz-metadata-directive", "x-amz-tagging-directive",
-		"x-amz-storage-class", "x-amz-website-redirect-location",
-		"x-amz-server-side-encryption", "x-amz-server-side-encryption-customer-algorithm",
-		"x-amz-server-side-encryption-customer-key", "x-amz-server-side-encryption-customer-key-md5",
-		"x-amz-acl", "x-amz-grant-read", "x-amz-grant-write", "x-amz-grant-read-acp",
-		"x-amz-grant-write-acp", "x-amz-grant-full-control",
-		"x-amz-tagging", "x-amz-object-lock-mode", "x-amz-object-lock-retain-until-date",
-		"x-amz-object-lock-legal-hold", "x-amz-expected-bucket-owner":
-		return true
 	// Conditional request headers
 	case "if-match", "if-none-match", "if-modified-since", "if-unmodified-since":
 		return true
 	}
-	// Copy user metadata headers
-	if strings.HasPrefix(lower, "x-amz-meta-") {
+	// All x-amz-* headers (S3 operations, metadata, etc.)
+	if strings.HasPrefix(lower, "x-amz-") {
+		return true
+	}
+	// All Tigris-specific headers (tigris-* and x-tigris-*)
+	if strings.HasPrefix(lower, "tigris-") || strings.HasPrefix(lower, "x-tigris-") {
 		return true
 	}
 	return false

@@ -322,6 +322,51 @@ cache:
 	}
 }
 
+func TestTransparentProxy_DisabledByDefault(t *testing.T) {
+	cfg := NewDefault()
+	if cfg.Upstream.TransparentProxy {
+		t.Error("TransparentProxy = true, want false (disabled by default)")
+	}
+}
+
+func TestTransparentProxy_EnabledByYAML(t *testing.T) {
+	content := `
+upstream:
+  transparent_proxy: true
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if !cfg.Upstream.TransparentProxy {
+		t.Error("TransparentProxy = false, want true")
+	}
+}
+
+func TestTransparentProxy_EnabledByEnv(t *testing.T) {
+	t.Setenv("TAG_TRANSPARENT_PROXY", "true")
+
+	cfg := NewDefault()
+	if !cfg.Upstream.TransparentProxy {
+		t.Error("TransparentProxy = false, want true (enabled by env)")
+	}
+}
+
+func TestTransparentProxy_EnabledByEnv_NumericOne(t *testing.T) {
+	t.Setenv("TAG_TRANSPARENT_PROXY", "1")
+
+	cfg := NewDefault()
+	if !cfg.Upstream.TransparentProxy {
+		t.Error("TransparentProxy = false, want true (enabled by env with '1')")
+	}
+}
+
 func TestCacheDefaultValues(t *testing.T) {
 	cfg := NewDefault()
 

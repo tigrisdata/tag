@@ -13,7 +13,7 @@ import (
 // Default configuration values.
 const (
 	// DefaultHTTPPort is the default S3 API port.
-	DefaultHTTPPort = 8080
+	DefaultHTTPPort = 80
 
 	// DefaultBindIP is the default bind address.
 	DefaultBindIP = "0.0.0.0"
@@ -79,6 +79,7 @@ type UpstreamConfig struct {
 	Endpoint            string `yaml:"endpoint"`                // Tigris S3 endpoint (e.g., https://fly.storage.tigris.dev)
 	Region              string `yaml:"region"`                  // AWS region for signing (default: auto)
 	MaxIdleConnsPerHost int    `yaml:"max_idle_conns_per_host"` // HTTP connection pool size per host (default: 100)
+	TransparentProxy    bool   `yaml:"transparent_proxy"`       // Forward client requests as-is with proxy headers (default: false)
 }
 
 // CredentialsConfig holds credential store configuration.
@@ -278,6 +279,11 @@ func applyEnvOverrides(cfg *Config) {
 	// Enable pprof from environment (disabled by default for security)
 	if enabled := os.Getenv("TAG_PPROF_ENABLED"); enabled == "true" || enabled == "1" {
 		cfg.Server.PprofEnabled = true
+	}
+
+	// Enable transparent proxy from environment (disabled by default)
+	if enabled := os.Getenv("TAG_TRANSPARENT_PROXY"); enabled == "true" || enabled == "1" {
+		cfg.Upstream.TransparentProxy = true
 	}
 }
 
