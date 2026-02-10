@@ -13,7 +13,7 @@ import (
 // Default configuration values.
 const (
 	// DefaultHTTPPort is the default S3 API port.
-	DefaultHTTPPort = 80
+	DefaultHTTPPort = 8080
 
 	// DefaultBindIP is the default bind address.
 	DefaultBindIP = "0.0.0.0"
