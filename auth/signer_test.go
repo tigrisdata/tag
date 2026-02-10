@@ -202,6 +202,11 @@ func TestShouldCopyHeader(t *testing.T) {
 		// Tigris-specific headers (tigris-* and x-tigris-*)
 		{"Tigris-Force-Delete", true},
 		{"X-Tigris-Custom", true},
+		// Proxy headers are blocked to prevent client injection in signing mode
+		{"X-Tigris-Forwarded-Host", false},
+		{"X-Tigris-Proxy-Access-Key", false},
+		{"X-Tigris-Proxy-Timestamp", false},
+		{"X-Tigris-Proxy-Signature", false},
 		// Conditional request headers
 		{"If-None-Match", true},
 		{"If-Modified-Since", true},

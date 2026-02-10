@@ -274,7 +274,12 @@ func shouldCopyHeader(key string) bool {
 	if strings.HasPrefix(lower, "x-amz-") {
 		return true
 	}
-	// All Tigris-specific headers (tigris-* and x-tigris-*)
+	// All Tigris-specific headers (tigris-* and x-tigris-*), except proxy headers
+	// which must not be forwarded in signing mode to prevent client injection.
+	// The transparent forwarder overwrites these with .Set() so it's unaffected.
+	if strings.HasPrefix(lower, "x-tigris-proxy-") || lower == "x-tigris-forwarded-host" {
+		return false
+	}
 	if strings.HasPrefix(lower, "tigris-") || strings.HasPrefix(lower, "x-tigris-") {
 		return true
 	}
