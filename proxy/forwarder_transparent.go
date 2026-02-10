@@ -30,6 +30,7 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 	}
 
 	baseURL.Path = r.URL.Path
+	baseURL.RawPath = r.URL.RawPath
 	baseURL.RawQuery = r.URL.RawQuery
 
 	fwdReq, err := http.NewRequestWithContext(ctx, r.Method, baseURL.String(), r.Body)
