@@ -28,7 +28,7 @@ const (
 
 // Service provides the core caching proxy logic.
 type Service struct {
-	forwarder              *Forwarder
+	forwarder              RequestForwarder
 	cache                  *cache.Cache
 	config                 *config.Config
 	cacheSemaphore         chan struct{}      // Limits concurrent cache writes
@@ -37,7 +37,7 @@ type Service struct {
 }
 
 // NewService creates a new proxy service.
-func NewService(forwarder *Forwarder, cache *cache.Cache, cfg *config.Config) *Service {
+func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Config) *Service {
 	channelBuf := cfg.Broadcast.ChannelBuffer
 	if channelBuf <= 0 {
 		channelBuf = broadcast.DefaultChannelBuffer

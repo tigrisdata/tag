@@ -92,6 +92,7 @@ func main() {
 		Int("http_port", cfg.Server.HTTPPort).
 		Str("upstream", cfg.Upstream.Endpoint).
 		Bool("cache_enabled", cfg.Cache.IsEnabled()).
+		Bool("transparent_proxy", cfg.Upstream.IsTransparentProxy()).
 		Str("node_id", cfg.Cache.NodeID).
 		Msg("Starting TAG (Tigris Access Gateway)")
 
@@ -107,7 +108,19 @@ func main() {
 		log.Warn().Err(err).Msg("Failed to load credentials from environment")
 	}
 
-	if credStore.Count() == 0 {
+	// Initialize proxy signer if transparent proxy is enabled
+	var proxySigner *auth.ProxySigner
+	if cfg.Upstream.IsTransparentProxy() {
+		accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+		if accessKey == "" || secretKey == "" {
+			log.Fatal().Msg("Transparent proxy requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+		}
+		proxySigner = auth.NewProxySigner(accessKey, secretKey)
+		log.Info().Msg("Transparent proxy mode enabled")
+	}
+
+	if credStore.Count() == 0 && !cfg.Upstream.IsTransparentProxy() {
 		log.Warn().Msg("No credentials loaded - TAG will reject all requests")
 	}
 
@@ -162,7 +175,7 @@ func main() {
 	}
 
 	// 3. Initialize forwarder
-	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost)
+	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, proxySigner)
 
 	// 4. Initialize proxy service
 	service := proxy.NewService(forwarder, objectCache, cfg)

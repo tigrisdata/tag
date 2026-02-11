@@ -14,6 +14,29 @@ import (
 	"github.com/tigrisdata/tag/metrics"
 )
 
+// RequestForwarder is the interface for forwarding requests to the upstream Tigris server.
+// Two implementations exist: signingForwarder (validate + re-sign) and
+// transparentForwarder (clone headers + proxy headers).
+type RequestForwarder interface {
+	// Forward forwards a request to Tigris and writes the response to the client.
+	Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error
+
+	// ForwardWithCapture forwards request and captures response for caching.
+	ForwardWithCapture(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error)
+
+	// ValidateAndGetCredentials validates the request signature and returns credentials.
+	ValidateAndGetCredentials(r *http.Request) (accessKey, secretKey string, err error)
+
+	// DoRequestWithCreds executes a request with pre-validated credentials.
+	// Returns the raw response for streaming. Caller is responsible for closing the response body.
+	DoRequestWithCreds(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error)
+
+	// DoFullObjectRequest executes a full object GET request (no Range header).
+	// Used for background cache population after a Range request cache miss.
+	// Caller is responsible for closing the response body.
+	DoFullObjectRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error)
+}
+
 // AuthErrorCode represents the type of authentication error.
 type AuthErrorCode int
 
@@ -88,24 +111,27 @@ func IsAuthError(err error) (*AuthError, bool) {
 	return nil, false
 }
 
-// Forwarder handles forwarding requests to the upstream Tigris server.
-type Forwarder struct {
-	credStore  *auth.CredentialStore
-	validator  *auth.RequestValidator
-	signer     *auth.RequestSigner
+// Compile-time interface satisfaction checks.
+var (
+	_ RequestForwarder = (*signingForwarder)(nil)
+	_ RequestForwarder = (*transparentForwarder)(nil)
+)
+
+// baseForwarder contains shared HTTP execution logic used by both
+// signingForwarder and transparentForwarder.
+type baseForwarder struct {
+	signer     *auth.RequestSigner // Both modes need this for DoFullObjectRequest
 	httpClient *http.Client
 }
 
-// NewForwarder creates a new forwarder with configurable HTTP connection pool.
-func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string, maxIdleConnsPerHost int) *Forwarder {
+// newBaseForwarder creates the shared base with HTTP client and signer.
+func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) baseForwarder {
 	if maxIdleConnsPerHost <= 0 {
 		maxIdleConnsPerHost = 100 // Default
 	}
 
-	return &Forwarder{
-		credStore: credStore,
-		validator: auth.NewRequestValidator(credStore),
-		signer:    auth.NewRequestSigner(tigrisEndpoint, region),
+	return baseForwarder{
+		signer: auth.NewRequestSigner(tigrisEndpoint, region),
 		httpClient: &http.Client{
 			Transport: &http.Transport{
 				MaxIdleConns:        maxIdleConnsPerHost,
@@ -114,6 +140,140 @@ func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string
 			},
 			Timeout: 5 * time.Minute,
 		},
+	}
+}
+
+// executeAndStream executes the request and streams the response to the client.
+func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64) error {
+	if inContentLength > 0 {
+		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
+	}
+
+	upstreamStart := time.Now()
+	resp, err := b.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest(fwdReq.Method, time.Since(upstreamStart).Seconds(), err)
+	if err != nil {
+		log.Error().Err(err).Str("method", fwdReq.Method).Str("path", fwdReq.URL.Path).Msg("Failed to forward request")
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Stream response back to client
+	copyHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	n, copyErr := io.Copy(w, resp.Body)
+	if copyErr != nil {
+		log.Warn().Err(copyErr).Msg("Failed to copy response body to client")
+	}
+	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+
+	return nil
+}
+
+// executeAndCapture executes the request, streams to client, and captures the response.
+func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64) (*ResponseCapture, error) {
+	if inContentLength > 0 {
+		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
+	}
+
+	upstreamStart := time.Now()
+	resp, err := b.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest(fwdReq.Method, time.Since(upstreamStart).Seconds(), err)
+	if err != nil {
+		log.Error().Err(err).Str("method", fwdReq.Method).Str("path", fwdReq.URL.Path).Msg("Failed to forward request")
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// Capture response
+	capture := &ResponseCapture{
+		StatusCode: resp.StatusCode,
+		Headers:    resp.Header.Clone(),
+	}
+
+	// Copy headers to response writer
+	copyHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+
+	// Capture body while streaming to client
+	var readErr error
+	capture.Body, readErr = io.ReadAll(io.TeeReader(resp.Body, w))
+	if readErr != nil {
+		log.Warn().Err(readErr).Msg("Failed to fully capture response body")
+		capture.Complete = false
+	} else {
+		capture.Complete = true
+	}
+
+	// Track bytes out from response body
+	metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
+
+	return capture, nil
+}
+
+// executeRequest executes the request and returns the raw response.
+// Caller is responsible for closing the response body.
+func (b *baseForwarder) executeRequest(fwdReq *http.Request, inContentLength int64) (*http.Response, error) {
+	if inContentLength > 0 {
+		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
+	}
+
+	upstreamStart := time.Now()
+	resp, err := b.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest(fwdReq.Method, time.Since(upstreamStart).Seconds(), err)
+	if err != nil {
+		log.Error().Err(err).Str("method", fwdReq.Method).Str("path", fwdReq.URL.Path).Msg("Failed to forward request")
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// DoFullObjectRequest executes a full object GET request (no Range header).
+// Used for background cache population after a Range request cache miss.
+// Caller is responsible for closing the response body.
+//
+// This always uses standard SigV4 signing because it is a synthetic request
+// initiated by TAG itself, not a forwarded client request. TAG's credentials
+// (from AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) are valid Tigris credentials
+// that can sign requests directly.
+func (b *baseForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+	path := "/" + bucket + "/" + key
+
+	// Create request without Range header - just a simple GET for the full object
+	fwdReq, err := b.signer.SignRequest(ctx, "GET", path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	upstreamStart := time.Now()
+	resp, err := b.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest("GET", time.Since(upstreamStart).Seconds(), err)
+	if err != nil {
+		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background fetch failed")
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// NewForwarder creates a new forwarder with configurable HTTP connection pool.
+// If proxySigner is non-nil, transparent proxy mode is enabled.
+func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string, maxIdleConnsPerHost int, proxySigner *auth.ProxySigner) RequestForwarder {
+	base := newBaseForwarder(tigrisEndpoint, region, maxIdleConnsPerHost)
+
+	if proxySigner != nil {
+		return &transparentForwarder{
+			baseForwarder:    base,
+			proxySigner:      proxySigner,
+			upstreamEndpoint: strings.TrimSuffix(tigrisEndpoint, "/"),
+		}
+	}
+
+	return &signingForwarder{
+		baseForwarder: base,
+		credStore:     credStore,
+		validator:     auth.NewRequestValidator(credStore),
 	}
 }
 
@@ -159,143 +319,6 @@ func stripAWSChunkedEncoding(req *http.Request) {
 	}
 }
 
-// Forward forwards a request to Tigris and writes the response to the client.
-// Uses zero-copy streaming - the X-Amz-Content-Sha256 header is required (all AWS SDKs set this).
-// If the request uses AWS chunked transfer encoding (streaming SigV4), the body
-// is decoded on-the-fly and forwarded as UNSIGNED-PAYLOAD.
-func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
-	// Decode AWS chunked encoding if present, otherwise pass through unchanged
-	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
-
-	// Validate incoming request signature
-	accessKey, err := f.validator.ValidateRequest(r)
-	if err != nil {
-		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
-		return mapAuthError(err)
-	}
-
-	// Look up secret key from credential store
-	secretKey, err := f.credStore.GetSecretKey(accessKey)
-	if err != nil {
-		return mapAuthError(err)
-	}
-
-	// Build the path with query string
-	path := r.URL.Path
-	if r.URL.RawQuery != "" {
-		path = path + "?" + r.URL.RawQuery
-	}
-
-	// Create signed request (passes body hash, streams body directly)
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, r.Header)
-	if err != nil {
-		return err
-	}
-	prepareForwardedRequest(fwdReq, contentLength, chunked)
-
-	// Track bytes in from request body
-	if contentLength > 0 {
-		metrics.BytesTransferred.WithLabelValues("in").Add(float64(contentLength))
-	}
-
-	// Forward to Tigris
-	upstreamStart := time.Now()
-	resp, err := f.httpClient.Do(fwdReq)
-	metrics.RecordUpstreamRequest(r.Method, time.Since(upstreamStart).Seconds(), err)
-	if err != nil {
-		log.Error().Err(err).Str("method", r.Method).Str("path", path).Msg("Failed to forward request")
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Stream response back to client
-	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	n, copyErr := io.Copy(w, resp.Body)
-	if copyErr != nil {
-		log.Warn().Err(copyErr).Msg("Failed to copy response body to client")
-	}
-	// Track bytes out from response body
-	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-
-	return nil
-}
-
-// ForwardWithCapture forwards request and captures response for caching.
-// Uses zero-copy streaming for the request body (X-Amz-Content-Sha256 header is required).
-// The response body is captured for caching while streaming to the client.
-// If the request uses AWS chunked transfer encoding, the body is decoded on-the-fly.
-func (f *Forwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
-	// Decode AWS chunked encoding if present, otherwise pass through unchanged
-	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
-
-	// Validate incoming request signature
-	accessKey, err := f.validator.ValidateRequest(r)
-	if err != nil {
-		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
-		return nil, mapAuthError(err)
-	}
-
-	// Look up secret key
-	secretKey, err := f.credStore.GetSecretKey(accessKey)
-	if err != nil {
-		return nil, mapAuthError(err)
-	}
-
-	// Build the path with query string
-	path := r.URL.Path
-	if r.URL.RawQuery != "" {
-		path = path + "?" + r.URL.RawQuery
-	}
-
-	// Create signed request (passes body hash, streams body directly)
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, r.Header)
-	if err != nil {
-		return nil, err
-	}
-	prepareForwardedRequest(fwdReq, contentLength, chunked)
-
-	// Track bytes in from request body
-	if contentLength > 0 {
-		metrics.BytesTransferred.WithLabelValues("in").Add(float64(contentLength))
-	}
-
-	// Forward to Tigris
-	upstreamStart := time.Now()
-	resp, err := f.httpClient.Do(fwdReq)
-	metrics.RecordUpstreamRequest(r.Method, time.Since(upstreamStart).Seconds(), err)
-	if err != nil {
-		log.Error().Err(err).Str("method", r.Method).Str("path", path).Msg("Failed to forward request")
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	// Capture response
-	capture := &ResponseCapture{
-		StatusCode: resp.StatusCode,
-		Headers:    resp.Header.Clone(),
-	}
-
-	// Copy headers to response writer
-	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-
-	// Capture body while streaming to client
-	var readErr error
-	capture.Body, readErr = io.ReadAll(io.TeeReader(resp.Body, w))
-	if readErr != nil {
-		log.Warn().Err(readErr).Msg("Failed to fully capture response body")
-		capture.Complete = false
-	} else {
-		capture.Complete = true
-	}
-
-	// Track bytes out from response body
-	metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
-
-	return capture, nil
-}
-
 // ResponseCapture holds captured response data.
 type ResponseCapture struct {
 	StatusCode int
@@ -322,78 +345,4 @@ func copyHeaders(dst, src http.Header) {
 			dst[k] = v
 		}
 	}
-}
-
-// ValidateAndGetCredentials validates the request signature and returns credentials.
-// This is used to validate credentials before joining a broadcast.
-func (f *Forwarder) ValidateAndGetCredentials(r *http.Request) (accessKey, secretKey string, err error) {
-	accessKey, err = f.validator.ValidateRequest(r)
-	if err != nil {
-		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
-		return "", "", mapAuthError(err)
-	}
-
-	secretKey, err = f.credStore.GetSecretKey(accessKey)
-	if err != nil {
-		return "", "", mapAuthError(err)
-	}
-
-	return accessKey, secretKey, nil
-}
-
-// DoRequestWithCreds executes a request with pre-validated credentials.
-// Returns the raw response for streaming. Caller is responsible for closing the response body.
-// If the request uses AWS chunked transfer encoding, the body is decoded on-the-fly.
-func (f *Forwarder) DoRequestWithCreds(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error) {
-	// Decode AWS chunked encoding if present, otherwise pass through unchanged
-	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
-
-	path := r.URL.Path
-	if r.URL.RawQuery != "" {
-		path = path + "?" + r.URL.RawQuery
-	}
-
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, r.Header)
-	if err != nil {
-		return nil, err
-	}
-	prepareForwardedRequest(fwdReq, contentLength, chunked)
-
-	// Track bytes in from request body
-	if contentLength > 0 {
-		metrics.BytesTransferred.WithLabelValues("in").Add(float64(contentLength))
-	}
-
-	upstreamStart := time.Now()
-	resp, err := f.httpClient.Do(fwdReq)
-	metrics.RecordUpstreamRequest(r.Method, time.Since(upstreamStart).Seconds(), err)
-	if err != nil {
-		log.Error().Err(err).Str("method", r.Method).Str("path", path).Msg("Failed to forward request")
-		return nil, err
-	}
-
-	return resp, nil
-}
-
-// DoFullObjectRequest executes a full object GET request (no Range header).
-// Used for background cache population after a Range request cache miss.
-// Caller is responsible for closing the response body.
-func (f *Forwarder) DoFullObjectRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
-	path := "/" + bucket + "/" + key
-
-	// Create request without Range header - just a simple GET for the full object
-	fwdReq, err := f.signer.SignRequest(ctx, "GET", path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	upstreamStart := time.Now()
-	resp, err := f.httpClient.Do(fwdReq)
-	metrics.RecordUpstreamRequest("GET", time.Since(upstreamStart).Seconds(), err)
-	if err != nil {
-		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background fetch failed")
-		return nil, err
-	}
-
-	return resp, nil
 }

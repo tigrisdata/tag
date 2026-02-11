@@ -4,13 +4,13 @@ This document describes the architecture of TAG (Tigris Access Gateway), a high-
 
 ## System Overview
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                              TAG Proxy                                   │
-│  ┌─────────┐  ┌──────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────┐  │
-│  │ Handler │──│   Auth   │──│  Proxy  │──│  Cache  │──│  Forwarder  │  │
-│  │ Server  │  │ Validator│  │ Service │  │ Client  │  │   (Signer)  │  │
-│  └────┬────┘  └──────────┘  └────┬────┘  └────┬────┘  └──────┬──────┘  │
+│                              TAG Proxy                                  │
+│  ┌─────────┐  ┌──────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────┐   │
+│  │ Handler │──│   Auth   │──│  Proxy  │──│  Cache  │──│  Forwarder  │   │
+│  │ Server  │  │ Validator│  │ Service │  │ Client  │  │             │   │
+│  └────┬────┘  └──────────┘  └────┬────┘  └────┬────┘  └──────┬──────┘   │
 │       │                          │            │               │         │
 │       │                          │     ┌──────┴──────┐        │         │
 │       │                          │     │  Embedded   │        │         │
@@ -41,6 +41,7 @@ The HTTP server that receives incoming S3 requests.
 - **errors.go**: S3-compatible error responses
 
 Routes requests to appropriate handlers based on HTTP method and path:
+
 - `GET /{bucket}/{key}` → GetObject
 - `PUT /{bucket}/{key}` → PutObject
 - `DELETE /{bucket}/{key}` → DeleteObject
@@ -53,12 +54,14 @@ Routes requests to appropriate handlers based on HTTP method and path:
 AWS Signature Version 4 authentication and request signing.
 
 - **credentials.go**: Credential store for access/secret key pairs
-- **validator.go**: Validates incoming request signatures
+- **validator.go**: Validates incoming request signatures (signing mode only)
 - **signer.go**: Re-signs requests for upstream Tigris
+- **proxy_signer.go**: Computes proxy headers for transparent proxy mode
 - **parser.go**: Parses Authorization headers and presigned URLs
 
-**Authentication Flow:**
-```
+**Authentication Flow (signing mode):**
+
+```text
 1. Extract access key from Authorization header or query params
 2. Look up secret key from credential store
 3. Compute expected signature using AWS SigV4 algorithm
@@ -66,12 +69,16 @@ AWS Signature Version 4 authentication and request signing.
 5. If valid, re-sign request for upstream with same credentials
 ```
 
+In transparent proxy mode (default), steps 1-4 are skipped. The client's original Authorization header is forwarded as-is, and proxy headers are added so Tigris validates the signature against the original host.
+
 ### Proxy Service (`proxy/`)
 
 Core proxy logic including caching and request coalescing.
 
 - **service.go**: Main request handling, cache logic, broadcast coordination
-- **forwarder.go**: Forwards requests to upstream Tigris
+- **forwarder.go**: `RequestForwarder` interface and shared `baseForwarder` logic
+- **forwarder_transparent.go**: Transparent proxy forwarding (preserves client signatures)
+- **forwarder_signing.go**: Signing mode forwarding (validates and re-signs requests)
 - **broadcast/**: Streaming broadcast pattern for request coalescing
 
 ### Cache Client (`cache/`)
@@ -82,19 +89,22 @@ Interface to the embedded OCache module with RocksDB storage.
 - **object.go**: Cached object metadata structure
 
 TAG embeds OCache directly, providing:
+
 - High-performance RocksDB-based storage
 - Optional clustering via gossip protocol (memberlist)
 - gRPC-based cache routing between nodes
 - Consistent hashing for key distribution
 
 **Two-Key Storage Pattern:**
-```
+
+```text
 Object "bucket/key" is stored as:
   - Metadata key: "meta:bucket/key" → JSON with headers, size, etag, etc.
   - Body key: "body:bucket/key" → Raw object bytes
 ```
 
 This pattern enables:
+
 - Efficient HEAD requests (metadata only)
 - Conditional request support (If-None-Match, If-Modified-Since)
 - Range requests from cached full objects
@@ -105,39 +115,64 @@ Prometheus metrics for monitoring and alerting.
 
 - **metrics.go**: Metric definitions and recording functions
 
+## Request Forwarding Modes
+
+TAG supports two request forwarding modes, controlled by the `transparent_proxy` config setting:
+
+### Transparent Proxy (default)
+
+Forwards client requests to Tigris as-is, preserving the original Authorization header. TAG adds four proxy headers so Tigris can validate the client's signature against the original host:
+
+- `X-Tigris-Forwarded-Host` - The original Host header from the client
+- `X-Tigris-Proxy-Access-Key` - TAG's own access key for proxy authentication
+- `X-Tigris-Proxy-Timestamp` - Timestamp for proxy signature
+- `X-Tigris-Proxy-Signature` - HMAC signature proving TAG's identity
+
+No local credential store is needed in this mode. URL encoding (including `RawPath`) is preserved exactly as received from the client.
+
+### Signing Mode
+
+Validates incoming request signatures against a local credential store, then re-signs requests for the upstream Tigris endpoint. This mode is used when TAG needs to perform credential translation (e.g., clients use different credentials than the upstream Tigris account).
+
+In signing mode, proxy headers (`X-Tigris-Proxy-*` and `X-Tigris-Forwarded-Host`) are stripped from client requests to prevent injection of unsigned headers.
+
+### Shared Infrastructure
+
+Both modes share the same `baseForwarder` for HTTP execution, response streaming, and cache interactions. Both use SigV4 signing for background cache operations (e.g., fetching full objects for range request caching).
+
 ## Cluster Architecture
 
 For multi-node deployments, TAG nodes form a distributed cache cluster:
 
-```
+```text
                     ┌─────────────────────────────────────────┐
                     │            Gossip Protocol              │
                     │         (Cluster Discovery)             │
                     └─────────────────────────────────────────┘
                               ▲           ▲           ▲
                               │           │           │
-                    ┌─────────┴───┐ ┌─────┴─────┐ ┌───┴─────────┐
-                    │   TAG-1     │ │   TAG-2   │ │   TAG-3     │
-                    │ ┌─────────┐ │ │ ┌───────┐ │ │ ┌─────────┐ │
-                    │ │ Embedded│ │ │ │Embedded│ │ │ │ Embedded│ │
-                    │ │ Cache   │ │ │ │ Cache  │ │ │ │ Cache   │ │
+                    ┌─────────┴───┐ ┌─────┴───────┐ ┌───┴─────────┐
+                    │   TAG-1     │ │   TAG-2     │ │   TAG-3     │
+                    │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │
+                    │ │ Embedded│ │ │ │ Embedded│ │ │ │ Embedded│ │
+                    │ │ Cache   │ │ │ │ Cache   │ │ │ │ Cache   │ │
                     │ │(RocksDB)│ │ │ │(RocksDB)│ │ │ │(RocksDB)│ │
-                    │ └─────────┘ │ │ └───────┘ │ │ └─────────┘ │
-                    └──────┬──────┘ └─────┬─────┘ └──────┬──────┘
-                           │              │              │
-                    ┌──────┴──────────────┴──────────────┴──────┐
-                    │              gRPC Routing                  │
-                    │         (Cache Key Distribution)           │
-                    └───────────────────────────────────────────┘
+                    │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │
+                    └──────┬──────┘ └─────┬───────┘ └──────┬──────┘
+                           │              │                │
+                    ┌──────┴──────────────┴────────────────┴──────┐
+                    │              gRPC Routing                   │
+                    │         (Cache Key Distribution)            │
+                    └─────────────────────────────────────────────┘
 ```
 
 **Cluster Components:**
 
-| Port | Protocol | Purpose |
-|------|----------|---------|
-| 8080 | HTTP | S3 API requests |
-| 7000 | TCP | Memberlist gossip (cluster discovery) |
-| 9000 | gRPC | Cache routing between nodes |
+| Port | Protocol | Purpose                               |
+| ---- | -------- | ------------------------------------- |
+| 8080 | HTTP     | S3 API requests                       |
+| 7000 | TCP      | Memberlist gossip (cluster discovery) |
+| 9000 | gRPC     | Cache routing between nodes           |
 
 **How Clustering Works:**
 
@@ -150,7 +185,7 @@ For multi-node deployments, TAG nodes form a distributed cache cluster:
 
 ### GET Object (Cache Hit)
 
-```
+```text
 Client                 TAG                    Embedded Cache
   │                     │                       │
   │ GET /bucket/key     │                       │
@@ -168,7 +203,7 @@ Client                 TAG                    Embedded Cache
 
 ### GET Object (Cache Miss)
 
-```
+```text
 Client                 TAG                    Embedded Cache         Tigris
   │                     │                       │                    │
   │ GET /bucket/key     │                       │                    │
@@ -191,7 +226,7 @@ Client                 TAG                    Embedded Cache         Tigris
 
 ### GET Object (Cluster Mode - Remote Key)
 
-```
+```text
 Client                 TAG-1                   TAG-2 (owns key)       Tigris
   │                     │                       │                       │
   │ GET /bucket/key     │                       │                       │
@@ -212,7 +247,7 @@ Client                 TAG-1                   TAG-2 (owns key)       Tigris
 
 When multiple clients request the same uncached object simultaneously:
 
-```
+```text
 Client1                TAG                              Tigris
 Client2                 │                                  │
 Client3                 │                                  │
@@ -243,6 +278,7 @@ Client3                 │                                  │
 ```
 
 **Key Points:**
+
 - First request becomes the "fetcher" and initiates upstream request
 - Subsequent requests before streaming starts join as "listeners"
 - All clients receive data simultaneously as chunks arrive
@@ -253,7 +289,7 @@ Client3                 │                                  │
 
 Range requests use a background fetch pattern for optimal ML training workloads:
 
-```
+```text
 Client                 TAG                    Embedded Cache         Tigris
   │                     │                       │                    │
   │ GET /bucket/key     │                       │                    │
@@ -278,6 +314,7 @@ Client                 TAG                    Embedded Cache         Tigris
 ```
 
 **Benefits:**
+
 - Low latency: Client gets range immediately
 - Future ranges served from cache
 - Background fetches are coalesced (multiple range requests = single fetch)
@@ -302,7 +339,7 @@ type CachedObjectMeta struct {
 
 ### Cache Keys
 
-```
+```text
 Metadata key:           "meta|bucket|key"
 Body key:               "body|bucket|key"
 ```
@@ -310,11 +347,13 @@ Body key:               "body|bucket|key"
 ### Cacheability Rules
 
 Objects are cached when:
+
 - Response status is 200 OK
 - Size is within `size_threshold` (default 1GB)
 - No `Cache-Control: no-store` or `private` headers
 
 Objects are NOT cached when:
+
 - Response is not 200 (errors, redirects)
 - Size exceeds threshold
 - Cache-Control prevents caching
@@ -344,6 +383,7 @@ type Listener struct {
 ```
 
 **Policies:**
+
 - **No Late Joiners**: Once streaming starts, new requests start their own broadcast
 - **Slow Consumer Handling**: Listeners with full channels are disconnected
 - **Memory Bounded**: `chunkSize × channelBuffer × numListeners` per broadcast
@@ -365,10 +405,10 @@ TAG returns S3-compatible XML error responses:
 
 ### Error Mapping
 
-| Internal Error | S3 Error Code | HTTP Status |
-|----------------|---------------|-------------|
-| Invalid signature | SignatureDoesNotMatch | 403 |
-| Unknown access key | InvalidAccessKeyId | 403 |
-| Request expired | RequestTimeTooSkewed | 403 |
-| Slow consumer | InternalError | 500 |
-| Upstream error | InternalError | 502 |
+| Internal Error     | S3 Error Code         | HTTP Status |
+| ------------------ | --------------------- | ----------- |
+| Invalid signature  | SignatureDoesNotMatch | 403         |
+| Unknown access key | InvalidAccessKeyId    | 403         |
+| Request expired    | RequestTimeTooSkewed  | 403         |
+| Slow consumer      | InternalError         | 500         |
+| Upstream error     | InternalError         | 502         |

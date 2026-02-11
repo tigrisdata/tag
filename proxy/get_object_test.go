@@ -17,7 +17,7 @@ func TestWriteChunksToResponse_ErrorBeforeData(t *testing.T) {
 	listener := b.Subscribe()
 	b.SetHeaders(http.StatusOK, http.Header{
 		"Content-Length": []string{"3"},
-		"Content-Type":  []string{"application/octet-stream"},
+		"Content-Type":   []string{"application/octet-stream"},
 	})
 
 	// Complete with error before any data chunks
@@ -61,7 +61,7 @@ func TestWriteChunksToResponse_NormalDataFlow(t *testing.T) {
 	listener := b.Subscribe()
 	b.SetHeaders(http.StatusOK, http.Header{
 		"Content-Length": []string{"6"},
-		"Content-Type":  []string{"text/plain"},
+		"Content-Type":   []string{"text/plain"},
 	})
 
 	go func() {
@@ -98,7 +98,7 @@ func TestWriteChunksToResponse_ZeroByteResponse(t *testing.T) {
 	listener := b.Subscribe()
 	b.SetHeaders(http.StatusOK, http.Header{
 		"Content-Length": []string{"0"},
-		"Content-Type":  []string{"application/octet-stream"},
+		"Content-Type":   []string{"application/octet-stream"},
 	})
 
 	go func() {
@@ -129,7 +129,7 @@ func TestWriteChunksToResponse_ErrorAfterPartialData(t *testing.T) {
 	listener := b.Subscribe()
 	b.SetHeaders(http.StatusOK, http.Header{
 		"Content-Length": []string{"6"},
-		"Content-Type":  []string{"text/plain"},
+		"Content-Type":   []string{"text/plain"},
 	})
 
 	go func() {

@@ -5,6 +5,7 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 ## Features
 
 - **S3-Compatible API**: Supports all S3 API endpoints supported by Tigris
+- **Transparent Proxy Mode**: Forwards client requests as-is with proxy headers, preserving original signatures (enabled by default)
 - **Embedded Cache**: High-performance RocksDB-based cache with automatic cluster discovery
 - **Request Coalescing**: Streaming broadcast pattern reduces duplicate upstream requests under concurrent load
 - **Range Request Caching**: Background fetch of full objects on range cache miss for optimal ML training workloads
@@ -87,7 +88,7 @@ See [docs/configuration.md](docs/configuration.md) for full configuration refere
 
 ## Architecture
 
-```
+```text
 ┌─────────────┐     ┌─────────────────────────────┐     ┌─────────────┐
 │   Client    │────▶│           TAG               │────▶│   Tigris    │
 │  (S3 SDK)   │◀────│  ┌─────────────────────┐    │◀────│   Storage   │

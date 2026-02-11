@@ -37,10 +37,10 @@ func TestValidateContentLength_Regular(t *testing.T) {
 
 func TestValidateContentLength_Chunked(t *testing.T) {
 	tests := []struct {
-		name         string
-		bodyHash     string // X-Amz-Content-Sha256 value
-		decodedLen   string // X-Amz-Decoded-Content-Length value; empty = omit header
-		wantValid    bool
+		name       string
+		bodyHash   string // X-Amz-Content-Sha256 value
+		decodedLen string // X-Amz-Decoded-Content-Length value; empty = omit header
+		wantValid  bool
 	}{
 		{name: "valid length", bodyHash: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", decodedLen: "1048576", wantValid: true},
 		{name: "zero byte upload", bodyHash: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", decodedLen: "0", wantValid: true},

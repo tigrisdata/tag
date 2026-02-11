@@ -184,6 +184,7 @@ func TestShouldCopyHeader(t *testing.T) {
 		header   string
 		expected bool
 	}{
+		// Content headers
 		{"Content-Type", true},
 		{"Content-Length", true},
 		{"Content-Encoding", true},
@@ -191,10 +192,26 @@ func TestShouldCopyHeader(t *testing.T) {
 		{"Cache-Control", true},
 		{"Expires", true},
 		{"Content-MD5", true},
+		// All x-amz-* headers are allowed (signer overwrites X-Amz-Date etc.)
 		{"X-Amz-Meta-Custom", true},
 		{"X-Amz-Meta-Another-Header", true},
+		{"X-Amz-Date", true},
+		{"X-Amz-Content-Sha256", true},
+		{"X-Amz-Copy-Source", true},
+		{"X-Amz-Tagging", true},
+		// Tigris-specific headers (tigris-* and x-tigris-*)
+		{"Tigris-Force-Delete", true},
+		{"X-Tigris-Custom", true},
+		// Proxy headers are blocked to prevent client injection in signing mode
+		{"X-Tigris-Forwarded-Host", false},
+		{"X-Tigris-Proxy-Access-Key", false},
+		{"X-Tigris-Proxy-Timestamp", false},
+		{"X-Tigris-Proxy-Signature", false},
+		// Conditional request headers
+		{"If-None-Match", true},
+		{"If-Modified-Since", true},
+		// Not copied
 		{"Authorization", false},
-		{"X-Amz-Date", false},
 		{"Host", false},
 		{"Random-Header", false},
 	}
@@ -229,6 +246,38 @@ func TestHashSHA256(t *testing.T) {
 			result := hashSHA256([]byte(tt.input))
 			if result != tt.expected {
 				t.Errorf("hashSHA256(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseHTTPDate(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{name: "ISO 8601", input: "20260211T055514Z", wantErr: false},
+		{name: "RFC 1123", input: "Wed, 11 Feb 2026 05:55:14 GMT", wantErr: false},
+		{name: "RFC 1123Z", input: "Wed, 11 Feb 2026 05:55:14 -0000", wantErr: false},
+		{name: "invalid format", input: "not-a-date", wantErr: true},
+		{name: "empty string", input: "", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseHTTPDate(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseHTTPDate(%q) error = nil, want error", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseHTTPDate(%q) error = %v, want nil", tt.input, err)
+			}
+			if got.IsZero() {
+				t.Errorf("ParseHTTPDate(%q) returned zero time", tt.input)
 			}
 		})
 	}
