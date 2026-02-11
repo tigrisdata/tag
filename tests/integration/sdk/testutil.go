@@ -19,7 +19,7 @@ import (
 
 const (
 	// DefaultTAGEndpoint is the default TAG endpoint when running via make s3-test-local.
-	DefaultTAGEndpoint = "http://127-0-0-1.sslip.io:8080"
+	DefaultTAGEndpoint = "http://localhost:8080"
 	// DefaultRegion is the default AWS region for signing.
 	DefaultRegion = "auto"
 	// BucketPrefixBase is the base prefix for test buckets.

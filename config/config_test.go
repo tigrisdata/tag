@@ -14,7 +14,7 @@ server:
   http_port: 9000
   bind_ip: "127.0.0.1"
 upstream:
-  endpoint: "https://custom.endpoint.com"
+  endpoint: "https://fly.storage.tigris.dev"
   region: "us-west-2"
 cache:
   enabled: true
@@ -48,8 +48,8 @@ log:
 	}
 
 	// Verify upstream config
-	if cfg.Upstream.Endpoint != "https://custom.endpoint.com" {
-		t.Errorf("Upstream.Endpoint = %q, want https://custom.endpoint.com", cfg.Upstream.Endpoint)
+	if cfg.Upstream.Endpoint != "https://fly.storage.tigris.dev" {
+		t.Errorf("Upstream.Endpoint = %q, want https://fly.storage.tigris.dev", cfg.Upstream.Endpoint)
 	}
 	if cfg.Upstream.Region != "us-west-2" {
 		t.Errorf("Upstream.Region = %q, want us-west-2", cfg.Upstream.Region)
@@ -123,7 +123,7 @@ func TestLoad_EnvOverrides(t *testing.T) {
 server:
   http_port: 8080
 upstream:
-  endpoint: "https://default.endpoint.com"
+  endpoint: "https://fly.storage.tigris.dev"
 log:
   level: "info"
 `
@@ -134,7 +134,7 @@ log:
 	}
 
 	// Set environment variables
-	t.Setenv("TAG_UPSTREAM_ENDPOINT", "https://env.endpoint.com")
+	t.Setenv("TAG_UPSTREAM_ENDPOINT", "https://t3.storage.dev")
 	t.Setenv("TAG_CACHE_NODE_ID", "env-node-1")
 	t.Setenv("TAG_CACHE_DISK_PATH", "/env/cache/path")
 	t.Setenv("TAG_CACHE_SEED_NODES", "env-node-0:7000,env-node-1:7000")
@@ -146,8 +146,8 @@ log:
 	}
 
 	// Verify env overrides
-	if cfg.Upstream.Endpoint != "https://env.endpoint.com" {
-		t.Errorf("Upstream.Endpoint = %q, want https://env.endpoint.com", cfg.Upstream.Endpoint)
+	if cfg.Upstream.Endpoint != "https://t3.storage.dev" {
+		t.Errorf("Upstream.Endpoint = %q, want https://t3.storage.dev", cfg.Upstream.Endpoint)
 	}
 	if cfg.Cache.NodeID != "env-node-1" {
 		t.Errorf("Cache.NodeID = %q, want env-node-1", cfg.Cache.NodeID)
@@ -322,17 +322,17 @@ cache:
 	}
 }
 
-func TestTransparentProxy_DisabledByDefault(t *testing.T) {
+func TestTransparentProxy_EnabledByDefault(t *testing.T) {
 	cfg := NewDefault()
-	if cfg.Upstream.TransparentProxy {
-		t.Error("TransparentProxy = true, want false (disabled by default)")
+	if !cfg.Upstream.IsTransparentProxy() {
+		t.Error("IsTransparentProxy() = false, want true (enabled by default)")
 	}
 }
 
-func TestTransparentProxy_EnabledByYAML(t *testing.T) {
+func TestTransparentProxy_DisabledByYAML(t *testing.T) {
 	content := `
 upstream:
-  transparent_proxy: true
+  transparent_proxy: false
 `
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
@@ -344,26 +344,67 @@ upstream:
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	if !cfg.Upstream.TransparentProxy {
-		t.Error("TransparentProxy = false, want true")
+	if cfg.Upstream.IsTransparentProxy() {
+		t.Error("IsTransparentProxy() = true, want false")
 	}
 }
 
-func TestTransparentProxy_EnabledByEnv(t *testing.T) {
-	t.Setenv("TAG_TRANSPARENT_PROXY", "true")
+func TestTransparentProxy_DisabledByEnv(t *testing.T) {
+	t.Setenv("TAG_TRANSPARENT_PROXY", "false")
 
 	cfg := NewDefault()
-	if !cfg.Upstream.TransparentProxy {
-		t.Error("TransparentProxy = false, want true (enabled by env)")
+	if cfg.Upstream.IsTransparentProxy() {
+		t.Error("IsTransparentProxy() = true, want false (disabled by env)")
 	}
 }
 
-func TestTransparentProxy_EnabledByEnv_NumericOne(t *testing.T) {
-	t.Setenv("TAG_TRANSPARENT_PROXY", "1")
+func TestTransparentProxy_DisabledByEnv_NumericZero(t *testing.T) {
+	t.Setenv("TAG_TRANSPARENT_PROXY", "0")
 
 	cfg := NewDefault()
-	if !cfg.Upstream.TransparentProxy {
-		t.Error("TransparentProxy = false, want true (enabled by env with '1')")
+	if cfg.Upstream.IsTransparentProxy() {
+		t.Error("IsTransparentProxy() = true, want false (disabled by env with '0')")
+	}
+}
+
+func TestValidateUpstreamEndpoint(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		wantErr  bool
+	}{
+		{"tigris.dev domain", "https://fly.storage.tigris.dev", false},
+		{"storage.dev domain", "https://t3.storage.dev", false},
+		{"localhost", "http://localhost:8080", false},
+		{"localhost no port", "http://localhost", false},
+		{"disallowed domain", "https://evil.example.com", true},
+		{"subdomain of tigris.dev", "https://sub.tigris.dev", false},
+		{"not a suffix match", "https://nottrigris.dev", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateUpstreamEndpoint(tt.endpoint)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateUpstreamEndpoint(%q) error = %v, wantErr %v", tt.endpoint, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoad_InvalidUpstreamEndpoint(t *testing.T) {
+	content := `
+upstream:
+  endpoint: "https://evil.example.com"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	_, err := Load(tmpFile)
+	if err == nil {
+		t.Error("Load() should return error for disallowed upstream endpoint")
 	}
 }
 

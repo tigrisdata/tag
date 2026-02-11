@@ -2,6 +2,8 @@
 package config
 
 import (
+	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -79,7 +81,21 @@ type UpstreamConfig struct {
 	Endpoint            string `yaml:"endpoint"`                // Tigris S3 endpoint (e.g., https://fly.storage.tigris.dev)
 	Region              string `yaml:"region"`                  // AWS region for signing (default: auto)
 	MaxIdleConnsPerHost int    `yaml:"max_idle_conns_per_host"` // HTTP connection pool size per host (default: 100)
-	TransparentProxy    bool   `yaml:"transparent_proxy"`       // Forward client requests as-is with proxy headers (default: false)
+	TransparentProxy    *bool  `yaml:"transparent_proxy"`       // Forward client requests as-is with proxy headers (default: true when nil)
+}
+
+// IsTransparentProxy returns whether transparent proxy mode is enabled.
+// Returns true by default if not explicitly set.
+func (u *UpstreamConfig) IsTransparentProxy() bool {
+	if u.TransparentProxy == nil {
+		return true // Default to enabled
+	}
+	return *u.TransparentProxy
+}
+
+// SetTransparentProxy sets the TransparentProxy field to the given value.
+func (u *UpstreamConfig) SetTransparentProxy(enabled bool) {
+	u.TransparentProxy = &enabled
 }
 
 // CredentialsConfig holds credential store configuration.
@@ -149,14 +165,23 @@ func Load(path string) (*Config, error) {
 	// Override from environment variables
 	applyEnvOverrides(&cfg)
 
+	// Validate configuration
+	if err := validate(&cfg); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
 }
 
 // NewDefault creates a Config with default values.
+// Panics if the resulting configuration is invalid (e.g., disallowed upstream endpoint).
 func NewDefault() *Config {
 	cfg := &Config{}
 	applyDefaults(cfg)
 	applyEnvOverrides(cfg)
+	if err := validate(cfg); err != nil {
+		panic(fmt.Sprintf("invalid default configuration: %v", err))
+	}
 	return cfg
 }
 
@@ -281,10 +306,37 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Server.PprofEnabled = true
 	}
 
-	// Enable transparent proxy from environment (disabled by default)
-	if enabled := os.Getenv("TAG_TRANSPARENT_PROXY"); enabled == "true" || enabled == "1" {
-		cfg.Upstream.TransparentProxy = true
+	// Override transparent proxy from environment (enabled by default)
+	if val := os.Getenv("TAG_TRANSPARENT_PROXY"); val != "" {
+		enabled := val == "true" || val == "1"
+		cfg.Upstream.SetTransparentProxy(enabled)
 	}
+}
+
+// validate checks that the final configuration is valid.
+func validate(cfg *Config) error {
+	if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateUpstreamEndpoint ensures the upstream endpoint is an allowed Tigris domain or localhost.
+func validateUpstreamEndpoint(endpoint string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("invalid upstream endpoint %q: %w", endpoint, err)
+	}
+
+	host := u.Hostname() // strips port if present
+	if host == "localhost" {
+		return nil
+	}
+	if strings.HasSuffix(host, ".tigris.dev") || strings.HasSuffix(host, ".storage.dev") {
+		return nil
+	}
+
+	return fmt.Errorf("upstream endpoint %q is not allowed: host must be localhost, *.tigris.dev, or *.storage.dev", endpoint)
 }
 
 // splitEndpoints splits a comma-separated string into a slice of endpoints.

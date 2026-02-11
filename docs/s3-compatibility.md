@@ -1,6 +1,6 @@
 # S3 API Compatibility
 
-TAG implements all the commonly used bucket and object APIs from the Amazon S3 REST API, acting as a caching proxy between S3 clients and Tigris object storage. All requests are authenticated using AWS Signature Version 4, re-signed, and forwarded to the Tigris upstream endpoint.
+TAG implements all the commonly used bucket and object APIs from the Amazon S3 REST API, acting as a caching proxy between S3 clients and Tigris object storage. By default, TAG operates in transparent proxy mode where client requests are forwarded as-is with proxy headers. In signing mode, requests are validated, re-signed, and forwarded to the Tigris upstream endpoint.
 
 ## Supported Operations
 
@@ -61,9 +61,9 @@ All bucket operations support both `/{bucket}` and `/{bucket}/` path forms for c
 
 TAG supports AWS chunked transfer encoding (streaming SigV4), used by tools like [warp](https://github.com/minio/warp) and many AWS SDKs for large uploads.
 
-When a client sends a PUT with `X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, the body is wrapped in an AWS-proprietary chunked format where each chunk includes a signature chained from the request-level seed signature. Because TAG re-signs requests with the upstream Tigris hostname (changing the `Host` header), these per-chunk signatures become invalid.
+In **transparent proxy mode** (default), chunked uploads are forwarded as-is since the original signatures remain valid (the Host header is not changed).
 
-TAG handles this by decoding the chunked body on-the-fly — stripping the chunk framing and signatures — and forwarding the raw payload as `UNSIGNED-PAYLOAD`. The decoded content length is read from the `X-Amz-Decoded-Content-Length` header. This is a streaming operation with no buffering of the full object.
+In **signing mode**, when a client sends a PUT with `X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, the body is wrapped in an AWS-proprietary chunked format where each chunk includes a signature chained from the request-level seed signature. Because TAG re-signs requests with the upstream Tigris hostname (changing the `Host` header), these per-chunk signatures become invalid. TAG handles this by decoding the chunked body on-the-fly — stripping the chunk framing and signatures — and forwarding the raw payload as `UNSIGNED-PAYLOAD`. The decoded content length is read from the `X-Amz-Decoded-Content-Length` header. This is a streaming operation with no buffering of the full object.
 
 ## Caching Behavior
 
@@ -90,7 +90,11 @@ TAG uses **path-style** addressing only (`http://host:port/bucket/key`). Virtual
 
 ## Authentication
 
-All requests must be signed with AWS Signature Version 4 (header-based). TAG validates the incoming signature against its credential store, then re-signs the request with the same credentials for the Tigris upstream endpoint.
+All requests must be signed with AWS Signature Version 4 (header-based).
+
+In **transparent proxy mode** (default), TAG forwards the client's original Authorization header as-is and adds proxy headers (`X-Tigris-Forwarded-Host`, etc.) so Tigris validates the signature against the original host. No local credential store is needed.
+
+In **signing mode**, TAG validates the incoming signature against its credential store, then re-signs the request with the same credentials for the Tigris upstream endpoint.
 
 Presigned URL authentication (`X-Amz-Algorithm` query parameter) is supported for request validation.
 

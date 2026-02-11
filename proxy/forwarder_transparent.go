@@ -42,6 +42,20 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 	// Clone avoids mutating the original request headers when adding proxy headers below.
 	fwdReq.Header = r.Header.Clone()
 
+	// Ensure X-Amz-Date is present for Tigris's proxy validation path.
+	// Some SDK versions (botocore 1.42+) sign with "date" in SignedHeaders
+	// and don't set X-Amz-Date at all. Tigris's proxy code path requires
+	// X-Amz-Date, so synthesize it from Date when missing.
+	// We never remove Date — it may be in SignedHeaders and required for
+	// signature verification.
+	if fwdReq.Header.Get("X-Amz-Date") == "" {
+		if dateStr := fwdReq.Header.Get("Date"); dateStr != "" {
+			if t, err := auth.ParseHTTPDate(dateStr); err == nil {
+				fwdReq.Header.Set("X-Amz-Date", t.UTC().Format(auth.TimeFormat))
+			}
+		}
+	}
+
 	// Preserve Content-Length from original request
 	fwdReq.ContentLength = r.ContentLength
 

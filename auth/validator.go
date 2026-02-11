@@ -86,7 +86,7 @@ func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, s
 	}
 
 	// Parse and validate the date
-	requestTime, err := time.Parse(timeFormat, dateStr)
+	requestTime, err := time.Parse(TimeFormat, dateStr)
 	if err != nil {
 		// Try HTTP date format
 		requestTime, err = time.Parse(time.RFC1123, dateStr)
@@ -122,7 +122,7 @@ func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo
 		return ErrInvalidDate
 	}
 
-	requestTime, err := time.Parse(timeFormat, dateStr)
+	requestTime, err := time.Parse(TimeFormat, dateStr)
 	if err != nil {
 		return ErrInvalidDate
 	}
@@ -162,7 +162,7 @@ func (v *RequestValidator) computeSignature(r *http.Request, authInfo *AuthInfo,
 	// Build string to sign
 	stringToSign := strings.Join([]string{
 		algorithm,
-		signingTime.Format(timeFormat),
+		signingTime.Format(TimeFormat),
 		credentialScope,
 		hashSHA256([]byte(canonicalRequest)),
 	}, "\n")
@@ -185,7 +185,7 @@ func (v *RequestValidator) computePresignedSignature(r *http.Request, authInfo *
 	// Build string to sign
 	stringToSign := strings.Join([]string{
 		algorithm,
-		signingTime.Format(timeFormat),
+		signingTime.Format(TimeFormat),
 		credentialScope,
 		hashSHA256([]byte(canonicalRequest)),
 	}, "\n")

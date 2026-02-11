@@ -21,8 +21,8 @@ const (
 	// unsignedPayload is used for streaming uploads or when payload hash is not computed.
 	unsignedPayload = "UNSIGNED-PAYLOAD"
 
-	// timeFormat is the format for X-Amz-Date header.
-	timeFormat = "20060102T150405Z"
+	// TimeFormat is the format for X-Amz-Date header.
+	TimeFormat = "20060102T150405Z"
 
 	// shortTimeFormat is the format for the date in the credential scope.
 	shortTimeFormat = "20060102"
@@ -36,6 +36,20 @@ const (
 	// terminationString is the termination string for AWS SigV4.
 	terminationString = "aws4_request"
 )
+
+// ParseHTTPDate parses a date string in common HTTP/AWS formats.
+func ParseHTTPDate(dateStr string) (time.Time, error) {
+	for _, layout := range []string{
+		TimeFormat,
+		time.RFC1123,
+		time.RFC1123Z,
+	} {
+		if t, err := time.Parse(layout, dateStr); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unrecognized date format: %s", dateStr)
+}
 
 // RequestSigner signs HTTP requests using AWS SigV4.
 type RequestSigner struct {
@@ -101,7 +115,7 @@ func (s *RequestSigner) SignRequest(ctx context.Context, method, path string,
 
 	// Set required headers for signing
 	now := time.Now().UTC()
-	req.Header.Set("X-Amz-Date", now.Format(timeFormat))
+	req.Header.Set("X-Amz-Date", now.Format(TimeFormat))
 	req.Header.Set("X-Amz-Content-Sha256", bodyHash)
 	req.Header.Set("Host", req.URL.Host)
 
@@ -239,7 +253,7 @@ func (s *RequestSigner) buildCanonicalHeaders(req *http.Request) (string, string
 func (s *RequestSigner) buildStringToSign(signingTime time.Time, credentialScope, canonicalRequest string) string {
 	return strings.Join([]string{
 		algorithm,
-		signingTime.Format(timeFormat),
+		signingTime.Format(TimeFormat),
 		credentialScope,
 		hashSHA256([]byte(canonicalRequest)),
 	}, "\n")

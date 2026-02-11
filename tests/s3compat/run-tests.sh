@@ -242,6 +242,9 @@ test_objects=(
     "test_object_copy_16m"
     # Special prefix handling
     "test_bucket_list_special_prefix"
+    # Chunked encoding tests
+    # "test_object_write_with_chunked_transfer_encoding"  # Requires HTTP Transfer-Encoding: chunked (Ceph RGW-specific, not supported by S3/Tigris)
+    # "test_object_content_encoding_aws_chunked"  # Tigris stores aws-chunked in Content-Encoding as-is; stripping it in TAG breaks signatures in transparent mode
 )
 
 # Bucket operations tests

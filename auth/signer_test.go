@@ -251,6 +251,38 @@ func TestHashSHA256(t *testing.T) {
 	}
 }
 
+func TestParseHTTPDate(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{name: "ISO 8601", input: "20260211T055514Z", wantErr: false},
+		{name: "RFC 1123", input: "Wed, 11 Feb 2026 05:55:14 GMT", wantErr: false},
+		{name: "RFC 1123Z", input: "Wed, 11 Feb 2026 05:55:14 -0000", wantErr: false},
+		{name: "invalid format", input: "not-a-date", wantErr: true},
+		{name: "empty string", input: "", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseHTTPDate(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseHTTPDate(%q) error = nil, want error", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseHTTPDate(%q) error = %v, want nil", tt.input, err)
+			}
+			if got.IsZero() {
+				t.Errorf("ParseHTTPDate(%q) returned zero time", tt.input)
+			}
+		})
+	}
+}
+
 func TestAwsURIEncode(t *testing.T) {
 	tests := []struct {
 		name        string
