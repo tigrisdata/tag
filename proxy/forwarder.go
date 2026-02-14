@@ -378,6 +378,28 @@ func stripAWSChunkedEncoding(req *http.Request) {
 	}
 }
 
+// ensureAWSChunkedEncoding adds "aws-chunked" to the Content-Encoding header
+// if not already present. Some S3 clients (e.g., minio-go) use streaming SigV4
+// (X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD) but omit the
+// required Content-Encoding: aws-chunked header. This ensures the upstream
+// server can correctly identify and process the chunked body.
+func ensureAWSChunkedEncoding(req *http.Request) {
+	ce := req.Header.Get("Content-Encoding")
+	if ce == "" {
+		req.Header.Set("Content-Encoding", "aws-chunked")
+		return
+	}
+
+	for _, part := range strings.Split(ce, ",") {
+		if strings.TrimSpace(part) == "aws-chunked" {
+			return // Already present
+		}
+	}
+
+	// Prepend aws-chunked (it's the outermost encoding layer)
+	req.Header.Set("Content-Encoding", "aws-chunked,"+ce)
+}
+
 // ResponseCapture holds captured response data.
 type ResponseCapture struct {
 	StatusCode int

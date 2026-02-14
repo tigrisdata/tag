@@ -50,6 +50,10 @@ func (f *transparentForwarder) interceptResponse(resp *http.Response, originalRe
 // buildTransparentRequest creates a forwarded request for transparent proxy mode.
 // Copies ALL headers from the original request (including Authorization, X-Amz-Date, etc.)
 // and adds the 4 proxy headers. The body is streamed as-is without decoding.
+//
+// For AWS chunked transfer encoding (streaming SigV4), ensures the required
+// Content-Encoding: aws-chunked header is present per the S3 spec. Some clients
+// (e.g., minio-go) omit this header despite using chunked encoding on the wire.
 func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *http.Request) (*http.Request, error) {
 	baseURL, err := url.Parse(f.upstreamEndpoint)
 	if err != nil {
@@ -85,6 +89,15 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 
 	// Preserve Content-Length from original request
 	fwdReq.ContentLength = r.ContentLength
+
+	// AWS S3 spec requires Content-Encoding: aws-chunked for streaming SigV4
+	// uploads. Some clients (e.g., minio-go) send STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+	// in X-Amz-Content-Sha256 but omit the Content-Encoding header. Ensure it's
+	// present so upstream Tigris can correctly process the chunked body.
+	// Content-Encoding is not in the client's SignedHeaders so adding it is safe.
+	if IsStreamingPayload(fwdReq.Header.Get("X-Amz-Content-Sha256")) {
+		ensureAWSChunkedEncoding(fwdReq)
+	}
 
 	// Capture original Host before it gets overwritten by the upstream URL
 	forwardedHost := r.Host
