@@ -429,3 +429,132 @@ func TestCacheDefaultValues(t *testing.T) {
 		t.Errorf("Cache.GRPCAddr = %q, want %q", cfg.Cache.GRPCAddr, DefaultCacheGRPCAddr)
 	}
 }
+
+func TestTLSEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		cert     string
+		key      string
+		expected bool
+	}{
+		{"both set", "/path/cert.pem", "/path/key.pem", true},
+		{"neither set", "", "", false},
+		{"only cert", "/path/cert.pem", "", false},
+		{"only key", "", "/path/key.pem", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := ServerConfig{TLSCertFile: tt.cert, TLSKeyFile: tt.key}
+			if got := s.TLSEnabled(); got != tt.expected {
+				t.Errorf("TLSEnabled() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestTLS_FromYAML(t *testing.T) {
+	content := `
+server:
+  tls_cert_file: "/etc/tag/tls/cert.pem"
+  tls_key_file: "/etc/tag/tls/key.pem"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Server.TLSCertFile != "/etc/tag/tls/cert.pem" {
+		t.Errorf("TLSCertFile = %q, want /etc/tag/tls/cert.pem", cfg.Server.TLSCertFile)
+	}
+	if cfg.Server.TLSKeyFile != "/etc/tag/tls/key.pem" {
+		t.Errorf("TLSKeyFile = %q, want /etc/tag/tls/key.pem", cfg.Server.TLSKeyFile)
+	}
+	if !cfg.Server.TLSEnabled() {
+		t.Error("TLSEnabled() = false, want true")
+	}
+}
+
+func TestTLS_FromEnv(t *testing.T) {
+	t.Setenv("TAG_TLS_CERT_FILE", "/env/cert.pem")
+	t.Setenv("TAG_TLS_KEY_FILE", "/env/key.pem")
+
+	cfg := NewDefault()
+	if cfg.Server.TLSCertFile != "/env/cert.pem" {
+		t.Errorf("TLSCertFile = %q, want /env/cert.pem", cfg.Server.TLSCertFile)
+	}
+	if cfg.Server.TLSKeyFile != "/env/key.pem" {
+		t.Errorf("TLSKeyFile = %q, want /env/key.pem", cfg.Server.TLSKeyFile)
+	}
+}
+
+func TestTLS_EnvOverridesFile(t *testing.T) {
+	content := `
+server:
+  tls_cert_file: "/file/cert.pem"
+  tls_key_file: "/file/key.pem"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	t.Setenv("TAG_TLS_CERT_FILE", "/env/cert.pem")
+	t.Setenv("TAG_TLS_KEY_FILE", "/env/key.pem")
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Server.TLSCertFile != "/env/cert.pem" {
+		t.Errorf("TLSCertFile = %q, want /env/cert.pem (env override)", cfg.Server.TLSCertFile)
+	}
+	if cfg.Server.TLSKeyFile != "/env/key.pem" {
+		t.Errorf("TLSKeyFile = %q, want /env/key.pem (env override)", cfg.Server.TLSKeyFile)
+	}
+}
+
+func TestTLS_ValidationOnlyCert(t *testing.T) {
+	content := `
+server:
+  tls_cert_file: "/path/cert.pem"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	_, err := Load(tmpFile)
+	if err == nil {
+		t.Error("Load() should return error when only tls_cert_file is set")
+	}
+}
+
+func TestTLS_ValidationOnlyKey(t *testing.T) {
+	content := `
+server:
+  tls_key_file: "/path/key.pem"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	_, err := Load(tmpFile)
+	if err == nil {
+		t.Error("Load() should return error when only tls_key_file is set")
+	}
+}
+
+func TestTLS_DisabledByDefault(t *testing.T) {
+	cfg := NewDefault()
+	if cfg.Server.TLSEnabled() {
+		t.Error("TLSEnabled() = true, want false (disabled by default)")
+	}
+}

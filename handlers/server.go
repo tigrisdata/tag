@@ -24,6 +24,8 @@ type Server struct {
 	httpServer   *http.Server
 	bindAddr     string
 	pprofEnabled bool
+	tlsCertFile  string
+	tlsKeyFile   string
 }
 
 // NewServer creates a new HTTP server.
@@ -36,6 +38,13 @@ func NewServer(service *proxy.Service, bindIP string, port int, pprofEnabled boo
 
 	s.router = s.setupRouter()
 	return s
+}
+
+// SetTLS configures TLS certificate and key files.
+// When both are set, the server will use HTTPS instead of HTTP.
+func (s *Server) SetTLS(certFile, keyFile string) {
+	s.tlsCertFile = certFile
+	s.tlsKeyFile = keyFile
 }
 
 // connectionTrackingMiddleware tracks active HTTP connections.
@@ -175,6 +184,7 @@ func (s *Server) setupRouter() *mux.Router {
 }
 
 // Start starts the HTTP server.
+// If TLS is configured via SetTLS, the server listens with HTTPS.
 func (s *Server) Start() error {
 	s.httpServer = &http.Server{
 		Addr:         s.bindAddr,
@@ -182,6 +192,11 @@ func (s *Server) Start() error {
 		ReadTimeout:  5 * time.Minute,
 		WriteTimeout: 5 * time.Minute,
 		IdleTimeout:  120 * time.Second,
+	}
+
+	if s.tlsCertFile != "" && s.tlsKeyFile != "" {
+		log.Info().Str("addr", s.bindAddr).Msg("Starting HTTPS server (TLS enabled)")
+		return s.httpServer.ListenAndServeTLS(s.tlsCertFile, s.tlsKeyFile)
 	}
 
 	log.Info().Str("addr", s.bindAddr).Msg("Starting HTTP server")
