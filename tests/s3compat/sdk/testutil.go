@@ -15,6 +15,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+
+	"github.com/tigrisdata/tag/auth"
 )
 
 const (
@@ -235,6 +237,20 @@ func getEnvOrDefault(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// DoRawGet performs a SigV4-signed raw HTTP GET request and returns the full response.
+// Unlike DoGet (which uses the AWS SDK), this returns the raw *http.Response so callers
+// can inspect response headers like X-Cache and X-Tigris-Proxy-Signing-Keys.
+// Caller is responsible for closing the response body.
+func (e *TestEnvironment) DoRawGet(bucket, key string) (*http.Response, error) {
+	signer := auth.NewRequestSigner(e.Endpoint, e.Region)
+	path := "/" + bucket + "/" + key
+	req, err := signer.SignRequest(context.Background(), "GET", path, nil, "", e.AccessKeyID, e.SecretAccessKey, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign raw GET request: %w", err)
+	}
+	return http.DefaultClient.Do(req)
 }
 
 // randomString generates a random alphanumeric string of the specified length.

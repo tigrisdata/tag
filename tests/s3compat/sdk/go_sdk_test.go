@@ -1233,4 +1233,3 @@ func TestSDK_UserMetadata_WithCache(t *testing.T) {
 
 	t.Logf("User metadata caching verified")
 }
-

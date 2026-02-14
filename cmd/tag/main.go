@@ -174,9 +174,9 @@ func main() {
 		objectCache = cache.NewDisabledCache()
 	}
 
-	// 3. Initialize local auth for transparent proxy (if enabled)
+	// 3. Initialize local auth for transparent proxy
 	var localAuth *proxy.LocalAuthConfig
-	if cfg.Upstream.IsTransparentProxy() && cfg.Credentials.IsLocalAuthEnabled() {
+	if cfg.Upstream.IsTransparentProxy() {
 		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 		derivedKeyStore := auth.NewDerivedKeyStore(auth.DefaultDerivedKeyTTL)
 		keyUnwrapper, err := auth.NewKeyUnwrapper(secretKey)

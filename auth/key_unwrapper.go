@@ -16,9 +16,9 @@ const (
 
 // SigningKeyEntry represents a single derived signing key from Tigris.
 type SigningKeyEntry struct {
-	Date      string `json:"date"`   // YYYYMMDD format
-	Region    string `json:"region"` // e.g., "auto"
-	SigningKey string `json:"key"`   // hex-encoded 32-byte kSigning
+	Date       string `json:"date"`   // YYYYMMDD format
+	Region     string `json:"region"` // e.g., "auto"
+	SigningKey string `json:"key"`    // hex-encoded 32-byte kSigning
 }
 
 // KeyUnwrapper decrypts derived signing keys from the X-Tigris-Proxy-Signing-Keys
