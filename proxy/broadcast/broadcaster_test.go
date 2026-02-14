@@ -359,10 +359,14 @@ func TestConcurrentRequestsCoalescing(t *testing.T) {
 	numRequests := 100
 	var fetchCount int32
 
-	// Use barrier to ensure all goroutines start at the same time
-	// and subscribe before any fetcher starts broadcasting
+	// Two-phase barrier:
+	// 1. startBarrier: all goroutines block until released together
+	// 2. subscribedWg: fetcher waits until all listeners have subscribed
 	startBarrier := make(chan struct{})
-	subscribeBarrier := make(chan struct{})
+	var subscribedWg sync.WaitGroup
+	// We expect numRequests-1 subscribers (1 goroutine becomes the fetcher).
+	// Pre-add the count; the fetcher will adjust if needed.
+	subscribedWg.Add(numRequests - 1)
 
 	var wg sync.WaitGroup
 	var subscribedCount int32
@@ -377,12 +381,12 @@ func TestConcurrentRequestsCoalescing(t *testing.T) {
 
 			b, isFirst := m.GetOrCreate(key)
 			if isFirst {
-				// I'm the fetcher - wait for others to subscribe before broadcasting
+				// I'm the fetcher - wait for all others to subscribe before broadcasting
 				atomic.AddInt32(&fetchCount, 1)
 				defer m.Remove(key)
 
-				// Wait for subscribe barrier to ensure listeners subscribe
-				<-subscribeBarrier
+				// Wait for all listeners to subscribe
+				subscribedWg.Wait()
 
 				// Simulate fetching with some delay
 				b.SetHeaders(http.StatusOK, http.Header{})
@@ -392,6 +396,7 @@ func TestConcurrentRequestsCoalescing(t *testing.T) {
 				// I'm a listener
 				listener := b.Subscribe()
 				atomic.AddInt32(&subscribedCount, 1)
+				subscribedWg.Done()
 				if listener == nil {
 					// Late joiner - would need own fetch in real code
 					return
@@ -410,12 +415,6 @@ func TestConcurrentRequestsCoalescing(t *testing.T) {
 
 	// Start all goroutines at once
 	close(startBarrier)
-
-	// Give time for listeners to subscribe
-	time.Sleep(10 * time.Millisecond)
-
-	// Let fetcher start broadcasting
-	close(subscribeBarrier)
 
 	wg.Wait()
 
