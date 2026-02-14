@@ -5,7 +5,9 @@ TAG is fully compatible with standard S3 tools and SDKs. This guide shows how to
 ## Prerequisites
 
 - TAG running locally or accessible via network
-- Valid AWS credentials configured for TAG
+- TAG's own Tigris credentials configured via `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (see [configuration.md](configuration.md))
+- **Transparent proxy mode** (default): Clients use their own Tigris credentials directly when making S3 requests
+- **Signing mode**: Clients must use credentials known to TAG's credential store
 
 ## AWS CLI
 
@@ -45,7 +47,7 @@ Then use the profile:
 aws s3 ls --profile tag
 ```
 
-### Common Operations
+### Common CLI Operations
 
 ```bash
 # List buckets

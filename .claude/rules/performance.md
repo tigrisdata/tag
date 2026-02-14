@@ -24,3 +24,7 @@ Avoid explicit batching delays:
 - Explicit batching (waiting for timeout or N items) adds latency
 - Prefer implicit pipelining via HTTP/2 layer
 - Let the transport handle batching naturally
+
+## Prefer Standard Cache Libraries
+
+Use `hashicorp/golang-lru/v2/expirable` for bounded, TTL-based caches. Avoid custom map implementations with manual O(N) cleanup loops. The library handles LRU eviction and TTL expiration efficiently.
