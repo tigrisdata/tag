@@ -326,4 +326,3 @@ func (v *RequestValidator) buildCanonicalHeadersFromList(r *http.Request, signed
 
 	return builder.String()
 }
-
