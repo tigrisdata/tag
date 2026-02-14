@@ -2,12 +2,19 @@ package proxy
 
 import (
 	"context"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 
+	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/auth"
+	"github.com/tigrisdata/tag/metrics"
 )
+
+// signingKeysHeader is the response header containing encrypted derived signing keys.
+const signingKeysHeader = "X-Tigris-Proxy-Signing-Keys"
 
 // transparentForwarder forwards client requests as-is (preserving their
 // Authorization header) and adds proxy headers so Tigris validates the
@@ -18,6 +25,26 @@ type transparentForwarder struct {
 	baseForwarder
 	proxySigner      *auth.ProxySigner
 	upstreamEndpoint string
+
+	// Local auth validation (nil when feature disabled)
+	derivedKeyStore *auth.DerivedKeyStore
+	validator       *auth.RequestValidator
+	keyUnwrapper    *auth.KeyUnwrapper
+	authzCache      *auth.AuthzCache
+}
+
+// initInterceptor sets the response interceptor on the base forwarder.
+// Must be called after all fields are set.
+func (f *transparentForwarder) initInterceptor() {
+	f.responseInterceptor = f.interceptResponse
+}
+
+// interceptResponse is called by base forwarder methods after receiving the
+// upstream response but before headers are sent to the client. It extracts
+// signing keys from successful responses and revokes authZ on 403s.
+func (f *transparentForwarder) interceptResponse(resp *http.Response, originalReq *http.Request) {
+	f.learnSigningKeys(resp, originalReq)
+	f.handleAuthzRevocation(resp, originalReq)
 }
 
 // buildTransparentRequest creates a forwarded request for transparent proxy mode.
@@ -74,30 +101,89 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 
 // Forward forwards a request to Tigris in transparent proxy mode.
 // The client's original signed request is forwarded as-is with proxy headers added.
+// Response interception (signing key learning, header stripping, authZ revocation)
+// is handled by the base forwarder's response interceptor.
 func (f *transparentForwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
 	fwdReq, err := f.buildTransparentRequest(ctx, r)
 	if err != nil {
 		return err
 	}
 
-	return f.executeAndStream(w, fwdReq, r.ContentLength)
+	return f.executeAndStream(w, fwdReq, r.ContentLength, r)
 }
 
 // ForwardWithCapture forwards request in transparent proxy mode and captures the response.
+// Response interception (signing key learning, header stripping, authZ revocation)
+// is handled by the base forwarder's response interceptor.
 func (f *transparentForwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
 	fwdReq, err := f.buildTransparentRequest(ctx, r)
 	if err != nil {
 		return nil, err
 	}
 
-	return f.executeAndCapture(w, fwdReq, r.ContentLength)
+	return f.executeAndCapture(w, fwdReq, r.ContentLength, r)
 }
 
-// ValidateAndGetCredentials returns proxy credentials for background operations.
-// In transparent mode, there is no client signature validation - the proxy credentials
-// (TAG's own Tigris credentials) are returned for use by DoFullObjectRequest.
-func (f *transparentForwarder) ValidateAndGetCredentials(r *http.Request) (accessKey, secretKey string, err error) {
-	return f.proxySigner.AccessKey(), f.proxySigner.SecretKey(), nil
+// ValidateAndGetCredentials validates the client's request locally if possible.
+// Returns AuthResult to indicate whether the request was locally validated:
+//   - AuthValidated: safe to serve from cache; credentials are TAG's proxy credentials
+//   - AuthNotValidated with nil error: skip cache, forward to Tigris for validation
+//   - AuthNotValidated with error: malformed auth header — return error to client
+func (f *transparentForwarder) ValidateAndGetCredentials(r *http.Request) (AuthResult, string, string, error) {
+	result, err := f.validateLocally(r)
+	if err != nil {
+		return AuthNotValidated, "", "", err
+	}
+	if result == AuthNotValidated {
+		return AuthNotValidated, "", "", nil
+	}
+	return AuthValidated, f.proxySigner.AccessKey(), f.proxySigner.SecretKey(), nil
+}
+
+// validateLocally performs local SigV4 validation of the client's request.
+func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, error) {
+	// If local auth is not configured, always treat as validated (legacy behavior)
+	if f.validator == nil {
+		return AuthValidated, nil
+	}
+
+	// Parse auth info from the client's request
+	authInfo, err := auth.ParseAuthInfo(r)
+	if err != nil {
+		// Missing auth (anonymous request) → forward to Tigris for authoritative
+		// handling (e.g., public bucket access). Only truly malformed auth headers
+		// are rejected as client errors.
+		if errors.Is(err, auth.ErrMissingAuth) {
+			metrics.RecordLocalAuthValidation("missing_auth")
+			return AuthNotValidated, nil
+		}
+		metrics.RecordLocalAuthValidation("parse_error")
+		return AuthNotValidated, mapAuthError(err)
+	}
+
+	// Check if we have any signing key for this access key
+	if !f.derivedKeyStore.HasKey(authInfo.AccessKey) {
+		metrics.RecordLocalAuthValidation("unknown_key")
+		return AuthNotValidated, nil // Unknown key → skip cache, forward to Tigris
+	}
+
+	// Validate the SigV4 signature locally
+	if _, err := f.validator.ValidateRequest(r); err != nil {
+		// Any validation failure (signature mismatch, unknown date/region, key rotation)
+		// → skip cache, forward to Tigris to get authoritative decision + fresh keys
+		metrics.RecordLocalAuthValidation("signature_mismatch")
+		return AuthNotValidated, nil
+	}
+
+	// Check authorization cache
+	bucket, _ := ParseBucketKey(r)
+	if !f.authzCache.IsAuthorized(authInfo.AccessKey, bucket) {
+		metrics.RecordLocalAuthValidation("authz_expired")
+		return AuthNotValidated, nil // AuthZ expired → forward to Tigris
+	}
+
+	metrics.RecordLocalAuthValidation("success")
+	return AuthValidated, nil
 }
 
 // DoRequestWithCreds executes a request with transparent proxy headers.
@@ -111,5 +197,64 @@ func (f *transparentForwarder) DoRequestWithCreds(ctx context.Context, r *http.R
 		return nil, err
 	}
 
-	return f.executeRequest(fwdReq, r.ContentLength)
+	return f.executeRequest(fwdReq, r.ContentLength, r)
+}
+
+// learnSigningKeys extracts and caches derived signing keys from the Tigris response.
+// The signing keys header is always stripped before the response reaches the client.
+func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Request) {
+	if f.keyUnwrapper == nil {
+		return
+	}
+
+	headerVal := resp.Header.Get(signingKeysHeader)
+	resp.Header.Del(signingKeysHeader) // Always strip
+
+	// Header may be absent on 2xx if feature is disabled on Tigris side, or non-proxy request
+	if headerVal == "" || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return
+	}
+
+	authInfo, err := auth.ParseAuthInfo(r)
+	if err != nil {
+		log.Debug().Err(err).Msg("Failed to parse auth info for signing key learning")
+		return
+	}
+
+	entries, err := f.keyUnwrapper.Unwrap(headerVal, authInfo.AccessKey)
+	if err != nil {
+		log.Warn().Err(err).Str("access_key", authInfo.AccessKey).Msg("Failed to unwrap signing keys")
+		return
+	}
+
+	for _, entry := range entries {
+		keyBytes, err := hex.DecodeString(entry.SigningKey)
+		if err != nil {
+			log.Warn().Err(err).Str("date", entry.Date).Msg("Failed to decode signing key hex")
+			continue
+		}
+		f.derivedKeyStore.Store(authInfo.AccessKey, entry.Date, entry.Region, keyBytes)
+	}
+
+	bucket, _ := ParseBucketKey(r)
+	f.authzCache.Grant(authInfo.AccessKey, bucket)
+
+	metrics.ProxySigningKeysReceived.Inc()
+	metrics.DerivedKeyStoreSize.Set(float64(f.derivedKeyStore.Count()))
+	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
+}
+
+// handleAuthzRevocation revokes authorization when Tigris returns 403.
+func (f *transparentForwarder) handleAuthzRevocation(resp *http.Response, r *http.Request) {
+	if f.authzCache == nil || resp.StatusCode != http.StatusForbidden {
+		return
+	}
+
+	authInfo, err := auth.ParseAuthInfo(r)
+	if err != nil {
+		return
+	}
+
+	bucket, _ := ParseBucketKey(r)
+	f.authzCache.Revoke(authInfo.AccessKey, bucket)
 }

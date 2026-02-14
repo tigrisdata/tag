@@ -117,8 +117,15 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleHeadObject")
 
+	// Validate credentials before serving from cache
+	result, _, _, err := s.forwarder.ValidateAndGetCredentials(r)
+	if err != nil {
+		metrics.RecordRequest("HeadObject", "auth_error", time.Since(start).Seconds())
+		return err
+	}
+
 	// Try to serve from cached metadata (no body needed)
-	if !noCacheRead && s.cache.IsEnabled() {
+	if result == AuthValidated && !noCacheRead && s.cache.IsEnabled() {
 		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
 		if cacheErr == nil && found && meta != nil {
 			metrics.RecordCacheHit()
@@ -139,7 +146,7 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	} else {
 		w.Header().Set(XCacheHeader, XCacheDisabled)
 	}
-	err := s.forwarder.Forward(ctx, w, r)
+	err = s.forwarder.Forward(ctx, w, r)
 
 	status := "success"
 	if err != nil {

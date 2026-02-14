@@ -101,7 +101,22 @@ func (u *UpstreamConfig) SetTransparentProxy(enabled bool) {
 // CredentialsConfig holds credential store configuration.
 // Credentials are loaded from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.
 type CredentialsConfig struct {
-	// Reserved for future configuration options
+	LocalAuthEnabled *bool         `yaml:"local_auth_enabled"` // Enable local SigV4 validation for transparent proxy (default: false)
+	AuthzCacheTTL    time.Duration `yaml:"authz_cache_ttl"`    // TTL for authorization cache entries (default: 10m)
+}
+
+// IsLocalAuthEnabled returns whether local auth validation is enabled.
+// Returns false by default if not explicitly set.
+func (c *CredentialsConfig) IsLocalAuthEnabled() bool {
+	if c.LocalAuthEnabled == nil {
+		return false
+	}
+	return *c.LocalAuthEnabled
+}
+
+// SetLocalAuthEnabled sets the LocalAuthEnabled field to the given value.
+func (c *CredentialsConfig) SetLocalAuthEnabled(enabled bool) {
+	c.LocalAuthEnabled = &enabled
 }
 
 // CacheConfig holds cache configuration.
@@ -310,6 +325,18 @@ func applyEnvOverrides(cfg *Config) {
 	if val := os.Getenv("TAG_TRANSPARENT_PROXY"); val != "" {
 		enabled := val == "true" || val == "1"
 		cfg.Upstream.SetTransparentProxy(enabled)
+	}
+
+	// Enable local auth validation from environment (disabled by default)
+	if val := os.Getenv("TAG_LOCAL_AUTH_ENABLED"); val == "true" || val == "1" {
+		cfg.Credentials.SetLocalAuthEnabled(true)
+	}
+
+	// Override authz cache TTL from environment
+	if val := os.Getenv("TAG_AUTHZ_CACHE_TTL"); val != "" {
+		if ttl, err := time.ParseDuration(val); err == nil && ttl > 0 {
+			cfg.Credentials.AuthzCacheTTL = ttl
+		}
 	}
 }
 
