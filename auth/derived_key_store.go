@@ -16,7 +16,7 @@ const DefaultDerivedKeyTTL = 48 * time.Hour
 const maxDerivedKeyStoreSize = 100_000
 
 // maxAccessKeyCacheSize is the maximum number of tracked access keys.
-const maxAccessKeyCacheSize = 50_000
+const maxAccessKeyCacheSize = 100_000
 
 // DerivedKeyStore stores pre-derived SigV4 signing keys for transparent proxy mode.
 // Keys are indexed by (accessKey, date, region) and expire after a configurable TTL.
