@@ -156,6 +156,48 @@ func TestBuildTransparentRequest_StreamingPayload(t *testing.T) {
 			t.Errorf("Content-Encoding = %q, want empty for non-streaming", ce)
 		}
 	})
+
+	t.Run("skips mutation when content-encoding is in SignedHeaders", func(t *testing.T) {
+		chunkedBody := "4;chunk-signature=sig\r\ntest\r\n0;chunk-signature=sig\r\n\r\n"
+
+		req, _ := http.NewRequest(http.MethodPut, "http://localhost:8080/bucket/key", strings.NewReader(chunkedBody))
+		req.ContentLength = int64(len(chunkedBody))
+		req.Header.Set("X-Amz-Content-Sha256", StreamingPayloadHash)
+		req.Header.Set("X-Amz-Decoded-Content-Length", "4")
+		req.Header.Set("Content-Encoding", "gzip")
+		// content-encoding IS in SignedHeaders — must not be mutated
+		req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=key/20260214/us-east-1/s3/aws4_request,SignedHeaders=content-encoding;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=sig")
+
+		fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
+		if err != nil {
+			t.Fatalf("buildTransparentRequest() error = %v", err)
+		}
+
+		// Content-Encoding should be preserved as-is (no aws-chunked prepended)
+		if ce := fwdReq.Header.Get("Content-Encoding"); ce != "gzip" {
+			t.Errorf("Content-Encoding = %q, want %q (should not be mutated when signed)", ce, "gzip")
+		}
+	})
+
+	t.Run("case-insensitive aws-chunked detection", func(t *testing.T) {
+		chunkedBody := "4;chunk-signature=sig\r\ntest\r\n0;chunk-signature=sig\r\n\r\n"
+
+		req, _ := http.NewRequest(http.MethodPut, "http://localhost:8080/bucket/key", strings.NewReader(chunkedBody))
+		req.ContentLength = int64(len(chunkedBody))
+		req.Header.Set("X-Amz-Content-Sha256", StreamingPayloadHash)
+		req.Header.Set("X-Amz-Decoded-Content-Length", "4")
+		req.Header.Set("Content-Encoding", "AWS-CHUNKED")
+
+		fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
+		if err != nil {
+			t.Fatalf("buildTransparentRequest() error = %v", err)
+		}
+
+		// Should not duplicate — case-insensitive match should detect AWS-CHUNKED
+		if ce := fwdReq.Header.Get("Content-Encoding"); ce != "AWS-CHUNKED" {
+			t.Errorf("Content-Encoding = %q, want %q (should not duplicate)", ce, "AWS-CHUNKED")
+		}
+	})
 }
 
 func TestBuildTransparentRequest_DateHandling(t *testing.T) {

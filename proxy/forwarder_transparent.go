@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/auth"
@@ -94,8 +95,9 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 	// uploads. Some clients (e.g., minio-go) send STREAMING-AWS4-HMAC-SHA256-PAYLOAD
 	// in X-Amz-Content-Sha256 but omit the Content-Encoding header. Ensure it's
 	// present so upstream Tigris can correctly process the chunked body.
-	// Content-Encoding is not in the client's SignedHeaders so adding it is safe.
-	if IsStreamingPayload(fwdReq.Header.Get("X-Amz-Content-Sha256")) {
+	// Only add the header if content-encoding is NOT in the client's SignedHeaders,
+	// since mutating a signed header would invalidate the Authorization signature.
+	if IsStreamingPayload(fwdReq.Header.Get("X-Amz-Content-Sha256")) && !isContentEncodingSigned(r) {
 		ensureAWSChunkedEncoding(fwdReq)
 	}
 
@@ -197,6 +199,24 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 
 	metrics.RecordLocalAuthValidation("success")
 	return AuthValidated, nil
+}
+
+// isContentEncodingSigned returns true if "content-encoding" is listed in the
+// request's SigV4 SignedHeaders. When it is signed, we must not modify the
+// Content-Encoding header because doing so would invalidate the Authorization
+// signature. Returns false if the auth header can't be parsed (anonymous or
+// malformed requests will be forwarded to Tigris for authoritative handling).
+func isContentEncodingSigned(r *http.Request) bool {
+	authInfo, err := auth.ParseAuthInfo(r)
+	if err != nil {
+		return false
+	}
+	for _, h := range authInfo.SignedHeaders {
+		if strings.EqualFold(h, "content-encoding") {
+			return true
+		}
+	}
+	return false
 }
 
 // DoRequestWithCreds executes a request with transparent proxy headers.

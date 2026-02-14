@@ -391,7 +391,7 @@ func ensureAWSChunkedEncoding(req *http.Request) {
 	}
 
 	for _, part := range strings.Split(ce, ",") {
-		if strings.TrimSpace(part) == "aws-chunked" {
+		if strings.EqualFold(strings.TrimSpace(part), "aws-chunked") {
 			return // Already present
 		}
 	}
