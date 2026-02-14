@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"io"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -133,7 +134,15 @@ func TestSDK_LocalAuth_MultipleAccessPatterns(t *testing.T) {
 	io.ReadAll(resp1.Body)
 	resp1.Body.Close()
 
-	// First GET from bucket B: learns signing keys + grants authz for bucket B
+	// Bucket A first request must not be a cache HIT (no signing keys known yet)
+	xCacheA1 := resp1.Header.Get("X-Cache")
+	if xCacheA1 == "HIT" {
+		t.Errorf("First GET (bucket A): expected X-Cache != HIT (should forward to upstream), got %q", xCacheA1)
+	}
+	t.Logf("Bucket A first GET forwarded to upstream: X-Cache=%s", xCacheA1)
+
+	// First GET from bucket B: even though signing keys are now known from bucket A,
+	// authz is per-bucket so bucket B must still forward to upstream (not served from cache).
 	resp2, err := globalEnv.DoRawGet(bucketB, "key-b")
 	if err != nil {
 		t.Fatalf("First GET (bucket B) failed: %v", err)
@@ -141,10 +150,17 @@ func TestSDK_LocalAuth_MultipleAccessPatterns(t *testing.T) {
 	io.ReadAll(resp2.Body)
 	resp2.Body.Close()
 
+	// Bucket B first request must not be a cache HIT (bucket A's authz doesn't cover bucket B)
+	xCacheB1 := resp2.Header.Get("X-Cache")
+	if xCacheB1 == "HIT" {
+		t.Errorf("First GET (bucket B): expected X-Cache != HIT (bucket A authz should not cover bucket B), got %q", xCacheB1)
+	}
+	t.Logf("Bucket B first GET forwarded to upstream: X-Cache=%s", xCacheB1)
+
 	// Wait for cache population
 	time.Sleep(500 * time.Millisecond)
 
-	// Second GET from bucket A: should be served from cache
+	// Second GET from bucket A: should be served from cache (signing keys + authz both known)
 	resp3, err := globalEnv.DoRawGet(bucketA, "key-a")
 	if err != nil {
 		t.Fatalf("Second GET (bucket A) failed: %v", err)
@@ -156,10 +172,10 @@ func TestSDK_LocalAuth_MultipleAccessPatterns(t *testing.T) {
 		t.Errorf("Bucket A: expected body %q, got %q", contentA, body3)
 	}
 	if resp3.Header.Get("X-Cache") != "HIT" {
-		t.Errorf("Bucket A: expected X-Cache HIT, got %q", resp3.Header.Get("X-Cache"))
+		t.Errorf("Bucket A second GET: expected X-Cache HIT, got %q", resp3.Header.Get("X-Cache"))
 	}
 
-	// Second GET from bucket B: should be served from cache
+	// Second GET from bucket B: should be served from cache (signing keys + authz both known)
 	resp4, err := globalEnv.DoRawGet(bucketB, "key-b")
 	if err != nil {
 		t.Fatalf("Second GET (bucket B) failed: %v", err)
@@ -171,8 +187,92 @@ func TestSDK_LocalAuth_MultipleAccessPatterns(t *testing.T) {
 		t.Errorf("Bucket B: expected body %q, got %q", contentB, body4)
 	}
 	if resp4.Header.Get("X-Cache") != "HIT" {
-		t.Errorf("Bucket B: expected X-Cache HIT, got %q", resp4.Header.Get("X-Cache"))
+		t.Errorf("Bucket B second GET: expected X-Cache HIT, got %q", resp4.Header.Get("X-Cache"))
 	}
 
-	t.Logf("Multi-bucket local auth verified: both buckets served from cache")
+	t.Logf("Multi-bucket local auth verified: per-bucket authz enforced, both buckets cache HIT after learning")
+}
+
+// TestSDK_LocalAuth_CacheNotServedWithoutValidAuth verifies that cached objects
+// are NOT served from cache when the client has invalid credentials or no auth.
+//
+// Even though the object is in cache, TAG must not serve it because local auth
+// cannot validate the request — it falls through to Tigris which rejects it.
+func TestSDK_LocalAuth_CacheNotServedWithoutValidAuth(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("local-auth-denied")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	content := []byte("secret content that requires valid auth")
+	if err := globalEnv.PutTestObject(bucket, "secret-key", content); err != nil {
+		t.Fatalf("Failed to put test object: %v", err)
+	}
+
+	// Step 1: GET with valid creds to populate cache + learn signing keys
+	resp1, err := globalEnv.DoRawGet(bucket, "secret-key")
+	if err != nil {
+		t.Fatalf("First GET (valid creds) failed: %v", err)
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
+	}
+	if string(body1) != string(content) {
+		t.Errorf("First GET: expected body %q, got %q", content, body1)
+	}
+
+	// Wait for cache to be populated
+	time.Sleep(500 * time.Millisecond)
+
+	// Step 2: Sanity check — valid creds should get cache HIT
+	resp2, err := globalEnv.DoRawGet(bucket, "secret-key")
+	if err != nil {
+		t.Fatalf("Second GET (valid creds) failed: %v", err)
+	}
+	io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("Second GET (valid creds): expected 200, got %d", resp2.StatusCode)
+	}
+	if resp2.Header.Get("X-Cache") != "HIT" {
+		t.Errorf("Second GET (valid creds): expected X-Cache HIT, got %q", resp2.Header.Get("X-Cache"))
+	}
+
+	// Step 3: GET with fake credentials (unknown access key)
+	// TAG's local auth: derivedKeyStore.HasKey() returns false → AuthNotValidated → forward to Tigris → 403
+	resp3, err := globalEnv.DoRawGetWithCreds(bucket, "secret-key", "FAKE_ACCESS_KEY_12345", "fake-secret-key-for-testing")
+	if err != nil {
+		t.Fatalf("GET with fake creds failed: %v", err)
+	}
+	io.ReadAll(resp3.Body)
+	resp3.Body.Close()
+
+	if resp3.StatusCode != http.StatusForbidden {
+		t.Errorf("GET with fake creds: expected 403 Forbidden, got %d", resp3.StatusCode)
+	}
+	if resp3.Header.Get("X-Cache") == "HIT" {
+		t.Errorf("GET with fake creds: must NOT get X-Cache HIT (cached object served to unauthorized client)")
+	}
+	t.Logf("Fake creds correctly rejected: status=%d, X-Cache=%s", resp3.StatusCode, resp3.Header.Get("X-Cache"))
+
+	// Step 4: GET with no auth (anonymous request)
+	// TAG's local auth: ParseAuthInfo returns ErrMissingAuth → AuthNotValidated → forward to Tigris → 403
+	resp4, err := globalEnv.DoRawGetUnauthenticated(bucket, "secret-key")
+	if err != nil {
+		t.Fatalf("GET without auth failed: %v", err)
+	}
+	io.ReadAll(resp4.Body)
+	resp4.Body.Close()
+
+	if resp4.StatusCode != http.StatusForbidden {
+		t.Errorf("GET without auth: expected 403 Forbidden, got %d", resp4.StatusCode)
+	}
+	if resp4.Header.Get("X-Cache") == "HIT" {
+		t.Errorf("GET without auth: must NOT get X-Cache HIT (cached object served to anonymous client)")
+	}
+	t.Logf("Unauthenticated request correctly rejected: status=%d, X-Cache=%s", resp4.StatusCode, resp4.Header.Get("X-Cache"))
 }

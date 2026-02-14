@@ -244,11 +244,30 @@ func getEnvOrDefault(key, defaultValue string) string {
 // can inspect response headers like X-Cache and X-Tigris-Proxy-Signing-Keys.
 // Caller is responsible for closing the response body.
 func (e *TestEnvironment) DoRawGet(bucket, key string) (*http.Response, error) {
+	return e.DoRawGetWithCreds(bucket, key, e.AccessKeyID, e.SecretAccessKey)
+}
+
+// DoRawGetWithCreds performs a SigV4-signed raw HTTP GET with the given credentials.
+// Useful for testing with invalid or different credentials.
+// Caller is responsible for closing the response body.
+func (e *TestEnvironment) DoRawGetWithCreds(bucket, key, accessKey, secretKey string) (*http.Response, error) {
 	signer := auth.NewRequestSigner(e.Endpoint, e.Region)
 	path := "/" + bucket + "/" + key
-	req, err := signer.SignRequest(context.Background(), "GET", path, nil, "", e.AccessKeyID, e.SecretAccessKey, nil)
+	req, err := signer.SignRequest(context.Background(), "GET", path, nil, "", accessKey, secretKey, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sign raw GET request: %w", err)
+	}
+	return http.DefaultClient.Do(req)
+}
+
+// DoRawGetUnauthenticated performs an HTTP GET without any Authorization header.
+// Useful for testing that cached objects are not served to anonymous requests.
+// Caller is responsible for closing the response body.
+func (e *TestEnvironment) DoRawGetUnauthenticated(bucket, key string) (*http.Response, error) {
+	url := e.Endpoint + "/" + bucket + "/" + key
+	req, err := http.NewRequestWithContext(context.Background(), "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create unauthenticated GET request: %w", err)
 	}
 	return http.DefaultClient.Do(req)
 }
