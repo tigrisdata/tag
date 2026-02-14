@@ -1,50 +1,53 @@
 package auth
 
 import (
-	"strings"
-	"sync"
 	"time"
+
+	expirable "github.com/hashicorp/golang-lru/v2/expirable"
 )
 
+// DefaultDerivedKeyTTL is the default TTL for derived signing keys.
+// 48 hours covers today + yesterday for SigV4 clock skew tolerance.
+const DefaultDerivedKeyTTL = 48 * time.Hour
+
+// maxDerivedKeyStoreSize is the maximum number of signing key entries.
+// Each entry is a composite key (~80 bytes) mapped to a 32-byte signing key,
+// plus LRU node overhead (~200 bytes). At ~300 bytes per entry, 100K entries ≈ 30MB.
+const maxDerivedKeyStoreSize = 100_000
+
+// maxAccessKeyCacheSize is the maximum number of tracked access keys.
+const maxAccessKeyCacheSize = 50_000
+
 // DerivedKeyStore stores pre-derived SigV4 signing keys for transparent proxy mode.
-// Keys are indexed by (accessKey, date, region) and are day-scoped.
+// Keys are indexed by (accessKey, date, region) and expire after a configurable TTL.
 // It implements the KeyProvider interface.
 type DerivedKeyStore struct {
-	keys       map[string][]byte // "accessKey\x00date\x00region" → kSigning
-	accessKeys map[string]bool   // quick existence check by access key
-	mu         sync.RWMutex
+	keys       *expirable.LRU[string, []byte]
+	accessKeys *expirable.LRU[string, struct{}]
 }
 
-// NewDerivedKeyStore creates a new empty derived key store.
-func NewDerivedKeyStore() *DerivedKeyStore {
+// NewDerivedKeyStore creates a new derived key store with the given TTL.
+func NewDerivedKeyStore(ttl time.Duration) *DerivedKeyStore {
+	if ttl <= 0 {
+		ttl = DefaultDerivedKeyTTL
+	}
 	return &DerivedKeyStore{
-		keys:       make(map[string][]byte),
-		accessKeys: make(map[string]bool),
+		keys:       expirable.NewLRU[string, []byte](maxDerivedKeyStoreSize, nil, ttl),
+		accessKeys: expirable.NewLRU[string, struct{}](maxAccessKeyCacheSize, nil, ttl),
 	}
 }
 
 // Store adds or updates a derived signing key for the given access key, date, and region.
-// Old keys (dates before yesterday) are lazily cleaned up on each Store call.
 func (d *DerivedKeyStore) Store(accessKey, date, region string, signingKey []byte) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	d.keys[makeKey(accessKey, date, region)] = signingKey
-	d.accessKeys[accessKey] = true
-
-	// Lazy cleanup: remove keys older than yesterday
-	yesterday := time.Now().UTC().AddDate(0, 0, -1).Format("20060102")
-	d.cleanupBeforeLocked(yesterday)
+	d.keys.Add(makeKey(accessKey, date, region), signingKey)
+	d.accessKeys.Add(accessKey, struct{}{})
 }
 
 // GetSigningKey returns the signing key for the given access key, date, and region.
 // Returns an error wrapping ErrUnknownAccessKey if the key is not found.
 // Implements the KeyProvider interface.
 func (d *DerivedKeyStore) GetSigningKey(accessKey, date, region string) ([]byte, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	key, ok := d.keys[makeKey(accessKey, date, region)]
+	key, ok := d.keys.Get(makeKey(accessKey, date, region))
 	if !ok {
 		return nil, ErrUnknownAccessKey
 	}
@@ -54,68 +57,18 @@ func (d *DerivedKeyStore) GetSigningKey(accessKey, date, region string) ([]byte,
 // HasKey returns whether any signing key exists for the given access key.
 // Implements the KeyProvider interface.
 func (d *DerivedKeyStore) HasKey(accessKey string) bool {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return d.accessKeys[accessKey]
+	_, ok := d.accessKeys.Get(accessKey)
+	return ok
 }
 
 // Count returns the number of stored signing keys.
 func (d *DerivedKeyStore) Count() int {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return len(d.keys)
-}
-
-// cleanupBeforeLocked removes keys with dates strictly before the given date string.
-// Must be called with d.mu held for writing.
-func (d *DerivedKeyStore) cleanupBeforeLocked(minDate string) {
-	for k := range d.keys {
-		date := extractDate(k)
-		if date < minDate {
-			accessKey := extractAccessKey(k)
-			delete(d.keys, k)
-
-			// Check if this access key still has any keys
-			if !d.hasKeysForAccessKeyLocked(accessKey) {
-				delete(d.accessKeys, accessKey)
-			}
-		}
-	}
-}
-
-// hasKeysForAccessKeyLocked checks if any keys exist for the given access key.
-// Must be called with d.mu held.
-func (d *DerivedKeyStore) hasKeysForAccessKeyLocked(accessKey string) bool {
-	prefix := accessKey + "\x00"
-	for k := range d.keys {
-		if strings.HasPrefix(k, prefix) {
-			return true
-		}
-	}
-	return false
+	return d.keys.Len()
 }
 
 // makeKey builds the composite map key from access key, date, and region.
 func makeKey(accessKey, date, region string) string {
 	return accessKey + "\x00" + date + "\x00" + region
-}
-
-// extractDate extracts the date component from a composite key.
-func extractDate(compositeKey string) string {
-	parts := strings.SplitN(compositeKey, "\x00", 3)
-	if len(parts) >= 2 {
-		return parts[1]
-	}
-	return ""
-}
-
-// extractAccessKey extracts the access key component from a composite key.
-func extractAccessKey(compositeKey string) string {
-	parts := strings.SplitN(compositeKey, "\x00", 2)
-	if len(parts) >= 1 {
-		return parts[0]
-	}
-	return ""
 }
 
 // Compile-time check that DerivedKeyStore implements KeyProvider.

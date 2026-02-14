@@ -178,7 +178,7 @@ func main() {
 	var localAuth *proxy.LocalAuthConfig
 	if cfg.Upstream.IsTransparentProxy() && cfg.Credentials.IsLocalAuthEnabled() {
 		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
-		derivedKeyStore := auth.NewDerivedKeyStore()
+		derivedKeyStore := auth.NewDerivedKeyStore(auth.DefaultDerivedKeyTTL)
 		keyUnwrapper, err := auth.NewKeyUnwrapper(secretKey)
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize key unwrapper for local auth")
