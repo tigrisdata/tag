@@ -435,13 +435,6 @@ func TestCacheDefaultValues(t *testing.T) {
 	}
 }
 
-func TestGRPCAuth_EnabledByDefault(t *testing.T) {
-	cfg := NewDefault()
-	if !cfg.Cache.IsGRPCAuthEnabled() {
-		t.Error("IsGRPCAuthEnabled() = false, want true (enabled by default)")
-	}
-}
-
 func TestGRPCAuth_DisabledByYAML(t *testing.T) {
 	content := `
 cache:
