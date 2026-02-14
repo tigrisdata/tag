@@ -203,12 +203,13 @@ func (f *transparentForwarder) DoRequestWithCreds(ctx context.Context, r *http.R
 // learnSigningKeys extracts and caches derived signing keys from the Tigris response.
 // The signing keys header is always stripped before the response reaches the client.
 func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Request) {
+	// Always strip the internal header, even when local auth is disabled.
+	headerVal := resp.Header.Get(signingKeysHeader)
+	resp.Header.Del(signingKeysHeader)
+
 	if f.keyUnwrapper == nil {
 		return
 	}
-
-	headerVal := resp.Header.Get(signingKeysHeader)
-	resp.Header.Del(signingKeysHeader) // Always strip
 
 	// Header may be absent on 2xx if feature is disabled on Tigris side, or non-proxy request
 	if headerVal == "" || resp.StatusCode < 200 || resp.StatusCode >= 300 {

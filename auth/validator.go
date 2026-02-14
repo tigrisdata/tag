@@ -70,16 +70,13 @@ func (v *RequestValidator) ValidateRequest(r *http.Request) (string, error) {
 		dateStr = r.URL.Query().Get("X-Amz-Date")
 	}
 	// Parse the date and extract short date (YYYYMMDD) for signing key lookup.
-	// Try TimeFormat first (X-Amz-Date: 20250211T120000Z), then HTTP date (RFC1123).
 	shortDate := authInfo.Date // From credential scope, already YYYYMMDD
 	if shortDate == "" {
-		if t, err := time.Parse(TimeFormat, dateStr); err == nil {
-			shortDate = t.UTC().Format(shortTimeFormat)
-		} else if t, err := time.Parse(time.RFC1123, dateStr); err == nil {
-			shortDate = t.UTC().Format(shortTimeFormat)
-		} else {
+		t, err := ParseHTTPDate(dateStr)
+		if err != nil {
 			return "", ErrInvalidDate
 		}
+		shortDate = t.UTC().Format(shortTimeFormat)
 	}
 
 	// Look up signing key
@@ -107,13 +104,9 @@ func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, s
 	}
 
 	// Parse and validate the date
-	requestTime, err := time.Parse(TimeFormat, dateStr)
+	requestTime, err := ParseHTTPDate(dateStr)
 	if err != nil {
-		// Try HTTP date format
-		requestTime, err = time.Parse(time.RFC1123, dateStr)
-		if err != nil {
-			return ErrInvalidDate
-		}
+		return ErrInvalidDate
 	}
 
 	// Check request age
