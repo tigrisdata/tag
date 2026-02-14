@@ -281,7 +281,7 @@ help:
 	@echo ""
 	@echo "S3 compatibility test targets:"
 	@echo "  s3-test-local      - Start TAG locally with embedded cache"
-	@echo "  s3-tests           - Run S3 compatibility tests (ceph s3-tests)"
+	@echo "  s3-tests           - Run S3 compatibility tests (Python s3-tests)"
 	@echo "  s3-tests-clean     - Remove cloned s3-tests repository"
 	@echo "  s3-test-local-down - Stop local TAG and cleanup"
 	@echo ""
@@ -348,12 +348,12 @@ s3-test-local-down:
 .PHONY: s3-tests
 s3-tests:
 	@echo "Running S3 compatibility tests..."
-	cd tests/s3compat && ./run-tests.sh
+	cd tests/s3compat/python && ./run-tests.sh
 
 .PHONY: s3-tests-clean
 s3-tests-clean:
 	@echo "Cleaning up S3 test artifacts..."
-	rm -rf tests/s3compat/s3-tests
+	rm -rf tests/s3compat/python/s3-tests
 
 # SDK tests against external TAG (requires running TAG instance)
 .PHONY: test-sdk
@@ -370,6 +370,6 @@ test-sdk: rocksdb-static
 		echo "  Start TAG with: make s3-test-local"; \
 		exit 1; \
 	fi
-	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) $(CGO_ENV) go test -v -timeout 300s $(TESTFLAGS) ./tests/integration/sdk/...
+	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) $(CGO_ENV) go test -v -timeout 300s $(TESTFLAGS) ./tests/s3compat/sdk/...
 
 .DEFAULT_GOAL := help

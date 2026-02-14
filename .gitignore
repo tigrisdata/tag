@@ -9,9 +9,9 @@
 .bin/
 
 # S3 compatibility tests (cloned repo, venv, and generated config with credentials)
-tests/s3compat/s3-tests/
-tests/s3compat/.venv/
-tests/s3compat/s3tests.conf.generated
+tests/s3compat/python/s3-tests/
+tests/s3compat/python/.venv/
+tests/s3compat/python/s3tests.conf.generated
 
 # Coverage reports
 coverage.out
