@@ -1,6 +1,6 @@
 # S3 Compatibility Tests
 
-TAG includes S3 compatibility tests using the upstream [ceph/s3-tests](https://github.com/ceph/s3-tests) test suite. Test files are located in `tests/s3compat/`.
+TAG includes S3 compatibility tests using the upstream [ceph/s3-tests](https://github.com/ceph/s3-tests) test suite. Test files are located in `tests/s3compat/python/` (Python s3-tests) and `tests/s3compat/sdk/` (Go SDK tests).
 
 ## Overview
 
@@ -52,7 +52,7 @@ make s3-test-local-down
 To run a specific test, pass the test path as an argument:
 
 ```bash
-cd tests/s3compat
+cd tests/s3compat/python
 ./run-tests.sh test_s3.py::test_bucket_list_empty
 ```
 
@@ -86,7 +86,7 @@ The test suite is organized into categories based on the [ceph/s3-tests](https:/
 
 ## Configuration
 
-The test configuration is in `tests/s3compat/s3tests.conf`. Key settings:
+The test configuration is in `tests/s3compat/python/s3tests.conf`. Key settings:
 
 - **Host/Port**: `localhost:8080` (TAG endpoint)
 - **Protocol**: HTTP (not HTTPS)
@@ -123,11 +123,12 @@ make s3-tests-clean
 
 ## Files
 
-| File                                | Description                                               |
-| ----------------------------------- | --------------------------------------------------------- |
-| `tests/s3compat/run-tests.sh`       | Test runner script (clones s3-tests, runs pytest via tox) |
-| `tests/s3compat/s3tests.conf`       | Test configuration template                               |
-| `tests/s3compat/docker-compose.yml` | Docker setup for TAG                                      |
+| File                                       | Description                                               |
+| ------------------------------------------ | --------------------------------------------------------- |
+| `tests/s3compat/python/run-tests.sh`       | Test runner script (clones s3-tests, runs pytest via tox) |
+| `tests/s3compat/python/s3tests.conf`       | Test configuration template                               |
+| `tests/s3compat/sdk/go_sdk_test.go`        | Go SDK S3 compatibility tests                             |
+| `tests/s3compat/sdk/testutil.go`           | Go SDK test utilities and environment setup                |
 
 ## Future Improvements
 

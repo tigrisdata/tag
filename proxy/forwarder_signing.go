@@ -53,7 +53,7 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 	}
 	prepareForwardedRequest(fwdReq, contentLength, chunked)
 
-	return f.executeAndStream(w, fwdReq, contentLength)
+	return f.executeAndStream(w, fwdReq, contentLength, nil)
 }
 
 // ForwardWithCapture forwards request and captures response for caching.
@@ -89,24 +89,24 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 	}
 	prepareForwardedRequest(fwdReq, contentLength, chunked)
 
-	return f.executeAndCapture(w, fwdReq, contentLength)
+	return f.executeAndCapture(w, fwdReq, contentLength, nil)
 }
 
 // ValidateAndGetCredentials validates the request signature and returns credentials.
-// This is used to validate credentials before joining a broadcast.
-func (f *signingForwarder) ValidateAndGetCredentials(r *http.Request) (accessKey, secretKey string, err error) {
-	accessKey, err = f.validator.ValidateRequest(r)
+// In signing mode, validation is always performed locally — returns AuthValidated on success.
+func (f *signingForwarder) ValidateAndGetCredentials(r *http.Request) (AuthResult, string, string, error) {
+	accessKey, err := f.validator.ValidateRequest(r)
 	if err != nil {
 		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
-		return "", "", mapAuthError(err)
+		return AuthNotValidated, "", "", mapAuthError(err)
 	}
 
-	secretKey, err = f.credStore.GetSecretKey(accessKey)
+	secretKey, err := f.credStore.GetSecretKey(accessKey)
 	if err != nil {
-		return "", "", mapAuthError(err)
+		return AuthNotValidated, "", "", mapAuthError(err)
 	}
 
-	return accessKey, secretKey, nil
+	return AuthValidated, accessKey, secretKey, nil
 }
 
 // DoRequestWithCreds executes a request with pre-validated credentials.
@@ -127,5 +127,5 @@ func (f *signingForwarder) DoRequestWithCreds(ctx context.Context, r *http.Reque
 	}
 	prepareForwardedRequest(fwdReq, contentLength, chunked)
 
-	return f.executeRequest(fwdReq, contentLength)
+	return f.executeRequest(fwdReq, contentLength, nil)
 }

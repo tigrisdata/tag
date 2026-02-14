@@ -14,6 +14,17 @@ import (
 	"github.com/tigrisdata/tag/metrics"
 )
 
+// AuthResult represents the outcome of authentication validation.
+type AuthResult int
+
+const (
+	// AuthValidated means the request was locally validated — safe to serve from cache.
+	AuthValidated AuthResult = iota
+	// AuthNotValidated means local validation was skipped (unknown key, signature
+	// mismatch, expired authZ) — skip cache, forward to Tigris.
+	AuthNotValidated
+)
+
 // RequestForwarder is the interface for forwarding requests to the upstream Tigris server.
 // Two implementations exist: signingForwarder (validate + re-sign) and
 // transparentForwarder (clone headers + proxy headers).
@@ -25,7 +36,10 @@ type RequestForwarder interface {
 	ForwardWithCapture(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error)
 
 	// ValidateAndGetCredentials validates the request signature and returns credentials.
-	ValidateAndGetCredentials(r *http.Request) (accessKey, secretKey string, err error)
+	// Returns AuthResult to indicate whether the request was locally validated.
+	// On AuthValidated, the returned credentials can be used for cache-miss forwarding.
+	// On AuthNotValidated, skip cache and forward to Tigris for authoritative validation.
+	ValidateAndGetCredentials(r *http.Request) (result AuthResult, accessKey, secretKey string, err error)
 
 	// DoRequestWithCreds executes a request with pre-validated credentials.
 	// Returns the raw response for streaming. Caller is responsible for closing the response body.
@@ -117,11 +131,18 @@ var (
 	_ RequestForwarder = (*transparentForwarder)(nil)
 )
 
+// ResponseInterceptor is called after receiving the upstream response but before
+// headers are sent to the client. Used by transparentForwarder to extract signing
+// keys and strip internal headers from the response.
+// The originalReq parameter is the original client request (needed for parsing auth info).
+type ResponseInterceptor func(resp *http.Response, originalReq *http.Request)
+
 // baseForwarder contains shared HTTP execution logic used by both
 // signingForwarder and transparentForwarder.
 type baseForwarder struct {
-	signer     *auth.RequestSigner // Both modes need this for DoFullObjectRequest
-	httpClient *http.Client
+	signer              *auth.RequestSigner // Both modes need this for DoFullObjectRequest
+	httpClient          *http.Client
+	responseInterceptor ResponseInterceptor // Optional: called before headers are sent to client
 }
 
 // newBaseForwarder creates the shared base with HTTP client and signer.
@@ -144,7 +165,9 @@ func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) ba
 }
 
 // executeAndStream executes the request and streams the response to the client.
-func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64) error {
+// originalReq is the original client request, passed to the response interceptor
+// for parsing auth info. It can be nil if no interceptor is set.
+func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) error {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
 	}
@@ -157,6 +180,11 @@ func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Req
 		return err
 	}
 	defer resp.Body.Close()
+
+	// Run response interceptor before sending headers to client
+	if b.responseInterceptor != nil {
+		b.responseInterceptor(resp, originalReq)
+	}
 
 	// Stream response back to client
 	copyHeaders(w.Header(), resp.Header)
@@ -171,7 +199,9 @@ func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Req
 }
 
 // executeAndCapture executes the request, streams to client, and captures the response.
-func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64) (*ResponseCapture, error) {
+// originalReq is the original client request, passed to the response interceptor
+// for parsing auth info. It can be nil if no interceptor is set.
+func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (*ResponseCapture, error) {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
 	}
@@ -184,6 +214,11 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	// Run response interceptor before sending headers to client
+	if b.responseInterceptor != nil {
+		b.responseInterceptor(resp, originalReq)
+	}
 
 	// Capture response
 	capture := &ResponseCapture{
@@ -213,7 +248,9 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 
 // executeRequest executes the request and returns the raw response.
 // Caller is responsible for closing the response body.
-func (b *baseForwarder) executeRequest(fwdReq *http.Request, inContentLength int64) (*http.Response, error) {
+// originalReq is the original client request, passed to the response interceptor
+// for parsing auth info. It can be nil if no interceptor is set.
+func (b *baseForwarder) executeRequest(fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (*http.Response, error) {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
 	}
@@ -224,6 +261,11 @@ func (b *baseForwarder) executeRequest(fwdReq *http.Request, inContentLength int
 	if err != nil {
 		log.Error().Err(err).Str("method", fwdReq.Method).Str("path", fwdReq.URL.Path).Msg("Failed to forward request")
 		return nil, err
+	}
+
+	// Run response interceptor (e.g., signing key learning, header stripping)
+	if b.responseInterceptor != nil {
+		b.responseInterceptor(resp, originalReq)
 	}
 
 	return resp, nil
@@ -257,17 +299,34 @@ func (b *baseForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, ac
 	return resp, nil
 }
 
+// LocalAuthConfig holds components for local SigV4 validation in transparent proxy mode.
+type LocalAuthConfig struct {
+	DerivedKeyStore *auth.DerivedKeyStore
+	Validator       *auth.RequestValidator
+	KeyUnwrapper    *auth.KeyUnwrapper
+	AuthzCache      *auth.AuthzCache
+}
+
 // NewForwarder creates a new forwarder with configurable HTTP connection pool.
 // If proxySigner is non-nil, transparent proxy mode is enabled.
-func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string, maxIdleConnsPerHost int, proxySigner *auth.ProxySigner) RequestForwarder {
+// If localAuth is non-nil, local SigV4 validation is enabled for cache hits.
+func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string, maxIdleConnsPerHost int, proxySigner *auth.ProxySigner, localAuth *LocalAuthConfig) RequestForwarder {
 	base := newBaseForwarder(tigrisEndpoint, region, maxIdleConnsPerHost)
 
 	if proxySigner != nil {
-		return &transparentForwarder{
+		f := &transparentForwarder{
 			baseForwarder:    base,
 			proxySigner:      proxySigner,
 			upstreamEndpoint: strings.TrimSuffix(tigrisEndpoint, "/"),
 		}
+		if localAuth != nil {
+			f.derivedKeyStore = localAuth.DerivedKeyStore
+			f.validator = localAuth.Validator
+			f.keyUnwrapper = localAuth.KeyUnwrapper
+			f.authzCache = localAuth.AuthzCache
+		}
+		f.initInterceptor()
+		return f
 	}
 
 	return &signingForwarder{

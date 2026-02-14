@@ -167,6 +167,39 @@ var (
 			Help: "Number of active background fetches",
 		},
 	)
+
+	// LocalAuthValidations counts local auth validation attempts and results.
+	LocalAuthValidations = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_local_auth_validations_total",
+			Help: "Local auth validation attempts (success, unknown_key, signature_mismatch, authz_expired)",
+		},
+		[]string{"result"},
+	)
+
+	// DerivedKeyStoreSize tracks the number of stored derived signing keys.
+	DerivedKeyStoreSize = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "tag_derived_key_store_size",
+			Help: "Number of stored derived signing keys",
+		},
+	)
+
+	// AuthzCacheSize tracks the number of active authorization cache entries.
+	AuthzCacheSize = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "tag_authz_cache_size",
+			Help: "Number of active authorization cache entries",
+		},
+	)
+
+	// ProxySigningKeysReceived counts signing key sets extracted from Tigris responses.
+	ProxySigningKeysReceived = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_proxy_signing_keys_received_total",
+			Help: "Number of signing key sets extracted from Tigris responses",
+		},
+	)
 )
 
 // RecordRequest records a request with its duration and status.
@@ -248,4 +281,9 @@ func RecordRangeFromCacheHit() {
 // SetActiveBackgroundFetches sets the number of active background fetches.
 func SetActiveBackgroundFetches(count int) {
 	ActiveBackgroundFetches.Set(float64(count))
+}
+
+// RecordLocalAuthValidation records a local auth validation result.
+func RecordLocalAuthValidation(result string) {
+	LocalAuthValidations.WithLabelValues(result).Inc()
 }

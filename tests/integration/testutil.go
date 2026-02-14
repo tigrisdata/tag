@@ -3,8 +3,14 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -37,6 +43,10 @@ const (
 	TestSecretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 	// TestRegion is the region used for testing.
 	TestRegion = "us-east-1"
+	// TestProxyAccessKey is TAG's own Tigris access key for transparent proxy mode.
+	TestProxyAccessKey = "PROXY_ACCESS_KEY_EXAMPLE"
+	// TestProxySecretKey is TAG's own Tigris secret key for transparent proxy mode.
+	TestProxySecretKey = "proxy-secret-key-for-testing"
 )
 
 // sharedEmbeddedCache is a singleton embedded cache instance shared across all cache tests.
@@ -214,6 +224,10 @@ type TestEnvironment struct {
 	// TLSHTTPClient is the HTTP client configured to trust the TLS test server certificate.
 	// Non-nil only for TLS test environments.
 	TLSHTTPClient *http.Client
+	// DerivedKeyStore is the derived key store for transparent auth tests (nil otherwise).
+	DerivedKeyStore *auth.DerivedKeyStore
+	// AuthzCache is the authorization cache for transparent auth tests (nil otherwise).
+	AuthzCache *auth.AuthzCache
 }
 
 // NewTestEnvironment creates a new test environment with gofakes3 in-memory backend.
@@ -312,7 +326,7 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 	testCache := cache.NewCacheWithClient(sharedEmbeddedCache, &cfg.Cache)
 
 	// Create forwarder
-	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, nil)
+	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, nil, nil)
 
 	// Create service
 	service := proxy.NewService(forwarder, testCache, cfg)
@@ -371,7 +385,7 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 	testCache := cache.NewDisabledCache()
 
 	// Create forwarder
-	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, nil)
+	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, nil, nil)
 
 	// Create service
 	service := proxy.NewService(forwarder, testCache, cfg)
@@ -807,4 +821,175 @@ func getFreePortForMain() (int, error) {
 	port := listener.Addr().(*net.TCPAddr).Port
 	listener.Close()
 	return port, nil
+}
+
+// --- Transparent Auth Test Helpers ---
+
+// hmacSHA256 computes HMAC-SHA256.
+func hmacSHA256(key, data []byte) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write(data)
+	return h.Sum(nil)
+}
+
+// deriveSigningKeyForTest derives the SigV4 signing key from a secret key, date, and region.
+// Replicates auth.deriveSigningKey (unexported).
+func deriveSigningKeyForTest(secretKey, dateStr, region string) []byte {
+	kDate := hmacSHA256([]byte("AWS4"+secretKey), []byte(dateStr))
+	kRegion := hmacSHA256(kDate, []byte(region))
+	kService := hmacSHA256(kRegion, []byte("s3"))
+	kSigning := hmacSHA256(kService, []byte("aws4_request"))
+	return kSigning
+}
+
+// encryptSigningKeysHeader encrypts signing key entries the same way Tigris does.
+// Replicates auth.encryptForTest (unexported).
+func encryptSigningKeysHeader(t *testing.T, proxySecret, accessKey string, entries []auth.SigningKeyEntry) string {
+	t.Helper()
+
+	payload, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatalf("failed to marshal entries: %v", err)
+	}
+
+	keyHash := sha256.Sum256([]byte(proxySecret))
+	block, err := aes.NewCipher(keyHash[:])
+	if err != nil {
+		t.Fatalf("failed to create cipher: %v", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("failed to create GCM: %v", err)
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("failed to generate nonce: %v", err)
+	}
+
+	ciphertext := gcm.Seal(nil, nonce, payload, []byte(accessKey))
+	raw := append(nonce, ciphertext...)
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+// newSigningKeysUpstreamHandler creates an upstream handler that wraps gofakes3
+// and injects encrypted signing keys in the response header on 2xx.
+func newSigningKeysUpstreamHandler(t *testing.T, backend *s3mem.Backend) http.HandlerFunc {
+	t.Helper()
+	faker := gofakes3.New(backend)
+	s3Handler := faker.Server()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Use a ResponseRecorder to capture the gofakes3 response
+		rec := httptest.NewRecorder()
+		s3Handler.ServeHTTP(rec, r)
+
+		// On 2xx, inject the signing keys header
+		if rec.Code >= 200 && rec.Code < 300 {
+			accessKey, _ := auth.ExtractAccessKey(r)
+			if accessKey != "" {
+				today := time.Now().UTC().Format("20060102")
+				signingKey := deriveSigningKeyForTest(TestSecretKey, today, TestRegion)
+				entries := []auth.SigningKeyEntry{
+					{Date: today, Region: TestRegion, SigningKey: hex.EncodeToString(signingKey)},
+				}
+				encrypted := encryptSigningKeysHeader(t, TestProxySecretKey, accessKey, entries)
+				rec.Header().Set("X-Tigris-Proxy-Signing-Keys", encrypted)
+			}
+		}
+
+		// Copy recorded response to the real writer
+		for k, v := range rec.Header() {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(rec.Code)
+		w.Write(rec.Body.Bytes())
+	}
+}
+
+// NewTestEnvironmentWithTransparentAuth creates a test environment with transparent proxy mode
+// and local auth enabled. Uses shared embedded cache for cache-hit testing.
+func NewTestEnvironmentWithTransparentAuth(t *testing.T, upstreamHandler http.HandlerFunc) *TestEnvironment {
+	t.Helper()
+
+	if sharedEmbeddedCache == nil {
+		panic("Shared embedded cache not initialized - TestMain must run first")
+	}
+
+	// Track upstream requests
+	var requestCount int32
+	counter := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&requestCount, 1)
+			next.ServeHTTP(w, r)
+		})
+	}
+
+	upstream := httptest.NewServer(counter(upstreamHandler))
+
+	// Create credential store (empty — transparent mode uses ProxySigner)
+	credStore := auth.NewCredentialStore()
+
+	// Create proxy signer (TAG's own Tigris credentials)
+	proxySigner := auth.NewProxySigner(TestProxyAccessKey, TestProxySecretKey)
+
+	// Create local auth components
+	derivedKeyStore := auth.NewDerivedKeyStore(auth.DefaultDerivedKeyTTL)
+	keyUnwrapper, err := auth.NewKeyUnwrapper(TestProxySecretKey)
+	if err != nil {
+		t.Fatalf("failed to create key unwrapper: %v", err)
+	}
+	authzCache := auth.NewAuthzCache(auth.DefaultAuthzCacheTTL)
+	validator := auth.NewRequestValidator(derivedKeyStore)
+
+	localAuth := &proxy.LocalAuthConfig{
+		DerivedKeyStore: derivedKeyStore,
+		Validator:       validator,
+		KeyUnwrapper:    keyUnwrapper,
+		AuthzCache:      authzCache,
+	}
+
+	// Create config with cache enabled
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			HTTPPort: 8080,
+			BindIP:   "127.0.0.1",
+		},
+		Upstream: config.UpstreamConfig{
+			Endpoint: upstream.URL,
+			Region:   TestRegion,
+		},
+		Cache: config.CacheConfig{
+			TTL:           config.DefaultCacheTTL,
+			SizeThreshold: config.DefaultCacheSizeThreshold,
+		},
+	}
+
+	testCache := cache.NewCacheWithClient(sharedEmbeddedCache, &cfg.Cache)
+
+	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, proxySigner, localAuth)
+	service := proxy.NewService(forwarder, testCache, cfg)
+
+	xCacheTracker := NewXCacheTracker()
+	server := handlers.NewServer(service, "127.0.0.1", 0, true)
+	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
+	tagServer := httptest.NewServer(wrappedRouter)
+
+	signer := auth.NewRequestSigner(tagServer.URL, TestRegion)
+
+	return &TestEnvironment{
+		UpstreamServer:       upstream,
+		TAGServer:            tagServer,
+		CredStore:            credStore,
+		Cache:                testCache,
+		Config:               cfg,
+		Service:              service,
+		Signer:               signer,
+		EmbeddedCache:        sharedEmbeddedCache,
+		UpstreamRequestCount: &requestCount,
+		XCacheTracker:        xCacheTracker,
+		DerivedKeyStore:      derivedKeyStore,
+		AuthzCache:           authzCache,
+	}
 }

@@ -101,7 +101,7 @@ func (u *UpstreamConfig) SetTransparentProxy(enabled bool) {
 // CredentialsConfig holds credential store configuration.
 // Credentials are loaded from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.
 type CredentialsConfig struct {
-	// Reserved for future configuration options
+	AuthzCacheTTL time.Duration `yaml:"authz_cache_ttl"` // TTL for authorization cache entries (default: 10m)
 }
 
 // CacheConfig holds cache configuration.
@@ -310,6 +310,13 @@ func applyEnvOverrides(cfg *Config) {
 	if val := os.Getenv("TAG_TRANSPARENT_PROXY"); val != "" {
 		enabled := val == "true" || val == "1"
 		cfg.Upstream.SetTransparentProxy(enabled)
+	}
+
+	// Override authz cache TTL from environment
+	if val := os.Getenv("TAG_AUTHZ_CACHE_TTL"); val != "" {
+		if ttl, err := time.ParseDuration(val); err == nil && ttl > 0 {
+			cfg.Credentials.AuthzCacheTTL = ttl
+		}
 	}
 }
 

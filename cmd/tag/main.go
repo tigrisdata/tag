@@ -174,13 +174,37 @@ func main() {
 		objectCache = cache.NewDisabledCache()
 	}
 
-	// 3. Initialize forwarder
-	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, proxySigner)
+	// 3. Initialize local auth for transparent proxy
+	var localAuth *proxy.LocalAuthConfig
+	if cfg.Upstream.IsTransparentProxy() {
+		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+		derivedKeyStore := auth.NewDerivedKeyStore(auth.DefaultDerivedKeyTTL)
+		keyUnwrapper, err := auth.NewKeyUnwrapper(secretKey)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize key unwrapper for local auth")
+		}
 
-	// 4. Initialize proxy service
+		authzCacheTTL := cfg.Credentials.AuthzCacheTTL
+		if authzCacheTTL == 0 {
+			authzCacheTTL = auth.DefaultAuthzCacheTTL
+		}
+
+		localAuth = &proxy.LocalAuthConfig{
+			DerivedKeyStore: derivedKeyStore,
+			Validator:       auth.NewRequestValidator(derivedKeyStore),
+			KeyUnwrapper:    keyUnwrapper,
+			AuthzCache:      auth.NewAuthzCache(authzCacheTTL),
+		}
+		log.Info().Msg("Local auth validation enabled for transparent proxy (derived signing keys)")
+	}
+
+	// 4. Initialize forwarder
+	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, proxySigner, localAuth)
+
+	// 5. Initialize proxy service
 	service := proxy.NewService(forwarder, objectCache, cfg)
 
-	// 5. Initialize HTTP server
+	// 6. Initialize HTTP server
 	server := handlers.NewServer(service, cfg.Server.BindIP, cfg.Server.HTTPPort, cfg.Server.PprofEnabled)
 
 	// Start HTTP server in goroutine
