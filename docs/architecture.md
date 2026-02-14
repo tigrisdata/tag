@@ -54,10 +54,13 @@ Routes requests to appropriate handlers based on HTTP method and path:
 AWS Signature Version 4 authentication and request signing.
 
 - **credentials.go**: Credential store for access/secret key pairs
-- **validator.go**: Validates incoming request signatures (signing mode only)
+- **validator.go**: Validates incoming request signatures using stored signing keys
 - **signer.go**: Re-signs requests for upstream Tigris
 - **proxy_signer.go**: Computes proxy headers for transparent proxy mode
 - **parser.go**: Parses Authorization headers and presigned URLs
+- **key_unwrapper.go**: Decrypts derived signing keys from upstream responses (AES-256-GCM)
+- **derived_key_store.go**: LRU cache of pre-derived SigV4 signing keys for local validation
+- **authz_cache.go**: Per-bucket authorization cache tracking `(accessKey, bucket)` decisions
 
 **Authentication Flow (signing mode):**
 
@@ -69,7 +72,9 @@ AWS Signature Version 4 authentication and request signing.
 5. If valid, re-sign request for upstream with same credentials
 ```
 
-In transparent proxy mode (default), steps 1-4 are skipped. The client's original Authorization header is forwarded as-is, and proxy headers are added so Tigris validates the signature against the original host.
+In transparent proxy mode (default), TAG forwards the client's original Authorization header as-is and adds proxy headers so Tigris validates the signature against the original host. TAG also performs local SigV4 validation using pre-derived signing keys learned from Tigris responses, enabling cache hits to be served without an upstream round-trip. Anonymous requests (missing auth) are forwarded to Tigris for authoritative handling (e.g., public bucket access), while malformed auth headers are rejected at TAG.
+
+See [security.md](security.md) for the full access control flow, local authentication mechanism, and authorization lifecycle.
 
 ### Proxy Service (`proxy/`)
 
