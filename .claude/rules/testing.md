@@ -51,3 +51,18 @@ When updating complex dependencies or configuration logic, build and test after 
 ## Cache Libraries
 
 Prefer `hashicorp/golang-lru/v2/expirable` for bounded TTL caches over custom map implementations with manual cleanup logic.
+
+## TLS Testing
+
+- Self-signed certificates generated via `openssl` for local testing
+- Health checks use `curl -sk` (silent, insecure) for HTTPS with self-signed certs
+- S3 test config: `is_secure = True` and `ssl_verify = False` for self-signed cert environments
+- Use `S3TEST_CONF_TEMPLATE` env var to select config templates (e.g., `s3tests.conf` vs `s3tests-tls.conf`)
+
+## Idempotent Makefile Targets
+
+Targets that generate artifacts (like certificates) should check for file existence before regenerating, making them safe to run repeatedly.
+
+## Process Management in Test Targets
+
+Use `pkill -f` and `lsof -ti:<port> | xargs kill` to ensure clean state (no stale processes, no port conflicts) before starting local services in Makefile targets.
