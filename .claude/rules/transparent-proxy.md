@@ -51,6 +51,12 @@ TAG adds four proxy headers using HMAC-SHA256 over `forwarded_host\ntimestamp\nm
 - `auth/parser.go` provides `ExtractAccessKey()` and `ParseAuthInfo()` for SigV4 headers and query params
 - SigV4 date parsing must handle `time.RFC1123Z` in addition to `RFC1123` and `TimeFormat`
 
+## Security Configuration Parsing
+
+- **Fail-closed**: Boolean security env vars (e.g., `TAG_CACHE_GRPC_AUTH`) must only disable on explicit "false" or "0". Any unrecognized value (typos, "True", "yes") defaults to enabled.
+- **Unconditional auth**: If the gRPC server is exposed and authentication is enabled, apply auth unconditionally regardless of deployment mode (single-node vs cluster). Disabling must be explicit.
+- **Missing credentials**: Missing AWS credentials when gRPC auth is enabled → `log.Fatal()` at startup.
+
 ## In-Memory Caches
 
 - `AuthzCache`: Expirable LRU with TTL, per-bucket auth decisions

@@ -36,6 +36,18 @@ Cover these scenarios for transparent proxy:
 - Internal header stripping (even on errors or cache hits)
 - Multi-bucket auth enforcement (access to bucket A ≠ access to bucket B)
 
+## Local Cluster Testing
+
+New features involving cluster communication should have dedicated Makefile targets to spin up local multi-node clusters (e.g., `s3-test-local-cluster`) for running compatibility tests against a multi-node setup.
+
+## Configuration Override Tests
+
+Always add explicit tests for env var overrides (e.g., `TestHTTPPort_OverrideByEnv`, `TestGRPCAuth_UnrecognizedValueKeepsEnabled`) to validate configuration parsing logic.
+
+## Incremental Verification
+
+When updating complex dependencies or configuration logic, build and test after each change rather than batching all changes together.
+
 ## Cache Libraries
 
 Prefer `hashicorp/golang-lru/v2/expirable` for bounded TTL caches over custom map implementations with manual cleanup logic.
