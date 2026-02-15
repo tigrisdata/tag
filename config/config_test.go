@@ -473,6 +473,19 @@ func TestGRPCAuth_EnabledByEnv(t *testing.T) {
 	}
 }
 
+func TestGRPCAuth_UnrecognizedValueKeepsEnabled(t *testing.T) {
+	// Unrecognized values like "True", "yes", "TRUE" must not silently disable auth
+	for _, val := range []string{"True", "TRUE", "yes", "enabled", "typo"} {
+		t.Run(val, func(t *testing.T) {
+			t.Setenv("TAG_CACHE_GRPC_AUTH", val)
+			cfg := NewDefault()
+			if !cfg.Cache.IsGRPCAuthEnabled() {
+				t.Errorf("IsGRPCAuthEnabled() = false with TAG_CACHE_GRPC_AUTH=%q, want true (only 'false'/'0' should disable)", val)
+			}
+		})
+	}
+}
+
 func TestHTTPPort_OverrideByEnv(t *testing.T) {
 	t.Setenv("TAG_HTTP_PORT", "9999")
 	cfg := NewDefault()

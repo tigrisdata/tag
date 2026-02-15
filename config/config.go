@@ -304,10 +304,10 @@ func applyEnvOverrides(cfg *Config) {
 		if seedNodes := os.Getenv("TAG_CACHE_SEED_NODES"); seedNodes != "" {
 			cfg.Cache.SeedNodes = splitEndpoints(seedNodes)
 		}
-		// Override gRPC auth from environment (enabled by default)
+		// Override gRPC auth from environment (enabled by default, only explicit "false"/"0" disables)
 		if val := os.Getenv("TAG_CACHE_GRPC_AUTH"); val != "" {
-			enabled := val == "true" || val == "1"
-			cfg.Cache.SetGRPCAuth(enabled)
+			disabled := val == "false" || val == "0"
+			cfg.Cache.SetGRPCAuth(!disabled)
 		}
 	}
 
