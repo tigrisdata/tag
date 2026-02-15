@@ -133,9 +133,10 @@ func main() {
 			Str("node_id", cfg.Cache.NodeID).
 			Str("disk_path", cfg.Cache.DiskPath).
 			Strs("seed_nodes", cfg.Cache.SeedNodes).
+			Bool("grpc_auth", cfg.Cache.IsGRPCAuthEnabled()).
 			Msg("Initializing embedded cache")
 
-		embeddedCache, err := embedded.New(&embedded.Config{
+		embeddedCfg := &embedded.Config{
 			DiskPath:      cfg.Cache.DiskPath,
 			TTL:           cfg.Cache.TTL,
 			MaxDiskUsage:  cfg.Cache.MaxDiskUsageBytes,
@@ -144,7 +145,22 @@ func main() {
 			GRPCAddr:      cfg.Cache.GRPCAddr,
 			AdvertiseAddr: cfg.Cache.AdvertiseAddr,
 			SeedNodes:     cfg.Cache.SeedNodes,
-		})
+		}
+
+		// Configure gRPC auth for cache cluster communication
+		if cfg.Cache.IsGRPCAuthEnabled() {
+			accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+			secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+			if accessKey == "" || secretKey == "" {
+				log.Fatal().Msg("Cache gRPC auth requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (set TAG_CACHE_GRPC_AUTH=false to disable)")
+			}
+			grpcToken := auth.DeriveGRPCAuthToken(accessKey, secretKey)
+			embeddedCfg.GRPCServerOptions = auth.GRPCServerOptions(grpcToken)
+			embeddedCfg.GRPCDialOptions = auth.GRPCDialOptions(grpcToken)
+			log.Info().Msg("Cache gRPC auth enabled")
+		}
+
+		embeddedCache, err := embedded.New(embeddedCfg)
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize embedded cache")
 		}

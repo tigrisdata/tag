@@ -127,6 +127,7 @@ type CacheConfig struct {
 	GRPCAddr          string   `yaml:"grpc_addr"`            // Address for gRPC server (default: :9000)
 	AdvertiseAddr     string   `yaml:"advertise_addr"`       // Address advertised to other nodes (defaults to GRPCAddr)
 	SeedNodes         []string `yaml:"seed_nodes"`           // Seed nodes for cluster discovery
+	GRPCAuth          *bool    `yaml:"grpc_auth"`            // Enable gRPC auth using proxy credentials (default: true when nil)
 }
 
 // IsEnabled returns whether caching is enabled.
@@ -141,6 +142,20 @@ func (c *CacheConfig) IsEnabled() bool {
 // SetEnabled sets the Enabled field to the given value.
 func (c *CacheConfig) SetEnabled(enabled bool) {
 	c.Enabled = &enabled
+}
+
+// IsGRPCAuthEnabled returns whether gRPC auth is enabled for cache cluster communication.
+// Returns true by default if not explicitly set.
+func (c *CacheConfig) IsGRPCAuthEnabled() bool {
+	if c.GRPCAuth == nil {
+		return true // Default to enabled
+	}
+	return *c.GRPCAuth
+}
+
+// SetGRPCAuth sets the GRPCAuth field to the given value.
+func (c *CacheConfig) SetGRPCAuth(enabled bool) {
+	c.GRPCAuth = &enabled
 }
 
 // BroadcastConfig holds streaming broadcast configuration for request coalescing.
@@ -297,6 +312,11 @@ func applyEnvOverrides(cfg *Config) {
 		if seedNodes := os.Getenv("TAG_CACHE_SEED_NODES"); seedNodes != "" {
 			cfg.Cache.SeedNodes = splitEndpoints(seedNodes)
 		}
+		// Override gRPC auth from environment (enabled by default, only explicit "false"/"0" disables)
+		if val := os.Getenv("TAG_CACHE_GRPC_AUTH"); val != "" {
+			disabled := val == "false" || val == "0"
+			cfg.Cache.SetGRPCAuth(!disabled)
+		}
 	}
 
 	// Override log level from environment
@@ -307,6 +327,13 @@ func applyEnvOverrides(cfg *Config) {
 	// Override log format from environment (json or console)
 	if logFormat := os.Getenv("TAG_LOG_FORMAT"); logFormat != "" {
 		cfg.Log.Format = logFormat
+	}
+
+	// Override HTTP port from environment
+	if port := os.Getenv("TAG_HTTP_PORT"); port != "" {
+		if p, err := strconv.Atoi(port); err == nil && p > 0 {
+			cfg.Server.HTTPPort = p
+		}
 	}
 
 	// Enable pprof from environment (disabled by default for security)

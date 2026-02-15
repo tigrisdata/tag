@@ -10,13 +10,23 @@ GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 # Local test/bench data directory for embedded cache
 TAG_CACHE_DATA_DIR := /tmp/tag-cache-data
 
+# TLS test certificate directory
+TAG_TEST_CERTS_DIR := /tmp/tag-test-certs
+
 # Local test ports (avoid macOS conflicts: 7000 is used by AirPlay Receiver)
 TAG_LOCAL_HTTP_PORT := 8080
 TAG_LOCAL_GRPC_PORT := 9090
 TAG_LOCAL_CLUSTER_PORT := 7070
 
-# TLS test certificate directory
-TAG_TEST_CERTS_DIR := /tmp/tag-test-certs
+# Cluster mode ports (2-node cluster for S3 compatibility testing)
+TAG_CLUSTER_NODE1_HTTP_PORT := 8080
+TAG_CLUSTER_NODE1_GRPC_PORT := 9090
+TAG_CLUSTER_NODE1_CLUSTER_PORT := 7070
+TAG_CLUSTER_NODE2_HTTP_PORT := 8081
+TAG_CLUSTER_NODE2_GRPC_PORT := 9091
+TAG_CLUSTER_NODE2_CLUSTER_PORT := 7071
+TAG_CLUSTER_CACHE_DIR_1 := /tmp/tag-cluster-data-1
+TAG_CLUSTER_CACHE_DIR_2 := /tmp/tag-cluster-data-2
 
 # Detect OS and architecture
 UNAME_S := $(shell uname -s)
@@ -284,9 +294,11 @@ help:
 	@echo ""
 	@echo "S3 compatibility test targets:"
 	@echo "  s3-test-local          - Start TAG locally with embedded cache"
+	@echo "  s3-test-local-cluster  - Start TAG locally as a 2-node cluster"
 	@echo "  s3-tests               - Run S3 compatibility tests (Python s3-tests)"
 	@echo "  s3-tests-clean         - Remove cloned s3-tests repository"
 	@echo "  s3-test-local-down     - Stop local TAG and cleanup"
+	@echo "  s3-test-local-cluster-down - Stop local TAG cluster and cleanup"
 	@echo ""
 	@echo "S3 compatibility test targets (TLS):"
 	@echo "  s3-test-local-tls      - Start TAG locally with TLS (auto-generates certs)"
@@ -354,6 +366,75 @@ s3-test-local-down:
 	-@lsof -ti:$(TAG_LOCAL_HTTP_PORT) | xargs kill 2>/dev/null || true
 	@echo "Cleaning up cache data directory..."
 	-@rm -rf $(TAG_CACHE_DATA_DIR)
+
+# Local development: Run a 2-node TAG cluster on host with embedded cache
+# Uses non-default ports to avoid macOS conflicts (AirPlay uses 7000)
+# Node 1 listens on the same HTTP port as single-node mode so s3-tests works unchanged
+.PHONY: s3-test-local-cluster
+s3-test-local-cluster: build
+	@echo "Starting TAG 2-node cluster (local mode)..."
+	@if [ -z "$$AWS_ACCESS_KEY_ID" ] || [ -z "$$AWS_SECRET_ACCESS_KEY" ]; then \
+		echo "Error: AWS credentials not set (required for gRPC auth)."; \
+		echo "  export AWS_ACCESS_KEY_ID=<your-key>"; \
+		echo "  export AWS_SECRET_ACCESS_KEY=<your-secret>"; \
+		exit 1; \
+	fi
+	@# Stop any existing TAG processes and free up ports
+	-@pkill -f "./$(BINARY_NAME)" 2>/dev/null || true
+	-@lsof -ti:$(TAG_CLUSTER_NODE1_HTTP_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_CLUSTER_NODE1_GRPC_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_CLUSTER_NODE1_CLUSTER_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_CLUSTER_NODE2_HTTP_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_CLUSTER_NODE2_GRPC_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_CLUSTER_NODE2_CLUSTER_PORT) | xargs kill 2>/dev/null || true
+	@sleep 1
+	@mkdir -p $(TAG_CLUSTER_CACHE_DIR_1) $(TAG_CLUSTER_CACHE_DIR_2)
+	@echo "Starting node 1..."
+	@echo "  HTTP: $(TAG_CLUSTER_NODE1_HTTP_PORT), gRPC: $(TAG_CLUSTER_NODE1_GRPC_PORT), Cluster: $(TAG_CLUSTER_NODE1_CLUSTER_PORT)"
+	@TAG_UPSTREAM_ENDPOINT=$${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev} \
+		TAG_CACHE_NODE_ID=tag-node-1 \
+		TAG_CACHE_DISK_PATH=$(TAG_CLUSTER_CACHE_DIR_1) \
+		TAG_CACHE_CLUSTER_ADDR=:$(TAG_CLUSTER_NODE1_CLUSTER_PORT) \
+		TAG_CACHE_GRPC_ADDR=:$(TAG_CLUSTER_NODE1_GRPC_PORT) \
+		TAG_CACHE_ADVERTISE_ADDR=localhost:$(TAG_CLUSTER_NODE1_GRPC_PORT) \
+		TAG_CACHE_SEED_NODES=localhost:$(TAG_CLUSTER_NODE1_CLUSTER_PORT),localhost:$(TAG_CLUSTER_NODE2_CLUSTER_PORT) \
+		TAG_LOG_LEVEL=$${TAG_LOG_LEVEL:-info} \
+		TAG_PPROF_ENABLED=true \
+		./$(BINARY_NAME) &
+	@echo "Starting node 2..."
+	@echo "  HTTP: $(TAG_CLUSTER_NODE2_HTTP_PORT), gRPC: $(TAG_CLUSTER_NODE2_GRPC_PORT), Cluster: $(TAG_CLUSTER_NODE2_CLUSTER_PORT)"
+	@TAG_UPSTREAM_ENDPOINT=$${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev} \
+		TAG_CACHE_NODE_ID=tag-node-2 \
+		TAG_CACHE_DISK_PATH=$(TAG_CLUSTER_CACHE_DIR_2) \
+		TAG_CACHE_CLUSTER_ADDR=:$(TAG_CLUSTER_NODE2_CLUSTER_PORT) \
+		TAG_CACHE_GRPC_ADDR=:$(TAG_CLUSTER_NODE2_GRPC_PORT) \
+		TAG_CACHE_ADVERTISE_ADDR=localhost:$(TAG_CLUSTER_NODE2_GRPC_PORT) \
+		TAG_CACHE_SEED_NODES=localhost:$(TAG_CLUSTER_NODE1_CLUSTER_PORT),localhost:$(TAG_CLUSTER_NODE2_CLUSTER_PORT) \
+		TAG_HTTP_PORT=$(TAG_CLUSTER_NODE2_HTTP_PORT) \
+		TAG_LOG_LEVEL=$${TAG_LOG_LEVEL:-info} \
+		TAG_PPROF_ENABLED=true \
+		./$(BINARY_NAME) &
+	@echo "Waiting for both nodes to be ready..."
+	@timeout 30 bash -c 'until curl -s http://localhost:$(TAG_CLUSTER_NODE1_HTTP_PORT)/health > /dev/null 2>&1; do sleep 1; done' || \
+		(echo "Node 1 failed to start"; exit 1)
+	@echo "Node 1 is ready at http://localhost:$(TAG_CLUSTER_NODE1_HTTP_PORT)"
+	@timeout 30 bash -c 'until curl -s http://localhost:$(TAG_CLUSTER_NODE2_HTTP_PORT)/health > /dev/null 2>&1; do sleep 1; done' || \
+		(echo "Node 2 failed to start"; exit 1)
+	@echo "Node 2 is ready at http://localhost:$(TAG_CLUSTER_NODE2_HTTP_PORT)"
+	@echo "TAG 2-node cluster is ready (run 'make s3-tests' to test)"
+
+.PHONY: s3-test-local-cluster-down
+s3-test-local-cluster-down:
+	@echo "Stopping TAG cluster (local mode)..."
+	-@pkill -f "./$(BINARY_NAME)" 2>/dev/null || true
+	-@lsof -ti:$(TAG_CLUSTER_NODE1_HTTP_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_CLUSTER_NODE1_GRPC_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_CLUSTER_NODE1_CLUSTER_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_CLUSTER_NODE2_HTTP_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_CLUSTER_NODE2_GRPC_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_CLUSTER_NODE2_CLUSTER_PORT) | xargs kill 2>/dev/null || true
+	@echo "Cleaning up cluster cache data directories..."
+	-@rm -rf $(TAG_CLUSTER_CACHE_DIR_1) $(TAG_CLUSTER_CACHE_DIR_2)
 
 .PHONY: s3-tests
 s3-tests:
