@@ -74,6 +74,14 @@ type ServerConfig struct {
 	HTTPPort     int    `yaml:"http_port"`     // S3 API port (default: 8080)
 	BindIP       string `yaml:"bind_ip"`       // Bind address (default: 0.0.0.0)
 	PprofEnabled bool   `yaml:"pprof_enabled"` // Enable pprof endpoints (default: false)
+	TLSCertFile  string `yaml:"tls_cert_file"` // Path to TLS certificate file (PEM format)
+	TLSKeyFile   string `yaml:"tls_key_file"`  // Path to TLS private key file (PEM format)
+}
+
+// TLSEnabled returns whether TLS is configured.
+// TLS is enabled when both TLSCertFile and TLSKeyFile are set.
+func (s *ServerConfig) TLSEnabled() bool {
+	return s.TLSCertFile != "" && s.TLSKeyFile != ""
 }
 
 // UpstreamConfig holds Tigris endpoint configuration.
@@ -333,6 +341,14 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Server.PprofEnabled = true
 	}
 
+	// Override TLS certificate from environment
+	if certFile := os.Getenv("TAG_TLS_CERT_FILE"); certFile != "" {
+		cfg.Server.TLSCertFile = certFile
+	}
+	if keyFile := os.Getenv("TAG_TLS_KEY_FILE"); keyFile != "" {
+		cfg.Server.TLSKeyFile = keyFile
+	}
+
 	// Override transparent proxy from environment (enabled by default)
 	if val := os.Getenv("TAG_TRANSPARENT_PROXY"); val != "" {
 		enabled := val == "true" || val == "1"
@@ -351,6 +367,23 @@ func applyEnvOverrides(cfg *Config) {
 func validate(cfg *Config) error {
 	if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint); err != nil {
 		return err
+	}
+	if err := validateTLS(&cfg.Server); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateTLS checks that TLS configuration is consistent.
+// Both cert and key must be provided together, or neither.
+func validateTLS(server *ServerConfig) error {
+	hasCert := server.TLSCertFile != ""
+	hasKey := server.TLSKeyFile != ""
+	if hasCert != hasKey {
+		if hasCert {
+			return fmt.Errorf("tls_cert_file is set but tls_key_file is missing")
+		}
+		return fmt.Errorf("tls_key_file is set but tls_cert_file is missing")
 	}
 	return nil
 }

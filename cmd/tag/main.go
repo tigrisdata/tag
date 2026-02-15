@@ -93,6 +93,7 @@ func main() {
 		Str("upstream", cfg.Upstream.Endpoint).
 		Bool("cache_enabled", cfg.Cache.IsEnabled()).
 		Bool("transparent_proxy", cfg.Upstream.IsTransparentProxy()).
+		Bool("tls_enabled", cfg.Server.TLSEnabled()).
 		Str("node_id", cfg.Cache.NodeID).
 		Msg("Starting TAG (Tigris Access Gateway)")
 
@@ -222,6 +223,9 @@ func main() {
 
 	// 6. Initialize HTTP server
 	server := handlers.NewServer(service, cfg.Server.BindIP, cfg.Server.HTTPPort, cfg.Server.PprofEnabled)
+	if cfg.Server.TLSEnabled() {
+		server.SetTLS(cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile)
+	}
 
 	// Start HTTP server in goroutine
 	go func() {
@@ -230,9 +234,14 @@ func main() {
 		}
 	}()
 
+	protocol := "http"
+	if cfg.Server.TLSEnabled() {
+		protocol = "https"
+	}
 	log.Info().
 		Str("addr", cfg.Server.BindIP).
 		Int("port", cfg.Server.HTTPPort).
+		Str("protocol", protocol).
 		Msg("TAG is ready")
 
 	// Handle shutdown signals

@@ -10,6 +10,9 @@ GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 # Local test/bench data directory for embedded cache
 TAG_CACHE_DATA_DIR := /tmp/tag-cache-data
 
+# TLS test certificate directory
+TAG_TEST_CERTS_DIR := /tmp/tag-test-certs
+
 # Local test ports (avoid macOS conflicts: 7000 is used by AirPlay Receiver)
 TAG_LOCAL_HTTP_PORT := 8080
 TAG_LOCAL_GRPC_PORT := 9090
@@ -290,21 +293,28 @@ help:
 	@echo "  run-verbose   - Run TAG with debug logging"
 	@echo ""
 	@echo "S3 compatibility test targets:"
-	@echo "  s3-test-local              - Start TAG locally with embedded cache (single node)"
-	@echo "  s3-test-local-cluster      - Start TAG locally as a 2-node cluster"
-	@echo "  s3-tests                   - Run S3 compatibility tests (Python s3-tests)"
-	@echo "  s3-tests-clean             - Remove cloned s3-tests repository"
-	@echo "  s3-test-local-down         - Stop local TAG (single node) and cleanup"
+	@echo "  s3-test-local          - Start TAG locally with embedded cache"
+	@echo "  s3-test-local-cluster  - Start TAG locally as a 2-node cluster"
+	@echo "  s3-tests               - Run S3 compatibility tests (Python s3-tests)"
+	@echo "  s3-tests-clean         - Remove cloned s3-tests repository"
+	@echo "  s3-test-local-down     - Stop local TAG and cleanup"
 	@echo "  s3-test-local-cluster-down - Stop local TAG cluster and cleanup"
 	@echo ""
+	@echo "S3 compatibility test targets (TLS):"
+	@echo "  s3-test-local-tls      - Start TAG locally with TLS (auto-generates certs)"
+	@echo "  s3-tests-tls           - Run S3 compatibility tests over HTTPS"
+	@echo "  s3-test-local-tls-down - Stop local TAG and cleanup (incl. certs)"
+	@echo ""
 	@echo "SDK test targets (Go SDK tests):"
-	@echo "  test-sdk           - Run SDK tests (requires running TAG + AWS creds)"
+	@echo "  test-sdk               - Run SDK tests (requires running TAG + AWS creds)"
 	@echo ""
 	@echo "  Usage:"
 	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
 	@echo "    export AWS_SECRET_ACCESS_KEY=<your-secret>"
-	@echo "    make s3-test-local      # Start TAG with embedded cache"
+	@echo "    make s3-test-local      # Start TAG with embedded cache (HTTP)"
+	@echo "    make s3-test-local-tls  # Start TAG with embedded cache (HTTPS)"
 	@echo "    make s3-tests           # Run S3 compatibility tests"
+	@echo "    make s3-tests-tls       # Run S3 compatibility tests (TLS)"
 	@echo "    make test-sdk           # Run Go SDK tests"
 	@echo "    make s3-test-local-down # Stop local TAG and cleanup"
 	@echo ""
@@ -435,6 +445,70 @@ s3-tests:
 s3-tests-clean:
 	@echo "Cleaning up S3 test artifacts..."
 	rm -rf tests/s3compat/python/s3-tests
+
+# Generate self-signed TLS certificates for local testing
+.PHONY: generate-test-certs
+generate-test-certs:
+	@if [ ! -f "$(TAG_TEST_CERTS_DIR)/cert.pem" ]; then \
+		echo "Generating self-signed TLS certificates..."; \
+		mkdir -p $(TAG_TEST_CERTS_DIR); \
+		openssl req -x509 -newkey rsa:2048 -keyout $(TAG_TEST_CERTS_DIR)/key.pem \
+			-out $(TAG_TEST_CERTS_DIR)/cert.pem -days 365 -nodes \
+			-subj "/CN=localhost" 2>/dev/null; \
+		echo "TLS certificates generated in $(TAG_TEST_CERTS_DIR)"; \
+	else \
+		echo "TLS certificates already present at $(TAG_TEST_CERTS_DIR)"; \
+	fi
+
+# Local development: Run TAG on host with embedded cache and TLS enabled
+.PHONY: s3-test-local-tls
+s3-test-local-tls: build generate-test-certs
+	@echo "Starting TAG with embedded cache and TLS (local mode)..."
+	@if [ -z "$$AWS_ACCESS_KEY_ID" ] || [ -z "$$AWS_SECRET_ACCESS_KEY" ]; then \
+		echo "Error: AWS credentials not set."; \
+		echo "  export AWS_ACCESS_KEY_ID=<your-key>"; \
+		echo "  export AWS_SECRET_ACCESS_KEY=<your-secret>"; \
+		exit 1; \
+	fi
+	@# Stop any existing TAG process and free up ports
+	-@pkill -f "./$(BINARY_NAME)" 2>/dev/null || true
+	-@lsof -ti:$(TAG_LOCAL_CLUSTER_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_LOCAL_GRPC_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_LOCAL_HTTP_PORT) | xargs kill 2>/dev/null || true
+	@sleep 1
+	@mkdir -p $(TAG_CACHE_DATA_DIR)
+	@echo "Starting TAG locally with embedded cache and TLS..."
+	@echo "  HTTPS: $(TAG_LOCAL_HTTP_PORT), gRPC: $(TAG_LOCAL_GRPC_PORT), Cluster: $(TAG_LOCAL_CLUSTER_PORT)"
+	@TAG_UPSTREAM_ENDPOINT=$${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev} \
+		TAG_CACHE_NODE_ID=tag-local \
+		TAG_CACHE_DISK_PATH=$(TAG_CACHE_DATA_DIR) \
+		TAG_CACHE_CLUSTER_ADDR=:$(TAG_LOCAL_CLUSTER_PORT) \
+		TAG_CACHE_GRPC_ADDR=:$(TAG_LOCAL_GRPC_PORT) \
+		TAG_LOG_LEVEL=$${TAG_LOG_LEVEL:-info} \
+		TAG_PPROF_ENABLED=true \
+		TAG_TLS_CERT_FILE=$(TAG_TEST_CERTS_DIR)/cert.pem \
+		TAG_TLS_KEY_FILE=$(TAG_TEST_CERTS_DIR)/key.pem \
+		./$(BINARY_NAME) &
+	@echo "Waiting for TAG to be ready..."
+	@timeout 30 bash -c 'until curl -sk https://localhost:$(TAG_LOCAL_HTTP_PORT)/health > /dev/null 2>&1; do sleep 1; done' || \
+		(echo "TAG failed to start"; exit 1)
+	@echo "TAG is ready at https://localhost:$(TAG_LOCAL_HTTP_PORT)"
+
+.PHONY: s3-test-local-tls-down
+s3-test-local-tls-down:
+	@echo "Stopping TAG (local TLS mode)..."
+	-@pkill -f "./$(BINARY_NAME)" 2>/dev/null || true
+	-@lsof -ti:$(TAG_LOCAL_CLUSTER_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_LOCAL_GRPC_PORT) | xargs kill 2>/dev/null || true
+	-@lsof -ti:$(TAG_LOCAL_HTTP_PORT) | xargs kill 2>/dev/null || true
+	@echo "Cleaning up cache data directory and TLS certificates..."
+	-@rm -rf $(TAG_CACHE_DATA_DIR)
+	-@rm -rf $(TAG_TEST_CERTS_DIR)
+
+.PHONY: s3-tests-tls
+s3-tests-tls:
+	@echo "Running S3 compatibility tests (TLS)..."
+	cd tests/s3compat/python && S3TEST_CONF_TEMPLATE=s3tests-tls.conf ./run-tests.sh
 
 # SDK tests against external TAG (requires running TAG instance)
 .PHONY: test-sdk
