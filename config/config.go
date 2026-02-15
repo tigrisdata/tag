@@ -321,6 +321,13 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Log.Format = logFormat
 	}
 
+	// Override HTTP port from environment
+	if port := os.Getenv("TAG_HTTP_PORT"); port != "" {
+		if p, err := strconv.Atoi(port); err == nil && p > 0 {
+			cfg.Server.HTTPPort = p
+		}
+	}
+
 	// Enable pprof from environment (disabled by default for security)
 	if enabled := os.Getenv("TAG_PPROF_ENABLED"); enabled == "true" || enabled == "1" {
 		cfg.Server.PprofEnabled = true

@@ -472,3 +472,11 @@ func TestGRPCAuth_EnabledByEnv(t *testing.T) {
 		t.Error("IsGRPCAuthEnabled() = false, want true (enabled by env)")
 	}
 }
+
+func TestHTTPPort_OverrideByEnv(t *testing.T) {
+	t.Setenv("TAG_HTTP_PORT", "9999")
+	cfg := NewDefault()
+	if cfg.Server.HTTPPort != 9999 {
+		t.Errorf("Server.HTTPPort = %d, want 9999", cfg.Server.HTTPPort)
+	}
+}
