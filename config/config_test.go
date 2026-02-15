@@ -428,4 +428,68 @@ func TestCacheDefaultValues(t *testing.T) {
 	if cfg.Cache.GRPCAddr != DefaultCacheGRPCAddr {
 		t.Errorf("Cache.GRPCAddr = %q, want %q", cfg.Cache.GRPCAddr, DefaultCacheGRPCAddr)
 	}
+
+	// Verify gRPC auth is enabled by default
+	if !cfg.Cache.IsGRPCAuthEnabled() {
+		t.Error("Cache.IsGRPCAuthEnabled() = false, want true (enabled by default)")
+	}
+}
+
+func TestGRPCAuth_DisabledByYAML(t *testing.T) {
+	content := `
+cache:
+  grpc_auth: false
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Cache.IsGRPCAuthEnabled() {
+		t.Error("IsGRPCAuthEnabled() = true, want false")
+	}
+}
+
+func TestGRPCAuth_DisabledByEnv(t *testing.T) {
+	t.Setenv("TAG_CACHE_GRPC_AUTH", "false")
+
+	cfg := NewDefault()
+	if cfg.Cache.IsGRPCAuthEnabled() {
+		t.Error("IsGRPCAuthEnabled() = true, want false (disabled by env)")
+	}
+}
+
+func TestGRPCAuth_EnabledByEnv(t *testing.T) {
+	t.Setenv("TAG_CACHE_GRPC_AUTH", "true")
+
+	cfg := NewDefault()
+	if !cfg.Cache.IsGRPCAuthEnabled() {
+		t.Error("IsGRPCAuthEnabled() = false, want true (enabled by env)")
+	}
+}
+
+func TestGRPCAuth_UnrecognizedValueKeepsEnabled(t *testing.T) {
+	// Unrecognized values like "True", "yes", "TRUE" must not silently disable auth
+	for _, val := range []string{"True", "TRUE", "yes", "enabled", "typo"} {
+		t.Run(val, func(t *testing.T) {
+			t.Setenv("TAG_CACHE_GRPC_AUTH", val)
+			cfg := NewDefault()
+			if !cfg.Cache.IsGRPCAuthEnabled() {
+				t.Errorf("IsGRPCAuthEnabled() = false with TAG_CACHE_GRPC_AUTH=%q, want true (only 'false'/'0' should disable)", val)
+			}
+		})
+	}
+}
+
+func TestHTTPPort_OverrideByEnv(t *testing.T) {
+	t.Setenv("TAG_HTTP_PORT", "9999")
+	cfg := NewDefault()
+	if cfg.Server.HTTPPort != 9999 {
+		t.Errorf("Server.HTTPPort = %d, want 9999", cfg.Server.HTTPPort)
+	}
 }

@@ -1,0 +1,72 @@
+name: S3 Compatibility Tests (Cluster)
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  workflow_call:
+
+env:
+  GO_VERSION: "1.24.2"
+  GOPRIVATE: github.com/tigrisdata
+
+jobs:
+  s3-compat-tests:
+    runs-on: namespace-profile-ubuntu-2404
+    permissions:
+      actions: write
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure git for private modules
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_BOT_ACCESS_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Install system dependencies
+        run: make install-deps
+
+      - name: Start TAG (cluster mode)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: make s3-test-local-cluster
+
+      - name: Run S3 compatibility tests
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: make s3-tests
+
+      - name: Run SDK tests
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: make test-sdk
+
+      - name: Cleanup
+        if: always()
+        run: make s3-test-local-cluster-down
