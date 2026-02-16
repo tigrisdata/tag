@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -1233,12 +1232,4 @@ func TestSDK_UserMetadata_WithCache(t *testing.T) {
 	}
 
 	t.Logf("User metadata caching verified")
-}
-
-// ============================================================================
-// Helper function for generating test bucket names (used by individual tests)
-// ============================================================================
-
-func uniqueKey(prefix string) string {
-	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 }

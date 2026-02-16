@@ -34,13 +34,13 @@ const (
 
 // RequestValidator validates incoming AWS SigV4 signed requests.
 type RequestValidator struct {
-	credStore *CredentialStore
+	keyProvider KeyProvider
 }
 
 // NewRequestValidator creates a new request validator.
-func NewRequestValidator(credStore *CredentialStore) *RequestValidator {
+func NewRequestValidator(keyProvider KeyProvider) *RequestValidator {
 	return &RequestValidator{
-		credStore: credStore,
+		keyProvider: keyProvider,
 	}
 }
 
@@ -61,21 +61,39 @@ func (v *RequestValidator) ValidateRequest(r *http.Request) (string, error) {
 		return "", fmt.Errorf("failed to parse auth: %w", err)
 	}
 
-	// Look up secret key
-	secretKey, err := v.credStore.GetSecretKey(authInfo.AccessKey)
+	// Get the date string for signing key lookup
+	dateStr := r.Header.Get("X-Amz-Date")
+	if dateStr == "" {
+		dateStr = r.Header.Get("Date")
+	}
+	if authInfo.IsPresigned {
+		dateStr = r.URL.Query().Get("X-Amz-Date")
+	}
+	// Parse the date and extract short date (YYYYMMDD) for signing key lookup.
+	shortDate := authInfo.Date // From credential scope, already YYYYMMDD
+	if shortDate == "" {
+		t, err := ParseHTTPDate(dateStr)
+		if err != nil {
+			return "", ErrInvalidDate
+		}
+		shortDate = t.UTC().Format(shortTimeFormat)
+	}
+
+	// Look up signing key
+	signingKey, err := v.keyProvider.GetSigningKey(authInfo.AccessKey, shortDate, authInfo.Region)
 	if err != nil {
-		return "", fmt.Errorf("failed to get secret key: %w", err)
+		return "", fmt.Errorf("failed to get signing key: %w", err)
 	}
 
 	// Validate based on auth type
 	if authInfo.IsPresigned {
-		return authInfo.AccessKey, v.validatePresigned(r, authInfo, secretKey)
+		return authInfo.AccessKey, v.validatePresigned(r, authInfo, signingKey)
 	}
-	return authInfo.AccessKey, v.validateSigned(r, authInfo, secretKey, bodyHash)
+	return authInfo.AccessKey, v.validateSigned(r, authInfo, signingKey, bodyHash)
 }
 
 // validateSigned validates a header-based signed request using a pre-computed body hash.
-func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, secretKey string, bodyHash string) error {
+func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, signingKey []byte, bodyHash string) error {
 	// Get the date from the request
 	dateStr := r.Header.Get("X-Amz-Date")
 	if dateStr == "" {
@@ -86,13 +104,9 @@ func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, s
 	}
 
 	// Parse and validate the date
-	requestTime, err := time.Parse(timeFormat, dateStr)
+	requestTime, err := ParseHTTPDate(dateStr)
 	if err != nil {
-		// Try HTTP date format
-		requestTime, err = time.Parse(time.RFC1123, dateStr)
-		if err != nil {
-			return ErrInvalidDate
-		}
+		return ErrInvalidDate
 	}
 
 	// Check request age
@@ -102,7 +116,7 @@ func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, s
 	}
 
 	// Compute expected signature
-	expectedSig := v.computeSignature(r, authInfo, secretKey, bodyHash, requestTime)
+	expectedSig := v.computeSignature(r, authInfo, signingKey, bodyHash, requestTime)
 
 	// Compare signatures (constant time)
 	if !hmac.Equal([]byte(authInfo.Signature), []byte(expectedSig)) {
@@ -113,7 +127,7 @@ func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, s
 }
 
 // validatePresigned validates a presigned URL request.
-func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo, secretKey string) error {
+func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo, signingKey []byte) error {
 	query := r.URL.Query()
 
 	// Get expiration time
@@ -122,7 +136,7 @@ func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo
 		return ErrInvalidDate
 	}
 
-	requestTime, err := time.Parse(timeFormat, dateStr)
+	requestTime, err := time.Parse(TimeFormat, dateStr)
 	if err != nil {
 		return ErrInvalidDate
 	}
@@ -140,7 +154,7 @@ func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo
 	bodyHash := unsignedPayload
 
 	// Compute expected signature
-	expectedSig := v.computePresignedSignature(r, authInfo, secretKey, bodyHash, requestTime)
+	expectedSig := v.computePresignedSignature(r, authInfo, signingKey, bodyHash, requestTime)
 
 	// Compare signatures (constant time)
 	if !hmac.Equal([]byte(authInfo.Signature), []byte(expectedSig)) {
@@ -151,7 +165,7 @@ func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo
 }
 
 // computeSignature computes the expected signature for a signed request.
-func (v *RequestValidator) computeSignature(r *http.Request, authInfo *AuthInfo, secretKey, bodyHash string, signingTime time.Time) string {
+func (v *RequestValidator) computeSignature(r *http.Request, authInfo *AuthInfo, signingKey []byte, bodyHash string, signingTime time.Time) string {
 	// Build credential scope
 	dateStr := signingTime.Format(shortTimeFormat)
 	credentialScope := fmt.Sprintf("%s/%s/%s/%s", dateStr, authInfo.Region, service, terminationString)
@@ -162,18 +176,17 @@ func (v *RequestValidator) computeSignature(r *http.Request, authInfo *AuthInfo,
 	// Build string to sign
 	stringToSign := strings.Join([]string{
 		algorithm,
-		signingTime.Format(timeFormat),
+		signingTime.Format(TimeFormat),
 		credentialScope,
 		hashSHA256([]byte(canonicalRequest)),
 	}, "\n")
 
-	// Derive signing key and compute signature
-	signingKey := v.deriveSigningKey(secretKey, dateStr, authInfo.Region)
+	// Compute signature using pre-derived signing key
 	return hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
 }
 
 // computePresignedSignature computes the expected signature for a presigned URL.
-func (v *RequestValidator) computePresignedSignature(r *http.Request, authInfo *AuthInfo, secretKey, bodyHash string, signingTime time.Time) string {
+func (v *RequestValidator) computePresignedSignature(r *http.Request, authInfo *AuthInfo, signingKey []byte, bodyHash string, signingTime time.Time) string {
 	// Build credential scope
 	dateStr := signingTime.Format(shortTimeFormat)
 	credentialScope := fmt.Sprintf("%s/%s/%s/%s", dateStr, authInfo.Region, service, terminationString)
@@ -185,13 +198,12 @@ func (v *RequestValidator) computePresignedSignature(r *http.Request, authInfo *
 	// Build string to sign
 	stringToSign := strings.Join([]string{
 		algorithm,
-		signingTime.Format(timeFormat),
+		signingTime.Format(TimeFormat),
 		credentialScope,
 		hashSHA256([]byte(canonicalRequest)),
 	}, "\n")
 
-	// Derive signing key and compute signature
-	signingKey := v.deriveSigningKey(secretKey, dateStr, authInfo.Region)
+	// Compute signature using pre-derived signing key
 	return hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
 }
 
@@ -306,13 +318,4 @@ func (v *RequestValidator) buildCanonicalHeadersFromList(r *http.Request, signed
 	}
 
 	return builder.String()
-}
-
-// deriveSigningKey derives the signing key from the secret key.
-func (v *RequestValidator) deriveSigningKey(secretKey, dateStr, region string) []byte {
-	kDate := hmacSHA256([]byte("AWS4"+secretKey), []byte(dateStr))
-	kRegion := hmacSHA256(kDate, []byte(region))
-	kService := hmacSHA256(kRegion, []byte(service))
-	kSigning := hmacSHA256(kService, []byte(terminationString))
-	return kSigning
 }

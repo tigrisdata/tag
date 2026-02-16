@@ -92,6 +92,8 @@ func main() {
 		Int("http_port", cfg.Server.HTTPPort).
 		Str("upstream", cfg.Upstream.Endpoint).
 		Bool("cache_enabled", cfg.Cache.IsEnabled()).
+		Bool("transparent_proxy", cfg.Upstream.IsTransparentProxy()).
+		Bool("tls_enabled", cfg.Server.TLSEnabled()).
 		Str("node_id", cfg.Cache.NodeID).
 		Msg("Starting TAG (Tigris Access Gateway)")
 
@@ -107,7 +109,19 @@ func main() {
 		log.Warn().Err(err).Msg("Failed to load credentials from environment")
 	}
 
-	if credStore.Count() == 0 {
+	// Initialize proxy signer if transparent proxy is enabled
+	var proxySigner *auth.ProxySigner
+	if cfg.Upstream.IsTransparentProxy() {
+		accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+		if accessKey == "" || secretKey == "" {
+			log.Fatal().Msg("Transparent proxy requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+		}
+		proxySigner = auth.NewProxySigner(accessKey, secretKey)
+		log.Info().Msg("Transparent proxy mode enabled")
+	}
+
+	if credStore.Count() == 0 && !cfg.Upstream.IsTransparentProxy() {
 		log.Warn().Msg("No credentials loaded - TAG will reject all requests")
 	}
 
@@ -119,9 +133,10 @@ func main() {
 			Str("node_id", cfg.Cache.NodeID).
 			Str("disk_path", cfg.Cache.DiskPath).
 			Strs("seed_nodes", cfg.Cache.SeedNodes).
+			Bool("grpc_auth", cfg.Cache.IsGRPCAuthEnabled()).
 			Msg("Initializing embedded cache")
 
-		embeddedCache, err := embedded.New(&embedded.Config{
+		embeddedCfg := &embedded.Config{
 			DiskPath:      cfg.Cache.DiskPath,
 			TTL:           cfg.Cache.TTL,
 			MaxDiskUsage:  cfg.Cache.MaxDiskUsageBytes,
@@ -130,7 +145,22 @@ func main() {
 			GRPCAddr:      cfg.Cache.GRPCAddr,
 			AdvertiseAddr: cfg.Cache.AdvertiseAddr,
 			SeedNodes:     cfg.Cache.SeedNodes,
-		})
+		}
+
+		// Configure gRPC auth for cache cluster communication
+		if cfg.Cache.IsGRPCAuthEnabled() {
+			accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+			secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+			if accessKey == "" || secretKey == "" {
+				log.Fatal().Msg("Cache gRPC auth requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (set TAG_CACHE_GRPC_AUTH=false to disable)")
+			}
+			grpcToken := auth.DeriveGRPCAuthToken(accessKey, secretKey)
+			embeddedCfg.GRPCServerOptions = auth.GRPCServerOptions(grpcToken)
+			embeddedCfg.GRPCDialOptions = auth.GRPCDialOptions(grpcToken)
+			log.Info().Msg("Cache gRPC auth enabled")
+		}
+
+		embeddedCache, err := embedded.New(embeddedCfg)
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize embedded cache")
 		}
@@ -161,14 +191,41 @@ func main() {
 		objectCache = cache.NewDisabledCache()
 	}
 
-	// 3. Initialize forwarder
-	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost)
+	// 3. Initialize local auth for transparent proxy
+	var localAuth *proxy.LocalAuthConfig
+	if cfg.Upstream.IsTransparentProxy() {
+		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+		derivedKeyStore := auth.NewDerivedKeyStore(auth.DefaultDerivedKeyTTL)
+		keyUnwrapper, err := auth.NewKeyUnwrapper(secretKey)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize key unwrapper for local auth")
+		}
 
-	// 4. Initialize proxy service
+		authzCacheTTL := cfg.Credentials.AuthzCacheTTL
+		if authzCacheTTL == 0 {
+			authzCacheTTL = auth.DefaultAuthzCacheTTL
+		}
+
+		localAuth = &proxy.LocalAuthConfig{
+			DerivedKeyStore: derivedKeyStore,
+			Validator:       auth.NewRequestValidator(derivedKeyStore),
+			KeyUnwrapper:    keyUnwrapper,
+			AuthzCache:      auth.NewAuthzCache(authzCacheTTL),
+		}
+		log.Info().Msg("Local auth validation enabled for transparent proxy (derived signing keys)")
+	}
+
+	// 4. Initialize forwarder
+	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, proxySigner, localAuth)
+
+	// 5. Initialize proxy service
 	service := proxy.NewService(forwarder, objectCache, cfg)
 
-	// 5. Initialize HTTP server
+	// 6. Initialize HTTP server
 	server := handlers.NewServer(service, cfg.Server.BindIP, cfg.Server.HTTPPort, cfg.Server.PprofEnabled)
+	if cfg.Server.TLSEnabled() {
+		server.SetTLS(cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile)
+	}
 
 	// Start HTTP server in goroutine
 	go func() {
@@ -177,9 +234,14 @@ func main() {
 		}
 	}()
 
+	protocol := "http"
+	if cfg.Server.TLSEnabled() {
+		protocol = "https"
+	}
 	log.Info().
 		Str("addr", cfg.Server.BindIP).
 		Int("port", cfg.Server.HTTPPort).
+		Str("protocol", protocol).
 		Msg("TAG is ready")
 
 	// Handle shutdown signals

@@ -14,7 +14,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+
+	"github.com/tigrisdata/tag/auth"
 )
 
 const (
@@ -174,51 +176,12 @@ func (e *TestEnvironment) DeleteTestObject(bucket, key string) error {
 	return err
 }
 
-// deleteAllObjects deletes all objects in a bucket.
-func (e *TestEnvironment) deleteAllObjects(bucket string) error {
-	ctx := context.Background()
-
-	// List all objects
-	paginator := s3.NewListObjectsV2Paginator(e.S3Client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-	})
-
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to list objects in %s: %w", bucket, err)
-		}
-
-		if len(page.Contents) == 0 {
-			continue
-		}
-
-		// Build delete request
-		objects := make([]types.ObjectIdentifier, len(page.Contents))
-		for i, obj := range page.Contents {
-			objects[i] = types.ObjectIdentifier{Key: obj.Key}
-		}
-
-		// Delete objects
-		_, err = e.S3Client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-			Bucket: aws.String(bucket),
-			Delete: &types.Delete{
-				Objects: objects,
-				Quiet:   aws.Bool(true),
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("failed to delete objects in %s: %w", bucket, err)
-		}
-	}
-
-	return nil
-}
-
-// deleteBucket deletes a bucket (must be empty).
+// deleteBucket force-deletes a bucket and all its objects using Tigris-Force-Delete header.
 func (e *TestEnvironment) deleteBucket(bucket string) error {
 	_, err := e.S3Client.DeleteBucket(context.Background(), &s3.DeleteBucketInput{
 		Bucket: aws.String(bucket),
+	}, func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, smithyhttp.AddHeaderValue("Tigris-Force-Delete", "true"))
 	})
 	return err
 }
@@ -232,13 +195,6 @@ func (e *TestEnvironment) Cleanup() error {
 
 	var errs []error
 	for _, bucket := range buckets {
-		// Delete all objects first
-		if err := e.deleteAllObjects(bucket); err != nil {
-			errs = append(errs, fmt.Errorf("failed to empty bucket %s: %w", bucket, err))
-			continue
-		}
-
-		// Delete bucket
 		if err := e.deleteBucket(bucket); err != nil {
 			errs = append(errs, fmt.Errorf("failed to delete bucket %s: %w", bucket, err))
 		}
@@ -281,6 +237,39 @@ func getEnvOrDefault(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// DoRawGet performs a SigV4-signed raw HTTP GET request and returns the full response.
+// Unlike DoGet (which uses the AWS SDK), this returns the raw *http.Response so callers
+// can inspect response headers like X-Cache and X-Tigris-Proxy-Signing-Keys.
+// Caller is responsible for closing the response body.
+func (e *TestEnvironment) DoRawGet(bucket, key string) (*http.Response, error) {
+	return e.DoRawGetWithCreds(bucket, key, e.AccessKeyID, e.SecretAccessKey)
+}
+
+// DoRawGetWithCreds performs a SigV4-signed raw HTTP GET with the given credentials.
+// Useful for testing with invalid or different credentials.
+// Caller is responsible for closing the response body.
+func (e *TestEnvironment) DoRawGetWithCreds(bucket, key, accessKey, secretKey string) (*http.Response, error) {
+	signer := auth.NewRequestSigner(e.Endpoint, e.Region)
+	path := "/" + bucket + "/" + key
+	req, err := signer.SignRequest(context.Background(), "GET", path, nil, "", accessKey, secretKey, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign raw GET request: %w", err)
+	}
+	return http.DefaultClient.Do(req)
+}
+
+// DoRawGetUnauthenticated performs an HTTP GET without any Authorization header.
+// Useful for testing that cached objects are not served to anonymous requests.
+// Caller is responsible for closing the response body.
+func (e *TestEnvironment) DoRawGetUnauthenticated(bucket, key string) (*http.Response, error) {
+	url := e.Endpoint + "/" + bucket + "/" + key
+	req, err := http.NewRequestWithContext(context.Background(), "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create unauthenticated GET request: %w", err)
+	}
+	return http.DefaultClient.Do(req)
 }
 
 // randomString generates a random alphanumeric string of the specified length.

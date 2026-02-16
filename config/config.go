@@ -2,6 +2,8 @@
 package config
 
 import (
+	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -72,6 +74,14 @@ type ServerConfig struct {
 	HTTPPort     int    `yaml:"http_port"`     // S3 API port (default: 8080)
 	BindIP       string `yaml:"bind_ip"`       // Bind address (default: 0.0.0.0)
 	PprofEnabled bool   `yaml:"pprof_enabled"` // Enable pprof endpoints (default: false)
+	TLSCertFile  string `yaml:"tls_cert_file"` // Path to TLS certificate file (PEM format)
+	TLSKeyFile   string `yaml:"tls_key_file"`  // Path to TLS private key file (PEM format)
+}
+
+// TLSEnabled returns whether TLS is configured.
+// TLS is enabled when both TLSCertFile and TLSKeyFile are set.
+func (s *ServerConfig) TLSEnabled() bool {
+	return s.TLSCertFile != "" && s.TLSKeyFile != ""
 }
 
 // UpstreamConfig holds Tigris endpoint configuration.
@@ -79,12 +89,27 @@ type UpstreamConfig struct {
 	Endpoint            string `yaml:"endpoint"`                // Tigris S3 endpoint (e.g., https://fly.storage.tigris.dev)
 	Region              string `yaml:"region"`                  // AWS region for signing (default: auto)
 	MaxIdleConnsPerHost int    `yaml:"max_idle_conns_per_host"` // HTTP connection pool size per host (default: 100)
+	TransparentProxy    *bool  `yaml:"transparent_proxy"`       // Forward client requests as-is with proxy headers (default: true when nil)
+}
+
+// IsTransparentProxy returns whether transparent proxy mode is enabled.
+// Returns true by default if not explicitly set.
+func (u *UpstreamConfig) IsTransparentProxy() bool {
+	if u.TransparentProxy == nil {
+		return true // Default to enabled
+	}
+	return *u.TransparentProxy
+}
+
+// SetTransparentProxy sets the TransparentProxy field to the given value.
+func (u *UpstreamConfig) SetTransparentProxy(enabled bool) {
+	u.TransparentProxy = &enabled
 }
 
 // CredentialsConfig holds credential store configuration.
 // Credentials are loaded from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.
 type CredentialsConfig struct {
-	// Reserved for future configuration options
+	AuthzCacheTTL time.Duration `yaml:"authz_cache_ttl"` // TTL for authorization cache entries (default: 10m)
 }
 
 // CacheConfig holds cache configuration.
@@ -102,6 +127,7 @@ type CacheConfig struct {
 	GRPCAddr          string   `yaml:"grpc_addr"`            // Address for gRPC server (default: :9000)
 	AdvertiseAddr     string   `yaml:"advertise_addr"`       // Address advertised to other nodes (defaults to GRPCAddr)
 	SeedNodes         []string `yaml:"seed_nodes"`           // Seed nodes for cluster discovery
+	GRPCAuth          *bool    `yaml:"grpc_auth"`            // Enable gRPC auth using proxy credentials (default: true when nil)
 }
 
 // IsEnabled returns whether caching is enabled.
@@ -116,6 +142,20 @@ func (c *CacheConfig) IsEnabled() bool {
 // SetEnabled sets the Enabled field to the given value.
 func (c *CacheConfig) SetEnabled(enabled bool) {
 	c.Enabled = &enabled
+}
+
+// IsGRPCAuthEnabled returns whether gRPC auth is enabled for cache cluster communication.
+// Returns true by default if not explicitly set.
+func (c *CacheConfig) IsGRPCAuthEnabled() bool {
+	if c.GRPCAuth == nil {
+		return true // Default to enabled
+	}
+	return *c.GRPCAuth
+}
+
+// SetGRPCAuth sets the GRPCAuth field to the given value.
+func (c *CacheConfig) SetGRPCAuth(enabled bool) {
+	c.GRPCAuth = &enabled
 }
 
 // BroadcastConfig holds streaming broadcast configuration for request coalescing.
@@ -148,14 +188,23 @@ func Load(path string) (*Config, error) {
 	// Override from environment variables
 	applyEnvOverrides(&cfg)
 
+	// Validate configuration
+	if err := validate(&cfg); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
 }
 
 // NewDefault creates a Config with default values.
+// Panics if the resulting configuration is invalid (e.g., disallowed upstream endpoint).
 func NewDefault() *Config {
 	cfg := &Config{}
 	applyDefaults(cfg)
 	applyEnvOverrides(cfg)
+	if err := validate(cfg); err != nil {
+		panic(fmt.Sprintf("invalid default configuration: %v", err))
+	}
 	return cfg
 }
 
@@ -263,6 +312,11 @@ func applyEnvOverrides(cfg *Config) {
 		if seedNodes := os.Getenv("TAG_CACHE_SEED_NODES"); seedNodes != "" {
 			cfg.Cache.SeedNodes = splitEndpoints(seedNodes)
 		}
+		// Override gRPC auth from environment (enabled by default, only explicit "false"/"0" disables)
+		if val := os.Getenv("TAG_CACHE_GRPC_AUTH"); val != "" {
+			disabled := val == "false" || val == "0"
+			cfg.Cache.SetGRPCAuth(!disabled)
+		}
 	}
 
 	// Override log level from environment
@@ -275,10 +329,81 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Log.Format = logFormat
 	}
 
+	// Override HTTP port from environment
+	if port := os.Getenv("TAG_HTTP_PORT"); port != "" {
+		if p, err := strconv.Atoi(port); err == nil && p > 0 {
+			cfg.Server.HTTPPort = p
+		}
+	}
+
 	// Enable pprof from environment (disabled by default for security)
 	if enabled := os.Getenv("TAG_PPROF_ENABLED"); enabled == "true" || enabled == "1" {
 		cfg.Server.PprofEnabled = true
 	}
+
+	// Override TLS certificate from environment
+	if certFile := os.Getenv("TAG_TLS_CERT_FILE"); certFile != "" {
+		cfg.Server.TLSCertFile = certFile
+	}
+	if keyFile := os.Getenv("TAG_TLS_KEY_FILE"); keyFile != "" {
+		cfg.Server.TLSKeyFile = keyFile
+	}
+
+	// Override transparent proxy from environment (enabled by default)
+	if val := os.Getenv("TAG_TRANSPARENT_PROXY"); val != "" {
+		enabled := val == "true" || val == "1"
+		cfg.Upstream.SetTransparentProxy(enabled)
+	}
+
+	// Override authz cache TTL from environment
+	if val := os.Getenv("TAG_AUTHZ_CACHE_TTL"); val != "" {
+		if ttl, err := time.ParseDuration(val); err == nil && ttl > 0 {
+			cfg.Credentials.AuthzCacheTTL = ttl
+		}
+	}
+}
+
+// validate checks that the final configuration is valid.
+func validate(cfg *Config) error {
+	if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint); err != nil {
+		return err
+	}
+	if err := validateTLS(&cfg.Server); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateTLS checks that TLS configuration is consistent.
+// Both cert and key must be provided together, or neither.
+func validateTLS(server *ServerConfig) error {
+	hasCert := server.TLSCertFile != ""
+	hasKey := server.TLSKeyFile != ""
+	if hasCert != hasKey {
+		if hasCert {
+			return fmt.Errorf("tls_cert_file is set but tls_key_file is missing")
+		}
+		return fmt.Errorf("tls_key_file is set but tls_cert_file is missing")
+	}
+	return nil
+}
+
+// validateUpstreamEndpoint ensures the upstream endpoint is an allowed Tigris domain or localhost.
+func validateUpstreamEndpoint(endpoint string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("invalid upstream endpoint %q: %w", endpoint, err)
+	}
+
+	host := u.Hostname() // strips port if present
+	if host == "localhost" {
+		return nil
+	}
+	if strings.HasSuffix(host, ".tigris.dev") || strings.HasSuffix(host, ".storage.dev") {
+		return nil
+	}
+
+	return fmt.Errorf("upstream endpoint %q is not allowed: host must be localhost, *.tigris.dev, or *.storage.dev", endpoint)
 }
 
 // splitEndpoints splits a comma-separated string into a slice of endpoints.

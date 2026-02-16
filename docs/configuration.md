@@ -6,7 +6,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `AWS_ACCESS_KEY_ID` | S3 access key for authentication | (required) |
+| `AWS_ACCESS_KEY_ID` | S3 access key (must have read-only access for all buckets accessed through TAG) | (required) |
 | `AWS_SECRET_ACCESS_KEY` | S3 secret key for authentication | (required) |
 | `TAG_UPSTREAM_ENDPOINT` | Tigris S3 endpoint URL | `https://t3.storage.dev` |
 | `TAG_MAX_IDLE_CONNS_PER_HOST` | HTTP connection pool size per upstream host | `100` |
@@ -20,6 +20,9 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_SEED_NODES` | Comma-separated seed nodes for cluster discovery | (none) |
 | `TAG_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error` | `info` |
 | `TAG_LOG_FORMAT` | Log format: `json` or `console` | `json` |
+| `TAG_TRANSPARENT_PROXY` | Disable transparent proxy mode (`false` or `0`) | `true` |
+| `TAG_TLS_CERT_FILE` | Path to TLS certificate file (PEM format) | (none) |
+| `TAG_TLS_KEY_FILE` | Path to TLS private key file (PEM format) | (none) |
 | `TAG_PPROF_ENABLED` | Enable pprof endpoints (`true` or `1`) | `false` |
 
 ## Configuration File
@@ -47,6 +50,16 @@ server:
   # Default: false (disabled for security)
   pprof_enabled: false
 
+  # Path to TLS certificate file (PEM format)
+  # When both tls_cert_file and tls_key_file are set, TAG serves HTTPS
+  # Default: "" (TLS disabled, serves HTTP)
+  tls_cert_file: ""
+
+  # Path to TLS private key file (PEM format)
+  # Must be set together with tls_cert_file
+  # Default: "" (TLS disabled, serves HTTP)
+  tls_key_file: ""
+
 # Upstream Tigris configuration
 upstream:
   # Tigris S3 endpoint URL
@@ -61,6 +74,12 @@ upstream:
   # Higher values improve throughput for cache miss scenarios
   # Default: 100
   max_idle_conns_per_host: 100
+
+  # Enable transparent proxy mode
+  # When true (default), client requests are forwarded as-is with proxy headers.
+  # When false, TAG validates and re-signs requests (signing mode).
+  # Default: true
+  transparent_proxy: true
 
 # Cache configuration (embedded OCache)
 cache:
@@ -141,6 +160,8 @@ Controls the HTTP server settings.
 | `http_port` | int | `8080` | Port for the S3 API |
 | `bind_ip` | string | `"0.0.0.0"` | IP address to bind to |
 | `pprof_enabled` | bool | `false` | Enable pprof profiling endpoints |
+| `tls_cert_file` | string | `""` | Path to TLS certificate file (PEM) |
+| `tls_key_file` | string | `""` | Path to TLS private key file (PEM) |
 
 ### Upstream
 
@@ -151,9 +172,43 @@ Configures the connection to upstream Tigris storage.
 | `endpoint` | string | `"https://t3.storage.dev"` | Tigris S3 endpoint URL |
 | `region` | string | `"auto"` | AWS region for request signing |
 | `max_idle_conns_per_host` | int | `100` | HTTP connection pool size per host |
+| `transparent_proxy` | bool | `true` | Forward client requests as-is with proxy headers |
 
-**Endpoint Options:**
-- `https://t3.storage.dev` - Default Tigris endpoint
+**Endpoint Validation:**
+
+The upstream endpoint must be one of the following allowed hosts:
+- `localhost` (for local development)
+- `*.tigris.dev` (e.g., `fly.storage.tigris.dev`)
+- `*.storage.dev` (e.g., `t3.storage.dev`)
+
+TAG will refuse to start if the endpoint host does not match one of these patterns.
+
+**Transparent Proxy Mode:**
+
+When `transparent_proxy` is `true` (default), TAG forwards client requests to Tigris as-is, preserving the original Authorization header and adding proxy headers so Tigris validates the signature against the original host. No local credential store is needed.
+
+When `transparent_proxy` is `false`, TAG validates incoming request signatures against its local credential store and re-signs requests for the upstream endpoint (signing mode). This is useful when TAG needs to perform credential translation.
+
+**TLS / HTTPS:**
+
+TAG can serve HTTPS when both `tls_cert_file` and `tls_key_file` are configured. Both must be provided together or TAG will refuse to start. This allows clients inside your environment to connect over an encrypted channel.
+
+```bash
+# Enable HTTPS via environment variables
+TAG_TLS_CERT_FILE=/etc/tag/tls/cert.pem TAG_TLS_KEY_FILE=/etc/tag/tls/key.pem ./tag
+```
+
+Or via configuration file:
+```yaml
+server:
+  tls_cert_file: "/etc/tag/tls/cert.pem"
+  tls_key_file: "/etc/tag/tls/key.pem"
+```
+
+The certificate file should contain the full chain (server certificate followed by intermediates). For development, you can generate self-signed certificates with:
+```bash
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'
+```
 
 ### Cache
 
@@ -281,6 +336,27 @@ cache:
 broadcast:
   chunk_size: 65536
   channel_buffer: 32
+
+log:
+  level: "info"
+```
+
+### Production (Single Node with TLS)
+
+```yaml
+server:
+  http_port: 443
+  bind_ip: "0.0.0.0"
+  tls_cert_file: "/etc/tag/tls/cert.pem"
+  tls_key_file: "/etc/tag/tls/key.pem"
+
+cache:
+  enabled: true
+  disk_path: "/var/cache/tag"
+  max_disk_usage_bytes: 107374182400  # 100GB
+  ttl: 60m
+  size_threshold: 1073741824
+  node_id: "tag-prod"
 
 log:
   level: "info"

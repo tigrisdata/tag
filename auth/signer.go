@@ -21,8 +21,8 @@ const (
 	// unsignedPayload is used for streaming uploads or when payload hash is not computed.
 	unsignedPayload = "UNSIGNED-PAYLOAD"
 
-	// timeFormat is the format for X-Amz-Date header.
-	timeFormat = "20060102T150405Z"
+	// TimeFormat is the format for X-Amz-Date header.
+	TimeFormat = "20060102T150405Z"
 
 	// shortTimeFormat is the format for the date in the credential scope.
 	shortTimeFormat = "20060102"
@@ -36,6 +36,20 @@ const (
 	// terminationString is the termination string for AWS SigV4.
 	terminationString = "aws4_request"
 )
+
+// ParseHTTPDate parses a date string in common HTTP/AWS formats.
+func ParseHTTPDate(dateStr string) (time.Time, error) {
+	for _, layout := range []string{
+		TimeFormat,
+		time.RFC1123,
+		time.RFC1123Z,
+	} {
+		if t, err := time.Parse(layout, dateStr); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unrecognized date format: %s", dateStr)
+}
 
 // RequestSigner signs HTTP requests using AWS SigV4.
 type RequestSigner struct {
@@ -101,7 +115,7 @@ func (s *RequestSigner) SignRequest(ctx context.Context, method, path string,
 
 	// Set required headers for signing
 	now := time.Now().UTC()
-	req.Header.Set("X-Amz-Date", now.Format(timeFormat))
+	req.Header.Set("X-Amz-Date", now.Format(TimeFormat))
 	req.Header.Set("X-Amz-Content-Sha256", bodyHash)
 	req.Header.Set("Host", req.URL.Host)
 
@@ -239,7 +253,7 @@ func (s *RequestSigner) buildCanonicalHeaders(req *http.Request) (string, string
 func (s *RequestSigner) buildStringToSign(signingTime time.Time, credentialScope, canonicalRequest string) string {
 	return strings.Join([]string{
 		algorithm,
-		signingTime.Format(timeFormat),
+		signingTime.Format(TimeFormat),
 		credentialScope,
 		hashSHA256([]byte(canonicalRequest)),
 	}, "\n")
@@ -266,25 +280,21 @@ func shouldCopyHeader(key string) bool {
 	// Range requests
 	case "range":
 		return true
-	// S3-specific headers for operations
-	case "x-amz-copy-source", "x-amz-copy-source-range",
-		"x-amz-copy-source-if-match", "x-amz-copy-source-if-none-match",
-		"x-amz-copy-source-if-modified-since", "x-amz-copy-source-if-unmodified-since",
-		"x-amz-metadata-directive", "x-amz-tagging-directive",
-		"x-amz-storage-class", "x-amz-website-redirect-location",
-		"x-amz-server-side-encryption", "x-amz-server-side-encryption-customer-algorithm",
-		"x-amz-server-side-encryption-customer-key", "x-amz-server-side-encryption-customer-key-md5",
-		"x-amz-acl", "x-amz-grant-read", "x-amz-grant-write", "x-amz-grant-read-acp",
-		"x-amz-grant-write-acp", "x-amz-grant-full-control",
-		"x-amz-tagging", "x-amz-object-lock-mode", "x-amz-object-lock-retain-until-date",
-		"x-amz-object-lock-legal-hold", "x-amz-expected-bucket-owner":
-		return true
 	// Conditional request headers
 	case "if-match", "if-none-match", "if-modified-since", "if-unmodified-since":
 		return true
 	}
-	// Copy user metadata headers
-	if strings.HasPrefix(lower, "x-amz-meta-") {
+	// All x-amz-* headers (S3 operations, metadata, etc.)
+	if strings.HasPrefix(lower, "x-amz-") {
+		return true
+	}
+	// All Tigris-specific headers (tigris-* and x-tigris-*), except proxy headers
+	// which must not be forwarded in signing mode to prevent client injection.
+	// The transparent forwarder overwrites these with .Set() so it's unaffected.
+	if strings.HasPrefix(lower, "x-tigris-proxy-") || lower == "x-tigris-forwarded-host" {
+		return false
+	}
+	if strings.HasPrefix(lower, "tigris-") || strings.HasPrefix(lower, "x-tigris-") {
 		return true
 	}
 	return false

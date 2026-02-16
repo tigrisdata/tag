@@ -65,7 +65,7 @@ TESTRUN="TestBroadcast" make test-proxy
 
 ## Commit & PR Conventions
 
-PR titles and commit messages must use [Conventional Commits](https://www.conventionalcommits.org/) format with one of these prefixes: `feat`, `fix`, `perf`, `docs`, `style`, `refactor`, `test`, `build`, `ci`, `chore`, `revert`. Example: `feat: add chunked transfer encoding support`.
+PR titles and commit messages must use [Conventional Commits](https://www.conventionalcommits.org/) format with one of these prefixes: `feat`, `fix`, `perf`, `docs`, `style`, `refactor`, `test`, `build`, `ci`, `chore`, `revert`. Example: `feat: add chunked transfer encoding support`. PR title format is enforced by CI (`amannn/action-semantic-pull-request@v5`) — always verify PR titles match before submitting.
 
 ## User Preferences
 
@@ -73,3 +73,6 @@ PR titles and commit messages must use [Conventional Commits](https://www.conven
 - **Zero added latency**: Prefer patterns like stream multiplexing over explicit batching delays
 - **Linux + macOS support**: OS-specific optimizations must have viable fallbacks
 - **Clear plan separation**: When changes span multiple codebases (OCache vs TAG), maintain distinct plans
+- **High-signal code reviews only**: Focus exclusively on objective bugs and clear CLAUDE.md violations. Avoid subjective suggestions, nitpicks, pre-existing issues, linter-catchable issues, or general code quality concerns not explicitly mandated
+- **Makefile help target**: New Makefile targets must include corresponding entries in the `help` target with usage examples
+- **Local TLS testing**: Prefer Makefile targets for local TLS testing with self-signed certificates. Use `--insecure` / `-k` flags when needed

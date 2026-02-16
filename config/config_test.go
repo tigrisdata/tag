@@ -14,7 +14,7 @@ server:
   http_port: 9000
   bind_ip: "127.0.0.1"
 upstream:
-  endpoint: "https://custom.endpoint.com"
+  endpoint: "https://fly.storage.tigris.dev"
   region: "us-west-2"
 cache:
   enabled: true
@@ -48,8 +48,8 @@ log:
 	}
 
 	// Verify upstream config
-	if cfg.Upstream.Endpoint != "https://custom.endpoint.com" {
-		t.Errorf("Upstream.Endpoint = %q, want https://custom.endpoint.com", cfg.Upstream.Endpoint)
+	if cfg.Upstream.Endpoint != "https://fly.storage.tigris.dev" {
+		t.Errorf("Upstream.Endpoint = %q, want https://fly.storage.tigris.dev", cfg.Upstream.Endpoint)
 	}
 	if cfg.Upstream.Region != "us-west-2" {
 		t.Errorf("Upstream.Region = %q, want us-west-2", cfg.Upstream.Region)
@@ -123,7 +123,7 @@ func TestLoad_EnvOverrides(t *testing.T) {
 server:
   http_port: 8080
 upstream:
-  endpoint: "https://default.endpoint.com"
+  endpoint: "https://fly.storage.tigris.dev"
 log:
   level: "info"
 `
@@ -134,7 +134,7 @@ log:
 	}
 
 	// Set environment variables
-	t.Setenv("TAG_UPSTREAM_ENDPOINT", "https://env.endpoint.com")
+	t.Setenv("TAG_UPSTREAM_ENDPOINT", "https://t3.storage.dev")
 	t.Setenv("TAG_CACHE_NODE_ID", "env-node-1")
 	t.Setenv("TAG_CACHE_DISK_PATH", "/env/cache/path")
 	t.Setenv("TAG_CACHE_SEED_NODES", "env-node-0:7000,env-node-1:7000")
@@ -146,8 +146,8 @@ log:
 	}
 
 	// Verify env overrides
-	if cfg.Upstream.Endpoint != "https://env.endpoint.com" {
-		t.Errorf("Upstream.Endpoint = %q, want https://env.endpoint.com", cfg.Upstream.Endpoint)
+	if cfg.Upstream.Endpoint != "https://t3.storage.dev" {
+		t.Errorf("Upstream.Endpoint = %q, want https://t3.storage.dev", cfg.Upstream.Endpoint)
 	}
 	if cfg.Cache.NodeID != "env-node-1" {
 		t.Errorf("Cache.NodeID = %q, want env-node-1", cfg.Cache.NodeID)
@@ -322,6 +322,92 @@ cache:
 	}
 }
 
+func TestTransparentProxy_EnabledByDefault(t *testing.T) {
+	cfg := NewDefault()
+	if !cfg.Upstream.IsTransparentProxy() {
+		t.Error("IsTransparentProxy() = false, want true (enabled by default)")
+	}
+}
+
+func TestTransparentProxy_DisabledByYAML(t *testing.T) {
+	content := `
+upstream:
+  transparent_proxy: false
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Upstream.IsTransparentProxy() {
+		t.Error("IsTransparentProxy() = true, want false")
+	}
+}
+
+func TestTransparentProxy_DisabledByEnv(t *testing.T) {
+	t.Setenv("TAG_TRANSPARENT_PROXY", "false")
+
+	cfg := NewDefault()
+	if cfg.Upstream.IsTransparentProxy() {
+		t.Error("IsTransparentProxy() = true, want false (disabled by env)")
+	}
+}
+
+func TestTransparentProxy_DisabledByEnv_NumericZero(t *testing.T) {
+	t.Setenv("TAG_TRANSPARENT_PROXY", "0")
+
+	cfg := NewDefault()
+	if cfg.Upstream.IsTransparentProxy() {
+		t.Error("IsTransparentProxy() = true, want false (disabled by env with '0')")
+	}
+}
+
+func TestValidateUpstreamEndpoint(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		wantErr  bool
+	}{
+		{"tigris.dev domain", "https://fly.storage.tigris.dev", false},
+		{"storage.dev domain", "https://t3.storage.dev", false},
+		{"localhost", "http://localhost:8080", false},
+		{"localhost no port", "http://localhost", false},
+		{"disallowed domain", "https://evil.example.com", true},
+		{"subdomain of tigris.dev", "https://sub.tigris.dev", false},
+		{"not a suffix match", "https://nottrigris.dev", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateUpstreamEndpoint(tt.endpoint)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateUpstreamEndpoint(%q) error = %v, wantErr %v", tt.endpoint, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoad_InvalidUpstreamEndpoint(t *testing.T) {
+	content := `
+upstream:
+  endpoint: "https://evil.example.com"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	_, err := Load(tmpFile)
+	if err == nil {
+		t.Error("Load() should return error for disallowed upstream endpoint")
+	}
+}
+
 func TestCacheDefaultValues(t *testing.T) {
 	cfg := NewDefault()
 
@@ -341,5 +427,198 @@ func TestCacheDefaultValues(t *testing.T) {
 	}
 	if cfg.Cache.GRPCAddr != DefaultCacheGRPCAddr {
 		t.Errorf("Cache.GRPCAddr = %q, want %q", cfg.Cache.GRPCAddr, DefaultCacheGRPCAddr)
+	}
+
+	// Verify gRPC auth is enabled by default
+	if !cfg.Cache.IsGRPCAuthEnabled() {
+		t.Error("Cache.IsGRPCAuthEnabled() = false, want true (enabled by default)")
+	}
+}
+
+func TestGRPCAuth_DisabledByYAML(t *testing.T) {
+	content := `
+cache:
+  grpc_auth: false
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Cache.IsGRPCAuthEnabled() {
+		t.Error("IsGRPCAuthEnabled() = true, want false")
+	}
+}
+
+func TestGRPCAuth_DisabledByEnv(t *testing.T) {
+	t.Setenv("TAG_CACHE_GRPC_AUTH", "false")
+
+	cfg := NewDefault()
+	if cfg.Cache.IsGRPCAuthEnabled() {
+		t.Error("IsGRPCAuthEnabled() = true, want false (disabled by env)")
+	}
+}
+
+func TestGRPCAuth_EnabledByEnv(t *testing.T) {
+	t.Setenv("TAG_CACHE_GRPC_AUTH", "true")
+
+	cfg := NewDefault()
+	if !cfg.Cache.IsGRPCAuthEnabled() {
+		t.Error("IsGRPCAuthEnabled() = false, want true (enabled by env)")
+	}
+}
+
+func TestGRPCAuth_UnrecognizedValueKeepsEnabled(t *testing.T) {
+	// Unrecognized values like "True", "yes", "TRUE" must not silently disable auth
+	for _, val := range []string{"True", "TRUE", "yes", "enabled", "typo"} {
+		t.Run(val, func(t *testing.T) {
+			t.Setenv("TAG_CACHE_GRPC_AUTH", val)
+			cfg := NewDefault()
+			if !cfg.Cache.IsGRPCAuthEnabled() {
+				t.Errorf("IsGRPCAuthEnabled() = false with TAG_CACHE_GRPC_AUTH=%q, want true (only 'false'/'0' should disable)", val)
+			}
+		})
+	}
+}
+
+func TestHTTPPort_OverrideByEnv(t *testing.T) {
+	t.Setenv("TAG_HTTP_PORT", "9999")
+	cfg := NewDefault()
+	if cfg.Server.HTTPPort != 9999 {
+		t.Errorf("Server.HTTPPort = %d, want 9999", cfg.Server.HTTPPort)
+	}
+}
+
+func TestTLSEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		cert     string
+		key      string
+		expected bool
+	}{
+		{"both set", "/path/cert.pem", "/path/key.pem", true},
+		{"neither set", "", "", false},
+		{"only cert", "/path/cert.pem", "", false},
+		{"only key", "", "/path/key.pem", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := ServerConfig{TLSCertFile: tt.cert, TLSKeyFile: tt.key}
+			if got := s.TLSEnabled(); got != tt.expected {
+				t.Errorf("TLSEnabled() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestTLS_FromYAML(t *testing.T) {
+	content := `
+server:
+  tls_cert_file: "/etc/tag/tls/cert.pem"
+  tls_key_file: "/etc/tag/tls/key.pem"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Server.TLSCertFile != "/etc/tag/tls/cert.pem" {
+		t.Errorf("TLSCertFile = %q, want /etc/tag/tls/cert.pem", cfg.Server.TLSCertFile)
+	}
+	if cfg.Server.TLSKeyFile != "/etc/tag/tls/key.pem" {
+		t.Errorf("TLSKeyFile = %q, want /etc/tag/tls/key.pem", cfg.Server.TLSKeyFile)
+	}
+	if !cfg.Server.TLSEnabled() {
+		t.Error("TLSEnabled() = false, want true")
+	}
+}
+
+func TestTLS_FromEnv(t *testing.T) {
+	t.Setenv("TAG_TLS_CERT_FILE", "/env/cert.pem")
+	t.Setenv("TAG_TLS_KEY_FILE", "/env/key.pem")
+
+	cfg := NewDefault()
+	if cfg.Server.TLSCertFile != "/env/cert.pem" {
+		t.Errorf("TLSCertFile = %q, want /env/cert.pem", cfg.Server.TLSCertFile)
+	}
+	if cfg.Server.TLSKeyFile != "/env/key.pem" {
+		t.Errorf("TLSKeyFile = %q, want /env/key.pem", cfg.Server.TLSKeyFile)
+	}
+}
+
+func TestTLS_EnvOverridesFile(t *testing.T) {
+	content := `
+server:
+  tls_cert_file: "/file/cert.pem"
+  tls_key_file: "/file/key.pem"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	t.Setenv("TAG_TLS_CERT_FILE", "/env/cert.pem")
+	t.Setenv("TAG_TLS_KEY_FILE", "/env/key.pem")
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Server.TLSCertFile != "/env/cert.pem" {
+		t.Errorf("TLSCertFile = %q, want /env/cert.pem (env override)", cfg.Server.TLSCertFile)
+	}
+	if cfg.Server.TLSKeyFile != "/env/key.pem" {
+		t.Errorf("TLSKeyFile = %q, want /env/key.pem (env override)", cfg.Server.TLSKeyFile)
+	}
+}
+
+func TestTLS_ValidationOnlyCert(t *testing.T) {
+	content := `
+server:
+  tls_cert_file: "/path/cert.pem"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	_, err := Load(tmpFile)
+	if err == nil {
+		t.Error("Load() should return error when only tls_cert_file is set")
+	}
+}
+
+func TestTLS_ValidationOnlyKey(t *testing.T) {
+	content := `
+server:
+  tls_key_file: "/path/key.pem"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	_, err := Load(tmpFile)
+	if err == nil {
+		t.Error("Load() should return error when only tls_key_file is set")
+	}
+}
+
+func TestTLS_DisabledByDefault(t *testing.T) {
+	cfg := NewDefault()
+	if cfg.Server.TLSEnabled() {
+		t.Error("TLSEnabled() = true, want false (disabled by default)")
 	}
 }

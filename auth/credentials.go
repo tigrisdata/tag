@@ -81,3 +81,22 @@ func (c *CredentialStore) HasCredential(accessKey string) bool {
 	_, ok := c.credentials[accessKey]
 	return ok
 }
+
+// GetSigningKey derives the SigV4 signing key for the given access key, date, and region.
+// Implements the KeyProvider interface.
+func (c *CredentialStore) GetSigningKey(accessKey, date, region string) ([]byte, error) {
+	secretKey, err := c.GetSecretKey(accessKey)
+	if err != nil {
+		return nil, err
+	}
+	return deriveSigningKey(secretKey, date, region), nil
+}
+
+// HasKey returns whether a signing key can be produced for the given access key.
+// Implements the KeyProvider interface.
+func (c *CredentialStore) HasKey(accessKey string) bool {
+	return c.HasCredential(accessKey)
+}
+
+// Compile-time check that CredentialStore implements KeyProvider.
+var _ KeyProvider = (*CredentialStore)(nil)

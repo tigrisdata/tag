@@ -76,7 +76,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 		Msg("HandleGetObject")
 
 	// 1. Validate credentials FIRST (before any broadcast operations)
-	accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
+	result, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil {
 		metrics.RecordRequest("GetObject", "auth_error", time.Since(start).Seconds())
 		return err
@@ -85,7 +85,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// 2. Check cache (fast path) - now also works for range requests!
 	// For range requests: check if full object is in cache, then serve range from it.
 	// Uses two-phase approach: GetMeta first, then GetBodyStream for direct streaming.
-	if !noCacheRead && s.cache.IsEnabled() {
+	if result == AuthValidated && !noCacheRead && s.cache.IsEnabled() {
 		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
 		if cacheErr == nil && found && meta != nil {
 			// If this is a Range request and we have the full object cached,

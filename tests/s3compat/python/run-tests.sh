@@ -61,10 +61,12 @@ fi
 
 # Generate s3tests.conf with actual credentials from environment variables
 # The template uses __AWS_ACCESS_KEY_ID__ and __AWS_SECRET_ACCESS_KEY__ as placeholders
+# Use S3TEST_CONF_TEMPLATE env var to override the template file (e.g., s3tests-tls.conf)
+S3TEST_CONF_TEMPLATE="${S3TEST_CONF_TEMPLATE:-s3tests.conf}"
 S3TEST_CONF="$SCRIPT_DIR/s3tests.conf.generated"
 if ! sed -e "s|__AWS_ACCESS_KEY_ID__|${AWS_ACCESS_KEY_ID}|g" \
     -e "s|__AWS_SECRET_ACCESS_KEY__|${AWS_SECRET_ACCESS_KEY}|g" \
-    "$SCRIPT_DIR/s3tests.conf" > "$S3TEST_CONF"; then
+    "$SCRIPT_DIR/$S3TEST_CONF_TEMPLATE" > "$S3TEST_CONF"; then
     echo "Error: Failed to generate s3tests.conf"
     exit 1
 fi
@@ -242,6 +244,9 @@ test_objects=(
     "test_object_copy_16m"
     # Special prefix handling
     "test_bucket_list_special_prefix"
+    # Chunked encoding tests
+    # "test_object_write_with_chunked_transfer_encoding"  # Requires HTTP Transfer-Encoding: chunked (Ceph RGW-specific, not supported by S3/Tigris)
+    # "test_object_content_encoding_aws_chunked"  # Tigris stores aws-chunked in Content-Encoding as-is; stripping it in TAG breaks signatures in transparent mode
 )
 
 # Bucket operations tests

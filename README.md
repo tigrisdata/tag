@@ -5,6 +5,7 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 ## Features
 
 - **S3-Compatible API**: Supports all S3 API endpoints supported by Tigris
+- **Transparent Proxy Mode**: Forwards client requests as-is with proxy headers, preserving original signatures (enabled by default)
 - **Embedded Cache**: High-performance RocksDB-based cache with automatic cluster discovery
 - **Request Coalescing**: Streaming broadcast pattern reduces duplicate upstream requests under concurrent load
 - **Range Request Caching**: Background fetch of full objects on range cache miss for optimal ML training workloads
@@ -78,7 +79,7 @@ See [docs/s3-compatibility-testing.md](docs/s3-compatibility-testing.md) for det
 
 TAG can be configured via YAML file or environment variables. Key settings:
 
-- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` - Tigris credentials (required)
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` - TAG's own Tigris credentials with read-only access (required). In transparent proxy mode (default), clients use their own credentials directly.
 - `TAG_CACHE_NODE_ID` - Unique node identifier for cluster mode
 - `TAG_CACHE_DISK_PATH` - Path to cache data directory
 - `TAG_LOG_LEVEL` - Log level: debug, info, warn, error
@@ -87,7 +88,7 @@ See [docs/configuration.md](docs/configuration.md) for full configuration refere
 
 ## Architecture
 
-```
+```text
 ┌─────────────┐     ┌─────────────────────────────┐     ┌─────────────┐
 │   Client    │────▶│           TAG               │────▶│   Tigris    │
 │  (S3 SDK)   │◀────│  ┌─────────────────────┐    │◀────│   Storage   │
@@ -119,6 +120,12 @@ See [docs/architecture.md](docs/architecture.md) for detailed architecture docum
 TAG exposes Prometheus metrics at `/metrics` including request counts, latencies, cache hit/miss rates, and broadcast statistics.
 
 See [docs/metrics.md](docs/metrics.md) for complete metrics reference.
+
+## Security
+
+TAG supports transparent proxy mode (default) with local SigV4 validation and per-bucket authorization caching, as well as signing mode with local credential stores.
+
+See [docs/security.md](docs/security.md) for authentication, access control, and security architecture.
 
 ## Deployment
 
