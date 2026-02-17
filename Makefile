@@ -119,10 +119,10 @@ endif
 
 # Testing targets
 .PHONY: test
-test: rocksdb-static
+test: build
 	@echo "Running unit tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test -v -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
+	$(CGO_ENV) go test -v -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./cmd/... ./config/... ./handlers/... ./metrics/... ./proxy/...
 
 .PHONY: test-all
 test-all: test test-integration
@@ -289,8 +289,8 @@ help:
 	@echo "  check         - Run all quality checks (fmt, vet, test)"
 	@echo ""
 	@echo "Run targets:"
-	@echo "  run           - Run TAG with default options"
-	@echo "  run-verbose   - Run TAG with debug logging"
+	@echo "  run           - Run TAG with default options (use --help for CLI flags)"
+	@echo "  run-verbose   - Run TAG with debug logging (use --version for version info)"
 	@echo ""
 	@echo "S3 compatibility test targets:"
 	@echo "  s3-test-local          - Start TAG locally with embedded cache"
