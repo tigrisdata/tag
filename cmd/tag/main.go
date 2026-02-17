@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -40,7 +41,35 @@ func main() {
 	// Parse command line flags
 	configPath := flag.String("config", "", "Path to configuration file")
 	disableCache := flag.Bool("disable-cache", false, "Disable caching (pass-through mode)")
+	showVersion := flag.Bool("version", false, "Print version information and exit")
+	httpPort := flag.Int("http-port", 0, "HTTP port (env: TAG_HTTP_PORT)")
+	logLevel := flag.String("log-level", "", "Log level: debug, info, warn, error (env: TAG_LOG_LEVEL)")
+	logFormat := flag.String("log-format", "", "Log format: json or console (env: TAG_LOG_FORMAT)")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: tag [options]\n\n")
+		fmt.Fprintf(os.Stderr, "TAG (Tigris Access Gateway) - S3-compatible caching proxy for Tigris\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		fmt.Fprintf(os.Stderr, "  --version              Print version information and exit\n")
+		fmt.Fprintf(os.Stderr, "  --config PATH          Path to YAML configuration file\n")
+		fmt.Fprintf(os.Stderr, "  --disable-cache        Disable caching (pass-through mode)\n")
+		fmt.Fprintf(os.Stderr, "  --http-port PORT       HTTP port (default: 8080, env: TAG_HTTP_PORT)\n")
+		fmt.Fprintf(os.Stderr, "  --log-level LEVEL      Log level: debug, info, warn, error (default: info, env: TAG_LOG_LEVEL)\n")
+		fmt.Fprintf(os.Stderr, "  --log-format FORMAT    Log format: json or console (default: json, env: TAG_LOG_FORMAT)\n")
+		fmt.Fprintf(os.Stderr, "\nConfiguration precedence: defaults < config file < environment variables < CLI flags\n")
+		fmt.Fprintf(os.Stderr, "See documentation for full list of environment variables (TAG_*).\n")
+	}
+
 	flag.Parse()
+
+	// Handle --version before any config loading
+	if *showVersion {
+		fmt.Printf("TAG (Tigris Access Gateway)\n")
+		fmt.Printf("  Version:    %s\n", Version)
+		fmt.Printf("  Build Time: %s\n", BuildTime)
+		fmt.Printf("  Git Commit: %s\n", GitCommit)
+		os.Exit(0)
+	}
 
 	// Load configuration first (before setting up logger, so we can use log format from config)
 	var cfg *config.Config
@@ -57,7 +86,24 @@ func main() {
 		cfg = config.NewDefault()
 	}
 
-	// Initialize logger based on configuration
+	// Override cache enabled from command line flag
+	if *disableCache {
+		cfg.Cache.SetEnabled(false)
+	}
+
+	// Apply convenience CLI flag overrides (only when explicitly set)
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "http-port":
+			cfg.Server.HTTPPort = *httpPort
+		case "log-level":
+			cfg.Log.Level = *logLevel
+		case "log-format":
+			cfg.Log.Format = *logFormat
+		}
+	})
+
+	// Initialize logger based on configuration (after CLI overrides)
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	if cfg.Log.Format == "console" {
 		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
@@ -78,11 +124,6 @@ func main() {
 
 	if *configPath == "" {
 		log.Info().Msg("Using default configuration")
-	}
-
-	// Override cache enabled from command line flag
-	if *disableCache {
-		cfg.Cache.SetEnabled(false)
 	}
 
 	log.Info().
