@@ -14,8 +14,8 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
-	github.com/tigrisdata/ocache/client v1.3.0
-	github.com/tigrisdata/ocache/embedded v1.3.0
+	github.com/tigrisdata/ocache/client v1.3.1
+	github.com/tigrisdata/ocache/embedded v1.3.1
 	google.golang.org/grpc v1.72.2
 	gopkg.in/yaml.v3 v3.0.1
 )
