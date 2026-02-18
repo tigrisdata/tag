@@ -374,8 +374,8 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 	metrics.ActiveBackgroundFetches.Inc()
 
 	go func() {
-		defer s.activeBackgroundFetches.Delete(bcastKey)
 		defer metrics.ActiveBackgroundFetches.Dec()
+		defer s.activeBackgroundFetches.Delete(bcastKey)
 
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
