@@ -47,12 +47,30 @@ func (s *signalingReader) Ready() <-chan struct{} {
 }
 
 const (
-	// cacheWriteTimeout is the timeout for cache writes.
+	// cacheWriteTimeout is the base timeout for cache writes.
 	cacheWriteTimeout = 60 * time.Second
 
 	// backgroundFetchTimeout is the timeout for background fetches.
 	backgroundFetchTimeout = 5 * time.Minute
+
+	// minCacheWriteThroughput is the minimum expected cache write speed.
+	// Used to compute dynamic timeouts for large objects.
+	// 5 MB/s is conservative for local disk writes.
+	minCacheWriteThroughput = 5 * 1024 * 1024 // 5 MB/s
 )
+
+// cacheWriteTimeoutForSize returns a timeout scaled to contentLength.
+// Returns at least cacheWriteTimeout (60s), scaling up for large objects.
+func cacheWriteTimeoutForSize(contentLength int64) time.Duration {
+	if contentLength <= 0 {
+		return cacheWriteTimeout
+	}
+	sizeBasedTimeout := time.Duration(contentLength/minCacheWriteThroughput) * time.Second
+	if sizeBasedTimeout > cacheWriteTimeout {
+		return sizeBasedTimeout
+	}
+	return cacheWriteTimeout
+}
 
 // setupCacheListener creates a listener that streams chunks directly to cache via io.Pipe.
 // This avoids buffering the entire response in memory.
@@ -108,7 +126,8 @@ func (s *Service) setupCacheListener(
 		}
 
 		// Use a detached context for cache writes to avoid cancellation when HTTP request completes.
-		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
+		// Scale timeout by content length so large objects have enough time to write.
+		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
 		defer cacheCancel()
 
 		ttl := int(s.config.Cache.TTL.Seconds())
@@ -327,7 +346,7 @@ streamLoop:
 				return streamErr
 			}
 			return err
-		case <-time.After(cacheWriteTimeout):
+		case <-time.After(cacheWriteTimeoutForSize(resp.ContentLength)):
 			log.Warn().Str("bucket", bucket).Str("key", key).Msg("Background cache write timeout")
 			return errors.New("cache write timeout")
 		}
