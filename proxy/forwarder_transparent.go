@@ -301,11 +301,18 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
 }
 
-// learnPublicAccess grants public bucket authorization when an anonymous request
-// receives a successful response from Tigris. Uses dedicated public access methods
-// on AuthzCache to track which buckets are publicly accessible.
+// learnPublicAccess grants public bucket authorization when an anonymous
+// GET/HEAD request for a specific object receives a successful response from
+// Tigris. Only object-level reads are used for learning to avoid granting
+// broad cache access from bucket-level operations (e.g., ListObjectsV2) that
+// may have different access policies than individual objects.
 func (f *transparentForwarder) learnPublicAccess(resp *http.Response, r *http.Request) {
 	if f.authzCache == nil {
+		return
+	}
+
+	// Only learn from GET/HEAD on specific objects, not bucket-level operations
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return
 	}
 
@@ -319,9 +326,9 @@ func (f *transparentForwarder) learnPublicAccess(resp *http.Response, r *http.Re
 		return
 	}
 
-	bucket, _ := ParseBucketKey(r)
-	if bucket == "" {
-		return
+	bucket, key := ParseBucketKey(r)
+	if bucket == "" || key == "" {
+		return // Bucket-only path (e.g., list operations) — skip
 	}
 
 	f.authzCache.GrantPublic(bucket)
