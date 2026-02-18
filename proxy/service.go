@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -33,7 +34,7 @@ type Service struct {
 	config                 *config.Config
 	cacheSemaphore         chan struct{}      // Limits concurrent cache writes
 	broadcastManager       *broadcast.Manager // For streaming request coalescing
-	backgroundFetchManager *broadcast.Manager // For background full-object fetches (range caching)
+	activeBackgroundFetches sync.Map          // Dedup for background full-object fetches (range caching)
 }
 
 // NewService creates a new proxy service.
@@ -44,12 +45,11 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 	}
 
 	return &Service{
-		forwarder:              forwarder,
-		cache:                  cache,
-		config:                 cfg,
-		cacheSemaphore:         make(chan struct{}, maxConcurrentCacheWrites),
-		broadcastManager:       broadcast.NewManager(channelBuf),
-		backgroundFetchManager: broadcast.NewManager(channelBuf),
+		forwarder:        forwarder,
+		cache:            cache,
+		config:           cfg,
+		cacheSemaphore:   make(chan struct{}, maxConcurrentCacheWrites),
+		broadcastManager: broadcast.NewManager(channelBuf),
 	}
 }
 

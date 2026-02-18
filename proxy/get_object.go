@@ -670,12 +670,16 @@ func (s *Service) handleRangeWithBackgroundCache(
 	// - Total size is known and within cache threshold
 	// - Cache is enabled
 	// - We have valid credentials for the background fetch
+	// - Object is not already cached (prevents redundant fetches when many
+	//   parallel range requests each finish after a prior background fetch completes)
 	if resp.StatusCode == http.StatusPartialContent &&
 		totalSize > 0 &&
 		totalSize <= s.config.Cache.SizeThreshold &&
 		s.cache.IsEnabled() &&
 		accessKey != "" && secretKey != "" {
-		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey)
+		if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
+			s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey)
+		}
 	}
 
 	return nil

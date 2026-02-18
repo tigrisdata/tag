@@ -45,6 +45,7 @@ func (f *transparentForwarder) initInterceptor() {
 // signing keys from successful responses and revokes authZ on 403s.
 func (f *transparentForwarder) interceptResponse(resp *http.Response, originalReq *http.Request) {
 	f.learnSigningKeys(resp, originalReq)
+	f.learnPublicAccess(resp, originalReq)
 	f.handleAuthzRevocation(resp, originalReq)
 }
 
@@ -149,10 +150,12 @@ func (f *transparentForwarder) ValidateAndGetCredentials(r *http.Request) (AuthR
 	if err != nil {
 		return AuthNotValidated, "", "", err
 	}
-	if result == AuthNotValidated {
-		return AuthNotValidated, "", "", nil
-	}
-	return AuthValidated, f.proxySigner.AccessKey(), f.proxySigner.SecretKey(), nil
+	// Always return proxy credentials regardless of auth result.
+	// AuthResult controls cache reads (line 88 in get_object.go).
+	// Credentials are needed for background cache fetch (DoFullObjectRequest),
+	// which always uses TAG's own credentials via SigV4 signing.
+	// DoRequestWithCreds in transparent mode ignores these (uses client's auth).
+	return result, f.proxySigner.AccessKey(), f.proxySigner.SecretKey(), nil
 }
 
 // validateLocally performs local SigV4 validation of the client's request.
@@ -169,6 +172,13 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 		// handling (e.g., public bucket access). Only truly malformed auth headers
 		// are rejected as client errors.
 		if errors.Is(err, auth.ErrMissingAuth) {
+			// Check if this bucket has been previously confirmed as publicly accessible
+			bucket, _ := ParseBucketKey(r)
+			if bucket != "" && f.authzCache != nil && f.authzCache.IsPublicAuthorized(bucket) {
+				metrics.RecordLocalAuthValidation("public_access")
+				log.Debug().Str("bucket", bucket).Msg("Local auth: public bucket - serving from cache")
+				return AuthValidated, nil
+			}
 			metrics.RecordLocalAuthValidation("missing_auth")
 			return AuthNotValidated, nil
 		}
@@ -179,6 +189,7 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 	// Check if we have any signing key for this access key
 	if !f.derivedKeyStore.HasKey(authInfo.AccessKey) {
 		metrics.RecordLocalAuthValidation("unknown_key")
+		log.Debug().Msg("Local auth: unknown key - no signing keys learned for this access key")
 		return AuthNotValidated, nil // Unknown key → skip cache, forward to Tigris
 	}
 
@@ -187,6 +198,7 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 		// Any validation failure (signature mismatch, unknown date/region, key rotation)
 		// → skip cache, forward to Tigris to get authoritative decision + fresh keys
 		metrics.RecordLocalAuthValidation("signature_mismatch")
+		log.Debug().Err(err).Msg("Local auth: signature mismatch")
 		return AuthNotValidated, nil
 	}
 
@@ -194,10 +206,12 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 	bucket, _ := ParseBucketKey(r)
 	if !f.authzCache.IsAuthorized(authInfo.AccessKey, bucket) {
 		metrics.RecordLocalAuthValidation("authz_expired")
+		log.Debug().Str("bucket", bucket).Msg("Local auth: authz expired for bucket")
 		return AuthNotValidated, nil // AuthZ expired → forward to Tigris
 	}
 
 	metrics.RecordLocalAuthValidation("success")
+	log.Debug().Msg("Local auth: validated successfully")
 	return AuthValidated, nil
 }
 
@@ -246,6 +260,9 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 
 	// Header may be absent on 2xx if feature is disabled on Tigris side, or non-proxy request
 	if headerVal == "" || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if headerVal == "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			log.Debug().Int("status", resp.StatusCode).Msg("Signing keys header absent from successful response")
+		}
 		return
 	}
 
@@ -273,8 +290,42 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 	bucket, _ := ParseBucketKey(r)
 	f.authzCache.Grant(authInfo.AccessKey, bucket)
 
+	log.Debug().
+		Str("bucket", bucket).
+		Int("keys_learned", len(entries)).
+		Int("store_size", f.derivedKeyStore.Count()).
+		Msg("Signing keys learned successfully")
+
 	metrics.ProxySigningKeysReceived.Inc()
 	metrics.DerivedKeyStoreSize.Set(float64(f.derivedKeyStore.Count()))
+	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
+}
+
+// learnPublicAccess grants public bucket authorization when an anonymous request
+// receives a successful response from Tigris. Uses dedicated public access methods
+// on AuthzCache to track which buckets are publicly accessible.
+func (f *transparentForwarder) learnPublicAccess(resp *http.Response, r *http.Request) {
+	if f.authzCache == nil {
+		return
+	}
+
+	// Only learn from anonymous requests (no header or query param auth)
+	if r.Header.Get("Authorization") != "" || r.URL.Query().Get("X-Amz-Credential") != "" {
+		return
+	}
+
+	// Only learn from successful responses
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return
+	}
+
+	bucket, _ := ParseBucketKey(r)
+	if bucket == "" {
+		return
+	}
+
+	f.authzCache.GrantPublic(bucket)
+	log.Debug().Str("bucket", bucket).Msg("Public bucket access learned")
 	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
 }
 
@@ -286,6 +337,14 @@ func (f *transparentForwarder) handleAuthzRevocation(resp *http.Response, r *htt
 
 	authInfo, err := auth.ParseAuthInfo(r)
 	if err != nil {
+		// Anonymous request receiving 403 — revoke public access
+		if errors.Is(err, auth.ErrMissingAuth) {
+			bucket, _ := ParseBucketKey(r)
+			if bucket != "" {
+				f.authzCache.RevokePublic(bucket)
+				log.Debug().Str("bucket", bucket).Msg("Public bucket access revoked on 403")
+			}
+		}
 		return
 	}
 

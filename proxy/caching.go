@@ -357,32 +357,36 @@ streamLoop:
 }
 
 // triggerBackgroundCacheFetch starts a background fetch of the full object.
-// Uses broadcast manager to coalesce multiple triggers for the same object.
+// Uses sync.Map for deduplication: only the first trigger for a given object
+// starts a fetch; subsequent triggers while the fetch is in progress are no-ops.
+// This avoids broadcast.Manager's "no late joiners" policy which incorrectly
+// allows multiple fetches when the first has already started streaming.
 func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string) {
 	bcastKey := "bg:" + bucket + "/" + key
 
-	broadcaster, isFirst := s.backgroundFetchManager.GetOrCreate(bcastKey)
-	if !isFirst {
-		// Another background fetch is already in progress
+	// Atomic check-and-set: if key exists, a fetch is already in progress
+	if _, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, struct{}{}); loaded {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background fetch already in progress, coalescing")
 		return
 	}
 
-	// I'm the first - start the background fetch
 	metrics.RecordBackgroundFetchTriggered()
-	metrics.SetActiveBackgroundFetches(s.backgroundFetchManager.ActiveCount())
+	metrics.ActiveBackgroundFetches.Inc()
 
 	go func() {
-		defer func() {
-			s.backgroundFetchManager.Remove(bcastKey)
-			metrics.SetActiveBackgroundFetches(s.backgroundFetchManager.ActiveCount())
-		}()
+		defer s.activeBackgroundFetches.Delete(bcastKey)
+		defer metrics.ActiveBackgroundFetches.Dec()
 
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
 
-		// Note: fetchFullObjectToCache calls broadcaster.Complete() internally
-		// before waiting for cache write, to avoid deadlock.
+		// Create broadcaster directly — only used for streaming to cache listener
+		channelBuf := s.config.Broadcast.ChannelBuffer
+		if channelBuf <= 0 {
+			channelBuf = broadcast.DefaultChannelBuffer
+		}
+		broadcaster := broadcast.NewBroadcaster(channelBuf)
+
 		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, broadcaster)
 
 		if err != nil {
