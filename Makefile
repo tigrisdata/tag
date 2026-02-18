@@ -55,8 +55,17 @@ ROCKSDB_STATIC_DIR := $(shell pwd)/rocksdb-static
 
 # CGO configuration for RocksDB (always enabled for embedded cache)
 ifeq ($(UNAME_S),Darwin)
-    # macOS: link against static rocksdb + homebrew compression libs
-    CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -L$(BREW_PREFIX)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread
+    # macOS: link against static rocksdb + statically link compression libs
+    # Reference .a files directly to avoid dylib dependencies that break distribution.
+    # Using -l flags with Homebrew in the search path causes macOS ld to prefer .dylib,
+    # resulting in "Library not loaded: libsnappy.1.dylib" on machines without Homebrew.
+    CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -lrocksdb \
+        $(BREW_PREFIX)/opt/snappy/lib/libsnappy.a \
+        $(BREW_PREFIX)/opt/lz4/lib/liblz4.a \
+        $(BREW_PREFIX)/opt/zstd/lib/libzstd.a \
+        $(BREW_PREFIX)/opt/bzip2/lib/libbz2.a \
+        $(BREW_PREFIX)/opt/zlib/lib/libz.a \
+        -lstdc++ -lm -pthread
     # macOS can't fully static link, just strip symbols
     LDFLAGS := -ldflags "-s -w -X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME) -X main.GitCommit=$(GIT_COMMIT)"
 else
