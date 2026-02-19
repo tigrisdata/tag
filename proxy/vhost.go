@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net"
 	"net/url"
 	"strings"
 )
@@ -20,6 +21,33 @@ func VHostEndpoint(endpoint, bucket string) string {
 
 	u.Host = bucket + "." + u.Host
 	return u.String()
+}
+
+// SupportsVHost returns true if the endpoint supports vhost-style addressing
+// (bucket.hostname). This requires a real domain name with wildcard DNS.
+// IP addresses (127.0.0.1, [::1]) and localhost cannot resolve bucket subdomains.
+func SupportsVHost(endpoint string) bool {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+
+	host := u.Hostname() // strips port
+	if host == "" {
+		return false
+	}
+
+	// IP addresses don't support wildcard DNS subdomains
+	if net.ParseIP(host) != nil {
+		return false
+	}
+
+	// localhost doesn't support subdomains
+	if host == "localhost" {
+		return false
+	}
+
+	return true
 }
 
 // RemoveBucketPrefix strips the leading /bucket from a path.

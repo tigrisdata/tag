@@ -64,7 +64,7 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 	// was computed against the path-style canonical URI — changing it would break validation.
 	isAnonymous := hasNoAuthCredentials(r)
 	var endpointURL, reqPath, rawPath string
-	if isAnonymous && bucket != "" {
+	if isAnonymous && bucket != "" && SupportsVHost(f.upstreamEndpoint) {
 		endpointURL = VHostEndpoint(f.upstreamEndpoint, bucket)
 		reqPath = RemoveBucketPrefix(r.URL.Path, bucket)
 		if r.URL.RawPath != "" {

@@ -57,6 +57,34 @@ func TestVHostEndpoint(t *testing.T) {
 	}
 }
 
+func TestSupportsVHost(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		want     bool
+	}{
+		{name: "tigris domain", endpoint: "https://t3.storage.dev", want: true},
+		{name: "tigris subdomain", endpoint: "https://fly.storage.tigris.dev", want: true},
+		{name: "domain with port", endpoint: "https://t3.storage.dev:443", want: true},
+		{name: "localhost", endpoint: "http://localhost:8080", want: false},
+		{name: "ipv4", endpoint: "http://127.0.0.1:8080", want: false},
+		{name: "ipv4 no port", endpoint: "http://127.0.0.1", want: false},
+		{name: "ipv6 loopback", endpoint: "http://[::1]:8080", want: false},
+		{name: "ipv4 address", endpoint: "http://10.0.0.1:9000", want: false},
+		{name: "empty", endpoint: "", want: false},
+		{name: "invalid url", endpoint: "://bad", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SupportsVHost(tt.endpoint)
+			if got != tt.want {
+				t.Errorf("SupportsVHost(%q) = %v, want %v", tt.endpoint, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRemoveBucketPrefix(t *testing.T) {
 	tests := []struct {
 		name   string
