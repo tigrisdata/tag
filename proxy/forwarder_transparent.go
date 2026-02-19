@@ -125,7 +125,7 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 	forwardedHost := r.Host
 
 	// Compute and set the 4 proxy headers
-	proxyHeaders := f.proxySigner.ComputeProxyHeaders(forwardedHost, r.Method, r.URL.Path)
+	proxyHeaders := f.proxySigner.ComputeProxyHeaders(forwardedHost, r.Method, reqPath)
 	fwdReq.Header.Set("X-Tigris-Forwarded-Host", proxyHeaders.ForwardedHost)
 	fwdReq.Header.Set("X-Tigris-Proxy-Access-Key", proxyHeaders.ProxyAccessKey)
 	fwdReq.Header.Set("X-Tigris-Proxy-Timestamp", proxyHeaders.ProxyTimestamp)

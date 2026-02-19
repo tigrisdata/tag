@@ -696,7 +696,7 @@ func (s *Service) handleRangeWithBackgroundCache(
 		s.cache.IsEnabled() &&
 		accessKey != "" && secretKey != "" {
 		if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
-			s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey)
+			s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r))
 		}
 	}
 
