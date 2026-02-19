@@ -278,11 +278,6 @@ func RecordRangeFromCacheHit() {
 	RangeFromCacheHits.Inc()
 }
 
-// SetActiveBackgroundFetches sets the number of active background fetches.
-func SetActiveBackgroundFetches(count int) {
-	ActiveBackgroundFetches.Set(float64(count))
-}
-
 // RecordLocalAuthValidation records a local auth validation result.
 func RecordLocalAuthValidation(result string) {
 	LocalAuthValidations.WithLabelValues(result).Inc()

@@ -31,6 +31,7 @@ type CachedObjectMeta struct {
 	LastModified  int64             `json:"last_modified"` // Unix timestamp (seconds)
 	CacheControl  string            `json:"cache_control,omitempty"`
 	StorageClass  string            `json:"storage_class,omitempty"`
+	ACL           string            `json:"acl,omitempty"`           // X-Amz-Acl canned ACL (e.g., "public-read")
 	UserMetadata  map[string]string `json:"user_metadata,omitempty"` // x-amz-meta-*
 	StatusCode    int               `json:"status_code"`             // Original HTTP status (200, etc.)
 }
@@ -45,6 +46,7 @@ func MetaFromHTTPHeaders(bucket, key string, statusCode int, headers http.Header
 		ContentType:  headers.Get("Content-Type"),
 		CacheControl: headers.Get("Cache-Control"),
 		StorageClass: headers.Get("x-amz-storage-class"),
+		ACL:          headers.Get("X-Amz-Acl"),
 		UserMetadata: make(map[string]string),
 	}
 
@@ -93,11 +95,19 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter) {
 	if m.StorageClass != "" {
 		w.Header().Set("x-amz-storage-class", m.StorageClass)
 	}
+	if m.ACL != "" {
+		w.Header().Set("X-Amz-Acl", m.ACL)
+	}
 	// Write user metadata with lowercase keys per S3 convention
 	for k, v := range m.UserMetadata {
 		lk := strings.ToLower(k)
 		w.Header().Set(lk, v)
 	}
+}
+
+// IsPublicRead returns true if the object's ACL allows anonymous read access.
+func (m *CachedObjectMeta) IsPublicRead() bool {
+	return m.ACL == "public-read" || m.ACL == "public-read-write"
 }
 
 // IsCacheable returns true if the object should be cached based on headers.

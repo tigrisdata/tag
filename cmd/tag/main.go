@@ -130,12 +130,44 @@ func main() {
 		Str("version", Version).
 		Str("build_time", BuildTime).
 		Str("git_commit", GitCommit).
-		Int("http_port", cfg.Server.HTTPPort).
-		Str("upstream", cfg.Upstream.Endpoint).
-		Bool("cache_enabled", cfg.Cache.IsEnabled()).
-		Bool("transparent_proxy", cfg.Upstream.IsTransparentProxy()).
-		Bool("tls_enabled", cfg.Server.TLSEnabled()).
-		Str("node_id", cfg.Cache.NodeID).
+		Dict("server", zerolog.Dict().
+			Int("http_port", cfg.Server.HTTPPort).
+			Str("bind_ip", cfg.Server.BindIP).
+			Bool("tls_enabled", cfg.Server.TLSEnabled()).
+			Str("tls_cert_file", cfg.Server.TLSCertFile).
+			Str("tls_key_file", cfg.Server.TLSKeyFile).
+			Bool("pprof_enabled", cfg.Server.PprofEnabled),
+		).
+		Dict("upstream", zerolog.Dict().
+			Str("endpoint", cfg.Upstream.Endpoint).
+			Str("region", cfg.Upstream.Region).
+			Int("max_idle_conns_per_host", cfg.Upstream.MaxIdleConnsPerHost).
+			Bool("transparent_proxy", cfg.Upstream.IsTransparentProxy()),
+		).
+		Dict("cache", zerolog.Dict().
+			Bool("enabled", cfg.Cache.IsEnabled()).
+			Str("ttl", cfg.Cache.TTL.String()).
+			Int64("size_threshold", cfg.Cache.SizeThreshold).
+			Str("disk_path", cfg.Cache.DiskPath).
+			Int64("max_disk_usage_bytes", cfg.Cache.MaxDiskUsageBytes).
+			Str("node_id", cfg.Cache.NodeID).
+			Str("cluster_addr", cfg.Cache.ClusterAddr).
+			Str("grpc_addr", cfg.Cache.GRPCAddr).
+			Str("advertise_addr", cfg.Cache.AdvertiseAddr).
+			Strs("seed_nodes", cfg.Cache.SeedNodes).
+			Bool("grpc_auth", cfg.Cache.IsGRPCAuthEnabled()),
+		).
+		Dict("credentials", zerolog.Dict().
+			Str("authz_cache_ttl", cfg.Credentials.AuthzCacheTTL.String()),
+		).
+		Dict("broadcast", zerolog.Dict().
+			Int("chunk_size", cfg.Broadcast.ChunkSize).
+			Int("channel_buffer", cfg.Broadcast.ChannelBuffer),
+		).
+		Dict("log", zerolog.Dict().
+			Str("level", cfg.Log.Level).
+			Str("format", cfg.Log.Format),
+		).
 		Msg("Starting TAG (Tigris Access Gateway)")
 
 	// Create context for graceful shutdown
