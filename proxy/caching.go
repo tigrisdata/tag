@@ -47,12 +47,30 @@ func (s *signalingReader) Ready() <-chan struct{} {
 }
 
 const (
-	// cacheWriteTimeout is the timeout for cache writes.
+	// cacheWriteTimeout is the base timeout for cache writes.
 	cacheWriteTimeout = 60 * time.Second
 
 	// backgroundFetchTimeout is the timeout for background fetches.
 	backgroundFetchTimeout = 5 * time.Minute
+
+	// minCacheWriteThroughput is the minimum expected cache write speed.
+	// Used to compute dynamic timeouts for large objects.
+	// 5 MB/s is conservative for local disk writes.
+	minCacheWriteThroughput = 5 * 1024 * 1024 // 5 MB/s
 )
+
+// cacheWriteTimeoutForSize returns a timeout scaled to contentLength.
+// Returns at least cacheWriteTimeout (60s), scaling up for large objects.
+func cacheWriteTimeoutForSize(contentLength int64) time.Duration {
+	if contentLength <= 0 {
+		return cacheWriteTimeout
+	}
+	sizeBasedTimeout := time.Duration(contentLength/minCacheWriteThroughput) * time.Second
+	if sizeBasedTimeout > cacheWriteTimeout {
+		return sizeBasedTimeout
+	}
+	return cacheWriteTimeout
+}
 
 // setupCacheListener creates a listener that streams chunks directly to cache via io.Pipe.
 // This avoids buffering the entire response in memory.
@@ -108,7 +126,8 @@ func (s *Service) setupCacheListener(
 		}
 
 		// Use a detached context for cache writes to avoid cancellation when HTTP request completes.
-		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
+		// Scale timeout by content length so large objects have enough time to write.
+		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
 		defer cacheCancel()
 
 		ttl := int(s.config.Cache.TTL.Seconds())
@@ -240,6 +259,7 @@ func (s *Service) setupCacheListener(
 func (s *Service) fetchFullObjectToCache(
 	ctx context.Context,
 	bucket, key, accessKey, secretKey string,
+	publicACL bool,
 	broadcaster *broadcast.Broadcaster,
 ) error {
 	// Execute full object request (no Range header)
@@ -272,6 +292,13 @@ func (s *Service) fetchFullObjectToCache(
 
 	// Set up cache listener (streams to cache via pipe)
 	cachePipeWriter, cacheErrCh := s.setupCacheListener(ctx, bucket, key, broadcaster)
+
+	// If the original request was anonymous and succeeded, the object is publicly
+	// accessible. Tigris omits X-Amz-Acl for objects inheriting bucket-level access,
+	// so inject public-read to ensure the cached metadata allows anonymous reads.
+	if publicACL && resp.Header.Get("X-Amz-Acl") == "" {
+		resp.Header.Set("X-Amz-Acl", "public-read")
+	}
 
 	// Set headers for the cache listener
 	broadcaster.SetHeaders(resp.StatusCode, resp.Header)
@@ -327,7 +354,7 @@ streamLoop:
 				return streamErr
 			}
 			return err
-		case <-time.After(cacheWriteTimeout):
+		case <-time.After(cacheWriteTimeoutForSize(resp.ContentLength)):
 			log.Warn().Str("bucket", bucket).Str("key", key).Msg("Background cache write timeout")
 			return errors.New("cache write timeout")
 		}
@@ -338,33 +365,37 @@ streamLoop:
 }
 
 // triggerBackgroundCacheFetch starts a background fetch of the full object.
-// Uses broadcast manager to coalesce multiple triggers for the same object.
-func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string) {
+// Uses sync.Map for deduplication: only the first trigger for a given object
+// starts a fetch; subsequent triggers while the fetch is in progress are no-ops.
+// This avoids broadcast.Manager's "no late joiners" policy which incorrectly
+// allows multiple fetches when the first has already started streaming.
+func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, publicACL bool) {
 	bcastKey := "bg:" + bucket + "/" + key
 
-	broadcaster, isFirst := s.backgroundFetchManager.GetOrCreate(bcastKey)
-	if !isFirst {
-		// Another background fetch is already in progress
+	// Atomic check-and-set: if key exists, a fetch is already in progress
+	if _, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, struct{}{}); loaded {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background fetch already in progress, coalescing")
 		return
 	}
 
-	// I'm the first - start the background fetch
 	metrics.RecordBackgroundFetchTriggered()
-	metrics.SetActiveBackgroundFetches(s.backgroundFetchManager.ActiveCount())
+	metrics.ActiveBackgroundFetches.Inc()
 
 	go func() {
-		defer func() {
-			s.backgroundFetchManager.Remove(bcastKey)
-			metrics.SetActiveBackgroundFetches(s.backgroundFetchManager.ActiveCount())
-		}()
+		defer metrics.ActiveBackgroundFetches.Dec()
+		defer s.activeBackgroundFetches.Delete(bcastKey)
 
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
 
-		// Note: fetchFullObjectToCache calls broadcaster.Complete() internally
-		// before waiting for cache write, to avoid deadlock.
-		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, broadcaster)
+		// Create broadcaster directly — only used for streaming to cache listener
+		channelBuf := s.config.Broadcast.ChannelBuffer
+		if channelBuf <= 0 {
+			channelBuf = broadcast.DefaultChannelBuffer
+		}
+		broadcaster := broadcast.NewBroadcaster(channelBuf)
+
+		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, publicACL, broadcaster)
 
 		if err != nil {
 			log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background cache fetch failed")

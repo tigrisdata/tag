@@ -85,9 +85,18 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// 2. Check cache (fast path) - now also works for range requests!
 	// For range requests: check if full object is in cache, then serve range from it.
 	// Uses two-phase approach: GetMeta first, then GetBodyStream for direct streaming.
-	if result == AuthValidated && !noCacheRead && s.cache.IsEnabled() {
+	// Anonymous requests can also read from cache if the object's ACL is public-read.
+	isAnonymous := isAnonymousRequest(r, result, err)
+
+	if (result == AuthValidated || isAnonymous) && !noCacheRead && s.cache.IsEnabled() {
 		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
-		if cacheErr == nil && found && meta != nil {
+		cacheHit := cacheErr == nil && found && meta != nil
+		// Anonymous requests can only be served from cache if the object's ACL allows it
+		if cacheHit && isAnonymous && !meta.IsPublicRead() {
+			cacheHit = false
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping cache for anonymous request - object not public")
+		}
+		if cacheHit {
 			// If this is a Range request and we have the full object cached,
 			// serve the range from the cached object
 			if rangeHeader != "" {
@@ -322,6 +331,15 @@ func (s *Service) streamFromUpstream(
 
 	if shouldCache {
 		cachePipeWriter, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster)
+	}
+
+	// If an anonymous GET succeeded and Tigris didn't set an explicit per-object ACL,
+	// the object inherits public access from the bucket. Record this so subsequent
+	// anonymous requests can be served from cache.
+	if resp.StatusCode == http.StatusOK &&
+		hasNoAuthCredentials(r) &&
+		resp.Header.Get("X-Amz-Acl") == "" {
+		resp.Header.Set("X-Amz-Acl", "public-read")
 	}
 
 	// Set headers for all listeners
@@ -670,12 +688,16 @@ func (s *Service) handleRangeWithBackgroundCache(
 	// - Total size is known and within cache threshold
 	// - Cache is enabled
 	// - We have valid credentials for the background fetch
+	// - Object is not already cached (prevents redundant fetches when many
+	//   parallel range requests each finish after a prior background fetch completes)
 	if resp.StatusCode == http.StatusPartialContent &&
 		totalSize > 0 &&
 		totalSize <= s.config.Cache.SizeThreshold &&
 		s.cache.IsEnabled() &&
 		accessKey != "" && secretKey != "" {
-		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey)
+		if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
+			s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r))
+		}
 	}
 
 	return nil

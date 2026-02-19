@@ -56,13 +56,33 @@ func (f *transparentForwarder) interceptResponse(resp *http.Response, originalRe
 // Content-Encoding: aws-chunked header is present per the S3 spec. Some clients
 // (e.g., minio-go) omit this header despite using chunked encoding on the wire.
 func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *http.Request) (*http.Request, error) {
-	baseURL, err := url.Parse(f.upstreamEndpoint)
+	bucket, _ := ParseBucketKey(r)
+
+	// Use vhost-style addressing only for anonymous requests (no Authorization header).
+	// Tigris requires vhost-style for anonymous access to public buckets.
+	// Authenticated requests must keep path-style because the client's SigV4 signature
+	// was computed against the path-style canonical URI — changing it would break validation.
+	isAnonymous := hasNoAuthCredentials(r)
+	var endpointURL, reqPath, rawPath string
+	if isAnonymous && bucket != "" && SupportsVHost(f.upstreamEndpoint) {
+		endpointURL = VHostEndpoint(f.upstreamEndpoint, bucket)
+		reqPath = RemoveBucketPrefix(r.URL.Path, bucket)
+		if r.URL.RawPath != "" {
+			rawPath = RemoveBucketPrefix(r.URL.RawPath, bucket)
+		}
+	} else {
+		endpointURL = f.upstreamEndpoint
+		reqPath = r.URL.Path
+		rawPath = r.URL.RawPath
+	}
+
+	baseURL, err := url.Parse(endpointURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse endpoint: %w", err)
 	}
 
-	baseURL.Path = r.URL.Path
-	baseURL.RawPath = r.URL.RawPath
+	baseURL.Path = reqPath
+	baseURL.RawPath = rawPath
 	baseURL.RawQuery = r.URL.RawQuery
 
 	fwdReq, err := http.NewRequestWithContext(ctx, r.Method, baseURL.String(), r.Body)
@@ -105,7 +125,7 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 	forwardedHost := r.Host
 
 	// Compute and set the 4 proxy headers
-	proxyHeaders := f.proxySigner.ComputeProxyHeaders(forwardedHost, r.Method, r.URL.Path)
+	proxyHeaders := f.proxySigner.ComputeProxyHeaders(forwardedHost, r.Method, reqPath)
 	fwdReq.Header.Set("X-Tigris-Forwarded-Host", proxyHeaders.ForwardedHost)
 	fwdReq.Header.Set("X-Tigris-Proxy-Access-Key", proxyHeaders.ProxyAccessKey)
 	fwdReq.Header.Set("X-Tigris-Proxy-Timestamp", proxyHeaders.ProxyTimestamp)
@@ -149,10 +169,12 @@ func (f *transparentForwarder) ValidateAndGetCredentials(r *http.Request) (AuthR
 	if err != nil {
 		return AuthNotValidated, "", "", err
 	}
-	if result == AuthNotValidated {
-		return AuthNotValidated, "", "", nil
-	}
-	return AuthValidated, f.proxySigner.AccessKey(), f.proxySigner.SecretKey(), nil
+	// Always return proxy credentials regardless of auth result.
+	// AuthResult controls cache reads (line 88 in get_object.go).
+	// Credentials are needed for background cache fetch (DoFullObjectRequest),
+	// which always uses TAG's own credentials via SigV4 signing.
+	// DoRequestWithCreds in transparent mode ignores these (uses client's auth).
+	return result, f.proxySigner.AccessKey(), f.proxySigner.SecretKey(), nil
 }
 
 // validateLocally performs local SigV4 validation of the client's request.
@@ -179,6 +201,7 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 	// Check if we have any signing key for this access key
 	if !f.derivedKeyStore.HasKey(authInfo.AccessKey) {
 		metrics.RecordLocalAuthValidation("unknown_key")
+		log.Debug().Msg("Local auth: unknown key - no signing keys learned for this access key")
 		return AuthNotValidated, nil // Unknown key → skip cache, forward to Tigris
 	}
 
@@ -187,6 +210,7 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 		// Any validation failure (signature mismatch, unknown date/region, key rotation)
 		// → skip cache, forward to Tigris to get authoritative decision + fresh keys
 		metrics.RecordLocalAuthValidation("signature_mismatch")
+		log.Debug().Err(err).Msg("Local auth: signature mismatch")
 		return AuthNotValidated, nil
 	}
 
@@ -194,10 +218,12 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 	bucket, _ := ParseBucketKey(r)
 	if !f.authzCache.IsAuthorized(authInfo.AccessKey, bucket) {
 		metrics.RecordLocalAuthValidation("authz_expired")
+		log.Debug().Str("bucket", bucket).Msg("Local auth: authz expired for bucket")
 		return AuthNotValidated, nil // AuthZ expired → forward to Tigris
 	}
 
 	metrics.RecordLocalAuthValidation("success")
+	log.Debug().Msg("Local auth: validated successfully")
 	return AuthValidated, nil
 }
 
@@ -246,6 +272,9 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 
 	// Header may be absent on 2xx if feature is disabled on Tigris side, or non-proxy request
 	if headerVal == "" || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if headerVal == "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			log.Debug().Int("status", resp.StatusCode).Msg("Signing keys header absent from successful response")
+		}
 		return
 	}
 
@@ -272,6 +301,12 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 
 	bucket, _ := ParseBucketKey(r)
 	f.authzCache.Grant(authInfo.AccessKey, bucket)
+
+	log.Debug().
+		Str("bucket", bucket).
+		Int("keys_learned", len(entries)).
+		Int("store_size", f.derivedKeyStore.Count()).
+		Msg("Signing keys learned successfully")
 
 	metrics.ProxySigningKeysReceived.Inc()
 	metrics.DerivedKeyStoreSize.Set(float64(f.derivedKeyStore.Count()))

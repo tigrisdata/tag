@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/tigrisdata/tag/auth"
@@ -270,6 +271,79 @@ func (e *TestEnvironment) DoRawGetUnauthenticated(bucket, key string) (*http.Res
 		return nil, fmt.Errorf("failed to create unauthenticated GET request: %w", err)
 	}
 	return http.DefaultClient.Do(req)
+}
+
+// DoRawHeadUnauthenticated performs an HTTP HEAD without any Authorization header.
+// Useful for testing anonymous HEAD requests on public/private objects.
+// Caller is responsible for closing the response body.
+func (e *TestEnvironment) DoRawHeadUnauthenticated(bucket, key string) (*http.Response, error) {
+	url := e.Endpoint + "/" + bucket + "/" + key
+	req, err := http.NewRequestWithContext(context.Background(), "HEAD", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create unauthenticated HEAD request: %w", err)
+	}
+	return http.DefaultClient.Do(req)
+}
+
+// CreatePublicTestBucket creates a public-read bucket and tracks it for cleanup.
+// Sets X-Amz-Acl: public-read so all objects inherit public-read by default.
+func (e *TestEnvironment) CreatePublicTestBucket(suffix string) (string, error) {
+	bucketName := e.UniqueBucketName(suffix)
+
+	_, err := e.S3Client.CreateBucket(context.Background(), &s3.CreateBucketInput{
+		Bucket: aws.String(bucketName),
+		ACL:    types.BucketCannedACLPublicRead,
+	}, func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions,
+			smithyhttp.AddHeaderValue("X-Amz-Acl-Public-List-Objects-Enabled", "false"),
+		)
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create public bucket %s: %w", bucketName, err)
+	}
+
+	e.mu.Lock()
+	e.buckets = append(e.buckets, bucketName)
+	e.mu.Unlock()
+
+	return bucketName, nil
+}
+
+// CreatePublicTestBucketWithObjectACL creates a public-read bucket with per-object
+// ACL enforcement enabled. This allows individual objects to override the bucket's
+// public-read default with their own ACL (e.g., private).
+func (e *TestEnvironment) CreatePublicTestBucketWithObjectACL(suffix string) (string, error) {
+	bucketName := e.UniqueBucketName(suffix)
+
+	_, err := e.S3Client.CreateBucket(context.Background(), &s3.CreateBucketInput{
+		Bucket: aws.String(bucketName),
+		ACL:    types.BucketCannedACLPublicRead,
+	}, func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions,
+			smithyhttp.AddHeaderValue("X-Amz-Acl-Public-List-Objects-Enabled", "false"),
+			smithyhttp.AddHeaderValue("X-Tigris-Enable-Object-Acl", "true"),
+		)
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create public bucket with object ACL %s: %w", bucketName, err)
+	}
+
+	e.mu.Lock()
+	e.buckets = append(e.buckets, bucketName)
+	e.mu.Unlock()
+
+	return bucketName, nil
+}
+
+// PutTestObjectWithACL uploads an object with an explicit canned ACL.
+func (e *TestEnvironment) PutTestObjectWithACL(bucket, key string, data []byte, acl types.ObjectCannedACL) error {
+	_, err := e.S3Client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(data),
+		ACL:    acl,
+	})
+	return err
 }
 
 // randomString generates a random alphanumeric string of the specified length.
