@@ -125,9 +125,17 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	}
 
 	// Try to serve from cached metadata (no body needed)
-	if result == AuthValidated && !noCacheRead && s.cache.IsEnabled() {
+	// Anonymous requests can also read from cache if the object's ACL is public-read.
+	isAnonymous := isAnonymousRequest(r, result, err)
+
+	if (result == AuthValidated || isAnonymous) && !noCacheRead && s.cache.IsEnabled() {
 		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
-		if cacheErr == nil && found && meta != nil {
+		cacheHit := cacheErr == nil && found && meta != nil
+		if cacheHit && isAnonymous && !meta.IsPublicRead() {
+			cacheHit = false
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping HEAD cache for anonymous request - object not public")
+		}
+		if cacheHit {
 			metrics.RecordCacheHit()
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD served from cache")
 			meta.WriteHeaders(w)
@@ -232,6 +240,19 @@ func ParseBucketKey(r *http.Request) (bucket, key string) {
 		key = parts[1]
 	}
 	return
+}
+
+// hasNoAuthCredentials returns true if the request carries no SigV4 credentials
+// (no Authorization header and no X-Amz-Credential query parameter).
+func hasNoAuthCredentials(r *http.Request) bool {
+	return r.Header.Get("Authorization") == "" &&
+		r.URL.Query().Get("X-Amz-Credential") == ""
+}
+
+// isAnonymousRequest returns true if the request has no SigV4 authentication
+// and the auth result indicates it was not validated (AuthNotValidated with no error).
+func isAnonymousRequest(r *http.Request, result AuthResult, authErr error) bool {
+	return authErr == nil && result == AuthNotValidated && hasNoAuthCredentials(r)
 }
 
 // extractTotalSizeFromContentRange extracts total size from Content-Range header.

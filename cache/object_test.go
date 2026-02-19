@@ -17,6 +17,7 @@ func TestMetaFromHTTPHeaders(t *testing.T) {
 	headers.Set("Cache-Control", "max-age=3600")
 	headers.Set("X-Amz-Meta-Custom", "custom-value")
 	headers.Set("X-Amz-Storage-Class", "STANDARD")
+	headers.Set("X-Amz-Acl", "public-read")
 
 	obj := MetaFromHTTPHeaders("test-bucket", "test-key", http.StatusOK, headers)
 
@@ -46,6 +47,10 @@ func TestMetaFromHTTPHeaders(t *testing.T) {
 
 	if obj.StorageClass != "STANDARD" {
 		t.Errorf("StorageClass = %q, want %q", obj.StorageClass, "STANDARD")
+	}
+
+	if obj.ACL != "public-read" {
+		t.Errorf("ACL = %q, want %q", obj.ACL, "public-read")
 	}
 
 	if obj.StatusCode != http.StatusOK {
@@ -417,5 +422,97 @@ func TestCachedObjectMeta_EncodeDecodeMeta(t *testing.T) {
 	}
 	if decoded.StatusCode != original.StatusCode {
 		t.Errorf("StatusCode = %d, want %d", decoded.StatusCode, original.StatusCode)
+	}
+}
+
+func TestCachedObjectMeta_IsPublicRead(t *testing.T) {
+	tests := []struct {
+		name     string
+		acl      string
+		expected bool
+	}{
+		{name: "public-read", acl: "public-read", expected: true},
+		{name: "public-read-write", acl: "public-read-write", expected: true},
+		{name: "private", acl: "private", expected: false},
+		{name: "empty", acl: "", expected: false},
+		{name: "authenticated-read", acl: "authenticated-read", expected: false},
+		{name: "bucket-owner-full-control", acl: "bucket-owner-full-control", expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta := &CachedObjectMeta{ACL: tt.acl}
+			if got := meta.IsPublicRead(); got != tt.expected {
+				t.Errorf("IsPublicRead() = %v, want %v for ACL %q", got, tt.expected, tt.acl)
+			}
+		})
+	}
+}
+
+func TestMetaFromHTTPHeaders_ACL(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set("X-Amz-Acl", "private")
+
+	meta := MetaFromHTTPHeaders("bucket", "key", http.StatusOK, headers)
+	if meta.ACL != "private" {
+		t.Errorf("ACL = %q, want %q", meta.ACL, "private")
+	}
+}
+
+func TestMetaFromHTTPHeaders_NoACL(t *testing.T) {
+	headers := make(http.Header)
+
+	meta := MetaFromHTTPHeaders("bucket", "key", http.StatusOK, headers)
+	if meta.ACL != "" {
+		t.Errorf("ACL = %q, want empty string", meta.ACL)
+	}
+}
+
+func TestCachedObjectMeta_WriteHeaders_ACL(t *testing.T) {
+	meta := &CachedObjectMeta{
+		ACL:        "public-read",
+		StatusCode: http.StatusOK,
+	}
+
+	w := httptest.NewRecorder()
+	meta.WriteHeaders(w)
+
+	if got := w.Header().Get("X-Amz-Acl"); got != "public-read" {
+		t.Errorf("X-Amz-Acl header = %q, want %q", got, "public-read")
+	}
+}
+
+func TestCachedObjectMeta_WriteHeaders_NoACL(t *testing.T) {
+	meta := &CachedObjectMeta{
+		StatusCode: http.StatusOK,
+	}
+
+	w := httptest.NewRecorder()
+	meta.WriteHeaders(w)
+
+	if got := w.Header().Get("X-Amz-Acl"); got != "" {
+		t.Errorf("X-Amz-Acl header = %q, want empty", got)
+	}
+}
+
+func TestCachedObjectMeta_ACL_EncodeDecode(t *testing.T) {
+	original := &CachedObjectMeta{
+		Key:    "key",
+		Bucket: "bucket",
+		ACL:    "public-read",
+	}
+
+	data, err := original.Encode()
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+
+	decoded, err := DecodeMeta(data)
+	if err != nil {
+		t.Fatalf("DecodeMeta() error = %v", err)
+	}
+
+	if decoded.ACL != original.ACL {
+		t.Errorf("ACL = %q, want %q", decoded.ACL, original.ACL)
 	}
 }

@@ -56,28 +56,6 @@ func (c *AuthzCache) Count() int {
 	return c.cache.Len()
 }
 
-// publicAccessKey is the sentinel access key used for anonymous/public bucket access.
-// Kept internal — callers use GrantPublic/IsPublicAuthorized/RevokePublic.
-const publicAccessKey = "__public__"
-
-// GrantPublic records that the given bucket is publicly accessible.
-// The entry will expire after the configured TTL.
-func (c *AuthzCache) GrantPublic(bucket string) {
-	c.cache.Add(authzKey(publicAccessKey, bucket), struct{}{})
-}
-
-// IsPublicAuthorized checks if the given bucket has been confirmed as publicly accessible.
-// Returns false if the entry is expired or not found.
-func (c *AuthzCache) IsPublicAuthorized(bucket string) bool {
-	_, ok := c.cache.Get(authzKey(publicAccessKey, bucket))
-	return ok
-}
-
-// RevokePublic removes public access authorization for the given bucket.
-func (c *AuthzCache) RevokePublic(bucket string) {
-	c.cache.Remove(authzKey(publicAccessKey, bucket))
-}
-
 // authzKey builds the composite map key for the authorization cache.
 func authzKey(accessKey, bucket string) string {
 	return accessKey + "\x00" + bucket

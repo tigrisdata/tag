@@ -45,7 +45,6 @@ func (f *transparentForwarder) initInterceptor() {
 // signing keys from successful responses and revokes authZ on 403s.
 func (f *transparentForwarder) interceptResponse(resp *http.Response, originalReq *http.Request) {
 	f.learnSigningKeys(resp, originalReq)
-	f.learnPublicAccess(resp, originalReq)
 	f.handleAuthzRevocation(resp, originalReq)
 }
 
@@ -57,13 +56,33 @@ func (f *transparentForwarder) interceptResponse(resp *http.Response, originalRe
 // Content-Encoding: aws-chunked header is present per the S3 spec. Some clients
 // (e.g., minio-go) omit this header despite using chunked encoding on the wire.
 func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *http.Request) (*http.Request, error) {
-	baseURL, err := url.Parse(f.upstreamEndpoint)
+	bucket, _ := ParseBucketKey(r)
+
+	// Use vhost-style addressing only for anonymous requests (no Authorization header).
+	// Tigris requires vhost-style for anonymous access to public buckets.
+	// Authenticated requests must keep path-style because the client's SigV4 signature
+	// was computed against the path-style canonical URI — changing it would break validation.
+	isAnonymous := hasNoAuthCredentials(r)
+	var endpointURL, reqPath, rawPath string
+	if isAnonymous && bucket != "" {
+		endpointURL = VHostEndpoint(f.upstreamEndpoint, bucket)
+		reqPath = RemoveBucketPrefix(r.URL.Path, bucket)
+		if r.URL.RawPath != "" {
+			rawPath = RemoveBucketPrefix(r.URL.RawPath, bucket)
+		}
+	} else {
+		endpointURL = f.upstreamEndpoint
+		reqPath = r.URL.Path
+		rawPath = r.URL.RawPath
+	}
+
+	baseURL, err := url.Parse(endpointURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse endpoint: %w", err)
 	}
 
-	baseURL.Path = r.URL.Path
-	baseURL.RawPath = r.URL.RawPath
+	baseURL.Path = reqPath
+	baseURL.RawPath = rawPath
 	baseURL.RawQuery = r.URL.RawQuery
 
 	fwdReq, err := http.NewRequestWithContext(ctx, r.Method, baseURL.String(), r.Body)
@@ -172,13 +191,6 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 		// handling (e.g., public bucket access). Only truly malformed auth headers
 		// are rejected as client errors.
 		if errors.Is(err, auth.ErrMissingAuth) {
-			// Check if this bucket has been previously confirmed as publicly accessible
-			bucket, _ := ParseBucketKey(r)
-			if bucket != "" && f.authzCache != nil && f.authzCache.IsPublicAuthorized(bucket) {
-				metrics.RecordLocalAuthValidation("public_access")
-				log.Debug().Str("bucket", bucket).Msg("Local auth: public bucket - serving from cache")
-				return AuthValidated, nil
-			}
 			metrics.RecordLocalAuthValidation("missing_auth")
 			return AuthNotValidated, nil
 		}
@@ -301,41 +313,6 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
 }
 
-// learnPublicAccess grants public bucket authorization when an anonymous
-// GET/HEAD request for a specific object receives a successful response from
-// Tigris. Only object-level reads are used for learning to avoid granting
-// broad cache access from bucket-level operations (e.g., ListObjectsV2) that
-// may have different access policies than individual objects.
-func (f *transparentForwarder) learnPublicAccess(resp *http.Response, r *http.Request) {
-	if f.authzCache == nil {
-		return
-	}
-
-	// Only learn from GET/HEAD on specific objects, not bucket-level operations
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		return
-	}
-
-	// Only learn from anonymous requests (no header or query param auth)
-	if r.Header.Get("Authorization") != "" || r.URL.Query().Get("X-Amz-Credential") != "" {
-		return
-	}
-
-	// Only learn from successful responses
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return
-	}
-
-	bucket, key := ParseBucketKey(r)
-	if bucket == "" || key == "" {
-		return // Bucket-only path (e.g., list operations) — skip
-	}
-
-	f.authzCache.GrantPublic(bucket)
-	log.Debug().Str("bucket", bucket).Msg("Public bucket access learned")
-	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
-}
-
 // handleAuthzRevocation revokes authorization when Tigris returns 403.
 func (f *transparentForwarder) handleAuthzRevocation(resp *http.Response, r *http.Request) {
 	if f.authzCache == nil || resp.StatusCode != http.StatusForbidden {
@@ -344,14 +321,6 @@ func (f *transparentForwarder) handleAuthzRevocation(resp *http.Response, r *htt
 
 	authInfo, err := auth.ParseAuthInfo(r)
 	if err != nil {
-		// Anonymous request receiving 403 — revoke public access
-		if errors.Is(err, auth.ErrMissingAuth) {
-			bucket, _ := ParseBucketKey(r)
-			if bucket != "" {
-				f.authzCache.RevokePublic(bucket)
-				log.Debug().Str("bucket", bucket).Msg("Public bucket access revoked on 403")
-			}
-		}
 		return
 	}
 
