@@ -151,21 +151,21 @@ func TestSDK_PublicBucket_AnonymousReadsFromCache(t *testing.T) {
 }
 
 // TestSDK_PublicBucket_PrivateObjectDeniedAnonymously verifies that an explicitly
-// private object in a public-read bucket is NOT served from cache to anonymous requests.
+// private object in a public-read bucket (with per-object ACL enabled) is NOT
+// served from cache to anonymous requests.
 //
 // Flow:
-//  1. Create public-read bucket
+//  1. Create public-read bucket with X-Tigris-Enable-Object-Acl: true
 //  2. PUT one normal object (inherits public-read) and one with ACL: private
-//  3. Authenticated GET both → populates cache
-//  4. Anonymous GET on public object → should succeed
-//  5. Anonymous GET on private object → should return 403 (forwarded to Tigris)
-//  6. Anonymous HEAD on private object → should return 403
+//  3. Authenticated GET both → populates cache (private-obj cached with ACL: private)
+//  4. Anonymous GET on public object → MISS (re-caches with inferred public-read)
+//  5. Anonymous GET on public object again → HIT
+//  6. Anonymous GET on private object → should return 403 (not served from cache)
+//  7. Anonymous HEAD on private object → should return 403
 func TestSDK_PublicBucket_PrivateObjectDeniedAnonymously(t *testing.T) {
-	t.Skip("Tigris does not enforce per-object ACL in public buckets")
-
-	bucket, err := globalEnv.CreatePublicTestBucket("public-private-obj")
+	bucket, err := globalEnv.CreatePublicTestBucketWithObjectACL("public-private-obj")
 	if err != nil {
-		t.Fatalf("Failed to create public test bucket: %v", err)
+		t.Fatalf("Failed to create public test bucket with object ACL: %v", err)
 	}
 
 	publicContent := []byte("this is a public object")
@@ -196,21 +196,44 @@ func TestSDK_PublicBucket_PrivateObjectDeniedAnonymously(t *testing.T) {
 	// Wait for cache population
 	time.Sleep(500 * time.Millisecond)
 
-	// Anonymous GET on public object — should succeed
-	pubResp, err := globalEnv.DoRawGetUnauthenticated(bucket, "public-obj")
+	// Anonymous GET on public object — MISS (auth GET cached without ACL for inherited ACLs),
+	// re-caches with inferred public-read
+	pubResp1, err := globalEnv.DoRawGetUnauthenticated(bucket, "public-obj")
 	if err != nil {
-		t.Fatalf("Anonymous GET public-obj failed: %v", err)
+		t.Fatalf("First anonymous GET public-obj failed: %v", err)
 	}
-	pubBody, _ := io.ReadAll(pubResp.Body)
-	pubResp.Body.Close()
+	pubBody1, _ := io.ReadAll(pubResp1.Body)
+	pubResp1.Body.Close()
 
-	if pubResp.StatusCode != http.StatusOK {
-		t.Errorf("Anonymous GET public-obj: expected 200, got %d", pubResp.StatusCode)
+	if pubResp1.StatusCode != http.StatusOK {
+		t.Errorf("First anonymous GET public-obj: expected 200, got %d", pubResp1.StatusCode)
 	}
-	if string(pubBody) != string(publicContent) {
-		t.Errorf("Anonymous GET public-obj: expected body %q, got %q", publicContent, pubBody)
+	if string(pubBody1) != string(publicContent) {
+		t.Errorf("First anonymous GET public-obj: expected body %q, got %q", publicContent, pubBody1)
 	}
-	t.Logf("Anonymous GET public-obj: status=%d, X-Cache=%s", pubResp.StatusCode, pubResp.Header.Get("X-Cache"))
+	t.Logf("First anonymous GET public-obj: status=%d, X-Cache=%s", pubResp1.StatusCode, pubResp1.Header.Get("X-Cache"))
+
+	// Wait for cache population from anonymous GET
+	time.Sleep(500 * time.Millisecond)
+
+	// Anonymous GET on public object again — should be HIT
+	pubResp2, err := globalEnv.DoRawGetUnauthenticated(bucket, "public-obj")
+	if err != nil {
+		t.Fatalf("Second anonymous GET public-obj failed: %v", err)
+	}
+	pubBody2, _ := io.ReadAll(pubResp2.Body)
+	pubResp2.Body.Close()
+
+	if pubResp2.StatusCode != http.StatusOK {
+		t.Errorf("Second anonymous GET public-obj: expected 200, got %d", pubResp2.StatusCode)
+	}
+	if string(pubBody2) != string(publicContent) {
+		t.Errorf("Second anonymous GET public-obj: expected body %q, got %q", publicContent, pubBody2)
+	}
+	if pubResp2.Header.Get("X-Cache") != "HIT" {
+		t.Errorf("Second anonymous GET public-obj: expected X-Cache HIT, got %q", pubResp2.Header.Get("X-Cache"))
+	}
+	t.Logf("Second anonymous GET public-obj: status=%d, X-Cache=%s", pubResp2.StatusCode, pubResp2.Header.Get("X-Cache"))
 
 	// Anonymous GET on private object — should be denied (403)
 	privResp, err := globalEnv.DoRawGetUnauthenticated(bucket, "private-obj")
