@@ -16,6 +16,7 @@ import (
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy/broadcast"
+	"github.com/tigrisdata/tag/s3err"
 )
 
 // bufferPool provides reusable buffers for small object caching.
@@ -101,7 +102,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			// serve the range from the cached object
 			if rangeHeader != "" {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving range from cached full object")
-				return s.serveRangeFromCache(ctx, w, bucket, key, meta, rangeHeader, start)
+				return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
 			}
 
 			// Check conditional request: If-None-Match
@@ -579,6 +580,7 @@ func parseRangeHeader(rangeHeader string, totalSize int64) ([]byteRange, error) 
 func (s *Service) serveRangeFromCache(
 	ctx context.Context,
 	w http.ResponseWriter,
+	r *http.Request,
 	bucket, key string,
 	meta *cache.CachedObjectMeta,
 	rangeHeader string,
@@ -587,10 +589,7 @@ func (s *Service) serveRangeFromCache(
 	// Parse Range header
 	ranges, err := parseRangeHeader(rangeHeader, meta.ContentLength)
 	if err != nil || len(ranges) == 0 {
-		// Invalid range - return 416 Range Not Satisfiable
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
-		w.Header().Set(XCacheHeader, XCacheHit)
-		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		s3err.WriteError(w, r, s3err.ErrInvalidRange)
 		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
 		return nil
 	}
@@ -598,10 +597,7 @@ func (s *Service) serveRangeFromCache(
 	// Only support single range (multi-range is complex and rare)
 	if len(ranges) > 1 {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Multi-range not supported from cache")
-		// For multi-range, return 416 - we don't support it
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
-		w.Header().Set(XCacheHeader, XCacheHit)
-		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		s3err.WriteError(w, r, s3err.ErrInvalidRange)
 		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
 		return nil
 	}

@@ -195,6 +195,7 @@ func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Req
 	}
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 
+	logUpstreamResponse(fwdReq, originalReq, resp.StatusCode, upstreamStart)
 	return nil
 }
 
@@ -243,6 +244,7 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 	// Track bytes out from response body
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
 
+	logUpstreamResponse(fwdReq, originalReq, resp.StatusCode, upstreamStart)
 	return capture, nil
 }
 
@@ -398,6 +400,21 @@ func ensureAWSChunkedEncoding(req *http.Request) {
 
 	// Prepend aws-chunked (it's the outermost encoding layer)
 	req.Header.Set("Content-Encoding", "aws-chunked,"+ce)
+}
+
+// logUpstreamResponse logs a completed upstream request at debug level.
+func logUpstreamResponse(fwdReq *http.Request, originalReq *http.Request, statusCode int, upstreamStart time.Time) {
+	host := fwdReq.URL.Host
+	if originalReq != nil && originalReq.Host != "" {
+		host = originalReq.Host
+	}
+	log.Debug().
+		Str("method", fwdReq.Method).
+		Str("path", fwdReq.URL.Path).
+		Str("host", host).
+		Int("status", statusCode).
+		Int64("upstream_ms", time.Since(upstreamStart).Milliseconds()).
+		Msg("Upstream response")
 }
 
 // ResponseCapture holds captured response data.

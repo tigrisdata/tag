@@ -1233,3 +1233,587 @@ func TestSDK_UserMetadata_WithCache(t *testing.T) {
 
 	t.Logf("User metadata caching verified")
 }
+
+// ============================================================================
+// Extended S3 Operation Tests
+// These tests cover additional S3 scenarios from the Tigris e2e test suite.
+// ============================================================================
+
+// TestSDK_PutObject_1MB verifies PUT and GET of a 1MB object.
+func TestSDK_PutObject_1MB(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("put-1mb")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	client := globalEnv.GetS3Client()
+	ctx := context.Background()
+
+	objectData := make([]byte, 1024*1024)
+	rand.Read(objectData)
+
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String("1mb-key"),
+		Body:   bytes.NewReader(objectData),
+	})
+	if err != nil {
+		t.Fatalf("PutObject failed: %v", err)
+	}
+
+	result, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String("1mb-key"),
+	})
+	if err != nil {
+		t.Fatalf("GetObject verification failed: %v", err)
+	}
+	defer result.Body.Close()
+
+	body, _ := io.ReadAll(result.Body)
+	if !bytes.Equal(body, objectData) {
+		t.Error("1MB PUT: downloaded content does not match original")
+	}
+}
+
+// TestSDK_MultipartUpload_MultipleParts verifies multipart upload with two 5MB parts
+// and full content verification via GET.
+func TestSDK_MultipartUpload_MultipleParts(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("multipart-multi")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	client := globalEnv.GetS3Client()
+	ctx := context.Background()
+
+	createResult, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String("multipart-multi-key"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload failed: %v", err)
+	}
+
+	const partSize = 5 * 1024 * 1024
+	part1Data := make([]byte, partSize)
+	part2Data := make([]byte, partSize)
+	rand.Read(part1Data)
+	rand.Read(part2Data)
+
+	uploadResult1, err := client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     aws.String(bucket),
+		Key:        aws.String("multipart-multi-key"),
+		UploadId:   createResult.UploadId,
+		PartNumber: aws.Int32(1),
+		Body:       bytes.NewReader(part1Data),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart 1 failed: %v", err)
+	}
+
+	uploadResult2, err := client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     aws.String(bucket),
+		Key:        aws.String("multipart-multi-key"),
+		UploadId:   createResult.UploadId,
+		PartNumber: aws.Int32(2),
+		Body:       bytes.NewReader(part2Data),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart 2 failed: %v", err)
+	}
+
+	_, err = client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(bucket),
+		Key:      aws.String("multipart-multi-key"),
+		UploadId: createResult.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{
+				{ETag: uploadResult1.ETag, PartNumber: aws.Int32(1)},
+				{ETag: uploadResult2.ETag, PartNumber: aws.Int32(2)},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload failed: %v", err)
+	}
+
+	result, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String("multipart-multi-key"),
+	})
+	if err != nil {
+		t.Fatalf("GetObject verification failed: %v", err)
+	}
+	defer result.Body.Close()
+
+	body, _ := io.ReadAll(result.Body)
+	expectedData := append(part1Data, part2Data...)
+	if !bytes.Equal(body, expectedData) {
+		t.Errorf("Multipart upload content mismatch: got %d bytes, want %d bytes", len(body), len(expectedData))
+	}
+}
+
+// TestSDK_MultipartUpload_SmallPart verifies multipart upload with a single small
+// (16KB) part, matching the small-part scenario from the Tigris e2e test suite.
+func TestSDK_MultipartUpload_SmallPart(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("multipart-small")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	client := globalEnv.GetS3Client()
+	ctx := context.Background()
+
+	createResult, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String("multipart-small-key"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload failed: %v", err)
+	}
+
+	partData := make([]byte, 16*1024)
+	rand.Read(partData)
+
+	uploadResult, err := client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     aws.String(bucket),
+		Key:        aws.String("multipart-small-key"),
+		UploadId:   createResult.UploadId,
+		PartNumber: aws.Int32(1),
+		Body:       bytes.NewReader(partData),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart failed: %v", err)
+	}
+
+	_, err = client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(bucket),
+		Key:      aws.String("multipart-small-key"),
+		UploadId: createResult.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{
+				{ETag: uploadResult.ETag, PartNumber: aws.Int32(1)},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload failed: %v", err)
+	}
+
+	result, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String("multipart-small-key"),
+	})
+	if err != nil {
+		t.Fatalf("GetObject verification failed: %v", err)
+	}
+	defer result.Body.Close()
+
+	body, _ := io.ReadAll(result.Body)
+	if !bytes.Equal(body, partData) {
+		t.Errorf("Small multipart upload content mismatch: got %d bytes, want %d bytes", len(body), len(partData))
+	}
+}
+
+// TestSDK_MultipartUpload_Abort verifies that AbortMultipartUpload correctly cancels
+// an in-progress multipart upload.
+func TestSDK_MultipartUpload_Abort(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("multipart-abort")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	client := globalEnv.GetS3Client()
+	ctx := context.Background()
+
+	createResult, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String("multipart-abort-key"),
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload failed: %v", err)
+	}
+
+	partData := make([]byte, 16*1024)
+	rand.Read(partData)
+
+	_, err = client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:     aws.String(bucket),
+		Key:        aws.String("multipart-abort-key"),
+		UploadId:   createResult.UploadId,
+		PartNumber: aws.Int32(1),
+		Body:       bytes.NewReader(partData),
+	})
+	if err != nil {
+		t.Fatalf("UploadPart failed: %v", err)
+	}
+
+	_, err = client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(bucket),
+		Key:      aws.String("multipart-abort-key"),
+		UploadId: createResult.UploadId,
+	})
+	if err != nil {
+		t.Fatalf("AbortMultipartUpload failed: %v", err)
+	}
+
+	_, err = client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String("multipart-abort-key"),
+	})
+	if err == nil {
+		t.Error("Expected error when getting aborted multipart object, got nil")
+	}
+}
+
+// TestSDK_GetObjectRange_Comprehensive verifies various range request scenarios,
+// matching the comprehensive range test coverage from the Tigris e2e suite.
+// Uses a 1024-byte random object and verifies byte-for-byte content for each range.
+func TestSDK_GetObjectRange_Comprehensive(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("range-comprehensive")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	client := globalEnv.GetS3Client()
+	ctx := context.Background()
+
+	const objSize = 1024
+	objectData := make([]byte, objSize)
+	rand.Read(objectData)
+
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String("range-key"),
+		Body:   bytes.NewReader(objectData),
+	})
+	if err != nil {
+		t.Fatalf("PutObject failed: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		rangeHdr string
+		expected []byte
+	}{
+		{"first 128 bytes", "bytes=0-127", objectData[0:128]},
+		{"open-ended from start", "bytes=0-", objectData[0:]},
+		{"open-ended from middle", "bytes=128-", objectData[128:]},
+		{"middle range", "bytes=128-511", objectData[128:512]},
+		{"exact full range", "bytes=0-1023", objectData[0:]},
+		{"single byte at start", "bytes=0-0", objectData[0:1]},
+		{"two bytes from start", "bytes=0-1", objectData[0:2]},
+		{"end beyond object size", "bytes=0-4096", objectData[0:]},
+		{"start valid end beyond size", "bytes=512-4096", objectData[512:]},
+		{"suffix last 128 bytes", "bytes=-128", objectData[objSize-128:]},
+		{"suffix larger than object", "bytes=-4096", objectData[0:]},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := client.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String("range-key"),
+				Range:  aws.String(tc.rangeHdr),
+			})
+			if err != nil {
+				t.Fatalf("GetObject with Range %q failed: %v", tc.rangeHdr, err)
+			}
+			defer result.Body.Close()
+
+			body, _ := io.ReadAll(result.Body)
+			if !bytes.Equal(body, tc.expected) {
+				t.Errorf("Range %q: got %d bytes, want %d bytes", tc.rangeHdr, len(body), len(tc.expected))
+			}
+		})
+	}
+}
+
+// TestSDK_GetObjectRange_Invalid verifies that invalid range requests return errors.
+// Tests ranges where the start position is at or beyond the object size.
+func TestSDK_GetObjectRange_Invalid(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("range-invalid")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	client := globalEnv.GetS3Client()
+	ctx := context.Background()
+
+	objectData := make([]byte, 1024)
+	rand.Read(objectData)
+
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String("range-invalid-key"),
+		Body:   bytes.NewReader(objectData),
+	})
+	if err != nil {
+		t.Fatalf("PutObject failed: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		rangeHdr string
+	}{
+		{"start equals object size", "bytes=1024-"},
+		{"start beyond object size", "bytes=1024-4096"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := client.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String("range-invalid-key"),
+				Range:  aws.String(tc.rangeHdr),
+			})
+			if err == nil {
+				t.Errorf("Expected error for invalid range %q, got nil", tc.rangeHdr)
+			}
+		})
+	}
+}
+
+// TestSDK_ContentEncodingPreservation verifies that Content-Encoding is preserved
+// through the proxy without altering the object data. The proxy must not attempt
+// to decompress or modify data based on Content-Encoding headers.
+func TestSDK_ContentEncodingPreservation(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("content-encoding")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	client := globalEnv.GetS3Client()
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		size int
+	}{
+		{"512B", 512},
+		{"1MB", 1024 * 1024},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			key := "ce-" + tc.name
+			objectData := make([]byte, tc.size)
+			rand.Read(objectData)
+
+			_, err := client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket:          aws.String(bucket),
+				Key:             aws.String(key),
+				Body:            bytes.NewReader(objectData),
+				ContentEncoding: aws.String("gzip"),
+			})
+			if err != nil {
+				t.Fatalf("PutObject failed: %v", err)
+			}
+
+			// Verify content is returned unmodified
+			getResult, err := client.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+			})
+			if err != nil {
+				t.Fatalf("GetObject failed: %v", err)
+			}
+			defer getResult.Body.Close()
+
+			body, _ := io.ReadAll(getResult.Body)
+			if !bytes.Equal(body, objectData) {
+				t.Errorf("Content mismatch: got %d bytes, want %d bytes", len(body), len(objectData))
+			}
+
+			// Verify Content-Encoding header is preserved
+			headResult, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+			})
+			if err != nil {
+				t.Fatalf("HeadObject failed: %v", err)
+			}
+
+			if aws.ToString(headResult.ContentEncoding) != "gzip" {
+				t.Errorf("Expected Content-Encoding %q, got %q", "gzip", aws.ToString(headResult.ContentEncoding))
+			}
+		})
+	}
+}
+
+// TestSDK_PutObject_Checksum verifies that checksums are preserved through the proxy
+// for PutObject operations. Tests SHA256, CRC32, and CRC32C at small (512B) and
+// medium (32KB) sizes, matching the Tigris e2e checksum test suite.
+func TestSDK_PutObject_Checksum(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("checksum-put")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	client := globalEnv.GetS3Client()
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		algo types.ChecksumAlgorithm
+		size int
+	}{
+		{"SHA256_512B", types.ChecksumAlgorithmSha256, 512},
+		{"SHA256_32KB", types.ChecksumAlgorithmSha256, 32 * 1024},
+		{"CRC32_512B", types.ChecksumAlgorithmCrc32, 512},
+		{"CRC32_32KB", types.ChecksumAlgorithmCrc32, 32 * 1024},
+		{"CRC32C_512B", types.ChecksumAlgorithmCrc32c, 512},
+		{"CRC32C_32KB", types.ChecksumAlgorithmCrc32c, 32 * 1024},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			key := "chk-" + tc.name
+			objectData := make([]byte, tc.size)
+			rand.Read(objectData)
+
+			_, err := client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket:            aws.String(bucket),
+				Key:               aws.String(key),
+				Body:              bytes.NewReader(objectData),
+				ChecksumAlgorithm: tc.algo,
+			})
+			if err != nil {
+				t.Fatalf("PutObject failed: %v", err)
+			}
+
+			// Verify content round-trip
+			getResult, err := client.GetObject(ctx, &s3.GetObjectInput{
+				Bucket:       aws.String(bucket),
+				Key:          aws.String(key),
+				ChecksumMode: types.ChecksumModeEnabled,
+			})
+			if err != nil {
+				t.Fatalf("GetObject failed: %v", err)
+			}
+			defer getResult.Body.Close()
+
+			body, _ := io.ReadAll(getResult.Body)
+			if !bytes.Equal(body, objectData) {
+				t.Errorf("Content mismatch: got %d bytes, want %d bytes", len(body), len(objectData))
+			}
+
+			// Verify checksum is present in GET response
+			switch tc.algo {
+			case types.ChecksumAlgorithmSha256:
+				if getResult.ChecksumSHA256 == nil || *getResult.ChecksumSHA256 == "" {
+					t.Error("Expected ChecksumSHA256 in GET response")
+				}
+			case types.ChecksumAlgorithmCrc32:
+				if getResult.ChecksumCRC32 == nil || *getResult.ChecksumCRC32 == "" {
+					t.Error("Expected ChecksumCRC32 in GET response")
+				}
+			case types.ChecksumAlgorithmCrc32c:
+				if getResult.ChecksumCRC32C == nil || *getResult.ChecksumCRC32C == "" {
+					t.Error("Expected ChecksumCRC32C in GET response")
+				}
+			}
+		})
+	}
+}
+
+// TestSDK_MultipartUpload_Checksum verifies that checksums are preserved through the
+// proxy for multipart uploads. Uses SHA256 with two 5MB parts and verifies content
+// round-trip and composite checksum presence.
+func TestSDK_MultipartUpload_Checksum(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("checksum-multipart")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	client := globalEnv.GetS3Client()
+	ctx := context.Background()
+
+	createResult, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket:            aws.String(bucket),
+		Key:               aws.String("chk-multipart-key"),
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+	})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload failed: %v", err)
+	}
+
+	const partSize = 5 * 1024 * 1024
+	part1Data := make([]byte, partSize)
+	part2Data := make([]byte, partSize)
+	rand.Read(part1Data)
+	rand.Read(part2Data)
+
+	uploadResult1, err := client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:            aws.String(bucket),
+		Key:               aws.String("chk-multipart-key"),
+		UploadId:          createResult.UploadId,
+		PartNumber:        aws.Int32(1),
+		Body:              bytes.NewReader(part1Data),
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+	})
+	if err != nil {
+		t.Fatalf("UploadPart 1 failed: %v", err)
+	}
+	if uploadResult1.ChecksumSHA256 == nil || *uploadResult1.ChecksumSHA256 == "" {
+		t.Error("Expected ChecksumSHA256 in UploadPart 1 response")
+	}
+
+	uploadResult2, err := client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket:            aws.String(bucket),
+		Key:               aws.String("chk-multipart-key"),
+		UploadId:          createResult.UploadId,
+		PartNumber:        aws.Int32(2),
+		Body:              bytes.NewReader(part2Data),
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+	})
+	if err != nil {
+		t.Fatalf("UploadPart 2 failed: %v", err)
+	}
+	if uploadResult2.ChecksumSHA256 == nil || *uploadResult2.ChecksumSHA256 == "" {
+		t.Error("Expected ChecksumSHA256 in UploadPart 2 response")
+	}
+
+	completeResult, err := client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(bucket),
+		Key:      aws.String("chk-multipart-key"),
+		UploadId: createResult.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{
+				{ETag: uploadResult1.ETag, PartNumber: aws.Int32(1), ChecksumSHA256: uploadResult1.ChecksumSHA256},
+				{ETag: uploadResult2.ETag, PartNumber: aws.Int32(2), ChecksumSHA256: uploadResult2.ChecksumSHA256},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload failed: %v", err)
+	}
+
+	// Composite checksum should be present (format: <hash>-<num_parts>)
+	if completeResult.ChecksumSHA256 == nil || *completeResult.ChecksumSHA256 == "" {
+		t.Error("Expected composite ChecksumSHA256 in CompleteMultipartUpload response")
+	}
+
+	// Verify content round-trip
+	getResult, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket:       aws.String(bucket),
+		Key:          aws.String("chk-multipart-key"),
+		ChecksumMode: types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		t.Fatalf("GetObject failed: %v", err)
+	}
+	defer getResult.Body.Close()
+
+	body, _ := io.ReadAll(getResult.Body)
+	expectedData := append(part1Data, part2Data...)
+	if !bytes.Equal(body, expectedData) {
+		t.Errorf("Content mismatch: got %d bytes, want %d bytes", len(body), len(expectedData))
+	}
+
+	// Verify checksum is returned on GET
+	if getResult.ChecksumSHA256 == nil || *getResult.ChecksumSHA256 == "" {
+		t.Error("Expected ChecksumSHA256 in GET response")
+	}
+}
