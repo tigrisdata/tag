@@ -589,6 +589,8 @@ func (s *Service) serveRangeFromCache(
 	// Parse Range header
 	ranges, err := parseRangeHeader(rangeHeader, meta.ContentLength)
 	if err != nil || len(ranges) == 0 {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
+		w.Header().Set(XCacheHeader, XCacheHit)
 		s3err.WriteError(w, r, s3err.ErrInvalidRange)
 		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
 		return nil
@@ -597,6 +599,8 @@ func (s *Service) serveRangeFromCache(
 	// Only support single range (multi-range is complex and rare)
 	if len(ranges) > 1 {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Multi-range not supported from cache")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
+		w.Header().Set(XCacheHeader, XCacheHit)
 		s3err.WriteError(w, r, s3err.ErrInvalidRange)
 		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
 		return nil
