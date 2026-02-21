@@ -30,24 +30,38 @@ type CachedObjectMeta struct {
 	ContentLength int64             `json:"content_length"`
 	LastModified  int64             `json:"last_modified"` // Unix timestamp (seconds)
 	CacheControl  string            `json:"cache_control,omitempty"`
-	StorageClass  string            `json:"storage_class,omitempty"`
-	ACL           string            `json:"acl,omitempty"`           // X-Amz-Acl canned ACL (e.g., "public-read")
-	UserMetadata  map[string]string `json:"user_metadata,omitempty"` // x-amz-meta-*
+	StorageClass         string            `json:"storage_class,omitempty"`
+	ACL                  string            `json:"acl,omitempty"`                    // X-Amz-Acl canned ACL (e.g., "public-read")
+	ContentEncoding      string            `json:"content_encoding,omitempty"`       // Content-Encoding (e.g., "gzip")
+	ContentDisposition   string            `json:"content_disposition,omitempty"`    // Content-Disposition (e.g., "attachment; filename=...")
+	ContentLanguage      string            `json:"content_language,omitempty"`       // Content-Language
+	Expires              string            `json:"expires,omitempty"`                // Expires header (raw HTTP-date string)
+	ServerSideEncryption string            `json:"server_side_encryption,omitempty"` // x-amz-server-side-encryption
+	VersionID            string            `json:"version_id,omitempty"`             // x-amz-version-id
+	PartsCount           string            `json:"parts_count,omitempty"`            // x-amz-mp-parts-count
+	UserMetadata         map[string]string `json:"user_metadata,omitempty"`          // x-amz-meta-*
 	StatusCode    int               `json:"status_code"`             // Original HTTP status (200, etc.)
 }
 
 // MetaFromHTTPHeaders builds CachedObjectMeta from S3 response headers.
 func MetaFromHTTPHeaders(bucket, key string, statusCode int, headers http.Header) *CachedObjectMeta {
 	meta := &CachedObjectMeta{
-		Key:          key,
-		Bucket:       bucket,
-		StatusCode:   statusCode,
-		ETag:         headers.Get("ETag"),
-		ContentType:  headers.Get("Content-Type"),
-		CacheControl: headers.Get("Cache-Control"),
-		StorageClass: headers.Get("x-amz-storage-class"),
-		ACL:          headers.Get("X-Amz-Acl"),
-		UserMetadata: make(map[string]string),
+		Key:                  key,
+		Bucket:               bucket,
+		StatusCode:           statusCode,
+		ETag:                 headers.Get("ETag"),
+		ContentType:          headers.Get("Content-Type"),
+		CacheControl:         headers.Get("Cache-Control"),
+		StorageClass:         headers.Get("x-amz-storage-class"),
+		ACL:                  headers.Get("X-Amz-Acl"),
+		ContentEncoding:      headers.Get("Content-Encoding"),
+		ContentDisposition:   headers.Get("Content-Disposition"),
+		ContentLanguage:      headers.Get("Content-Language"),
+		Expires:              headers.Get("Expires"),
+		ServerSideEncryption: headers.Get("x-amz-server-side-encryption"),
+		VersionID:            headers.Get("x-amz-version-id"),
+		PartsCount:           headers.Get("x-amz-mp-parts-count"),
+		UserMetadata:         make(map[string]string),
 	}
 
 	// Parse Content-Length
@@ -97,6 +111,27 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter) {
 	}
 	if m.ACL != "" {
 		w.Header().Set("X-Amz-Acl", m.ACL)
+	}
+	if m.ContentEncoding != "" {
+		w.Header().Set("Content-Encoding", m.ContentEncoding)
+	}
+	if m.ContentDisposition != "" {
+		w.Header().Set("Content-Disposition", m.ContentDisposition)
+	}
+	if m.ContentLanguage != "" {
+		w.Header().Set("Content-Language", m.ContentLanguage)
+	}
+	if m.Expires != "" {
+		w.Header().Set("Expires", m.Expires)
+	}
+	if m.ServerSideEncryption != "" {
+		w.Header().Set("x-amz-server-side-encryption", m.ServerSideEncryption)
+	}
+	if m.VersionID != "" {
+		w.Header().Set("x-amz-version-id", m.VersionID)
+	}
+	if m.PartsCount != "" {
+		w.Header().Set("x-amz-mp-parts-count", m.PartsCount)
 	}
 	// Write user metadata with lowercase keys per S3 convention
 	for k, v := range m.UserMetadata {

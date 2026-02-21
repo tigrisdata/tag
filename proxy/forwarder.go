@@ -158,6 +158,7 @@ func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) ba
 				MaxIdleConns:        maxIdleConnsPerHost,
 				MaxIdleConnsPerHost: maxIdleConnsPerHost,
 				IdleConnTimeout:     90 * time.Second,
+				DisableCompression:  true, // Proxy must never auto-decompress upstream responses
 			},
 			Timeout: 5 * time.Minute,
 		},
