@@ -11,7 +11,7 @@ var (
 	RequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "tag_requests_total",
-			Help: "Total number of requests processed by TAG",
+			Help: "Total number of requests processed",
 		},
 		[]string{"operation", "status"},
 	)
