@@ -183,7 +183,6 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 
 // HandlePassthrough handles requests that are passed through without caching.
 func (s *Service) HandlePassthrough(w http.ResponseWriter, r *http.Request) error {
-	log.Debug().Str("method", r.Method).Str("path", r.URL.Path).Msg("HandlePassthrough")
 	return s.forwarder.Forward(r.Context(), w, r)
 }
 
