@@ -607,18 +607,8 @@ func (s *Service) serveRangeFromCache(
 	}
 
 	rng := ranges[0]
-	contentLength := rng.end - rng.start + 1
 
-	// Set response headers
-	if meta.ContentType != "" {
-		w.Header().Set("Content-Type", meta.ContentType)
-	}
-	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rng.start, rng.end, meta.ContentLength))
-	if meta.ETag != "" {
-		w.Header().Set("ETag", meta.ETag)
-	}
-	w.Header().Set("Accept-Ranges", "bytes")
+	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
 	w.Header().Set(XCacheHeader, XCacheHit)
 	w.WriteHeader(http.StatusPartialContent)
 

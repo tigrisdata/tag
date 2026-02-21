@@ -2,6 +2,7 @@
 package cache
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,13 +24,13 @@ const (
 // - Conditional requests (If-None-Match, If-Modified-Since)
 // - Proper response headers on cache hits
 type CachedObjectMeta struct {
-	Key           string            `json:"key"`
-	Bucket        string            `json:"bucket"`
-	ETag          string            `json:"etag,omitempty"`
-	ContentType   string            `json:"content_type,omitempty"`
-	ContentLength int64             `json:"content_length"`
-	LastModified  int64             `json:"last_modified"` // Unix timestamp (seconds)
-	CacheControl  string            `json:"cache_control,omitempty"`
+	Key                  string            `json:"key"`
+	Bucket               string            `json:"bucket"`
+	ETag                 string            `json:"etag,omitempty"`
+	ContentType          string            `json:"content_type,omitempty"`
+	ContentLength        int64             `json:"content_length"`
+	LastModified         int64             `json:"last_modified"` // Unix timestamp (seconds)
+	CacheControl         string            `json:"cache_control,omitempty"`
 	StorageClass         string            `json:"storage_class,omitempty"`
 	ACL                  string            `json:"acl,omitempty"`                    // X-Amz-Acl canned ACL (e.g., "public-read")
 	ContentEncoding      string            `json:"content_encoding,omitempty"`       // Content-Encoding (e.g., "gzip")
@@ -40,7 +41,7 @@ type CachedObjectMeta struct {
 	VersionID            string            `json:"version_id,omitempty"`             // x-amz-version-id
 	PartsCount           string            `json:"parts_count,omitempty"`            // x-amz-mp-parts-count
 	UserMetadata         map[string]string `json:"user_metadata,omitempty"`          // x-amz-meta-*
-	StatusCode    int               `json:"status_code"`             // Original HTTP status (200, etc.)
+	StatusCode           int               `json:"status_code"`                      // Original HTTP status (200, etc.)
 }
 
 // MetaFromHTTPHeaders builds CachedObjectMeta from S3 response headers.
@@ -88,8 +89,23 @@ func MetaFromHTTPHeaders(bucket, key string, statusCode int, headers http.Header
 	return meta
 }
 
+// WriteHeaderOption customizes headers written by WriteHeaders.
+type WriteHeaderOption func(http.Header)
+
+// WithRangeHeaders overrides Content-Length for the range size and adds
+// Content-Range and Accept-Ranges headers for 206 Partial Content responses.
+func WithRangeHeaders(start, end, totalSize int64) WriteHeaderOption {
+	return func(h http.Header) {
+		contentLength := end - start + 1
+		h.Set("Content-Length", strconv.FormatInt(contentLength, 10))
+		h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize))
+		h.Set("Accept-Ranges", "bytes")
+	}
+}
+
 // WriteHeaders writes object metadata to response headers.
-func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter) {
+// Options are applied after standard headers, allowing overrides (e.g., WithRangeHeaders).
+func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter, opts ...WriteHeaderOption) {
 	if m.ETag != "" {
 		w.Header().Set("ETag", m.ETag)
 	}
@@ -137,6 +153,11 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter) {
 	for k, v := range m.UserMetadata {
 		lk := strings.ToLower(k)
 		w.Header().Set(lk, v)
+	}
+
+	// Apply options (may override headers like Content-Length for range responses)
+	for _, opt := range opts {
+		opt(w.Header())
 	}
 }
 
