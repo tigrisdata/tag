@@ -1790,11 +1790,13 @@ func TestSDK_MultipartUpload_Checksum(t *testing.T) {
 		t.Fatalf("CompleteMultipartUpload failed: %v", err)
 	}
 
-	// Composite checksum may or may not be present depending on the upstream
-	// S3 implementation. Some environments return it (format: <hash>-<num_parts>),
-	// others omit it from the CompleteMultipartUpload response.
-	if completeResult.ChecksumSHA256 == nil || *completeResult.ChecksumSHA256 == "" {
-		t.Log("Expected composite ChecksumSHA256 in CompleteMultipartUpload response")
+	// Composite checksum should be present (format: <hash>-<num_parts>).
+	// Some environments may not return it; log for diagnostics but don't fail,
+	// since TAG proxies the XML body faithfully and cannot add missing fields.
+	if completeResult.ChecksumSHA256 != nil && *completeResult.ChecksumSHA256 != "" {
+		t.Logf("CompleteMultipartUpload ChecksumSHA256: %s", *completeResult.ChecksumSHA256)
+	} else {
+		t.Log("CompleteMultipartUpload did not return composite ChecksumSHA256")
 	}
 
 	// Verify content round-trip
@@ -1814,9 +1816,11 @@ func TestSDK_MultipartUpload_Checksum(t *testing.T) {
 		t.Errorf("Content mismatch: got %d bytes, want %d bytes", len(body), len(expectedData))
 	}
 
-	// Checksum may or may not be returned on GET depending on the upstream
-	// S3 implementation.
-	if getResult.ChecksumSHA256 == nil || *getResult.ChecksumSHA256 == "" {
-		t.Log("Expected ChecksumSHA256 in GET response")
+	// Checksum should be present when ChecksumMode is enabled.
+	// Log the result for diagnostics — TAG forwards this header from upstream.
+	if getResult.ChecksumSHA256 != nil && *getResult.ChecksumSHA256 != "" {
+		t.Logf("GetObject ChecksumSHA256: %s", *getResult.ChecksumSHA256)
+	} else {
+		t.Log("GetObject did not return ChecksumSHA256 header")
 	}
 }
