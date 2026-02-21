@@ -290,11 +290,15 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 		return
 	}
 
+	newKeys := 0
 	for _, entry := range entries {
 		keyBytes, err := hex.DecodeString(entry.SigningKey)
 		if err != nil {
 			log.Warn().Err(err).Str("date", entry.Date).Msg("Failed to decode signing key hex")
 			continue
+		}
+		if _, err := f.derivedKeyStore.GetSigningKey(authInfo.AccessKey, entry.Date, entry.Region); err != nil {
+			newKeys++
 		}
 		f.derivedKeyStore.Store(authInfo.AccessKey, entry.Date, entry.Region, keyBytes)
 	}
@@ -302,11 +306,13 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 	bucket, _ := ParseBucketKey(r)
 	f.authzCache.Grant(authInfo.AccessKey, bucket)
 
-	log.Debug().
-		Str("bucket", bucket).
-		Int("keys_learned", len(entries)).
-		Int("store_size", f.derivedKeyStore.Count()).
-		Msg("Signing keys learned successfully")
+	if newKeys > 0 {
+		log.Debug().
+			Str("bucket", bucket).
+			Int("keys_learned", newKeys).
+			Int("store_size", f.derivedKeyStore.Count()).
+			Msg("Signing keys learned successfully")
+	}
 
 	metrics.ProxySigningKeysReceived.Inc()
 	metrics.DerivedKeyStoreSize.Set(float64(f.derivedKeyStore.Count()))
@@ -326,4 +332,14 @@ func (f *transparentForwarder) handleAuthzRevocation(resp *http.Response, r *htt
 
 	bucket, _ := ParseBucketKey(r)
 	f.authzCache.Revoke(authInfo.AccessKey, bucket)
+	log.Debug().Str("access_key", maskAccessKey(authInfo.AccessKey)).Str("bucket", bucket).Msg("Authorization revoked (upstream 403)")
+}
+
+// maskAccessKey returns the last 4 characters of an access key prefixed with "...",
+// or the full key if it's too short to mask.
+func maskAccessKey(key string) string {
+	if len(key) <= 4 {
+		return key
+	}
+	return "..." + key[len(key)-4:]
 }

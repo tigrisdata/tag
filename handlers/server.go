@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy"
+	"github.com/tigrisdata/tag/s3err"
 )
 
 // Server is the HTTP server for S3-compatible API.
@@ -274,7 +275,7 @@ func handleError(w http.ResponseWriter, r *http.Request, err error) {
 		WriteAuthError(w, r, int(authErr.Code), err)
 		return
 	}
-	WriteInternalError(w, r, err)
+	s3err.WriteInternalError(w, r, err)
 }
 
 // getBucketName extracts the bucket name from request path variables.
@@ -302,42 +303,42 @@ func validateBucketName(w http.ResponseWriter, r *http.Request) bool {
 	bucket := getBucketName(r)
 	if bucket == "" {
 		log.Error().Str("path", r.URL.Path).Msg("Empty bucket name")
-		WriteError(w, r, ErrInvalidArgument)
+		s3err.WriteError(w, r, s3err.ErrInvalidArgument)
 		return false
 	}
 
 	// Length check: 3-63 characters
 	if len(bucket) < 3 || len(bucket) > 63 {
 		log.Debug().Str("bucket", bucket).Msg("Bucket name length invalid")
-		WriteError(w, r, ErrInvalidBucketName)
+		s3err.WriteError(w, r, s3err.ErrInvalidBucketName)
 		return false
 	}
 
 	// Must match valid pattern (start/end with letter or number)
 	if !validBucketNameRegex.MatchString(bucket) {
 		log.Debug().Str("bucket", bucket).Msg("Bucket name format invalid")
-		WriteError(w, r, ErrInvalidBucketName)
+		s3err.WriteError(w, r, s3err.ErrInvalidBucketName)
 		return false
 	}
 
 	// Cannot contain consecutive dots (..)
 	if strings.Contains(bucket, "..") {
 		log.Debug().Str("bucket", bucket).Msg("Bucket name contains consecutive dots")
-		WriteError(w, r, ErrInvalidBucketName)
+		s3err.WriteError(w, r, s3err.ErrInvalidBucketName)
 		return false
 	}
 
 	// Cannot contain dot-dash (.-) or dash-dot (-.)
 	if strings.Contains(bucket, ".-") || strings.Contains(bucket, "-.") {
 		log.Debug().Str("bucket", bucket).Msg("Bucket name contains invalid dot-dash pattern")
-		WriteError(w, r, ErrInvalidBucketName)
+		s3err.WriteError(w, r, s3err.ErrInvalidBucketName)
 		return false
 	}
 
 	// Cannot contain underscore
 	if strings.Contains(bucket, "_") {
 		log.Debug().Str("bucket", bucket).Msg("Bucket name contains underscore")
-		WriteError(w, r, ErrInvalidBucketName)
+		s3err.WriteError(w, r, s3err.ErrInvalidBucketName)
 		return false
 	}
 
@@ -354,12 +355,12 @@ func validateContentLength(w http.ResponseWriter, r *http.Request) bool {
 	if proxy.IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) {
 		v := r.Header.Get("X-Amz-Decoded-Content-Length")
 		if v == "" {
-			WriteError(w, r, ErrMissingContentLength)
+			s3err.WriteError(w, r, s3err.ErrMissingContentLength)
 			return false
 		}
 		decodedLen, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || decodedLen < 0 {
-			WriteError(w, r, ErrBadContentLength)
+			s3err.WriteError(w, r, s3err.ErrBadContentLength)
 			return false
 		}
 		return true
@@ -367,16 +368,16 @@ func validateContentLength(w http.ResponseWriter, r *http.Request) bool {
 
 	v := r.Header.Get("Content-Length")
 	if v == "" {
-		WriteError(w, r, ErrMissingContentLength)
+		s3err.WriteError(w, r, s3err.ErrMissingContentLength)
 		return false
 	}
 	contentLength, err := strconv.ParseInt(v, 10, 64)
 	if err != nil {
-		WriteError(w, r, ErrBadContentLength)
+		s3err.WriteError(w, r, s3err.ErrBadContentLength)
 		return false
 	}
 	if contentLength < 0 {
-		WriteError(w, r, ErrBadContentLength)
+		s3err.WriteError(w, r, s3err.ErrBadContentLength)
 		return false
 	}
 	return true
@@ -413,7 +414,7 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		handler = s.service.HandleDeleteObject
 	default:
-		WriteError(w, r, ErrMethodNotAllowed)
+		s3err.WriteError(w, r, s3err.ErrMethodNotAllowed)
 		return
 	}
 
@@ -430,7 +431,7 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete:
 		handleWithError(w, r, s.service.HandlePassthrough)
 	default:
-		WriteError(w, r, ErrMethodNotAllowed)
+		s3err.WriteError(w, r, s3err.ErrMethodNotAllowed)
 	}
 }
 
