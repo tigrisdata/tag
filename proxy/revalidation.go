@@ -54,7 +54,28 @@ func (s *Service) revalidateAndServe(
 
 	switch resp.StatusCode {
 	case http.StatusNotModified:
-		return s.handleRevalidation304(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		revalErr := s.handleRevalidation304(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		if revalErr == nil {
+			return nil
+		}
+		// Cache body unavailable despite 304 — fall through to upstream.
+		// serveFromCache returns errors before committing headers, so we can
+		// safely write a new response. Range errors may have partial headers
+		// committed (serveRangeFromCache writes headers before streaming), so
+		// we return those directly.
+		if rangeHeader != "" {
+			return revalErr
+		}
+		log.Warn().Err(revalErr).Str("bucket", bucket).Str("key", key).
+			Msg("Revalidation 304 cache body unavailable, fetching from upstream")
+		w.Header().Set(XCacheHeader, XCacheMiss)
+		forwardErr := s.forwarder.Forward(ctx, w, r)
+		status := "success"
+		if forwardErr != nil {
+			status = "error"
+		}
+		metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+		return forwardErr
 	case http.StatusOK:
 		// Full-object response (no range or upstream ignored range)
 		return s.handleRevalidation200(ctx, w, bucket, key, resp, start)
@@ -396,7 +417,7 @@ func (s *Service) revalidateAndServeHead(
 // Per RFC 7234, Cache-Control: no-cache means "must revalidate with origin before serving".
 func shouldForceRevalidate(r *http.Request) bool {
 	cc := r.Header.Get("Cache-Control")
-	return strings.Contains(cc, "no-cache") || strings.Contains(cc, "max-age=0") || strings.Contains(cc, "must-revalidate")
+	return strings.Contains(cc, "no-cache") || strings.Contains(cc, "max-age=0")
 }
 
 // shouldBypassCache checks if the client is requesting full cache bypass.

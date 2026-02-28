@@ -22,9 +22,14 @@ type mockForwarder struct {
 	// Track calls for verification
 	conditionalCalled bool
 	conditionalETag   string
+	// Optional Forward implementation for fallback tests
+	forwardFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request) error
 }
 
 func (m *mockForwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+	if m.forwardFunc != nil {
+		return m.forwardFunc(ctx, w, r)
+	}
 	return nil
 }
 
@@ -656,5 +661,66 @@ func TestRevalidationRangeError_ServesStaleRange(t *testing.T) {
 	}
 	if w.Body.String() != "stale" {
 		t.Errorf("body = %q, want %q", w.Body.String(), "stale")
+	}
+}
+
+func TestRevalidation304_CacheBodyUnavailable_FallsThrough(t *testing.T) {
+	// Setup: mock upstream returns 304, but cache body has been evicted.
+	// Forward should be called as fallback to serve fresh content.
+	freshBody := "fresh from upstream"
+	mock := &mockForwarder{
+		conditionalResp: &http.Response{
+			StatusCode: http.StatusNotModified,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     http.Header{},
+		},
+		forwardFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(freshBody))
+			return nil
+		},
+	}
+
+	// Create cache with separate reference to underlying client for body deletion
+	cfg := config.NewDefault()
+	memCache := cacheclient.NewMemoryCache()
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	ctx := context.Background()
+	bucket, key := "test-bucket", "test-key"
+
+	// Pre-populate cache with metadata and body
+	meta := &cache.CachedObjectMeta{
+		Bucket:        bucket,
+		Key:           key,
+		ETag:          `"abc123"`,
+		ContentType:   "text/plain",
+		ContentLength: 12,
+		StatusCode:    http.StatusOK,
+	}
+	_ = c.PutWithMeta(ctx, bucket, key, meta, []byte("hello world!"), 0)
+
+	// Delete only the body key to simulate cache body eviction
+	_ = memCache.Delete(ctx, cache.MakeBodyKey(bucket, key))
+
+	// Execute revalidation — should fall through to Forward
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
+	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now())
+	if err != nil {
+		t.Fatalf("revalidateAndServe() error = %v (expected fallback to upstream)", err)
+	}
+
+	// Verify: fresh response from upstream (not InternalError)
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get(XCacheHeader); got != XCacheMiss {
+		t.Errorf("X-Cache = %q, want %q (upstream fallback)", got, XCacheMiss)
+	}
+	if w.Body.String() != freshBody {
+		t.Errorf("body = %q, want %q", w.Body.String(), freshBody)
 	}
 }

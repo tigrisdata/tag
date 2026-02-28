@@ -180,6 +180,8 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	var xCache string
 	if !s.cache.IsEnabled() {
 		xCache = XCacheDisabled
+	} else if bypassCache {
+		xCache = XCacheBypass
 	} else {
 		xCache = XCacheMiss
 	}

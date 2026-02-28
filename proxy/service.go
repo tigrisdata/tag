@@ -23,7 +23,7 @@ const (
 	XCacheHeader   = "X-Cache"
 	XCacheHit      = "HIT"
 	XCacheMiss     = "MISS"
-	XCacheBypass      = "BYPASS"      // Range requests bypass cache
+	XCacheBypass      = "BYPASS"      // Cache-Control: no-store bypassed cache
 	XCacheDisabled    = "DISABLED"    // Cache is disabled
 	XCacheRevalidated = "REVALIDATED" // Object revalidated with upstream
 )
@@ -161,10 +161,12 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 
 	// Cache miss - forward to upstream
 	// Set X-Cache header before forwarding (will be included in response)
-	if s.cache.IsEnabled() {
-		w.Header().Set(XCacheHeader, XCacheMiss)
-	} else {
+	if !s.cache.IsEnabled() {
 		w.Header().Set(XCacheHeader, XCacheDisabled)
+	} else if bypassCache {
+		w.Header().Set(XCacheHeader, XCacheBypass)
+	} else {
+		w.Header().Set(XCacheHeader, XCacheMiss)
 	}
 	err = s.forwarder.Forward(ctx, w, r)
 
