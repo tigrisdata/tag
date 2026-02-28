@@ -137,7 +137,7 @@ See [tigrisdata/tag-deploy](https://github.com/tigrisdata/tag-deploy) for comple
 
 TAG supports all S3 API endpoints supported by Tigris, including bucket operations, object operations, multipart uploads, and more. See the [Tigris S3 API documentation](https://www.tigrisdata.com/docs/api/s3/) for the complete list of supported operations.
 
-### S3 Addressing Style
+### S3 Client Usage
 
 TAG supports **path-style** S3 access only. Virtual-hosted style requests are not supported.
 
@@ -161,7 +161,7 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 - Range requests trigger background fetch of full object (if within threshold)
 - PUT/DELETE operations invalidate the cache entry
 
-See [docs/usage.md](docs/usage.md) for examples using AWS CLI and Python boto3.
+See [docs/cache-control.md](docs/cache-control.md) for detailed cache control and revalidation documentation.
 
 ## Development
 

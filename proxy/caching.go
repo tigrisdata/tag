@@ -116,7 +116,6 @@ func (s *Service) setupCacheListener(
 
 		// Build metadata from response headers
 		meta := cache.MetaFromHTTPHeaders(bucket, key, statusCode, headers)
-
 		// Check if still cacheable based on metadata
 		if !meta.IsCacheable(s.config.Cache.SizeThreshold) {
 			pipeWriter.CloseWithError(nil)
@@ -421,10 +420,4 @@ func (s *Service) isWithinSizeThreshold(resp *http.Response) bool {
 	}
 	// Unknown size - allow caching (will be handled by cache layer)
 	return true
-}
-
-// shouldSkipCache checks if cache should be skipped for this request.
-func shouldSkipCache(r *http.Request) bool {
-	cc := r.Header.Get("Cache-Control")
-	return strings.Contains(cc, "no-cache") || strings.Contains(cc, "max-age=0")
 }

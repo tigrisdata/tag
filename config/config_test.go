@@ -30,7 +30,7 @@ log:
 `
 
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -84,7 +84,7 @@ log:
 func TestLoad_Defaults(t *testing.T) {
 	// Create a minimal config file (empty YAML)
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte("{}"), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -129,7 +129,7 @@ log:
 `
 
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -172,7 +172,7 @@ cache:
 `
 
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -193,7 +193,7 @@ cache:
 func TestLoad_InvalidYAML(t *testing.T) {
 	// Create an invalid YAML file
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte("invalid: yaml: content: ["), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte("invalid: yaml: content: ["), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -284,7 +284,7 @@ server:
 `
 
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -307,7 +307,7 @@ cache:
 `
 
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -335,7 +335,7 @@ upstream:
   transparent_proxy: false
 `
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -398,7 +398,7 @@ upstream:
   endpoint: "https://evil.example.com"
 `
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -441,7 +441,7 @@ cache:
   grpc_auth: false
 `
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -524,7 +524,7 @@ server:
   tls_key_file: "/etc/tag/tls/key.pem"
 `
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -564,7 +564,7 @@ server:
   tls_key_file: "/file/key.pem"
 `
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -590,7 +590,7 @@ server:
   tls_cert_file: "/path/cert.pem"
 `
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 
@@ -606,7 +606,7 @@ server:
   tls_key_file: "/path/key.pem"
 `
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 

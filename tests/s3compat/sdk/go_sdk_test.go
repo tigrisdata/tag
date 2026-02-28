@@ -1235,6 +1235,404 @@ func TestSDK_UserMetadata_WithCache(t *testing.T) {
 }
 
 // ============================================================================
+// Cache Revalidation Tests
+// These tests verify RFC 7234-compliant cache revalidation using
+// Cache-Control: no-cache to trigger conditional requests (If-None-Match).
+// ============================================================================
+
+// noCacheHeaders returns headers that trigger cache revalidation.
+func noCacheHeaders() map[string]string {
+	return map[string]string{"Cache-Control": "no-cache"}
+}
+
+// TestSDK_Revalidation_GET_Unchanged verifies that GET with Cache-Control: no-cache
+// on an unchanged object returns the cached body after conditional validation (304 path).
+//
+// Flow:
+//  1. PUT object → GET (cache miss, learns ETag) → cache populated
+//  2. GET with Cache-Control: no-cache → TAG sends If-None-Match to upstream
+//  3. Upstream returns 304 Not Modified → TAG serves from cache with X-Cache: HIT
+func TestSDK_Revalidation_GET_Unchanged(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("reval-get-unchanged")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	content := []byte("revalidation get unchanged test content")
+	if err := globalEnv.PutTestObject(bucket, "reval-get-key", content); err != nil {
+		t.Fatalf("Failed to put test object: %v", err)
+	}
+
+	// First GET: cache miss, populates cache and learns ETag
+	resp1, err := globalEnv.DoRawGet(bucket, "reval-get-key")
+	if err != nil {
+		t.Fatalf("First GET failed: %v", err)
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
+	}
+	if string(body1) != string(content) {
+		t.Errorf("First GET: expected body %q, got %q", content, body1)
+	}
+	t.Logf("First GET: X-Cache=%s", resp1.Header.Get("X-Cache"))
+
+	// Wait for cache to be populated
+	time.Sleep(500 * time.Millisecond)
+
+	// Second GET with Cache-Control: no-cache → triggers revalidation
+	// Object is unchanged, so upstream returns 304 → TAG serves from cache
+	resp2, err := globalEnv.DoRawGetWithHeaders(bucket, "reval-get-key", noCacheHeaders())
+	if err != nil {
+		t.Fatalf("Revalidation GET failed: %v", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("Revalidation GET: expected 200, got %d", resp2.StatusCode)
+	}
+	if string(body2) != string(content) {
+		t.Errorf("Revalidation GET: expected body %q, got %q", content, body2)
+	}
+
+	xCache := resp2.Header.Get("X-Cache")
+	if xCache != "HIT" {
+		t.Errorf("Revalidation GET (unchanged): expected X-Cache HIT, got %q", xCache)
+	}
+	t.Logf("Revalidation GET unchanged verified: X-Cache=%s", xCache)
+}
+
+// TestSDK_Revalidation_GET_Changed verifies that GET with Cache-Control: no-cache
+// on a changed object returns the new body from upstream (200 path).
+//
+// Flow:
+//  1. PUT object v1 → GET (cache miss) → cache populated with v1
+//  2. PUT object v2 (different content, new ETag)
+//  3. GET with Cache-Control: no-cache → TAG sends If-None-Match with v1's ETag
+//  4. Upstream returns 200 with v2 body → TAG streams new body, X-Cache: REVALIDATED
+func TestSDK_Revalidation_GET_Changed(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("reval-get-changed")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	contentV1 := []byte("revalidation content version 1")
+	if err := globalEnv.PutTestObject(bucket, "reval-changed-key", contentV1); err != nil {
+		t.Fatalf("Failed to put test object v1: %v", err)
+	}
+
+	// First GET: cache miss, populates cache with v1
+	resp1, err := globalEnv.DoRawGet(bucket, "reval-changed-key")
+	if err != nil {
+		t.Fatalf("First GET failed: %v", err)
+	}
+	io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
+	}
+	t.Logf("First GET: X-Cache=%s", resp1.Header.Get("X-Cache"))
+
+	// Wait for cache to be populated
+	time.Sleep(500 * time.Millisecond)
+
+	// PUT new content (v2) directly to Tigris, bypassing TAG's cache invalidation.
+	// TAG's cache still holds stale v1 with old ETag.
+	contentV2 := []byte("revalidation content version 2 - updated")
+	if err := globalEnv.PutTestObjectDirect(bucket, "reval-changed-key", contentV2); err != nil {
+		t.Fatalf("Failed to put test object v2 direct: %v", err)
+	}
+
+	// GET with Cache-Control: no-cache → revalidation
+	// Object changed, so upstream returns 200 with new body
+	resp2, err := globalEnv.DoRawGetWithHeaders(bucket, "reval-changed-key", noCacheHeaders())
+	if err != nil {
+		t.Fatalf("Revalidation GET failed: %v", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("Revalidation GET: expected 200, got %d", resp2.StatusCode)
+	}
+	if string(body2) != string(contentV2) {
+		t.Errorf("Revalidation GET: expected body %q, got %q", contentV2, body2)
+	}
+
+	xCache := resp2.Header.Get("X-Cache")
+	if xCache != "REVALIDATED" {
+		t.Errorf("Revalidation GET (changed): expected X-Cache REVALIDATED, got %q", xCache)
+	}
+	t.Logf("Revalidation GET changed verified: X-Cache=%s", xCache)
+}
+
+// TestSDK_Revalidation_GETRange_Unchanged verifies that a range GET with
+// Cache-Control: no-cache on an unchanged object returns the correct byte range
+// from cache after conditional validation (304 path).
+//
+// Flow:
+//  1. PUT object → full GET (cache miss) → cache populated
+//  2. GET with Cache-Control: no-cache + Range: bytes=0-4
+//  3. Upstream returns 304 → TAG serves range from cache, X-Cache: HIT
+func TestSDK_Revalidation_GETRange_Unchanged(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("reval-range-unchanged")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	content := []byte("revalidation range test data!!")
+	if err := globalEnv.PutTestObject(bucket, "reval-range-key", content); err != nil {
+		t.Fatalf("Failed to put test object: %v", err)
+	}
+
+	// Full GET to populate cache
+	resp1, err := globalEnv.DoRawGet(bucket, "reval-range-key")
+	if err != nil {
+		t.Fatalf("First GET failed: %v", err)
+	}
+	io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
+	}
+	t.Logf("First GET: X-Cache=%s", resp1.Header.Get("X-Cache"))
+
+	// Wait for cache to be populated
+	time.Sleep(500 * time.Millisecond)
+
+	// Range GET with Cache-Control: no-cache → revalidation + range
+	headers := map[string]string{
+		"Cache-Control": "no-cache",
+		"Range":         "bytes=0-4",
+	}
+	resp2, err := globalEnv.DoRawGetWithHeaders(bucket, "reval-range-key", headers)
+	if err != nil {
+		t.Fatalf("Revalidation range GET failed: %v", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusPartialContent {
+		t.Fatalf("Revalidation range GET: expected 206, got %d", resp2.StatusCode)
+	}
+
+	expectedRange := string(content[0:5]) // "reval"
+	if string(body2) != expectedRange {
+		t.Errorf("Revalidation range GET: expected body %q, got %q", expectedRange, body2)
+	}
+
+	contentRange := resp2.Header.Get("Content-Range")
+	if contentRange == "" {
+		t.Error("Revalidation range GET: expected Content-Range header to be present")
+	}
+
+	xCache := resp2.Header.Get("X-Cache")
+	if xCache != "HIT" {
+		t.Errorf("Revalidation range GET (unchanged): expected X-Cache HIT, got %q", xCache)
+	}
+	t.Logf("Revalidation range GET unchanged verified: X-Cache=%s, Content-Range=%s", xCache, contentRange)
+}
+
+// TestSDK_Revalidation_GETRange_Changed verifies that a range GET with
+// Cache-Control: no-cache on a changed object returns the correct byte range
+// from the new upstream response (206 path).
+//
+// Flow:
+//  1. PUT object v1 → full GET (cache miss) → cache populated with v1
+//  2. PUT object v2 (different content)
+//  3. GET with Cache-Control: no-cache + Range: bytes=0-4
+//  4. Upstream returns 206 with new range → X-Cache: REVALIDATED
+func TestSDK_Revalidation_GETRange_Changed(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("reval-range-changed")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	contentV1 := []byte("version1 range revalidation data")
+	if err := globalEnv.PutTestObject(bucket, "reval-range-chg-key", contentV1); err != nil {
+		t.Fatalf("Failed to put test object v1: %v", err)
+	}
+
+	// Full GET to populate cache with v1
+	resp1, err := globalEnv.DoRawGet(bucket, "reval-range-chg-key")
+	if err != nil {
+		t.Fatalf("First GET failed: %v", err)
+	}
+	io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
+	}
+	t.Logf("First GET: X-Cache=%s", resp1.Header.Get("X-Cache"))
+
+	// Wait for cache to be populated
+	time.Sleep(500 * time.Millisecond)
+
+	// PUT new content (v2) directly to Tigris, bypassing TAG's cache invalidation.
+	// TAG's cache still holds stale v1 with old ETag.
+	contentV2 := []byte("updated2 range revalidation data")
+	if err := globalEnv.PutTestObjectDirect(bucket, "reval-range-chg-key", contentV2); err != nil {
+		t.Fatalf("Failed to put test object v2 direct: %v", err)
+	}
+
+	// Range GET with Cache-Control: no-cache → revalidation
+	// Object changed, upstream returns 206 with new range
+	headers := map[string]string{
+		"Cache-Control": "no-cache",
+		"Range":         "bytes=0-4",
+	}
+	resp2, err := globalEnv.DoRawGetWithHeaders(bucket, "reval-range-chg-key", headers)
+	if err != nil {
+		t.Fatalf("Revalidation range GET failed: %v", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusPartialContent {
+		t.Fatalf("Revalidation range GET: expected 206, got %d", resp2.StatusCode)
+	}
+
+	expectedRange := string(contentV2[0:5]) // "updat"
+	if string(body2) != expectedRange {
+		t.Errorf("Revalidation range GET: expected body %q, got %q", expectedRange, body2)
+	}
+
+	xCache := resp2.Header.Get("X-Cache")
+	if xCache != "REVALIDATED" {
+		t.Errorf("Revalidation range GET (changed): expected X-Cache REVALIDATED, got %q", xCache)
+	}
+	t.Logf("Revalidation range GET changed verified: X-Cache=%s", xCache)
+}
+
+// TestSDK_Revalidation_HEAD_Unchanged verifies that HEAD with Cache-Control: no-cache
+// on an unchanged object returns cached metadata after conditional validation (304 path).
+//
+// Flow:
+//  1. PUT object → GET (cache miss, populates cache + learns ETag)
+//  2. HEAD with Cache-Control: no-cache → TAG sends conditional HEAD to upstream
+//  3. Upstream returns 304 → TAG serves cached metadata with X-Cache: HIT
+func TestSDK_Revalidation_HEAD_Unchanged(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("reval-head-unchanged")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	content := []byte("revalidation head unchanged test content")
+	if err := globalEnv.PutTestObject(bucket, "reval-head-key", content); err != nil {
+		t.Fatalf("Failed to put test object: %v", err)
+	}
+
+	// GET to populate cache and learn ETag
+	resp1, err := globalEnv.DoRawGet(bucket, "reval-head-key")
+	if err != nil {
+		t.Fatalf("First GET failed: %v", err)
+	}
+	io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
+	}
+	t.Logf("First GET: X-Cache=%s", resp1.Header.Get("X-Cache"))
+
+	// Wait for cache to be populated
+	time.Sleep(500 * time.Millisecond)
+
+	// HEAD with Cache-Control: no-cache → revalidation
+	// Object unchanged → upstream 304 → serve cached metadata
+	resp2, err := globalEnv.DoRawHeadWithHeaders(bucket, "reval-head-key", noCacheHeaders())
+	if err != nil {
+		t.Fatalf("Revalidation HEAD failed: %v", err)
+	}
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("Revalidation HEAD: expected 200, got %d", resp2.StatusCode)
+	}
+
+	if resp2.ContentLength != int64(len(content)) {
+		t.Errorf("Revalidation HEAD: expected Content-Length %d, got %d", len(content), resp2.ContentLength)
+	}
+
+	xCache := resp2.Header.Get("X-Cache")
+	if xCache != "HIT" {
+		t.Errorf("Revalidation HEAD (unchanged): expected X-Cache HIT, got %q", xCache)
+	}
+	t.Logf("Revalidation HEAD unchanged verified: X-Cache=%s, Content-Length=%d", xCache, resp2.ContentLength)
+}
+
+// TestSDK_Revalidation_HEAD_Changed verifies that HEAD with Cache-Control: no-cache
+// on a changed object returns new metadata from upstream (200 path).
+//
+// Flow:
+//  1. PUT object v1 → GET (cache miss) → cache populated with v1
+//  2. PUT object v2 (different size, new ETag)
+//  3. HEAD with Cache-Control: no-cache → TAG sends conditional HEAD to upstream
+//  4. Upstream returns 200 with new metadata → X-Cache: REVALIDATED
+func TestSDK_Revalidation_HEAD_Changed(t *testing.T) {
+	bucket, err := globalEnv.CreateTestBucket("reval-head-changed")
+	if err != nil {
+		t.Fatalf("Failed to create test bucket: %v", err)
+	}
+
+	contentV1 := []byte("head revalidation v1")
+	if err := globalEnv.PutTestObject(bucket, "reval-head-chg-key", contentV1); err != nil {
+		t.Fatalf("Failed to put test object v1: %v", err)
+	}
+
+	// GET to populate cache with v1
+	resp1, err := globalEnv.DoRawGet(bucket, "reval-head-chg-key")
+	if err != nil {
+		t.Fatalf("First GET failed: %v", err)
+	}
+	io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
+	}
+	t.Logf("First GET: X-Cache=%s", resp1.Header.Get("X-Cache"))
+
+	// Wait for cache to be populated
+	time.Sleep(500 * time.Millisecond)
+
+	// PUT new content v2 directly to Tigris, bypassing TAG's cache invalidation.
+	// TAG's cache still holds stale v1 with old ETag. Different size so Content-Length changes.
+	contentV2 := []byte("head revalidation v2 - updated with more content")
+	if err := globalEnv.PutTestObjectDirect(bucket, "reval-head-chg-key", contentV2); err != nil {
+		t.Fatalf("Failed to put test object v2 direct: %v", err)
+	}
+
+	// HEAD with Cache-Control: no-cache → revalidation
+	// Object changed → upstream 200 → new metadata
+	resp2, err := globalEnv.DoRawHeadWithHeaders(bucket, "reval-head-chg-key", noCacheHeaders())
+	if err != nil {
+		t.Fatalf("Revalidation HEAD failed: %v", err)
+	}
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("Revalidation HEAD: expected 200, got %d", resp2.StatusCode)
+	}
+
+	if resp2.ContentLength != int64(len(contentV2)) {
+		t.Errorf("Revalidation HEAD: expected Content-Length %d (v2), got %d", len(contentV2), resp2.ContentLength)
+	}
+
+	xCache := resp2.Header.Get("X-Cache")
+	if xCache != "REVALIDATED" {
+		t.Errorf("Revalidation HEAD (changed): expected X-Cache REVALIDATED, got %q", xCache)
+	}
+	t.Logf("Revalidation HEAD changed verified: X-Cache=%s, Content-Length=%d", xCache, resp2.ContentLength)
+}
+
+// ============================================================================
 // Extended S3 Operation Tests
 // These tests cover additional S3 scenarios from the Tigris e2e test suite.
 // ============================================================================
