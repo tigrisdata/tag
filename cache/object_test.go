@@ -516,4 +516,3 @@ func TestCachedObjectMeta_ACL_EncodeDecode(t *testing.T) {
 		t.Errorf("ACL = %q, want %q", decoded.ACL, original.ACL)
 	}
 }
-

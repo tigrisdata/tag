@@ -154,7 +154,12 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				}
 
 				// Serve full response from cache
-				return s.serveFromCache(ctx, w, bucket, key, meta, start)
+				if cacheBodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); cacheBodyErr != nil {
+					log.Warn().Err(cacheBodyErr).Str("bucket", bucket).Str("key", key).Msg("Cache body unavailable, falling through to upstream")
+					// Fall through to cache miss path
+				} else {
+					return nil
+				}
 			}
 		}
 		metrics.RecordCacheMiss()

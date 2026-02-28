@@ -39,6 +39,12 @@ func (s *Service) revalidateAndServe(
 		Str("range", rangeHeader).
 		Msg("Revalidating cached object with upstream")
 
+	// Capture writeStartTime before the conditional GET to ensure the tombstone
+	// protection window covers the entire operation. If captured after, a DELETE
+	// arriving between the GET response and writeStartTime capture would have a
+	// tombstone timestamp less than writeStartTime, bypassing the tombstone check.
+	writeStartTime := time.Now().UnixNano()
+
 	// Send conditional GET to upstream (includes Range header if present).
 	// Uses the parent context (not a separate timeout) to avoid truncating body
 	// streaming for large objects. The httpClient has its own 5-minute timeout.
@@ -57,12 +63,13 @@ func (s *Service) revalidateAndServe(
 		return s.handleRevalidation304(ctx, w, r, bucket, key, meta, rangeHeader, start)
 	case http.StatusOK:
 		// Full-object response (no range or upstream ignored range)
-		return s.handleRevalidation200(ctx, w, bucket, key, resp, start)
+		return s.handleRevalidation200(ctx, w, bucket, key, resp, start, writeStartTime)
 	case http.StatusPartialContent:
 		// Range response — object changed, upstream returned only the requested range
 		return s.handleRevalidation206Range(ctx, w, r, bucket, key, accessKey, secretKey, resp, start)
 	default:
-		// Unexpected status (4xx, 5xx) — serve stale
+		// Unexpected status (4xx, 5xx) — drain body for connection reuse, serve stale
+		io.Copy(io.Discard, resp.Body)
 		log.Warn().
 			Int("status", resp.StatusCode).
 			Str("bucket", bucket).
@@ -104,6 +111,7 @@ func (s *Service) handleRevalidation200(
 	bucket, key string,
 	resp *http.Response,
 	start time.Time,
+	writeStartTime int64,
 ) error {
 	metrics.RecordRevalidationUpdated()
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Revalidation 200 - object changed, streaming new data")
@@ -136,7 +144,6 @@ func (s *Service) handleRevalidation200(
 
 	// Stream to client AND cache simultaneously via TeeReader + pipe
 	pr, pw := io.Pipe()
-	writeStartTime := time.Now().UnixNano()
 	ttl := int(s.config.Cache.TTL.Seconds())
 
 	// Background goroutine: write to cache from pipe reader
@@ -289,8 +296,7 @@ func (s *Service) handleRevalidation206Range(
 	metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
 
 	// Trigger background full-object fetch to repopulate cache
-	if resp.StatusCode == http.StatusPartialContent &&
-		totalSize > 0 &&
+	if totalSize > 0 &&
 		totalSize <= s.config.Cache.SizeThreshold &&
 		s.cache.IsEnabled() &&
 		accessKey != "" && secretKey != "" {
@@ -332,70 +338,54 @@ func (s *Service) revalidateAndServeHead(
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Revalidating cached HEAD with upstream (conditional HEAD)")
 
 	resp, err := s.forwarder.DoConditionalHeadRequest(ctx, bucket, key, accessKey, secretKey, meta.ETag, meta.LastModified)
-	if err != nil {
-		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("HEAD revalidation failed, serving stale")
-		metrics.RecordRevalidationFailed()
-		metrics.RecordRevalidationStaleServed()
-		metrics.RecordCacheHit()
-		meta.WriteHeaders(w)
-		w.Header().Set(XCacheHeader, XCacheHit)
-		w.WriteHeader(meta.StatusCode)
-		metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
-		return nil
-	}
-	defer resp.Body.Close()
 
-	switch resp.StatusCode {
-	case http.StatusNotModified:
-		metrics.RecordRevalidationNotModified()
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD revalidation 304 - unchanged")
-
-		metrics.RecordCacheHit()
-		meta.WriteHeaders(w)
-		w.Header().Set(XCacheHeader, XCacheHit)
-		w.WriteHeader(meta.StatusCode)
-		metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
-		return nil
-
-	case http.StatusOK:
+	// Object changed — serve new headers from upstream, invalidate cache
+	if err == nil && resp.StatusCode == http.StatusOK {
+		defer resp.Body.Close()
 		metrics.RecordRevalidationUpdated()
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD revalidation 200 - object changed")
 
-		// Invalidate stale cache entry so the next GET fetches the new version.
 		s.cache.Delete(context.Background(), bucket, key)
-
-		// Drain any unexpected body for connection reuse
 		io.Copy(io.Discard, resp.Body)
 
-		// Serve new headers from upstream response (HEAD = no body)
 		copyHeaders(w.Header(), resp.Header)
 		w.Header().Set(XCacheHeader, XCacheRevalidated)
 		w.WriteHeader(resp.StatusCode)
 		metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
-
-		return nil
-
-	default:
-		// Drain any unexpected body for connection reuse
-		io.Copy(io.Discard, resp.Body)
-
-		log.Warn().Int("status", resp.StatusCode).Str("bucket", bucket).Str("key", key).Msg("HEAD revalidation unexpected status, serving stale")
-		metrics.RecordRevalidationFailed()
-		metrics.RecordRevalidationStaleServed()
-		metrics.RecordCacheHit()
-		meta.WriteHeaders(w)
-		w.Header().Set(XCacheHeader, XCacheHit)
-		w.WriteHeader(meta.StatusCode)
-		metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
 		return nil
 	}
+
+	// 304, error, or unexpected status — record specific metrics, then serve cached headers
+	if err != nil {
+		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("HEAD revalidation failed, serving stale")
+		metrics.RecordRevalidationFailed()
+		metrics.RecordRevalidationStaleServed()
+	} else {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNotModified {
+			metrics.RecordRevalidationNotModified()
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD revalidation 304 - unchanged")
+		} else {
+			io.Copy(io.Discard, resp.Body)
+			log.Warn().Int("status", resp.StatusCode).Str("bucket", bucket).Str("key", key).Msg("HEAD revalidation unexpected status, serving stale")
+			metrics.RecordRevalidationFailed()
+			metrics.RecordRevalidationStaleServed()
+		}
+	}
+
+	metrics.RecordCacheHit()
+	meta.WriteHeaders(w)
+	w.Header().Set(XCacheHeader, XCacheHit)
+	w.WriteHeader(meta.StatusCode)
+	metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
+	return nil
 }
 
 // shouldForceRevalidate checks if the client is requesting cache revalidation.
 // Per RFC 7234, Cache-Control: no-cache means "must revalidate with origin before serving".
 func shouldForceRevalidate(r *http.Request) bool {
 	cc := r.Header.Get("Cache-Control")
-	return strings.Contains(cc, "no-cache") || strings.Contains(cc, "max-age=0")
+	return strings.Contains(cc, "no-cache") || strings.Contains(cc, "max-age=0") || strings.Contains(cc, "must-revalidate")
 }
 
 // shouldBypassCache checks if the client is requesting full cache bypass.

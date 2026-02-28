@@ -77,8 +77,6 @@ func TestParseBucketKey(t *testing.T) {
 	}
 }
 
-
-
 func TestShouldForceRevalidate(t *testing.T) {
 	tests := []struct {
 		name         string
