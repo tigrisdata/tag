@@ -39,12 +39,6 @@ func (s *Service) revalidateAndServe(
 		Str("range", rangeHeader).
 		Msg("Revalidating cached object with upstream")
 
-	// Capture writeStartTime before the conditional GET to ensure the tombstone
-	// protection window covers the entire operation. If captured after, a DELETE
-	// arriving between the GET response and writeStartTime capture would have a
-	// tombstone timestamp less than writeStartTime, bypassing the tombstone check.
-	writeStartTime := time.Now().UnixNano()
-
 	// Send conditional GET to upstream (includes Range header if present).
 	// Uses the parent context (not a separate timeout) to avoid truncating body
 	// streaming for large objects. The httpClient has its own 5-minute timeout.
@@ -63,7 +57,7 @@ func (s *Service) revalidateAndServe(
 		return s.handleRevalidation304(ctx, w, r, bucket, key, meta, rangeHeader, start)
 	case http.StatusOK:
 		// Full-object response (no range or upstream ignored range)
-		return s.handleRevalidation200(ctx, w, bucket, key, resp, start, writeStartTime)
+		return s.handleRevalidation200(ctx, w, bucket, key, resp, start)
 	case http.StatusPartialContent:
 		// Range response — object changed, upstream returned only the requested range
 		return s.handleRevalidation206Range(ctx, w, r, bucket, key, accessKey, secretKey, resp, start)
@@ -111,7 +105,6 @@ func (s *Service) handleRevalidation200(
 	bucket, key string,
 	resp *http.Response,
 	start time.Time,
-	writeStartTime int64,
 ) error {
 	metrics.RecordRevalidationUpdated()
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Revalidation 200 - object changed, streaming new data")
@@ -129,6 +122,11 @@ func (s *Service) handleRevalidation200(
 	// version is known-stale and must not be served to future requests.
 	s.cache.Delete(context.Background(), bucket, key)
 
+	// Capture writeStartTime after Delete so our own tombstone doesn't block
+	// the subsequent cache write. A concurrent DELETE arriving after this point
+	// will have a newer tombstone that correctly blocks our write.
+	writeStartTime := time.Now().UnixNano()
+
 	// Write response headers to client
 	copyHeaders(w.Header(), resp.Header)
 	w.Header().Set(XCacheHeader, XCacheRevalidated)
@@ -138,7 +136,11 @@ func (s *Service) handleRevalidation200(
 		// Not cacheable — just stream to client
 		n, copyErr := io.Copy(w, resp.Body)
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-		metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+		status := "success"
+		if copyErr != nil {
+			status = "error"
+		}
+		metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
 		return copyErr
 	}
 
@@ -183,7 +185,11 @@ func (s *Service) handleRevalidation200(
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Cache write timeout after revalidation")
 	}
 
-	metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+	status := "success"
+	if copyErr != nil {
+		status = "error"
+	}
+	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
 	return copyErr
 }
 
@@ -196,10 +202,9 @@ func (s *Service) serveFromCache(
 	meta *cache.CachedObjectMeta,
 	start time.Time,
 ) error {
-	metrics.RecordCacheHit()
-
 	// Zero-byte objects: no body to serve
 	if meta.ContentLength == 0 {
+		metrics.RecordCacheHit()
 		meta.WriteHeaders(w)
 		w.Header().Set(XCacheHeader, XCacheHit)
 		w.WriteHeader(meta.StatusCode)
@@ -214,6 +219,7 @@ func (s *Service) serveFromCache(
 
 		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, bodyBuf)
 		if bodyErr == nil && bodyBuf.Len() > 0 {
+			metrics.RecordCacheHit()
 			meta.WriteHeaders(w)
 			w.Header().Set(XCacheHeader, XCacheHit)
 			w.WriteHeader(meta.StatusCode)
@@ -250,6 +256,7 @@ func (s *Service) serveFromCache(
 		return fmt.Errorf("cache body unavailable: %w", readErr)
 	}
 
+	metrics.RecordCacheHit()
 	meta.WriteHeaders(w)
 	w.Header().Set(XCacheHeader, XCacheHit)
 	w.WriteHeader(meta.StatusCode)
@@ -293,7 +300,11 @@ func (s *Service) handleRevalidation206Range(
 	n, copyErr := io.Copy(w, resp.Body)
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 
-	metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+	status := "success"
+	if copyErr != nil {
+		status = "error"
+	}
+	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
 
 	// Trigger background full-object fetch to repopulate cache
 	if totalSize > 0 &&
