@@ -58,11 +58,13 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 // HandleGetObject handles GET requests for objects with cache-first logic.
 // Uses streaming broadcast for request coalescing to reduce upstream load.
 // Supports conditional requests (If-None-Match, If-Modified-Since).
+// Supports client-triggered cache revalidation via Cache-Control: no-cache/max-age=0.
 func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
-	noCacheRead := shouldSkipCache(r)
+	forceRevalidate := shouldForceRevalidate(r)
+	bypassCache := shouldBypassCache(r)
 	rangeHeader := r.Header.Get("Range")
 
 	// Conditional request headers
@@ -72,7 +74,8 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	log.Debug().
 		Str("bucket", bucket).
 		Str("key", key).
-		Bool("no_cache", noCacheRead).
+		Bool("force_revalidate", forceRevalidate).
+		Bool("bypass_cache", bypassCache).
 		Str("if_none_match", ifNoneMatch).
 		Msg("HandleGetObject")
 
@@ -87,9 +90,10 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// For range requests: check if full object is in cache, then serve range from it.
 	// Uses two-phase approach: GetMeta first, then GetBodyStream for direct streaming.
 	// Anonymous requests can also read from cache if the object's ACL is public-read.
+	// Cache-Control: no-store bypasses cache entirely; no-cache/max-age=0 triggers revalidation.
 	isAnonymous := isAnonymousRequest(r, result, err)
 
-	if (result == AuthValidated || isAnonymous) && !noCacheRead && s.cache.IsEnabled() {
+	if (result == AuthValidated || isAnonymous) && !bypassCache && s.cache.IsEnabled() {
 		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
 		cacheHit := cacheErr == nil && found && meta != nil
 		// Anonymous requests can only be served from cache if the object's ACL allows it
@@ -98,116 +102,62 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping cache for anonymous request - object not public")
 		}
 		if cacheHit {
-			// If this is a Range request and we have the full object cached,
-			// serve the range from the cached object
-			if rangeHeader != "" {
-				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving range from cached full object")
-				return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+			// Client-triggered revalidation: Cache-Control: no-cache/max-age=0
+			// For range requests, the Range header is included in the conditional GET
+			// so upstream returns 304 (serve range from cache) or 206 (stream range to client).
+			if forceRevalidate && meta.ETag != "" {
+				log.Debug().
+					Str("bucket", bucket).
+					Str("key", key).
+					Msg("Cache hit requires revalidation (client-triggered)")
+				return s.revalidateAndServe(ctx, w, r, bucket, key, accessKey, secretKey, meta, start)
 			}
 
-			// Check conditional request: If-None-Match
-			if ifNoneMatch != "" && meta.MatchesETag(ifNoneMatch) {
-				metrics.RecordCacheHit()
-				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified")
-				w.Header().Set(XCacheHeader, XCacheHit)
-				w.Header().Set("ETag", meta.ETag)
-				w.WriteHeader(http.StatusNotModified)
-				metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
-				return nil
-			}
+			// If client forced revalidation but no ETag available, fall through to full miss
+			if forceRevalidate {
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Force revalidate but no ETag, falling through to upstream")
+				// Fall through to cache miss path below
+			} else {
+				// Fresh cache hit — serve from cache
 
-			// Check conditional request: If-Modified-Since
-			if ifModifiedSince != "" {
-				if t, parseErr := http.ParseTime(ifModifiedSince); parseErr == nil {
-					if !meta.IsModifiedSince(t) {
-						metrics.RecordCacheHit()
-						log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified (time)")
-						w.Header().Set(XCacheHeader, XCacheHit)
-						w.Header().Set("ETag", meta.ETag)
-						w.WriteHeader(http.StatusNotModified)
-						metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
-						return nil
-					}
+				// If this is a Range request and we have the full object cached,
+				// serve the range from the cached object
+				if rangeHeader != "" {
+					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving range from cached full object")
+					return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
 				}
-			}
 
-			// Serve full response from cache with proper headers
-			// Handle zero-byte objects directly (no body to verify)
-			if meta.ContentLength == 0 {
-				metrics.RecordCacheHit()
-				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving zero-byte object from cache")
-				meta.WriteHeaders(w)
-				w.Header().Set(XCacheHeader, XCacheHit)
-				w.WriteHeader(meta.StatusCode)
-				metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
-				return nil
-			}
-
-			// Small objects: buffer body directly (no goroutine/io.Pipe overhead)
-			// Uses GetBodyStream to buffer, reusing metadata from GetMeta above (2 gRPC calls total)
-			if meta.ContentLength <= smallObjectThreshold {
-				// Get buffer from pool to reduce allocations
-				bodyBuf := bufferPool.Get().(*bytes.Buffer)
-				bodyBuf.Reset()
-
-				bodyErr := s.cache.GetBodyStream(ctx, bucket, key, bodyBuf)
-				// Verify body was actually retrieved: ocache GetStream returns nil
-				// for not-found keys (by design), so we must check bytes written.
-				if bodyErr == nil && bodyBuf.Len() > 0 {
+				// Check conditional request: If-None-Match
+				if ifNoneMatch != "" && meta.MatchesETag(ifNoneMatch) {
 					metrics.RecordCacheHit()
-					log.Debug().Str("bucket", bucket).Str("key", key).Int64("size", meta.ContentLength).Msg("Serving small object from cache (fast path)")
-					meta.WriteHeaders(w)
+					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified")
 					w.Header().Set(XCacheHeader, XCacheHit)
-					w.WriteHeader(meta.StatusCode)
-					n, _ := w.Write(bodyBuf.Bytes())
-					metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+					w.Header().Set("ETag", meta.ETag)
+					w.WriteHeader(http.StatusNotModified)
 					metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
-					putBuffer(bodyBuf) // Return buffer to pool
 					return nil
 				}
-				putBuffer(bodyBuf) // Return buffer to pool even on error/miss
-				// Fall through to upstream (cache miss handling below)
-				if bodyErr != nil {
-					log.Debug().Err(bodyErr).Str("bucket", bucket).Str("key", key).Msg("GetBodyStream failed for small object, falling back to upstream")
-				} else {
-					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache body empty despite meta hit, falling back to upstream")
-				}
-			} else {
-				// Large objects: use io.Pipe for streaming (avoids buffering entire object)
-				pr, pw := io.Pipe()
-				go func() {
-					err := s.cache.GetBodyStream(ctx, bucket, key, pw)
-					if err != nil {
-						pw.CloseWithError(err)
-					} else {
-						pw.Close()
+
+				// Check conditional request: If-Modified-Since
+				if ifModifiedSince != "" {
+					if t, parseErr := http.ParseTime(ifModifiedSince); parseErr == nil {
+						if !meta.IsModifiedSince(t) {
+							metrics.RecordCacheHit()
+							log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified (time)")
+							w.Header().Set(XCacheHeader, XCacheHit)
+							w.Header().Set("ETag", meta.ETag)
+							w.WriteHeader(http.StatusNotModified)
+							metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+							return nil
+						}
 					}
-				}()
+				}
 
-				// Read first byte to verify body exists before committing headers
-				firstByte := make([]byte, 1)
-				n, readErr := pr.Read(firstByte)
-				if readErr != nil {
-					// Body missing or error - close pipe and fall through to upstream
-					pr.Close()
-					log.Debug().Err(readErr).Str("bucket", bucket).Str("key", key).Msg("Cache body missing, falling back to upstream")
-					// Fall through to cache miss handling below
+				// Serve full response from cache
+				if cacheBodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); cacheBodyErr != nil {
+					log.Warn().Err(cacheBodyErr).Str("bucket", bucket).Str("key", key).Msg("Cache body unavailable, falling through to upstream")
+					// Fall through to cache miss path
 				} else {
-					// Body verified - safe to write headers and stream
-					metrics.RecordCacheHit()
-					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving large object from cache (streaming)")
-					meta.WriteHeaders(w)
-					w.Header().Set(XCacheHeader, XCacheHit)
-					w.WriteHeader(meta.StatusCode)
-
-					// Write first byte and stream the rest
-					cw := &countingWriter{w: w}
-					cw.Write(firstByte[:n])
-					io.Copy(cw, pr)
-					pr.Close()
-
-					metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-					metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
 					return nil
 				}
 			}
@@ -230,6 +180,8 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	var xCache string
 	if !s.cache.IsEnabled() {
 		xCache = XCacheDisabled
+	} else if bypassCache {
+		xCache = XCacheBypass
 	} else {
 		xCache = XCacheMiss
 	}

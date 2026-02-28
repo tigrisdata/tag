@@ -77,7 +77,7 @@ func TestParseBucketKey(t *testing.T) {
 	}
 }
 
-func TestShouldSkipCache(t *testing.T) {
+func TestShouldForceRevalidate(t *testing.T) {
 	tests := []struct {
 		name         string
 		cacheControl string
@@ -99,7 +99,7 @@ func TestShouldSkipCache(t *testing.T) {
 			want:         true,
 		},
 		{
-			name:         "max-age with other directives",
+			name:         "max-age=0 with must-revalidate",
 			cacheControl: "max-age=0, must-revalidate",
 			want:         true,
 		},
@@ -132,9 +132,57 @@ func TestShouldSkipCache(t *testing.T) {
 				req.Header.Set("Cache-Control", tt.cacheControl)
 			}
 
-			got := shouldSkipCache(req)
+			got := shouldForceRevalidate(req)
 			if got != tt.want {
-				t.Errorf("shouldSkipCache() = %v, want %v", got, tt.want)
+				t.Errorf("shouldForceRevalidate() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldBypassCache(t *testing.T) {
+	tests := []struct {
+		name         string
+		cacheControl string
+		want         bool
+	}{
+		{
+			name:         "no cache-control header",
+			cacheControl: "",
+			want:         false,
+		},
+		{
+			name:         "no-cache directive",
+			cacheControl: "no-cache",
+			want:         false,
+		},
+		{
+			name:         "no-store",
+			cacheControl: "no-store",
+			want:         true,
+		},
+		{
+			name:         "no-store with no-cache",
+			cacheControl: "no-cache, no-store",
+			want:         true,
+		},
+		{
+			name:         "normal max-age",
+			cacheControl: "max-age=3600",
+			want:         false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+			if tt.cacheControl != "" {
+				req.Header.Set("Cache-Control", tt.cacheControl)
+			}
+
+			got := shouldBypassCache(req)
+			if got != tt.want {
+				t.Errorf("shouldBypassCache() = %v, want %v", got, tt.want)
 			}
 		})
 	}

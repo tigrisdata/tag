@@ -200,6 +200,46 @@ var (
 			Help: "Number of signing key sets extracted from Tigris responses",
 		},
 	)
+
+	// RevalidationsTriggered counts cache revalidation attempts.
+	RevalidationsTriggered = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_revalidations_triggered_total",
+			Help: "Number of cache revalidation attempts (conditional GET to upstream)",
+		},
+	)
+
+	// RevalidationsNotModified counts revalidations where upstream returned 304.
+	RevalidationsNotModified = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_revalidations_not_modified_total",
+			Help: "Number of revalidations where upstream returned 304 Not Modified",
+		},
+	)
+
+	// RevalidationsUpdated counts revalidations where upstream returned 200 with new data.
+	RevalidationsUpdated = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_revalidations_updated_total",
+			Help: "Number of revalidations where upstream returned 200 with new data",
+		},
+	)
+
+	// RevalidationsFailed counts revalidations that failed.
+	RevalidationsFailed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_revalidations_failed_total",
+			Help: "Number of revalidations that failed (error or unexpected status)",
+		},
+	)
+
+	// RevalidationsStaleServed counts times stale data was served due to revalidation error.
+	RevalidationsStaleServed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_revalidations_stale_served_total",
+			Help: "Number of times stale cached data was served due to revalidation failure",
+		},
+	)
 )
 
 // RecordRequest records a request with its duration and status.
@@ -281,4 +321,29 @@ func RecordRangeFromCacheHit() {
 // RecordLocalAuthValidation records a local auth validation result.
 func RecordLocalAuthValidation(result string) {
 	LocalAuthValidations.WithLabelValues(result).Inc()
+}
+
+// RecordRevalidationTriggered records a revalidation attempt.
+func RecordRevalidationTriggered() {
+	RevalidationsTriggered.Inc()
+}
+
+// RecordRevalidationNotModified records a 304 revalidation result.
+func RecordRevalidationNotModified() {
+	RevalidationsNotModified.Inc()
+}
+
+// RecordRevalidationUpdated records a 200 revalidation result (object changed).
+func RecordRevalidationUpdated() {
+	RevalidationsUpdated.Inc()
+}
+
+// RecordRevalidationFailed records a failed revalidation.
+func RecordRevalidationFailed() {
+	RevalidationsFailed.Inc()
+}
+
+// RecordRevalidationStaleServed records serving stale data due to revalidation failure.
+func RecordRevalidationStaleServed() {
+	RevalidationsStaleServed.Inc()
 }

@@ -23,8 +23,9 @@ const (
 	XCacheHeader   = "X-Cache"
 	XCacheHit      = "HIT"
 	XCacheMiss     = "MISS"
-	XCacheBypass   = "BYPASS"   // Range requests bypass cache
-	XCacheDisabled = "DISABLED" // Cache is disabled
+	XCacheBypass      = "BYPASS"      // Cache-Control: no-store bypassed cache
+	XCacheDisabled    = "DISABLED"    // Cache is disabled
+	XCacheRevalidated = "REVALIDATED" // Object revalidated with upstream
 )
 
 // Service provides the core caching proxy logic.
@@ -109,16 +110,18 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 
 // HandleHeadObject handles HEAD requests for objects.
 // Serves from cached metadata when available (no body fetch needed).
+// Supports cache revalidation via Cache-Control: no-cache/max-age=0.
 func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
-	noCacheRead := shouldSkipCache(r)
+	forceRevalidate := shouldForceRevalidate(r)
+	bypassCache := shouldBypassCache(r)
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleHeadObject")
 
 	// Validate credentials before serving from cache
-	result, _, _, err := s.forwarder.ValidateAndGetCredentials(r)
+	result, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil {
 		metrics.RecordRequest("HeadObject", "auth_error", time.Since(start).Seconds())
 		return err
@@ -128,7 +131,7 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	// Anonymous requests can also read from cache if the object's ACL is public-read.
 	isAnonymous := isAnonymousRequest(r, result, err)
 
-	if (result == AuthValidated || isAnonymous) && !noCacheRead && s.cache.IsEnabled() {
+	if (result == AuthValidated || isAnonymous) && !bypassCache && s.cache.IsEnabled() {
 		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
 		cacheHit := cacheErr == nil && found && meta != nil
 		if cacheHit && isAnonymous && !meta.IsPublicRead() {
@@ -136,23 +139,34 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping HEAD cache for anonymous request - object not public")
 		}
 		if cacheHit {
-			metrics.RecordCacheHit()
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD served from cache")
-			meta.WriteHeaders(w)
-			w.Header().Set(XCacheHeader, XCacheHit)
-			w.WriteHeader(meta.StatusCode)
-			metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
-			return nil
+			// Client-triggered revalidation: Cache-Control: no-cache/max-age=0
+			if forceRevalidate && meta.ETag != "" {
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD cache hit requires revalidation (client-triggered)")
+				return s.revalidateAndServeHead(ctx, w, bucket, key, accessKey, secretKey, meta, start)
+			}
+
+			if !forceRevalidate {
+				metrics.RecordCacheHit()
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD served from cache")
+				meta.WriteHeaders(w)
+				w.Header().Set(XCacheHeader, XCacheHit)
+				w.WriteHeader(meta.StatusCode)
+				metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
+				return nil
+			}
+			// forceRevalidate but no ETag — fall through to upstream
 		}
 		metrics.RecordCacheMiss()
 	}
 
 	// Cache miss - forward to upstream
 	// Set X-Cache header before forwarding (will be included in response)
-	if s.cache.IsEnabled() {
-		w.Header().Set(XCacheHeader, XCacheMiss)
-	} else {
+	if !s.cache.IsEnabled() {
 		w.Header().Set(XCacheHeader, XCacheDisabled)
+	} else if bypassCache {
+		w.Header().Set(XCacheHeader, XCacheBypass)
+	} else {
+		w.Header().Set(XCacheHeader, XCacheMiss)
 	}
 	err = s.forwarder.Forward(ctx, w, r)
 

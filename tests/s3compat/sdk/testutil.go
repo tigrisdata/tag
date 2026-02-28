@@ -43,6 +43,9 @@ type TestEnvironment struct {
 	BucketPrefix string
 	// S3Client is the pre-configured S3 client.
 	S3Client *s3.Client
+	// DirectS3Client connects directly to Tigris (bypassing TAG).
+	// Used by revalidation tests to modify objects without invalidating TAG's cache.
+	DirectS3Client *s3.Client
 
 	// buckets tracks created buckets for cleanup.
 	buckets []string
@@ -69,6 +72,16 @@ func NewTestEnvironment() (*TestEnvironment, error) {
 	// Create S3 client
 	env.S3Client = s3.NewFromConfig(aws.Config{}, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(env.Endpoint)
+		o.Region = env.Region
+		o.UsePathStyle = true
+		o.Credentials = credentials.NewStaticCredentialsProvider(
+			env.AccessKeyID, env.SecretAccessKey, "")
+	})
+
+	// Create direct-to-Tigris S3 client (bypasses TAG).
+	// Used by revalidation tests to modify objects without invalidating TAG's cache.
+	env.DirectS3Client = s3.NewFromConfig(aws.Config{}, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String("https://t3.storage.dev")
 		o.Region = env.Region
 		o.UsePathStyle = true
 		o.Credentials = credentials.NewStaticCredentialsProvider(
@@ -139,6 +152,18 @@ func (e *TestEnvironment) CreateTestBucket(suffix string) (string, error) {
 // PutTestObject uploads an object to the specified bucket via S3 SDK.
 func (e *TestEnvironment) PutTestObject(bucket, key string, data []byte) error {
 	_, err := e.S3Client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(data),
+	})
+	return err
+}
+
+// PutTestObjectDirect uploads an object directly to Tigris, bypassing TAG.
+// This allows modifying objects without invalidating TAG's cache, which is needed
+// for testing the revalidation "changed" path (upstream returns 200, not 304).
+func (e *TestEnvironment) PutTestObjectDirect(bucket, key string, data []byte) error {
+	_, err := e.DirectS3Client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 		Body:   bytes.NewReader(data),
@@ -281,6 +306,37 @@ func (e *TestEnvironment) DoRawHeadUnauthenticated(bucket, key string) (*http.Re
 	req, err := http.NewRequestWithContext(context.Background(), "HEAD", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create unauthenticated HEAD request: %w", err)
+	}
+	return http.DefaultClient.Do(req)
+}
+
+// DoRawGetWithHeaders performs a SigV4-signed raw HTTP GET with custom headers.
+// Useful for testing Cache-Control, Range, and other request headers.
+// Caller is responsible for closing the response body.
+func (e *TestEnvironment) DoRawGetWithHeaders(bucket, key string, headers map[string]string) (*http.Response, error) {
+	return e.doRawRequestWithHeaders("GET", bucket, key, headers)
+}
+
+// DoRawHeadWithHeaders performs a SigV4-signed raw HTTP HEAD with custom headers.
+// Useful for testing Cache-Control and other request headers on HEAD requests.
+// Caller is responsible for closing the response body.
+func (e *TestEnvironment) DoRawHeadWithHeaders(bucket, key string, headers map[string]string) (*http.Response, error) {
+	return e.doRawRequestWithHeaders("HEAD", bucket, key, headers)
+}
+
+// doRawRequestWithHeaders performs a SigV4-signed raw HTTP request with custom headers.
+func (e *TestEnvironment) doRawRequestWithHeaders(method, bucket, key string, headers map[string]string) (*http.Response, error) {
+	signer := auth.NewRequestSigner(e.Endpoint, e.Region)
+	path := "/" + bucket + "/" + key
+
+	httpHeaders := make(http.Header)
+	for k, v := range headers {
+		httpHeaders.Set(k, v)
+	}
+
+	req, err := signer.SignRequest(context.Background(), method, path, nil, "", e.AccessKeyID, e.SecretAccessKey, httpHeaders)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign %s request with headers: %w", method, err)
 	}
 	return http.DefaultClient.Do(req)
 }
