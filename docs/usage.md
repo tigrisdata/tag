@@ -72,20 +72,6 @@ aws s3 rm s3://my-bucket/my-key --endpoint-url http://localhost:8080
 aws s3api head-object --bucket my-bucket --key my-key --endpoint-url http://localhost:8080
 ```
 
-### Verifying Cache Behavior
-
-Check the `X-Cache` header to verify caching:
-
-```bash
-# Using curl to see cache headers
-curl -I http://localhost:8080/my-bucket/my-key \
-  -H "Authorization: AWS4-HMAC-SHA256 ..."
-
-# Response will include:
-# X-Cache: HIT    (served from cache)
-# X-Cache: MISS   (fetched from upstream, now cached)
-```
-
 ## Python (boto3)
 
 ### Installation

@@ -194,6 +194,58 @@ rate(tag_background_fetches_triggered_total[5m])
 
 Number of currently active background fetches.
 
+### Revalidation Metrics
+
+#### tag_revalidations_triggered_total
+
+**Type:** Counter
+
+Number of cache revalidation attempts (conditional GET/HEAD to upstream). Incremented when a client sends `Cache-Control: no-cache` or `max-age=0` and a cached entry with an ETag exists.
+
+**Example queries:**
+```promql
+# Revalidation rate
+rate(tag_revalidations_triggered_total[5m])
+```
+
+#### tag_revalidations_not_modified_total
+
+**Type:** Counter
+
+Number of revalidations where upstream returned 304 Not Modified (cached entry is still fresh).
+
+**Example queries:**
+```promql
+# Revalidation 304 ratio (higher = better cache freshness)
+rate(tag_revalidations_not_modified_total[5m]) /
+rate(tag_revalidations_triggered_total[5m])
+```
+
+#### tag_revalidations_updated_total
+
+**Type:** Counter
+
+Number of revalidations where upstream returned 200 with new data (cached entry was stale).
+
+#### tag_revalidations_failed_total
+
+**Type:** Counter
+
+Number of revalidations that failed due to errors or unexpected status codes.
+
+#### tag_revalidations_stale_served_total
+
+**Type:** Counter
+
+Number of times stale cached data was served because the revalidation request to upstream failed.
+
+**Example queries:**
+```promql
+# Stale serve ratio (should be low)
+rate(tag_revalidations_stale_served_total[5m]) /
+rate(tag_revalidations_triggered_total[5m])
+```
+
 ### Upstream Metrics
 
 #### tag_upstream_request_duration_seconds
@@ -233,6 +285,46 @@ Total number of authentication failures.
 | Label | Description |
 |-------|-------------|
 | `reason` | Failure reason: `invalid_signature`, `unknown_key`, `expired` |
+
+### Transparent Proxy Metrics
+
+#### tag_local_auth_validations_total
+
+**Type:** Counter
+
+Local authentication validation attempts and results in transparent proxy mode.
+
+| Label | Description |
+|-------|-------------|
+| `result` | Validation result: `success`, `missing_auth`, `parse_error`, `unknown_key`, `signature_mismatch`, `authz_expired` |
+
+**Example queries:**
+```promql
+# Local auth success rate
+rate(tag_local_auth_validations_total{result="success"}[5m]) /
+sum(rate(tag_local_auth_validations_total[5m]))
+
+# Auth failure breakdown
+sum by (result) (rate(tag_local_auth_validations_total{result!="success"}[5m]))
+```
+
+#### tag_derived_key_store_size
+
+**Type:** Gauge
+
+Number of stored derived signing keys (learned from Tigris responses).
+
+#### tag_authz_cache_size
+
+**Type:** Gauge
+
+Number of active authorization cache entries (per access-key, per bucket).
+
+#### tag_proxy_signing_keys_received_total
+
+**Type:** Counter
+
+Number of signing key sets extracted from Tigris responses (used for local signature validation).
 
 ### Connection Metrics
 
