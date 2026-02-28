@@ -57,6 +57,7 @@ const (
 	// DefaultMaxIdleConnsPerHost is the default HTTP connection pool size per upstream host.
 	// Higher values improve throughput for cache miss scenarios with high concurrency.
 	DefaultMaxIdleConnsPerHost = 100
+
 )
 
 // Config holds all configuration for TAG.
@@ -127,7 +128,7 @@ type CacheConfig struct {
 	GRPCAddr          string   `yaml:"grpc_addr"`            // Address for gRPC server (default: :9000)
 	AdvertiseAddr     string   `yaml:"advertise_addr"`       // Address advertised to other nodes (defaults to GRPCAddr)
 	SeedNodes         []string `yaml:"seed_nodes"`           // Seed nodes for cluster discovery
-	GRPCAuth          *bool    `yaml:"grpc_auth"`            // Enable gRPC auth using proxy credentials (default: true when nil)
+	GRPCAuth             *bool         `yaml:"grpc_auth"`              // Enable gRPC auth using proxy credentials (default: true when nil)
 }
 
 // IsEnabled returns whether caching is enabled.

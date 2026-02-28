@@ -49,6 +49,19 @@ type RequestForwarder interface {
 	// Used for background cache population after a Range request cache miss.
 	// Caller is responsible for closing the response body.
 	DoFullObjectRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error)
+
+	// DoConditionalGetRequest executes a conditional GET for cache revalidation.
+	// Sends If-None-Match and/or If-Modified-Since headers.
+	// If rangeHeader is non-empty, includes a Range header (for range+revalidation).
+	// Returns 304 if unchanged, 200/206 with body if changed.
+	// Caller is responsible for closing the response body.
+	DoConditionalGetRequest(ctx context.Context, bucket, key, accessKey, secretKey, etag string, lastModified int64, rangeHeader string) (*http.Response, error)
+
+	// DoConditionalHeadRequest executes a conditional HEAD for cache revalidation of HEAD requests.
+	// Sends If-None-Match and/or If-Modified-Since headers.
+	// Returns 304 if unchanged, 200 with headers only if changed (no body).
+	// Caller is responsible for closing the response body.
+	DoConditionalHeadRequest(ctx context.Context, bucket, key, accessKey, secretKey, etag string, lastModified int64) (*http.Response, error)
 }
 
 // AuthErrorCode represents the type of authentication error.
@@ -296,6 +309,83 @@ func (b *baseForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, ac
 	metrics.RecordUpstreamRequest("GET", time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background fetch failed")
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// DoConditionalGetRequest executes a conditional GET request to upstream.
+// Used for cache revalidation: sends If-None-Match and/or If-Modified-Since headers
+// to check if a cached object is still fresh.
+// Returns 304 Not Modified if unchanged, 200 OK with body if changed.
+// Caller is responsible for closing the response body.
+//
+// This always uses standard SigV4 signing because it is a synthetic request
+// initiated by TAG itself, not a forwarded client request.
+func (b *baseForwarder) DoConditionalGetRequest(ctx context.Context, bucket, key, accessKey, secretKey, etag string, lastModified int64, rangeHeader string) (*http.Response, error) {
+	path := "/" + bucket + "/" + key
+
+	// Build extra headers for conditional request
+	extraHeaders := http.Header{}
+	if etag != "" {
+		extraHeaders.Set("If-None-Match", etag)
+	}
+	if lastModified > 0 {
+		t := time.Unix(lastModified, 0).UTC()
+		extraHeaders.Set("If-Modified-Since", t.Format(http.TimeFormat))
+	}
+	if rangeHeader != "" {
+		extraHeaders.Set("Range", rangeHeader)
+	}
+
+	fwdReq, err := b.signer.SignRequest(ctx, "GET", path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
+	if err != nil {
+		return nil, err
+	}
+
+	upstreamStart := time.Now()
+	resp, err := b.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest("GET", time.Since(upstreamStart).Seconds(), err)
+	if err != nil {
+		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Conditional GET failed")
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// DoConditionalHeadRequest executes a conditional HEAD request to upstream.
+// Used for cache revalidation of HEAD requests: sends If-None-Match and/or
+// If-Modified-Since headers to check if a cached object is still fresh.
+// Returns 304 Not Modified if unchanged, 200 OK with headers only if changed.
+// Caller is responsible for closing the response body.
+//
+// This always uses standard SigV4 signing because it is a synthetic request
+// initiated by TAG itself, not a forwarded client request.
+func (b *baseForwarder) DoConditionalHeadRequest(ctx context.Context, bucket, key, accessKey, secretKey, etag string, lastModified int64) (*http.Response, error) {
+	path := "/" + bucket + "/" + key
+
+	// Build extra headers for conditional request
+	extraHeaders := http.Header{}
+	if etag != "" {
+		extraHeaders.Set("If-None-Match", etag)
+	}
+	if lastModified > 0 {
+		t := time.Unix(lastModified, 0).UTC()
+		extraHeaders.Set("If-Modified-Since", t.Format(http.TimeFormat))
+	}
+
+	fwdReq, err := b.signer.SignRequest(ctx, "HEAD", path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
+	if err != nil {
+		return nil, err
+	}
+
+	upstreamStart := time.Now()
+	resp, err := b.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest("HEAD", time.Since(upstreamStart).Seconds(), err)
+	if err != nil {
+		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Conditional HEAD failed")
 		return nil, err
 	}
 

@@ -622,3 +622,4 @@ func TestTLS_DisabledByDefault(t *testing.T) {
 		t.Error("TLSEnabled() = true, want false (disabled by default)")
 	}
 }
+
