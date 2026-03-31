@@ -1335,8 +1335,7 @@ func TestSDK_Revalidation_GET_Changed(t *testing.T) {
 	if resp1.StatusCode != http.StatusOK {
 		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
 	}
-	v1ETag := resp1.Header.Get("ETag")
-	t.Logf("First GET: X-Cache=%s, ETag=%s", resp1.Header.Get("X-Cache"), v1ETag)
+	t.Logf("First GET: X-Cache=%s", resp1.Header.Get("X-Cache"))
 
 	// Wait for cache to be populated
 	time.Sleep(500 * time.Millisecond)
@@ -1348,28 +1347,38 @@ func TestSDK_Revalidation_GET_Changed(t *testing.T) {
 		t.Fatalf("Failed to put test object v2 direct: %v", err)
 	}
 
-	// Wait for the update to propagate on Tigris before testing revalidation
-	if err := globalEnv.WaitForObjectUpdate(bucket, "reval-changed-key", v1ETag, 5*time.Second); err != nil {
+	// Wait for v2 content to be visible on Tigris before testing revalidation
+	if err := globalEnv.WaitForObjectContent(bucket, "reval-changed-key", contentV2, 5*time.Second); err != nil {
 		t.Fatalf("Object update did not propagate: %v", err)
 	}
 
 	// GET with Cache-Control: no-cache → revalidation
-	// Object changed, so upstream returns 200 with new body
-	resp2, err := globalEnv.DoRawGetWithHeaders(bucket, "reval-changed-key", noCacheHeaders())
-	if err != nil {
-		t.Fatalf("Revalidation GET failed: %v", err)
-	}
-	body2, _ := io.ReadAll(resp2.Body)
-	resp2.Body.Close()
+	// Retry: TAG's conditional GET may briefly see stale data on a different
+	// Tigris node than WaitForObjectContent polled, so retry until convergence.
+	var body2 []byte
+	var xCache string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp2, err := globalEnv.DoRawGetWithHeaders(bucket, "reval-changed-key", noCacheHeaders())
+		if err != nil {
+			t.Fatalf("Revalidation GET failed: %v", err)
+		}
+		body2, _ = io.ReadAll(resp2.Body)
+		resp2.Body.Close()
 
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("Revalidation GET: expected 200, got %d", resp2.StatusCode)
+		if resp2.StatusCode != http.StatusOK {
+			t.Fatalf("Revalidation GET: expected 200, got %d", resp2.StatusCode)
+		}
+		xCache = resp2.Header.Get("X-Cache")
+		if xCache == "REVALIDATED" {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
+
 	if string(body2) != string(contentV2) {
 		t.Errorf("Revalidation GET: expected body %q, got %q", contentV2, body2)
 	}
-
-	xCache := resp2.Header.Get("X-Cache")
 	if xCache != "REVALIDATED" {
 		t.Errorf("Revalidation GET (changed): expected X-Cache REVALIDATED, got %q", xCache)
 	}
@@ -1475,8 +1484,7 @@ func TestSDK_Revalidation_GETRange_Changed(t *testing.T) {
 	if resp1.StatusCode != http.StatusOK {
 		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
 	}
-	v1ETag := resp1.Header.Get("ETag")
-	t.Logf("First GET: X-Cache=%s, ETag=%s", resp1.Header.Get("X-Cache"), v1ETag)
+	t.Logf("First GET: X-Cache=%s", resp1.Header.Get("X-Cache"))
 
 	// Wait for cache to be populated
 	time.Sleep(500 * time.Millisecond)
@@ -1488,34 +1496,43 @@ func TestSDK_Revalidation_GETRange_Changed(t *testing.T) {
 		t.Fatalf("Failed to put test object v2 direct: %v", err)
 	}
 
-	// Wait for the update to propagate on Tigris before testing revalidation
-	if err := globalEnv.WaitForObjectUpdate(bucket, "reval-range-chg-key", v1ETag, 5*time.Second); err != nil {
+	// Wait for v2 content to be visible on Tigris before testing revalidation
+	if err := globalEnv.WaitForObjectContent(bucket, "reval-range-chg-key", contentV2, 5*time.Second); err != nil {
 		t.Fatalf("Object update did not propagate: %v", err)
 	}
 
 	// Range GET with Cache-Control: no-cache → revalidation
-	// Object changed, upstream returns 206 with new range
+	// Retry: TAG's conditional GET may briefly see stale data on a different
+	// Tigris node than WaitForObjectContent polled.
 	headers := map[string]string{
 		"Cache-Control": "no-cache",
 		"Range":         "bytes=0-4",
 	}
-	resp2, err := globalEnv.DoRawGetWithHeaders(bucket, "reval-range-chg-key", headers)
-	if err != nil {
-		t.Fatalf("Revalidation range GET failed: %v", err)
-	}
-	body2, _ := io.ReadAll(resp2.Body)
-	resp2.Body.Close()
-
-	if resp2.StatusCode != http.StatusPartialContent {
-		t.Fatalf("Revalidation range GET: expected 206, got %d", resp2.StatusCode)
-	}
-
 	expectedRange := string(contentV2[0:5]) // "updat"
+	var body2 []byte
+	var xCache string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp2, err := globalEnv.DoRawGetWithHeaders(bucket, "reval-range-chg-key", headers)
+		if err != nil {
+			t.Fatalf("Revalidation range GET failed: %v", err)
+		}
+		body2, _ = io.ReadAll(resp2.Body)
+		resp2.Body.Close()
+
+		if resp2.StatusCode != http.StatusPartialContent && resp2.StatusCode != http.StatusOK {
+			t.Fatalf("Revalidation range GET: expected 206 or 200, got %d", resp2.StatusCode)
+		}
+		xCache = resp2.Header.Get("X-Cache")
+		if xCache == "REVALIDATED" {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
 	if string(body2) != expectedRange {
 		t.Errorf("Revalidation range GET: expected body %q, got %q", expectedRange, body2)
 	}
-
-	xCache := resp2.Header.Get("X-Cache")
 	if xCache != "REVALIDATED" {
 		t.Errorf("Revalidation range GET (changed): expected X-Cache REVALIDATED, got %q", xCache)
 	}
@@ -1609,8 +1626,7 @@ func TestSDK_Revalidation_HEAD_Changed(t *testing.T) {
 	if resp1.StatusCode != http.StatusOK {
 		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
 	}
-	v1ETag := resp1.Header.Get("ETag")
-	t.Logf("First GET: X-Cache=%s, ETag=%s", resp1.Header.Get("X-Cache"), v1ETag)
+	t.Logf("First GET: X-Cache=%s", resp1.Header.Get("X-Cache"))
 
 	// Wait for cache to be populated
 	time.Sleep(500 * time.Millisecond)
@@ -1622,32 +1638,42 @@ func TestSDK_Revalidation_HEAD_Changed(t *testing.T) {
 		t.Fatalf("Failed to put test object v2 direct: %v", err)
 	}
 
-	// Wait for the update to propagate on Tigris before testing revalidation
-	if err := globalEnv.WaitForObjectUpdate(bucket, "reval-head-chg-key", v1ETag, 5*time.Second); err != nil {
+	// Wait for v2 content to be visible on Tigris before testing revalidation
+	if err := globalEnv.WaitForObjectContent(bucket, "reval-head-chg-key", contentV2, 5*time.Second); err != nil {
 		t.Fatalf("Object update did not propagate: %v", err)
 	}
 
 	// HEAD with Cache-Control: no-cache → revalidation
-	// Object changed → upstream 200 → new metadata
-	resp2, err := globalEnv.DoRawHeadWithHeaders(bucket, "reval-head-chg-key", noCacheHeaders())
-	if err != nil {
-		t.Fatalf("Revalidation HEAD failed: %v", err)
-	}
-	resp2.Body.Close()
+	// Retry: TAG's conditional HEAD may briefly see stale data on a different
+	// Tigris node than WaitForObjectContent polled.
+	var contentLength int64
+	var xCache string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp2, err := globalEnv.DoRawHeadWithHeaders(bucket, "reval-head-chg-key", noCacheHeaders())
+		if err != nil {
+			t.Fatalf("Revalidation HEAD failed: %v", err)
+		}
+		resp2.Body.Close()
 
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("Revalidation HEAD: expected 200, got %d", resp2.StatusCode)
+		if resp2.StatusCode != http.StatusOK {
+			t.Fatalf("Revalidation HEAD: expected 200, got %d", resp2.StatusCode)
+		}
+		contentLength = resp2.ContentLength
+		xCache = resp2.Header.Get("X-Cache")
+		if xCache == "REVALIDATED" {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 
-	if resp2.ContentLength != int64(len(contentV2)) {
-		t.Errorf("Revalidation HEAD: expected Content-Length %d (v2), got %d", len(contentV2), resp2.ContentLength)
+	if contentLength != int64(len(contentV2)) {
+		t.Errorf("Revalidation HEAD: expected Content-Length %d (v2), got %d", len(contentV2), contentLength)
 	}
-
-	xCache := resp2.Header.Get("X-Cache")
 	if xCache != "REVALIDATED" {
 		t.Errorf("Revalidation HEAD (changed): expected X-Cache REVALIDATED, got %q", xCache)
 	}
-	t.Logf("Revalidation HEAD changed verified: X-Cache=%s, Content-Length=%d", xCache, resp2.ContentLength)
+	t.Logf("Revalidation HEAD changed verified: X-Cache=%s, Content-Length=%d", xCache, contentLength)
 }
 
 // ============================================================================

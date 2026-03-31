@@ -171,23 +171,26 @@ func (e *TestEnvironment) PutTestObjectDirect(bucket, key string, data []byte) e
 	return err
 }
 
-// WaitForObjectUpdate polls Tigris directly until the object's ETag differs from
-// previousETag, confirming that a direct PUT has propagated. This prevents race
-// conditions in revalidation tests where TAG's conditional GET could arrive before
-// the update is visible on all Tigris servers.
-func (e *TestEnvironment) WaitForObjectUpdate(bucket, key, previousETag string, timeout time.Duration) error {
+// WaitForObjectContent polls Tigris directly until the object body matches the
+// expected content. This confirms a direct PUT has fully propagated, avoiding
+// race conditions where TAG's conditional GET could see stale data.
+func (e *TestEnvironment) WaitForObjectContent(bucket, key string, expectedContent []byte, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resp, err := e.DirectS3Client.HeadObject(context.Background(), &s3.HeadObjectInput{
+		resp, err := e.DirectS3Client.GetObject(context.Background(), &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(key),
 		})
-		if err == nil && resp.ETag != nil && *resp.ETag != previousETag {
-			return nil
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if bytes.Equal(body, expectedContent) {
+				return nil
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("object %s/%s ETag did not change from %s within %v", bucket, key, previousETag, timeout)
+	return fmt.Errorf("object %s/%s content did not match expected within %v", bucket, key, timeout)
 }
 
 // PutTestObjectWithContentType uploads an object with a specific content type.
