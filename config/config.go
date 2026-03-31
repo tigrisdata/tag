@@ -116,7 +116,7 @@ type CredentialsConfig struct {
 // These fields map to github.com/tigrisdata/ocache/embedded.Config.
 type CacheConfig struct {
 	Enabled       *bool         `yaml:"enabled"`        // Enable caching (default: true when nil)
-	TTL           time.Duration `yaml:"ttl"`            // Default cache TTL (default: 60m)
+	TTL           time.Duration `yaml:"ttl"`            // Default cache TTL (default: 24h)
 	SizeThreshold int64         `yaml:"size_threshold"` // Max object size to cache in bytes (default: 1GB)
 
 	// OCache embedded configuration (see github.com/tigrisdata/ocache/embedded)
