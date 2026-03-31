@@ -163,6 +163,30 @@ log:
 	}
 }
 
+func TestLoad_CacheTTLOverrideByEnv(t *testing.T) {
+	content := `
+cache:
+  enabled: true
+  ttl: 10m
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	t.Setenv("TAG_CACHE_TTL", "12h")
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Cache.TTL != 12*time.Hour {
+		t.Errorf("Cache.TTL = %v, want 12h", cfg.Cache.TTL)
+	}
+}
+
 func TestLoad_CacheDisabledByEnv(t *testing.T) {
 	// Create a config file with cache enabled
 	content := `

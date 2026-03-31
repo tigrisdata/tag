@@ -23,12 +23,13 @@ curl http://localhost:8080/metrics
 
 Total number of requests processed by TAG.
 
-| Label | Description |
-|-------|-------------|
+| Label       | Description                                                          |
+| ----------- | -------------------------------------------------------------------- |
 | `operation` | S3 operation: `GetObject`, `PutObject`, `DeleteObject`, `HeadObject` |
-| `status` | Result: `success`, `error`, `auth_error`, `range_not_satisfiable` |
+| `status`    | Result: `success`, `error`, `auth_error`, `range_not_satisfiable`    |
 
 **Example queries:**
+
 ```promql
 # Request rate by operation
 rate(tag_requests_total[5m])
@@ -47,13 +48,14 @@ rate(tag_requests_total{operation="GetObject"}[5m])
 
 Request duration in seconds.
 
-| Label | Description |
-|-------|-------------|
+| Label       | Description  |
+| ----------- | ------------ |
 | `operation` | S3 operation |
 
 **Buckets:** Default Prometheus buckets (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)
 
 **Example queries:**
+
 ```promql
 # P50 latency
 histogram_quantile(0.5, rate(tag_request_duration_seconds_bucket[5m]))
@@ -74,6 +76,7 @@ rate(tag_request_duration_seconds_sum[5m]) / rate(tag_request_duration_seconds_c
 Total number of cache hits.
 
 **Example queries:**
+
 ```promql
 # Cache hit rate
 rate(tag_cache_hits_total[5m])
@@ -95,12 +98,13 @@ Total number of cache misses.
 
 Total number of cache operations.
 
-| Label | Description |
-|-------|-------------|
-| `operation` | Operation type: `get`, `put`, `delete` |
-| `result` | Result: `hit`, `miss`, `success`, `error` |
+| Label       | Description                               |
+| ----------- | ----------------------------------------- |
+| `operation` | Operation type: `get`, `put`, `delete`    |
+| `result`    | Result: `hit`, `miss`, `success`, `error` |
 
 **Example queries:**
+
 ```promql
 # Cache operation breakdown
 sum by (operation, result) (rate(tag_cache_operations_total[5m]))
@@ -113,6 +117,7 @@ sum by (operation, result) (rate(tag_cache_operations_total[5m]))
 Number of range requests served from cached full objects.
 
 **Example queries:**
+
 ```promql
 # Range cache efficiency
 rate(tag_range_from_cache_hits_total[5m]) /
@@ -128,6 +133,7 @@ rate(tag_requests_total{operation="GetObject"}[5m])
 Number of requests that joined an existing broadcast stream.
 
 **Example queries:**
+
 ```promql
 # Coalescing ratio (higher is better)
 rate(tag_broadcast_shared_total[5m]) /
@@ -153,6 +159,7 @@ Number of listeners disconnected for being too slow.
 Number of currently active broadcast streams.
 
 **Example queries:**
+
 ```promql
 # Active broadcasts over time
 tag_active_broadcasts
@@ -182,6 +189,7 @@ Number of background fetches that completed successfully.
 Number of background fetches that failed.
 
 **Example queries:**
+
 ```promql
 # Background fetch success rate
 rate(tag_background_fetches_succeeded_total[5m]) /
@@ -203,6 +211,7 @@ Number of currently active background fetches.
 Number of cache revalidation attempts (conditional GET/HEAD to upstream). Incremented when a client sends `Cache-Control: no-cache` or `max-age=0` and a cached entry with an ETag exists.
 
 **Example queries:**
+
 ```promql
 # Revalidation rate
 rate(tag_revalidations_triggered_total[5m])
@@ -215,6 +224,7 @@ rate(tag_revalidations_triggered_total[5m])
 Number of revalidations where upstream returned 304 Not Modified (cached entry is still fresh).
 
 **Example queries:**
+
 ```promql
 # Revalidation 304 ratio (higher = better cache freshness)
 rate(tag_revalidations_not_modified_total[5m]) /
@@ -240,6 +250,7 @@ Number of revalidations that failed due to errors or unexpected status codes.
 Number of times stale cached data was served because the revalidation request to upstream failed.
 
 **Example queries:**
+
 ```promql
 # Stale serve ratio (should be low)
 rate(tag_revalidations_stale_served_total[5m]) /
@@ -254,11 +265,12 @@ rate(tag_revalidations_triggered_total[5m])
 
 Upstream (Tigris) request duration in seconds.
 
-| Label | Description |
-|-------|-------------|
+| Label    | Description                                 |
+| -------- | ------------------------------------------- |
 | `method` | HTTP method: `GET`, `PUT`, `DELETE`, `HEAD` |
 
 **Example queries:**
+
 ```promql
 # Upstream P99 latency
 histogram_quantile(0.99, rate(tag_upstream_request_duration_seconds_bucket[5m]))
@@ -270,8 +282,8 @@ histogram_quantile(0.99, rate(tag_upstream_request_duration_seconds_bucket[5m]))
 
 Total number of upstream errors.
 
-| Label | Description |
-|-------|-------------|
+| Label    | Description |
+| -------- | ----------- |
 | `method` | HTTP method |
 
 ### Authentication Metrics
@@ -282,8 +294,8 @@ Total number of upstream errors.
 
 Total number of authentication failures.
 
-| Label | Description |
-|-------|-------------|
+| Label    | Description                                                   |
+| -------- | ------------------------------------------------------------- |
 | `reason` | Failure reason: `invalid_signature`, `unknown_key`, `expired` |
 
 ### Transparent Proxy Metrics
@@ -294,11 +306,12 @@ Total number of authentication failures.
 
 Local authentication validation attempts and results in transparent proxy mode.
 
-| Label | Description |
-|-------|-------------|
+| Label    | Description                                                                                                       |
+| -------- | ----------------------------------------------------------------------------------------------------------------- |
 | `result` | Validation result: `success`, `missing_auth`, `parse_error`, `unknown_key`, `signature_mismatch`, `authz_expired` |
 
 **Example queries:**
+
 ```promql
 # Local auth success rate
 rate(tag_local_auth_validations_total{result="success"}[5m]) /
@@ -340,11 +353,12 @@ Number of active connections.
 
 Total bytes transferred.
 
-| Label | Description |
-|-------|-------------|
+| Label       | Description                     |
+| ----------- | ------------------------------- |
 | `direction` | Transfer direction: `in`, `out` |
 
 **Example queries:**
+
 ```promql
 # Throughput (bytes/sec)
 rate(tag_bytes_transferred_total[5m])
@@ -357,7 +371,7 @@ rate(tag_bytes_transferred_total{direction="out"}[5m])
 
 ```yaml
 scrape_configs:
-  - job_name: 'tag'
+  - job_name: "tag"
     kubernetes_sd_configs:
       - role: pod
     relabel_configs:
@@ -368,4 +382,3 @@ scrape_configs:
         action: keep
         regex: "8080"
 ```
-
