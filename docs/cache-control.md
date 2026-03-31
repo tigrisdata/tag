@@ -47,7 +47,7 @@ TAG automatically invalidates cached objects when they are modified through TAG:
 - **DeleteObjects** (bulk) — Cache entries deleted for all keys in the request
 - **CopyObject** — Cache entry deleted for the destination key
 
-Objects modified directly on Tigris (bypassing TAG) remain in cache until they expire (default TTL: 60 minutes) or are revalidated via `Cache-Control: no-cache`.
+Objects modified directly on Tigris (bypassing TAG) remain in cache until they expire (default TTL: 24 hours, configurable via `TAG_CACHE_TTL`) or are revalidated via `Cache-Control: no-cache`.
 
 ## Verifying Cache Behavior
 

@@ -171,6 +171,28 @@ func (e *TestEnvironment) PutTestObjectDirect(bucket, key string, data []byte) e
 	return err
 }
 
+// WaitForObjectContent polls Tigris directly until the object body matches the
+// expected content. This confirms a direct PUT has fully propagated, avoiding
+// race conditions where TAG's conditional GET could see stale data.
+func (e *TestEnvironment) WaitForObjectContent(bucket, key string, expectedContent []byte, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := e.DirectS3Client.GetObject(context.Background(), &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if bytes.Equal(body, expectedContent) {
+				return nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("object %s/%s content did not match expected within %v", bucket, key, timeout)
+}
+
 // PutTestObjectWithContentType uploads an object with a specific content type.
 func (e *TestEnvironment) PutTestObjectWithContentType(bucket, key string, data []byte, contentType string) error {
 	_, err := e.S3Client.PutObject(context.Background(), &s3.PutObjectInput{

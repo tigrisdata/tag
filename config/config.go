@@ -27,7 +27,7 @@ const (
 	DefaultUpstreamRegion = "auto"
 
 	// DefaultCacheTTL is the default cache TTL.
-	DefaultCacheTTL = 60 * time.Minute
+	DefaultCacheTTL = 24 * time.Hour
 
 	// DefaultCacheSizeThreshold is the max object size to cache (1GB).
 	DefaultCacheSizeThreshold = 1024 * 1024 * 1024
@@ -116,7 +116,7 @@ type CredentialsConfig struct {
 // These fields map to github.com/tigrisdata/ocache/embedded.Config.
 type CacheConfig struct {
 	Enabled       *bool         `yaml:"enabled"`        // Enable caching (default: true when nil)
-	TTL           time.Duration `yaml:"ttl"`            // Default cache TTL (default: 60m)
+	TTL           time.Duration `yaml:"ttl"`            // Default cache TTL (default: 24h)
 	SizeThreshold int64         `yaml:"size_threshold"` // Max object size to cache in bytes (default: 1GB)
 
 	// OCache embedded configuration (see github.com/tigrisdata/ocache/embedded)
@@ -316,6 +316,12 @@ func applyEnvOverrides(cfg *Config) {
 		if val := os.Getenv("TAG_CACHE_GRPC_AUTH"); val != "" {
 			disabled := val == "false" || val == "0"
 			cfg.Cache.SetGRPCAuth(!disabled)
+		}
+		// Override cache TTL from environment
+		if val := os.Getenv("TAG_CACHE_TTL"); val != "" {
+			if ttl, err := time.ParseDuration(val); err == nil && ttl > 0 {
+				cfg.Cache.TTL = ttl
+			}
 		}
 	}
 
