@@ -70,11 +70,11 @@ The test suite is organized into categories based on the [ceph/s3-tests](https:/
 | `test_copy`      | Object copy operations                                             | 9          |
 | `test_tagging`   | Object and bucket tagging operations                               | 15         |
 
-**Total: 214 tests**
+Total: 214 tests
 
 ## Architecture
 
-```
+```text
 ┌─────────────────┐     ┌─────────────────────────────┐     ┌─────────────────┐
 │   s3-tests      │────▶│            TAG              │────▶│     Tigris      │
 │  (ceph/pytest)  │     │   ┌─────────────────────┐   │     │ (t3.storage.dev)│
@@ -123,12 +123,12 @@ make s3-tests-clean
 
 ## Files
 
-| File                                       | Description                                               |
-| ------------------------------------------ | --------------------------------------------------------- |
-| `tests/s3compat/python/run-tests.sh`       | Test runner script (clones s3-tests, runs pytest via tox) |
-| `tests/s3compat/python/s3tests.conf`       | Test configuration template                               |
-| `tests/s3compat/sdk/go_sdk_test.go`        | Go SDK S3 compatibility tests                             |
-| `tests/s3compat/sdk/testutil.go`           | Go SDK test utilities and environment setup                |
+| File                                 | Description                                               |
+| ------------------------------------ | --------------------------------------------------------- |
+| `tests/s3compat/python/run-tests.sh` | Test runner script (clones s3-tests, runs pytest via tox) |
+| `tests/s3compat/python/s3tests.conf` | Test configuration template                               |
+| `tests/s3compat/sdk/go_sdk_test.go`  | Go SDK S3 compatibility tests                             |
+| `tests/s3compat/sdk/testutil.go`     | Go SDK test utilities and environment setup               |
 
 ## Future Improvements
 
