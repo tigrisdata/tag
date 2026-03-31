@@ -1335,7 +1335,8 @@ func TestSDK_Revalidation_GET_Changed(t *testing.T) {
 	if resp1.StatusCode != http.StatusOK {
 		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
 	}
-	t.Logf("First GET: X-Cache=%s", resp1.Header.Get("X-Cache"))
+	v1ETag := resp1.Header.Get("ETag")
+	t.Logf("First GET: X-Cache=%s, ETag=%s", resp1.Header.Get("X-Cache"), v1ETag)
 
 	// Wait for cache to be populated
 	time.Sleep(500 * time.Millisecond)
@@ -1345,6 +1346,11 @@ func TestSDK_Revalidation_GET_Changed(t *testing.T) {
 	contentV2 := []byte("revalidation content version 2 - updated")
 	if err := globalEnv.PutTestObjectDirect(bucket, "reval-changed-key", contentV2); err != nil {
 		t.Fatalf("Failed to put test object v2 direct: %v", err)
+	}
+
+	// Wait for the update to propagate on Tigris before testing revalidation
+	if err := globalEnv.WaitForObjectUpdate(bucket, "reval-changed-key", v1ETag, 5*time.Second); err != nil {
+		t.Fatalf("Object update did not propagate: %v", err)
 	}
 
 	// GET with Cache-Control: no-cache → revalidation
@@ -1469,7 +1475,8 @@ func TestSDK_Revalidation_GETRange_Changed(t *testing.T) {
 	if resp1.StatusCode != http.StatusOK {
 		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
 	}
-	t.Logf("First GET: X-Cache=%s", resp1.Header.Get("X-Cache"))
+	v1ETag := resp1.Header.Get("ETag")
+	t.Logf("First GET: X-Cache=%s, ETag=%s", resp1.Header.Get("X-Cache"), v1ETag)
 
 	// Wait for cache to be populated
 	time.Sleep(500 * time.Millisecond)
@@ -1479,6 +1486,11 @@ func TestSDK_Revalidation_GETRange_Changed(t *testing.T) {
 	contentV2 := []byte("updated2 range revalidation data")
 	if err := globalEnv.PutTestObjectDirect(bucket, "reval-range-chg-key", contentV2); err != nil {
 		t.Fatalf("Failed to put test object v2 direct: %v", err)
+	}
+
+	// Wait for the update to propagate on Tigris before testing revalidation
+	if err := globalEnv.WaitForObjectUpdate(bucket, "reval-range-chg-key", v1ETag, 5*time.Second); err != nil {
+		t.Fatalf("Object update did not propagate: %v", err)
 	}
 
 	// Range GET with Cache-Control: no-cache → revalidation
@@ -1597,7 +1609,8 @@ func TestSDK_Revalidation_HEAD_Changed(t *testing.T) {
 	if resp1.StatusCode != http.StatusOK {
 		t.Fatalf("First GET: expected 200, got %d", resp1.StatusCode)
 	}
-	t.Logf("First GET: X-Cache=%s", resp1.Header.Get("X-Cache"))
+	v1ETag := resp1.Header.Get("ETag")
+	t.Logf("First GET: X-Cache=%s, ETag=%s", resp1.Header.Get("X-Cache"), v1ETag)
 
 	// Wait for cache to be populated
 	time.Sleep(500 * time.Millisecond)
@@ -1607,6 +1620,11 @@ func TestSDK_Revalidation_HEAD_Changed(t *testing.T) {
 	contentV2 := []byte("head revalidation v2 - updated with more content")
 	if err := globalEnv.PutTestObjectDirect(bucket, "reval-head-chg-key", contentV2); err != nil {
 		t.Fatalf("Failed to put test object v2 direct: %v", err)
+	}
+
+	// Wait for the update to propagate on Tigris before testing revalidation
+	if err := globalEnv.WaitForObjectUpdate(bucket, "reval-head-chg-key", v1ETag, 5*time.Second); err != nil {
+		t.Fatalf("Object update did not propagate: %v", err)
 	}
 
 	// HEAD with Cache-Control: no-cache → revalidation
