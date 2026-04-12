@@ -14,8 +14,8 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
-	github.com/tigrisdata/ocache/client v1.4.1
-	github.com/tigrisdata/ocache/embedded v1.4.1
+	github.com/tigrisdata/ocache/client v1.3.2
+	github.com/tigrisdata/ocache/embedded v1.3.2
 	google.golang.org/grpc v1.72.2
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -75,12 +75,12 @@ require (
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46 // indirect
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
-	github.com/tigrisdata/ocache/common v1.4.1 // indirect
-	github.com/tigrisdata/ocache/coordinator v1.4.1 // indirect
-	github.com/tigrisdata/ocache/coordinator/proto v1.4.1 // indirect
-	github.com/tigrisdata/ocache/proto v1.4.1 // indirect
-	github.com/tigrisdata/ocache/server v1.4.1 // indirect
-	github.com/tigrisdata/ocache/storage v1.4.1 // indirect
+	github.com/tigrisdata/ocache/common v1.3.2 // indirect
+	github.com/tigrisdata/ocache/coordinator v1.3.2 // indirect
+	github.com/tigrisdata/ocache/coordinator/proto v1.3.2 // indirect
+	github.com/tigrisdata/ocache/proto v1.3.2 // indirect
+	github.com/tigrisdata/ocache/server v1.3.2 // indirect
+	github.com/tigrisdata/ocache/storage v1.3.2 // indirect
 	github.com/uber/jaeger-client-go v2.28.0+incompatible // indirect
 	github.com/uber/jaeger-lib v2.2.0+incompatible // indirect
 	go.etcd.io/etcd/api/v3 v3.5.0 // indirect
