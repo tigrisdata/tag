@@ -320,6 +320,17 @@ help:
 	@echo "SDK test targets (Go SDK tests):"
 	@echo "  test-sdk               - Run SDK tests (requires running TAG + AWS creds)"
 	@echo ""
+	@echo "Benchmark test targets (warp):"
+	@echo "  bench-warp             - Benchmark core S3 ops with warp (requires running TAG + AWS creds)"
+	@echo "  bench-warp-clean       - Remove cached warp binary and benchmark results"
+	@echo ""
+	@echo "  Benchmark usage:"
+	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
+	@echo "    export AWS_SECRET_ACCESS_KEY=<your-secret>"
+	@echo "    make s3-test-local      # Start TAG with embedded cache"
+	@echo "    make bench-warp         # Run warp benchmarks (GET/RANGE/PUT/HEAD/LIST/DELETE)"
+	@echo "    make s3-test-local-down # Stop local TAG and cleanup"
+	@echo ""
 	@echo "  Usage:"
 	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
 	@echo "    export AWS_SECRET_ACCESS_KEY=<your-secret>"
@@ -538,5 +549,28 @@ test-sdk: rocksdb-static
 		exit 1; \
 	fi
 	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) $(CGO_ENV) go test $(BUILD_TAGS) -v -timeout 300s $(TESTFLAGS) ./tests/s3compat/sdk/...
+
+# Benchmark TAG's core S3 operations with warp (requires a running TAG + AWS creds).
+# Start TAG first with: make s3-test-local
+.PHONY: bench-warp
+bench-warp:
+	@echo "Running warp benchmarks against TAG..."
+	@if [ -z "$$AWS_ACCESS_KEY_ID" ] || [ -z "$$AWS_SECRET_ACCESS_KEY" ]; then \
+		echo "Error: AWS credentials not set."; \
+		echo "  export AWS_ACCESS_KEY_ID=<your-key>"; \
+		echo "  export AWS_SECRET_ACCESS_KEY=<your-secret>"; \
+		exit 1; \
+	fi
+	@if ! curl -s http://localhost:$(TAG_LOCAL_HTTP_PORT)/health > /dev/null 2>&1; then \
+		echo "Error: TAG not running at localhost:$(TAG_LOCAL_HTTP_PORT)"; \
+		echo "  Start TAG with: make s3-test-local"; \
+		exit 1; \
+	fi
+	cd tests/benchmark && TAG_HTTP_PORT=$(TAG_LOCAL_HTTP_PORT) ./run-warp.sh
+
+.PHONY: bench-warp-clean
+bench-warp-clean:
+	@echo "Cleaning up warp benchmark artifacts..."
+	rm -rf tests/benchmark/.bin tests/benchmark/results
 
 .DEFAULT_GOAL := help
