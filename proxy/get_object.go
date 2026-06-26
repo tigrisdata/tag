@@ -33,6 +33,14 @@ var bufferPool = sync.Pool{
 // allocation, and synchronization overhead for small objects.
 const smallObjectThreshold = 64 * 1024 // 64KB
 
+// upstreamFetchTimeout bounds the detached upstream fetch in fetchAndBroadcast.
+// The fetch runs on a context derived from the client request but with
+// cancellation/deadline stripped (context.WithoutCancel), so a client cancel
+// no longer abandons the in-flight fetch that feeds the cache writer. This
+// timeout caps how long that detached fetch may run. It mirrors the upstream
+// HTTP client timeout (see forwarder.go) so the two bounds stay aligned.
+const upstreamFetchTimeout = 5 * time.Minute
+
 // putBuffer returns a buffer to the pool only if it hasn't grown too large.
 // This prevents memory bloat from oversized buffers (e.g., if cached body
 // exceeds metadata claims due to corruption/inconsistency).
@@ -240,13 +248,24 @@ func (s *Service) fetchAndBroadcast(
 	// Subscribe ourselves as the first listener
 	listener := broadcaster.Subscribe()
 
+	// Detach the upstream fetch from the client request context. The fetch feeds
+	// the cache writer (via setupCacheListener inside streamFromUpstream), so if
+	// the client cancels mid-fetch on the raw ctx the source dies, the broadcast
+	// completes with context.Canceled, and the cache write never finalizes — the
+	// cold-owner cancel loop. WithoutCancel preserves request-scoped values
+	// (trace IDs) while dropping cancellation/deadline; the explicit timeout
+	// bounds the now-uncancelable fetch.
+	fetchCtx, fetchCancel := context.WithTimeout(context.WithoutCancel(ctx), upstreamFetchTimeout)
+
 	// Start the upstream fetch in a goroutine
 	go func() {
-		err := s.streamFromUpstream(ctx, r, bucket, key, accessKey, secretKey, broadcaster)
+		defer fetchCancel()
+		err := s.streamFromUpstream(fetchCtx, r, bucket, key, accessKey, secretKey, broadcaster)
 		broadcaster.Complete(err)
 	}()
 
-	// Receive chunks like any other listener
+	// Receive chunks like any other listener. This stays on the client ctx so the
+	// client side still cancels normally; only the upstream fetch is detached.
 	err := s.writeChunksToResponse(ctx, w, listener, xCache)
 
 	status := "success"
@@ -608,13 +627,38 @@ func (s *Service) handleRangeWithBackgroundCache(
 	// Format: "bytes 0-499/1234" where 1234 is total size
 	totalSize := extractTotalSizeFromContentRange(resp.Header.Get("Content-Range"))
 
+	// Decide up front whether this response is cacheable. Conditions:
+	// - Response is 206 Partial Content (successful range response)
+	// - Total size is known and within cache threshold
+	// - Cache is enabled
+	// - We have valid credentials for the background fetch
+	cacheable := resp.StatusCode == http.StatusPartialContent &&
+		totalSize > 0 &&
+		totalSize <= s.config.Cache.SizeThreshold &&
+		s.cache.IsEnabled() &&
+		accessKey != "" && secretKey != ""
+
+	// Trigger the background full-object fetch via defer so it fires AFTER
+	// streaming completes regardless of the io.Copy outcome — success OR client
+	// cancel. For a cold owner whose client deadline is shorter than the cold
+	// fetch, io.Copy fails mid-stream; without this the warming fetch never runs
+	// and the same keys are re-fetched on every request (cold-miss/cancel loop).
+	// The fetch is detached + deduplicated and guarded by GetMeta(!found), so
+	// warming the key here is safe and never issues redundant fetches.
+	if cacheable {
+		defer func() {
+			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
+				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r))
+			}
+		}()
+	}
+
 	// Write response headers
 	copyHeaders(w.Header(), resp.Header)
 	w.Header().Set(XCacheHeader, XCacheMiss)
 	w.WriteHeader(resp.StatusCode)
 
-	// Stream Range response body to client FIRST (before background fetch)
-	// This ensures the client request completes without resource contention
+	// Stream Range response body to client.
 	n, err := io.Copy(w, resp.Body)
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 	if err != nil {
@@ -623,24 +667,6 @@ func (s *Service) handleRangeWithBackgroundCache(
 	}
 
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
-
-	// Trigger background fetch AFTER streaming completes to avoid resource contention.
-	// Conditions:
-	// - Response is 206 Partial Content (successful range response)
-	// - Total size is known and within cache threshold
-	// - Cache is enabled
-	// - We have valid credentials for the background fetch
-	// - Object is not already cached (prevents redundant fetches when many
-	//   parallel range requests each finish after a prior background fetch completes)
-	if resp.StatusCode == http.StatusPartialContent &&
-		totalSize > 0 &&
-		totalSize <= s.config.Cache.SizeThreshold &&
-		s.cache.IsEnabled() &&
-		accessKey != "" && secretKey != "" {
-		if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
-			s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r))
-		}
-	}
 
 	return nil
 }

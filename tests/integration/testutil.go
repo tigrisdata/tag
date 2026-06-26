@@ -357,6 +357,72 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 	}
 }
 
+// NewTestEnvironmentWithCacheHandler creates a cache-enabled test environment whose
+// upstream is a custom HTTP handler (instead of gofakes3). This is useful for tests
+// that need precise control over the upstream response — e.g. blocking a range
+// response mid-stream to simulate a client cancel. Uses the shared embedded cache.
+func NewTestEnvironmentWithCacheHandler(upstreamHandler http.HandlerFunc) *TestEnvironment {
+	if sharedEmbeddedCache == nil {
+		panic("Shared embedded cache not initialized - TestMain must run first")
+	}
+
+	// Track upstream requests
+	var requestCount int32
+	counter := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&requestCount, 1)
+			next.ServeHTTP(w, r)
+		})
+	}
+
+	upstream := httptest.NewServer(counter(upstreamHandler))
+
+	// Create credential store with test credentials
+	credStore := auth.NewCredentialStore()
+	credStore.AddCredential(TestAccessKey, TestSecretKey)
+
+	// Create config with cache ENABLED
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			HTTPPort: 8080,
+			BindIP:   "127.0.0.1",
+		},
+		Upstream: config.UpstreamConfig{
+			Endpoint: upstream.URL,
+			Region:   TestRegion,
+		},
+		Cache: config.CacheConfig{
+			TTL:           config.DefaultCacheTTL,
+			SizeThreshold: config.DefaultCacheSizeThreshold,
+		},
+	}
+
+	testCache := cache.NewCacheWithClient(sharedEmbeddedCache, &cfg.Cache)
+
+	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, nil, nil)
+	service := proxy.NewService(forwarder, testCache, cfg)
+
+	xCacheTracker := NewXCacheTracker()
+	server := handlers.NewServer(service, "127.0.0.1", 0, true)
+	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
+	tagServer := httptest.NewServer(wrappedRouter)
+
+	signer := auth.NewRequestSigner(tagServer.URL, TestRegion)
+
+	return &TestEnvironment{
+		UpstreamServer:       upstream,
+		TAGServer:            tagServer,
+		CredStore:            credStore,
+		Cache:                testCache,
+		Config:               cfg,
+		Service:              service,
+		Signer:               signer,
+		EmbeddedCache:        sharedEmbeddedCache,
+		UpstreamRequestCount: &requestCount,
+		XCacheTracker:        xCacheTracker,
+	}
+}
+
 // newTestEnvironmentWithUpstream creates a test environment with the given upstream server.
 // If useTLS is true, the TAG server uses HTTPS (required for SDK chunked encoding tests).
 func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Backend, useTLS bool) *TestEnvironment {
