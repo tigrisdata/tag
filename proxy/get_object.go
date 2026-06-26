@@ -253,25 +253,30 @@ func (s *Service) fetchAndBroadcast(
 	// the cache — the cold-owner case, where a peer/client deadline shorter than
 	// the cold fetch aborts streamFromUpstream and starves the inline cache write —
 	// hand warming off to the deduplicated background fetcher (mirroring
-	// handleRangeWithBackgroundCache).
+	// handleRangeWithBackgroundCache). Two gates, both required:
 	//
-	// Gate on ctx cancellation rather than the generic writeChunksToResponse error,
-	// deliberately:
-	//   - Upstream failures (connection refused, 5xx) don't cancel ctx, so we don't
-	//     amplify load against an unhealthy upstream with a doomed background retry.
-	//   - A slow-consumer drop doesn't cancel ctx, and streamFromUpstream keeps
-	//     feeding the separate cache listener, so the inline write finalizes — no
-	//     redundant parallel fetch.
-	// When ctx is canceled the inline write is starved; when it isn't, the inline
-	// write completes — exactly one path populates the cache, never both.
+	//  1. ctx.Err() != nil — only warm when the client went away. A slow-consumer
+	//     drop or any non-cancel failure leaves the inline write streaming to its
+	//     own cache listener on the live ctx, so it finalizes on its own; warming
+	//     there would race a redundant parallel fetch.
+	//  2. the upstream was healthy — wait for the fetch goroutine's recorded
+	//     outcome and skip warming on a genuine upstream failure (connection
+	//     refused, 5xx, mid-stream drop). Otherwise a sustained upstream outage
+	//     would have every timed-out client spawn a doomed background retry,
+	//     amplifying load against an already-sick upstream. (A canceled fetch that
+	//     was otherwise healthy completes with a context error, which still warms.)
 	//
 	// The background fetch is detached, deduplicated, and GetMeta(!found)-guarded;
 	// fetchFullObjectToCache enforces the size threshold and skips the body download
 	// for oversized objects, so a canceled oversized request costs at most one
 	// deduplicated header round-trip, never a wasted body transfer.
 	if ctx.Err() != nil && s.cache.IsEnabled() && accessKey != "" && secretKey != "" {
-		if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
-			s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r))
+		<-broadcaster.Done() // the fetch goroutine above records the upstream outcome
+		if upErr := broadcaster.Error(); upErr == nil ||
+			errors.Is(upErr, context.Canceled) || errors.Is(upErr, context.DeadlineExceeded) {
+			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
+				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r))
+			}
 		}
 	}
 
