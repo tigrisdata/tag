@@ -33,14 +33,6 @@ var bufferPool = sync.Pool{
 // allocation, and synchronization overhead for small objects.
 const smallObjectThreshold = 64 * 1024 // 64KB
 
-// upstreamFetchTimeout bounds the detached upstream fetch in fetchAndBroadcast.
-// The fetch runs on a context derived from the client request but with
-// cancellation/deadline stripped (context.WithoutCancel), so a client cancel
-// no longer abandons the in-flight fetch that feeds the cache writer. This
-// timeout caps how long that detached fetch may run. It mirrors the upstream
-// HTTP client timeout (see forwarder.go) so the two bounds stay aligned.
-const upstreamFetchTimeout = 5 * time.Minute
-
 // putBuffer returns a buffer to the pool only if it hasn't grown too large.
 // This prevents memory bloat from oversized buffers (e.g., if cached body
 // exceeds metadata claims due to corruption/inconsistency).
@@ -248,25 +240,27 @@ func (s *Service) fetchAndBroadcast(
 	// Subscribe ourselves as the first listener
 	listener := broadcaster.Subscribe()
 
-	// Detach the upstream fetch from the client request context. The fetch feeds
-	// the cache writer (via setupCacheListener inside streamFromUpstream), so if
-	// the client cancels mid-fetch on the raw ctx the source dies, the broadcast
-	// completes with context.Canceled, and the cache write never finalizes — the
-	// cold-owner cancel loop. WithoutCancel preserves request-scoped values
-	// (trace IDs) while dropping cancellation/deadline; the explicit timeout
-	// bounds the now-uncancelable fetch.
-	fetchCtx, fetchCancel := context.WithTimeout(context.WithoutCancel(ctx), upstreamFetchTimeout)
-
 	// Start the upstream fetch in a goroutine
 	go func() {
-		defer fetchCancel()
-		err := s.streamFromUpstream(fetchCtx, r, bucket, key, accessKey, secretKey, broadcaster)
+		err := s.streamFromUpstream(ctx, r, bucket, key, accessKey, secretKey, broadcaster)
 		broadcaster.Complete(err)
 	}()
 
-	// Receive chunks like any other listener. This stays on the client ctx so the
-	// client side still cancels normally; only the upstream fetch is detached.
+	// Receive chunks like any other listener
 	err := s.writeChunksToResponse(ctx, w, listener, xCache)
+
+	// If the client went away before the inline fetch could populate the cache
+	// (a cold owner whose deadline is shorter than the cold fetch cancels here),
+	// hand warming off to the deduplicated background fetcher so the object still
+	// warms — mirroring handleRangeWithBackgroundCache. The background fetch is
+	// detached, deduplicated, size-checked, and guarded by GetMeta(!found), so it
+	// is a no-op on the happy path (object already cached) and cannot accumulate
+	// redundant fetches under a client-cancel storm.
+	if err != nil && s.cache.IsEnabled() && accessKey != "" && secretKey != "" {
+		if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
+			s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r))
+		}
+	}
 
 	status := "success"
 	if err != nil {

@@ -101,37 +101,44 @@ func TestColdOwner_RangeWarmsCacheOnClientCancel(t *testing.T) {
 
 // TestColdOwner_FullObjectWarmsCacheOnClientCancel reproduces issue #63 (path A):
 // a full-object cache miss must finish populating the cache even when the client
-// cancels mid-stream. The upstream fetch that feeds the (already-detached) cache
-// writer now runs on a detached context, so a client cancel no longer abandons
-// the in-flight fetch and starves the cache write.
+// cancels mid-stream. When the client cancels the inline fetch, warming is handed
+// off to the deduplicated background fetcher, which completes on a detached
+// context. Both the inline GET and the warming GET are full-object (no-Range)
+// requests, so the handler simply streams the whole body and tolerates the inline
+// request being cut mid-stream.
 func TestColdOwner_FullObjectWarmsCacheOnClientCancel(t *testing.T) {
 	const bucket = "cold-bucket"
 	const key = "blocks/compacted/02-full.sst"
 
-	body := make([]byte, 4096)
+	// Multi-MB body so TAG is blocked writing to the client when it disconnects,
+	// cutting the inline fetch deterministically on the write side.
+	body := make([]byte, 2*1024*1024)
 	for i := range body {
 		body[i] = byte('a' + (i % 26))
 	}
 	total := len(body)
 
-	fullStarted := make(chan struct{})
-	clientCanceled := make(chan struct{})
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(total))
 		w.Header().Set("ETag", `"cold-full-etag"`)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.WriteHeader(http.StatusOK)
-
-		// Emit a prefix and flush so TAG starts streaming to the client, then wait
-		// until the client has canceled before sending the rest. This proves the
-		// fetch (and cache write) complete on the detached context after cancel.
-		_, _ = w.Write(body[:16])
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
+		flusher, _ := w.(http.Flusher)
+		for off := 0; off < total; off += 64 * 1024 {
+			end := off + 64*1024
+			if end > total {
+				end = total
+			}
+			if _, err := w.Write(body[off:end]); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if r.Context().Err() != nil {
+				return
+			}
 		}
-		close(fullStarted)
-		<-clientCanceled
-		_, _ = w.Write(body[16:])
 	}
 
 	env := NewTestEnvironmentWithCacheHandler(handler)
@@ -146,16 +153,13 @@ func TestColdOwner_FullObjectWarmsCacheOnClientCancel(t *testing.T) {
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 
-	<-fullStarted
 	buf := make([]byte, 8)
 	_, _ = io.ReadFull(resp.Body, buf)
 	cancel()
 	_ = resp.Body.Close()
 
-	// Release the upstream to send the remaining bytes only after the client has
-	// canceled — the detached fetch must still complete the cache write.
-	close(clientCanceled)
-
+	// Despite the canceled client request, the background warm must populate the
+	// full object so the next request hits and the cold loop terminates.
 	require.True(t, env.WaitForCached(bucket, key, 5*time.Second),
 		"cache should warm after a canceled full-object request (issue #63 path A)")
 
