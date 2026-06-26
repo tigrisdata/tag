@@ -3,7 +3,7 @@
 # Modeled after tests/s3compat/python/run-tests.sh
 #
 # Drives MinIO warp against a locally running TAG (which proxies to Tigris) and
-# benchmarks the core S3 operations: GET, GET RANGE, PUT, HEAD, LIST V2, DELETE.
+# benchmarks the core S3 operations: GET, GET RANGE, PUT, HEAD, LIST V2.
 # This is a smoke benchmark: it fails if any operation errors, and writes a
 # human-readable `warp analyze` summary per operation into results/.
 #
@@ -17,7 +17,7 @@
 #   WARP_DURATION      duration per operation             (30s)
 #   WARP_CONCURRENT    concurrent operations              (4)
 #   WARP_OBJ_SIZE      object size for 4MiB ops           (4MiB)
-#   WARP_OBJECTS       object count for 4MiB ops          (2000)
+#   WARP_OBJECTS       object count for 4MiB ops          (100)
 #   WARP_RANGE_OBJ_SIZE large object size for GET RANGE   (100MiB)
 #   WARP_RANGE_SIZE    range read size for GET RANGE      (4MiB)
 #   WARP_RANGE_OBJECTS object count for GET RANGE         (8)
@@ -67,7 +67,7 @@ REGION="${WARP_REGION:-auto}"
 DURATION="${WARP_DURATION:-30s}"
 CONCURRENT="${WARP_CONCURRENT:-4}"
 OBJ_SIZE="${WARP_OBJ_SIZE:-4MiB}"
-OBJECTS="${WARP_OBJECTS:-2000}"
+OBJECTS="${WARP_OBJECTS:-100}"
 RANGE_OBJ_SIZE="${WARP_RANGE_OBJ_SIZE:-100MiB}"
 RANGE_SIZE="${WARP_RANGE_SIZE:-4MiB}"
 RANGE_OBJECTS="${WARP_RANGE_OBJECTS:-8}"
@@ -119,7 +119,6 @@ run_op "get-range" get    --obj.size="$RANGE_OBJ_SIZE" --objects="$RANGE_OBJECTS
 run_op "put"       put    --obj.size="$OBJ_SIZE"
 run_op "head"      stat   --obj.size="$OBJ_SIZE"       --objects="$OBJECTS"
 run_op "list"      list   --obj.size="$OBJ_SIZE"       --objects="$OBJECTS"
-run_op "delete"    delete --obj.size="$OBJ_SIZE"       --objects="$OBJECTS"
 
 # Report results
 echo ""

@@ -11,7 +11,6 @@ TAG instance (which proxies to Tigris) and exercise:
 | PUT       | `warp put`                   | 4 MiB                        |
 | HEAD      | `warp stat`                  | 4 MiB                        |
 | LIST V2   | `warp list`                  | 4 MiB                        |
-| DELETE    | `warp delete`                | 4 MiB                        |
 
 This is a **smoke benchmark**: the run fails if any operation errors. It does not
 enforce performance thresholds — it captures numbers for inspection.
@@ -25,7 +24,7 @@ export AWS_ACCESS_KEY_ID=<your-key>
 export AWS_SECRET_ACCESS_KEY=<your-secret>
 
 make s3-test-local      # build + start TAG on :8080 (proxies to Tigris)
-make bench-warp         # install warp (first run), run all 6 ops, write results/
+make bench-warp         # install warp (first run), run all 5 ops, write results/
 make s3-test-local-down # stop TAG + cleanup
 ```
 

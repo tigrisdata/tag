@@ -328,7 +328,7 @@ help:
 	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
 	@echo "    export AWS_SECRET_ACCESS_KEY=<your-secret>"
 	@echo "    make s3-test-local      # Start TAG with embedded cache"
-	@echo "    make bench-warp         # Run warp benchmarks (GET/RANGE/PUT/HEAD/LIST/DELETE)"
+	@echo "    make bench-warp         # Run warp benchmarks (GET/RANGE/PUT/HEAD/LIST)"
 	@echo "    make s3-test-local-down # Stop local TAG and cleanup"
 	@echo ""
 	@echo "  Usage:"
