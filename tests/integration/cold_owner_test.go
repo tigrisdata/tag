@@ -72,6 +72,10 @@ func TestColdOwner_RangeWarmsCacheOnClientCancel(t *testing.T) {
 	env := NewTestEnvironmentWithCacheHandler(handler)
 	defer env.Close()
 
+	// The shared embedded cache persists across tests and process re-runs
+	// (-count=N, retries), so evict any stale entry to keep the precondition
+	// repeatable.
+	_ = env.Cache.DeleteWithMeta(context.Background(), bucket, key)
 	require.False(t, env.IsCached(bucket, key), "object must start uncached")
 
 	// Issue a signed range request on a cancelable context, read a little, then
@@ -144,6 +148,10 @@ func TestColdOwner_FullObjectWarmsCacheOnClientCancel(t *testing.T) {
 	env := NewTestEnvironmentWithCacheHandler(handler)
 	defer env.Close()
 
+	// The shared embedded cache persists across tests and process re-runs
+	// (-count=N, retries), so evict any stale entry to keep the precondition
+	// repeatable.
+	_ = env.Cache.DeleteWithMeta(context.Background(), bucket, key)
 	require.False(t, env.IsCached(bucket, key), "object must start uncached")
 
 	ctx, cancel := context.WithCancel(context.Background())

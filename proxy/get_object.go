@@ -249,20 +249,27 @@ func (s *Service) fetchAndBroadcast(
 	// Receive chunks like any other listener
 	err := s.writeChunksToResponse(ctx, w, listener, xCache)
 
-	// If the client went away before the inline fetch could populate the cache
-	// (a cold owner whose deadline is shorter than the cold fetch cancels here),
-	// hand warming off to the deduplicated background fetcher so the object still
-	// warms — mirroring handleRangeWithBackgroundCache. The background fetch is
-	// detached, deduplicated, size-checked, and guarded by GetMeta(!found), so it
-	// is a no-op on the happy path (object already cached) and cannot accumulate
-	// redundant fetches under a client-cancel storm.
+	// If the client's context was canceled before the inline fetch could populate
+	// the cache — the cold-owner case, where a peer/client deadline shorter than
+	// the cold fetch aborts streamFromUpstream and starves the inline cache write —
+	// hand warming off to the deduplicated background fetcher (mirroring
+	// handleRangeWithBackgroundCache).
 	//
-	// Exclude ErrSlowConsumer: that drops only the fetcher's client-facing
-	// listener, while streamFromUpstream keeps feeding the separate cache listener
-	// on the still-live ctx, so the inline cache write is in flight and will
-	// finalize — warming here would race a redundant fetch against it.
-	if err != nil && err != broadcast.ErrSlowConsumer &&
-		s.cache.IsEnabled() && accessKey != "" && secretKey != "" {
+	// Gate on ctx cancellation rather than the generic writeChunksToResponse error,
+	// deliberately:
+	//   - Upstream failures (connection refused, 5xx) don't cancel ctx, so we don't
+	//     amplify load against an unhealthy upstream with a doomed background retry.
+	//   - A slow-consumer drop doesn't cancel ctx, and streamFromUpstream keeps
+	//     feeding the separate cache listener, so the inline write finalizes — no
+	//     redundant parallel fetch.
+	// When ctx is canceled the inline write is starved; when it isn't, the inline
+	// write completes — exactly one path populates the cache, never both.
+	//
+	// The background fetch is detached, deduplicated, and GetMeta(!found)-guarded;
+	// fetchFullObjectToCache enforces the size threshold and skips the body download
+	// for oversized objects, so a canceled oversized request costs at most one
+	// deduplicated header round-trip, never a wasted body transfer.
+	if ctx.Err() != nil && s.cache.IsEnabled() && accessKey != "" && secretKey != "" {
 		if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
 			s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r))
 		}
