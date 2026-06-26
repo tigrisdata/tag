@@ -13,6 +13,9 @@ tests/s3compat/python/s3-tests/
 tests/s3compat/python/.venv/
 tests/s3compat/python/s3tests.conf.generated
 
+# Warp benchmark results (the warp binary lives under .bin/, ignored above)
+tests/benchmark/results/
+
 # Coverage reports
 coverage.out
 coverage.html

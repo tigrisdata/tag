@@ -1,0 +1,64 @@
+name: Warp Benchmarks
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    # Nightly at 07:00 UTC
+    - cron: "0 7 * * *"
+
+env:
+  GO_VERSION: "1.24.2"
+  GOPRIVATE: github.com/tigrisdata
+
+jobs:
+  warp-benchmarks:
+    runs-on: namespace-profile-ubuntu-2404
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure git for private modules
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GH_BOT_ACCESS_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Install system dependencies
+        run: make install-deps
+
+      - name: Start TAG (local mode)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: make s3-test-local
+
+      - name: Run warp benchmarks
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: make bench-warp
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: tests/benchmark/results/
+          if-no-files-found: warn
+
+      - name: Cleanup
+        if: always()
+        run: make s3-test-local-down
