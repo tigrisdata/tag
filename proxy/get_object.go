@@ -256,7 +256,13 @@ func (s *Service) fetchAndBroadcast(
 	// detached, deduplicated, size-checked, and guarded by GetMeta(!found), so it
 	// is a no-op on the happy path (object already cached) and cannot accumulate
 	// redundant fetches under a client-cancel storm.
-	if err != nil && s.cache.IsEnabled() && accessKey != "" && secretKey != "" {
+	//
+	// Exclude ErrSlowConsumer: that drops only the fetcher's client-facing
+	// listener, while streamFromUpstream keeps feeding the separate cache listener
+	// on the still-live ctx, so the inline cache write is in flight and will
+	// finalize — warming here would race a redundant fetch against it.
+	if err != nil && err != broadcast.ErrSlowConsumer &&
+		s.cache.IsEnabled() && accessKey != "" && secretKey != "" {
 		if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
 			s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r))
 		}
@@ -633,12 +639,17 @@ func (s *Service) handleRangeWithBackgroundCache(
 		accessKey != "" && secretKey != ""
 
 	// Trigger the background full-object fetch via defer so it fires AFTER
-	// streaming completes regardless of the io.Copy outcome — success OR client
-	// cancel. For a cold owner whose client deadline is shorter than the cold
-	// fetch, io.Copy fails mid-stream; without this the warming fetch never runs
-	// and the same keys are re-fetched on every request (cold-miss/cancel loop).
-	// The fetch is detached + deduplicated and guarded by GetMeta(!found), so
-	// warming the key here is safe and never issues redundant fetches.
+	// streaming completes regardless of the io.Copy outcome — success OR error.
+	// For a cold owner whose client deadline is shorter than the cold fetch,
+	// io.Copy fails mid-stream; without this the warming fetch never runs and the
+	// same keys are re-fetched on every request (cold-miss/cancel loop).
+	//
+	// This intentionally also fires on upstream-side io.Copy errors (the range
+	// stream closing mid-transfer), not just client disconnects — io.Copy doesn't
+	// distinguish the two and warming is the right response to either. The fetch is
+	// detached, deduplicated (activeBackgroundFetches), and guarded by
+	// GetMeta(!found), so the cost is bounded to at most one background fetch per
+	// key and it's a no-op once the object is cached.
 	if cacheable {
 		defer func() {
 			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
