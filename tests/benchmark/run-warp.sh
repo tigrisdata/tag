@@ -17,8 +17,8 @@
 #   WARP_DURATION      duration per operation             (30s)
 #   WARP_CONCURRENT    concurrent operations              (4)
 #   WARP_OBJ_SIZE      object size for 4MiB ops           (4MiB)
-#   WARP_OBJECTS       object count for 4MiB ops          (100)
-#   WARP_RANGE_OBJ_SIZE large object size for GET RANGE    (100MiB)
+#   WARP_OBJECTS       object count for 4MiB ops          (2000)
+#   WARP_RANGE_OBJ_SIZE large object size for GET RANGE   (100MiB)
 #   WARP_RANGE_SIZE    range read size for GET RANGE      (4MiB)
 #   WARP_RANGE_OBJECTS object count for GET RANGE         (8)
 
@@ -67,7 +67,7 @@ REGION="${WARP_REGION:-auto}"
 DURATION="${WARP_DURATION:-30s}"
 CONCURRENT="${WARP_CONCURRENT:-4}"
 OBJ_SIZE="${WARP_OBJ_SIZE:-4MiB}"
-OBJECTS="${WARP_OBJECTS:-100}"
+OBJECTS="${WARP_OBJECTS:-2000}"
 RANGE_OBJ_SIZE="${WARP_RANGE_OBJ_SIZE:-100MiB}"
 RANGE_SIZE="${WARP_RANGE_SIZE:-4MiB}"
 RANGE_OBJECTS="${WARP_RANGE_OBJECTS:-8}"

@@ -14,10 +14,10 @@ env:
 jobs:
   warp-benchmarks:
     runs-on: namespace-profile-ubuntu-2404
+    timeout-minutes: 30
     permissions:
       actions: write
       contents: read
-      packages: write
 
     steps:
       - name: Checkout code
