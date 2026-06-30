@@ -19,6 +19,8 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_GRPC_ADDR`         | Address for gRPC server                                                         | `:9000`                  |
 | `TAG_CACHE_ADVERTISE_ADDR`    | Address advertised to other nodes                                               | (defaults to GRPC addr)  |
 | `TAG_CACHE_SEED_NODES`        | Comma-separated seed nodes for cluster discovery                                | (none)                   |
+| `TAG_CACHE_DELETE_BATCH_SIZE` | File deletions processed per deletion-queue batch                               | `1000`                   |
+| `TAG_CACHE_RECOVERY_WORKERS`  | Parallel workers for startup file recovery                                      | `16`                     |
 | `TAG_LOG_LEVEL`               | Log level: `debug`, `info`, `warn`, `error`                                     | `info`                   |
 | `TAG_LOG_FORMAT`              | Log format: `json` or `console`                                                 | `json`                   |
 | `TAG_TRANSPARENT_PROXY`       | Disable transparent proxy mode (`false` or `0`)                                 | `true`                   |
@@ -129,6 +131,16 @@ cache:
     - "tag-node-2:7000"
     - "tag-node-3:7000"
 
+  # File deletions processed per deletion-queue batch
+  # Default: 1000
+  # Override with TAG_CACHE_DELETE_BATCH_SIZE env var
+  delete_batch_size: 1000
+
+  # Parallel workers for startup file recovery
+  # Default: 16
+  # Override with TAG_CACHE_RECOVERY_WORKERS env var
+  recovery_workers: 16
+
 # Broadcast configuration (request coalescing)
 broadcast:
   # Chunk size for streaming (in bytes)
@@ -231,6 +243,8 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `grpc_addr`            | string   | `:9000`          | Address for gRPC server                 |
 | `advertise_addr`       | string   | `""`             | Address advertised to other nodes       |
 | `seed_nodes`           | []string | `[]`             | Seed nodes for cluster discovery        |
+| `delete_batch_size`    | int      | `1000`           | File deletions processed per deletion-queue batch |
+| `recovery_workers`     | int      | `16`             | Parallel workers for startup file recovery        |
 
 **TTL Format:**
 

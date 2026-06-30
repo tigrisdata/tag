@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/tigrisdata/ocache/embedded"
+	ocachestorage "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
@@ -218,6 +219,14 @@ func main() {
 			GRPCAddr:      cfg.Cache.GRPCAddr,
 			AdvertiseAddr: cfg.Cache.AdvertiseAddr,
 			SeedNodes:     cfg.Cache.SeedNodes,
+		}
+
+		// Advanced storage tuning. Defaults are applied by config.applyDefaults;
+		// the top-level embedded.Config fields (DiskPath, TTL, etc.) still take
+		// precedence over anything set here.
+		embeddedCfg.Storage = &ocachestorage.StorageConfig{
+			DeleteBatchSize: cfg.Cache.DeleteBatchSize,
+			RecoveryWorkers: cfg.Cache.RecoveryWorkers,
 		}
 
 		// Configure gRPC auth for cache cluster communication
