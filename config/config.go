@@ -57,6 +57,16 @@ const (
 	// DefaultMaxIdleConnsPerHost is the default HTTP connection pool size per upstream host.
 	// Higher values improve throughput for cache miss scenarios with high concurrency.
 	DefaultMaxIdleConnsPerHost = 100
+
+	// DefaultCacheDeleteBatchSize is the default number of file deletions processed
+	// per deletion-queue batch. Mirrors ocache storage.DefaultDeleteBatchSize; kept
+	// as a literal so the config package stays free of the cgo/RocksDB dependency.
+	DefaultCacheDeleteBatchSize = 1000
+
+	// DefaultCacheRecoveryWorkers is the default number of parallel workers for
+	// startup file recovery. Mirrors ocache storage.DefaultRecoveryWorkers; kept
+	// as a literal so the config package stays free of the cgo/RocksDB dependency.
+	DefaultCacheRecoveryWorkers = 16
 )
 
 // Config holds all configuration for TAG.
@@ -128,6 +138,10 @@ type CacheConfig struct {
 	AdvertiseAddr     string   `yaml:"advertise_addr"`       // Address advertised to other nodes (defaults to GRPCAddr)
 	SeedNodes         []string `yaml:"seed_nodes"`           // Seed nodes for cluster discovery
 	GRPCAuth          *bool    `yaml:"grpc_auth"`            // Enable gRPC auth using proxy credentials (default: true when nil)
+
+	// Advanced storage tuning (maps to ocache stor.StorageConfig).
+	DeleteBatchSize int `yaml:"delete_batch_size"` // File deletions processed per deletion-queue batch (default: DefaultCacheDeleteBatchSize)
+	RecoveryWorkers int `yaml:"recovery_workers"`  // Parallel workers for startup file recovery (default: DefaultCacheRecoveryWorkers)
 }
 
 // IsEnabled returns whether caching is enabled.
@@ -250,6 +264,12 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cache.GRPCAddr == "" {
 		cfg.Cache.GRPCAddr = DefaultCacheGRPCAddr
 	}
+	if cfg.Cache.DeleteBatchSize == 0 {
+		cfg.Cache.DeleteBatchSize = DefaultCacheDeleteBatchSize
+	}
+	if cfg.Cache.RecoveryWorkers == 0 {
+		cfg.Cache.RecoveryWorkers = DefaultCacheRecoveryWorkers
+	}
 
 	// Broadcast defaults
 	if cfg.Broadcast.ChunkSize == 0 {
@@ -321,6 +341,18 @@ func applyEnvOverrides(cfg *Config) {
 		if val := os.Getenv("TAG_CACHE_TTL"); val != "" {
 			if ttl, err := time.ParseDuration(val); err == nil && ttl > 0 {
 				cfg.Cache.TTL = ttl
+			}
+		}
+		// Override deletion-queue batch size from environment
+		if val := os.Getenv("TAG_CACHE_DELETE_BATCH_SIZE"); val != "" {
+			if size, err := strconv.Atoi(val); err == nil && size > 0 {
+				cfg.Cache.DeleteBatchSize = size
+			}
+		}
+		// Override startup recovery worker count from environment
+		if val := os.Getenv("TAG_CACHE_RECOVERY_WORKERS"); val != "" {
+			if workers, err := strconv.Atoi(val); err == nil && workers > 0 {
+				cfg.Cache.RecoveryWorkers = workers
 			}
 		}
 	}

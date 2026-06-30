@@ -187,6 +187,116 @@ cache:
 	}
 }
 
+func TestLoad_StorageTuningFromYAML(t *testing.T) {
+	content := `
+cache:
+  enabled: true
+  delete_batch_size: 500
+  recovery_workers: 4
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Cache.DeleteBatchSize != 500 {
+		t.Errorf("Cache.DeleteBatchSize = %d, want 500", cfg.Cache.DeleteBatchSize)
+	}
+	if cfg.Cache.RecoveryWorkers != 4 {
+		t.Errorf("Cache.RecoveryWorkers = %d, want 4", cfg.Cache.RecoveryWorkers)
+	}
+}
+
+func TestLoad_StorageTuningOverrideByEnv(t *testing.T) {
+	content := `
+cache:
+  enabled: true
+  delete_batch_size: 500
+  recovery_workers: 4
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	t.Setenv("TAG_CACHE_DELETE_BATCH_SIZE", "2000")
+	t.Setenv("TAG_CACHE_RECOVERY_WORKERS", "8")
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Cache.DeleteBatchSize != 2000 {
+		t.Errorf("Cache.DeleteBatchSize = %d, want 2000", cfg.Cache.DeleteBatchSize)
+	}
+	if cfg.Cache.RecoveryWorkers != 8 {
+		t.Errorf("Cache.RecoveryWorkers = %d, want 8", cfg.Cache.RecoveryWorkers)
+	}
+}
+
+func TestLoad_StorageTuningDefaults(t *testing.T) {
+	content := `
+cache:
+  enabled: true
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Unset values fall back to the ocache-sourced defaults.
+	if cfg.Cache.DeleteBatchSize != DefaultCacheDeleteBatchSize {
+		t.Errorf("Cache.DeleteBatchSize = %d, want %d", cfg.Cache.DeleteBatchSize, DefaultCacheDeleteBatchSize)
+	}
+	if cfg.Cache.RecoveryWorkers != DefaultCacheRecoveryWorkers {
+		t.Errorf("Cache.RecoveryWorkers = %d, want %d", cfg.Cache.RecoveryWorkers, DefaultCacheRecoveryWorkers)
+	}
+}
+
+func TestLoad_StorageTuningInvalidEnvIgnored(t *testing.T) {
+	content := `
+cache:
+  enabled: true
+  delete_batch_size: 500
+  recovery_workers: 4
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	// Non-positive or non-numeric values are ignored, leaving YAML values intact.
+	t.Setenv("TAG_CACHE_DELETE_BATCH_SIZE", "0")
+	t.Setenv("TAG_CACHE_RECOVERY_WORKERS", "notanumber")
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Cache.DeleteBatchSize != 500 {
+		t.Errorf("Cache.DeleteBatchSize = %d, want 500 (invalid env ignored)", cfg.Cache.DeleteBatchSize)
+	}
+	if cfg.Cache.RecoveryWorkers != 4 {
+		t.Errorf("Cache.RecoveryWorkers = %d, want 4 (invalid env ignored)", cfg.Cache.RecoveryWorkers)
+	}
+}
+
 func TestLoad_CacheDisabledByEnv(t *testing.T) {
 	// Create a config file with cache enabled
 	content := `
@@ -456,6 +566,14 @@ func TestCacheDefaultValues(t *testing.T) {
 	// Verify gRPC auth is enabled by default
 	if !cfg.Cache.IsGRPCAuthEnabled() {
 		t.Error("Cache.IsGRPCAuthEnabled() = false, want true (enabled by default)")
+	}
+
+	// Verify storage tuning defaults (sourced from ocache)
+	if cfg.Cache.DeleteBatchSize != DefaultCacheDeleteBatchSize {
+		t.Errorf("Cache.DeleteBatchSize = %d, want %d", cfg.Cache.DeleteBatchSize, DefaultCacheDeleteBatchSize)
+	}
+	if cfg.Cache.RecoveryWorkers != DefaultCacheRecoveryWorkers {
+		t.Errorf("Cache.RecoveryWorkers = %d, want %d", cfg.Cache.RecoveryWorkers, DefaultCacheRecoveryWorkers)
 	}
 }
 
