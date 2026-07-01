@@ -89,11 +89,23 @@ func (s *Service) setupCacheListener(
 	bucket, key string,
 	broadcaster *broadcast.Broadcaster,
 ) (*io.PipeWriter, chan error) {
+	// Bound concurrent cache-populate operations. When the limit is saturated,
+	// skip caching entirely: the object is still served/forwarded from upstream,
+	// we just don't populate the cache this time. This keeps the memory- and
+	// I/O-heavy write pipeline (pipe + goroutines + streaming RocksDB write) from
+	// growing without bound under load.
+	if !s.acquireCacheSlot() {
+		metrics.CachePopulateSkipped.Inc()
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping cache populate - concurrent write limit reached")
+		return nil, nil
+	}
+
 	// Record when this write started - used to check against tombstones
 	writeStartTime := time.Now().UnixNano()
 
 	listener := broadcaster.Subscribe()
 	if listener == nil {
+		s.releaseCacheSlot()
 		return nil, nil
 	}
 
@@ -103,6 +115,7 @@ func (s *Service) setupCacheListener(
 
 	// Start goroutine to consume chunks, build metadata, and write to cache
 	go func() {
+		defer s.releaseCacheSlot()
 		defer close(errCh)
 
 		// Wait for headers to build metadata

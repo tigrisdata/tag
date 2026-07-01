@@ -105,6 +105,16 @@ var (
 		},
 	)
 
+	// CachePopulateSkipped counts cache-populate operations skipped because the
+	// concurrent-cache-write limit was saturated (the object is still served from
+	// upstream, just not cached).
+	CachePopulateSkipped = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_cache_populate_skipped_total",
+			Help: "Total cache populates skipped due to the concurrent-cache-write limit",
+		},
+	)
+
 	// BytesTransferred tracks bytes transferred.
 	BytesTransferred = promauto.NewCounterVec(
 		prometheus.CounterOpts{

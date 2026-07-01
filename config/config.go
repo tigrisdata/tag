@@ -72,6 +72,10 @@ const (
 	// startup file recovery. Mirrors ocache storage.DefaultRecoveryWorkers; kept
 	// as a literal so the config package stays free of the cgo/RocksDB dependency.
 	DefaultCacheRecoveryWorkers = 16
+
+	// DefaultCacheMaxConcurrentWrites is the default ceiling on concurrent
+	// cache-populate operations.
+	DefaultCacheMaxConcurrentWrites = 100
 )
 
 // Config holds all configuration for TAG.
@@ -151,6 +155,11 @@ type CacheConfig struct {
 	// Advanced storage tuning (maps to ocache stor.StorageConfig).
 	DeleteBatchSize int `yaml:"delete_batch_size"` // File deletions processed per deletion-queue batch (default: DefaultCacheDeleteBatchSize)
 	RecoveryWorkers int `yaml:"recovery_workers"`  // Parallel workers for startup file recovery (default: DefaultCacheRecoveryWorkers)
+	// MaxConcurrentWrites bounds concurrent cache-populate operations (upstream
+	// fetch + streaming write). When saturated, the object is still served from
+	// upstream but not cached, so the memory/I/O-heavy write path can't grow
+	// unbounded (default: DefaultCacheMaxConcurrentWrites).
+	MaxConcurrentWrites int `yaml:"max_concurrent_writes"`
 }
 
 // IsEnabled returns whether caching is enabled.
@@ -281,6 +290,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Cache.RecoveryWorkers == 0 {
 		cfg.Cache.RecoveryWorkers = DefaultCacheRecoveryWorkers
+	}
+	if cfg.Cache.MaxConcurrentWrites == 0 {
+		cfg.Cache.MaxConcurrentWrites = DefaultCacheMaxConcurrentWrites
 	}
 
 	// Broadcast defaults
