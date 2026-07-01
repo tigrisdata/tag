@@ -71,7 +71,7 @@ func (s *Server) connectionTrackingMiddleware(next http.Handler) http.Handler {
 // pprof) are exempt so probes and observability keep working under load.
 func (s *Server) admissionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.admissionSem == nil || isExemptFromAdmission(r.URL.Path) {
+		if s.admissionSem == nil || s.isExemptFromAdmission(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -93,8 +93,19 @@ func (s *Server) admissionMiddleware(next http.Handler) http.Handler {
 
 // isExemptFromAdmission reports whether a path is a non-S3 operational endpoint
 // that must not be subject to admission control.
-func isExemptFromAdmission(path string) bool {
-	return path == "/health" || path == "/metrics" || strings.HasPrefix(path, "/debug/")
+//
+// Matching is deliberately precise: path-style S3 objects are /{bucket}/{key},
+// so a broad prefix like "/debug/" would also exempt objects in a bucket named
+// "debug" and let them bypass admission. /health and /metrics are matched
+// exactly (their routes are registered before the bucket routes, so they always
+// shadow same-named buckets). The pprof routes are only registered when pprof is
+// enabled — and, being registered before the bucket routes, they then shadow any
+// "debug" bucket — so we only exempt "/debug/pprof/" when pprof is enabled.
+func (s *Server) isExemptFromAdmission(path string) bool {
+	if path == "/health" || path == "/metrics" {
+		return true
+	}
+	return s.pprofEnabled && strings.HasPrefix(path, "/debug/pprof/")
 }
 
 // setupRouter configures the S3-compatible routes.

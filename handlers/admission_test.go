@@ -37,17 +37,39 @@ func TestAdmissionMiddleware_ShedsWhenFull(t *testing.T) {
 }
 
 // TestAdmissionMiddleware_ExemptPathsBypass verifies operational endpoints are
-// never shed, even when the admission limit is fully occupied.
+// never shed, even when the admission limit is fully occupied. pprof paths are
+// only exempt when pprof is enabled.
 func TestAdmissionMiddleware_ExemptPathsBypass(t *testing.T) {
-	s := &Server{admissionSem: make(chan struct{}, 1)}
+	s := &Server{admissionSem: make(chan struct{}, 1), pprofEnabled: true}
 	s.admissionSem <- struct{}{} // fully occupied
 
-	for _, p := range []string{"/health", "/metrics", "/debug/pprof/"} {
+	for _, p := range []string{"/health", "/metrics", "/debug/pprof/", "/debug/pprof/heap"} {
 		called := false
 		h := s.admissionMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true }))
 		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, p, nil))
 		if !called {
 			t.Fatalf("exempt path %s must bypass admission even when full", p)
+		}
+	}
+}
+
+// TestAdmissionMiddleware_DebugBucketNotExempt guards against the exemption
+// being bypassed by S3 objects: path-style URLs are /{bucket}/{key}, so an
+// object in a bucket named "debug" (/debug/my-key) must still be subject to
+// admission and shed with 503 when full. It must also not be exempt as a pprof
+// path when pprof is disabled.
+func TestAdmissionMiddleware_DebugBucketNotExempt(t *testing.T) {
+	for _, pprofEnabled := range []bool{false, true} {
+		s := &Server{admissionSem: make(chan struct{}, 1), pprofEnabled: pprofEnabled}
+		s.admissionSem <- struct{}{} // fully occupied
+
+		rec := httptest.NewRecorder()
+		h := s.admissionMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Fatalf("object in bucket 'debug' must not bypass admission (pprofEnabled=%v)", pprofEnabled)
+		}))
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/my-key", nil))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("bucket 'debug' object should be shed (503) when full, got %d (pprofEnabled=%v)", rec.Code, pprofEnabled)
 		}
 	}
 }

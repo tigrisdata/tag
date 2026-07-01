@@ -97,7 +97,8 @@ type ServerConfig struct {
 	TLSKeyFile   string `yaml:"tls_key_file"`  // Path to TLS private key file (PEM format)
 	// MaxInflightRequests bounds concurrently-served S3 requests; excess requests
 	// are shed with 503 SlowDown so overload becomes backpressure rather than
-	// unbounded goroutine/thread/memory growth (default: DefaultServerMaxInflightRequests).
+	// unbounded goroutine/thread/memory growth. 0 or unset uses
+	// DefaultServerMaxInflightRequests; a negative value disables the limit.
 	MaxInflightRequests int `yaml:"max_inflight_requests"`
 }
 
@@ -158,7 +159,8 @@ type CacheConfig struct {
 	// MaxConcurrentWrites bounds concurrent cache-populate operations (upstream
 	// fetch + streaming write). When saturated, the object is still served from
 	// upstream but not cached, so the memory/I/O-heavy write path can't grow
-	// unbounded (default: DefaultCacheMaxConcurrentWrites).
+	// unbounded. 0 or unset uses DefaultCacheMaxConcurrentWrites; a negative
+	// value disables the limit.
 	MaxConcurrentWrites int `yaml:"max_concurrent_writes"`
 }
 
