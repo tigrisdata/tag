@@ -20,6 +20,11 @@ const (
 	// DefaultBindIP is the default bind address.
 	DefaultBindIP = "0.0.0.0"
 
+	// DefaultServerMaxInflightRequests is the default ceiling on concurrently-served
+	// S3 requests. Sized so that, with streaming (per-request memory ~MiB), the
+	// worst case stays well within typical container memory limits.
+	DefaultServerMaxInflightRequests = 1024
+
 	// DefaultUpstreamEndpoint is the default Tigris S3 endpoint.
 	DefaultUpstreamEndpoint = "https://t3.storage.dev"
 
@@ -86,6 +91,10 @@ type ServerConfig struct {
 	PprofEnabled bool   `yaml:"pprof_enabled"` // Enable pprof endpoints (default: false)
 	TLSCertFile  string `yaml:"tls_cert_file"` // Path to TLS certificate file (PEM format)
 	TLSKeyFile   string `yaml:"tls_key_file"`  // Path to TLS private key file (PEM format)
+	// MaxInflightRequests bounds concurrently-served S3 requests; excess requests
+	// are shed with 503 SlowDown so overload becomes backpressure rather than
+	// unbounded goroutine/thread/memory growth (default: DefaultServerMaxInflightRequests).
+	MaxInflightRequests int `yaml:"max_inflight_requests"`
 }
 
 // TLSEnabled returns whether TLS is configured.
@@ -230,6 +239,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Server.BindIP == "" {
 		cfg.Server.BindIP = DefaultBindIP
+	}
+	if cfg.Server.MaxInflightRequests == 0 {
+		cfg.Server.MaxInflightRequests = DefaultServerMaxInflightRequests
 	}
 	// PprofEnabled defaults to false (disabled for security)
 	// Use TAG_PPROF_ENABLED=true to enable

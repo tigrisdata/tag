@@ -87,6 +87,24 @@ var (
 		},
 	)
 
+	// InflightRequests tracks the number of S3 requests currently admitted and
+	// being served (bounded by the ingress admission limit).
+	InflightRequests = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "tag_inflight_requests",
+			Help: "Number of S3 requests currently admitted and in flight",
+		},
+	)
+
+	// AdmissionShed counts S3 requests rejected with 503 SlowDown because the
+	// ingress admission limit was saturated.
+	AdmissionShed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_admission_shed_total",
+			Help: "Total S3 requests shed with 503 SlowDown due to the ingress admission limit",
+		},
+	)
+
 	// BytesTransferred tracks bytes transferred.
 	BytesTransferred = promauto.NewCounterVec(
 		prometheus.CounterOpts{

@@ -335,7 +335,7 @@ func NewTestEnvironmentWithCache() *TestEnvironment {
 	xCacheTracker := NewXCacheTracker()
 
 	// Create TAG server with X-Cache tracking middleware
-	server := handlers.NewServer(service, "127.0.0.1", 0, true)
+	server := handlers.NewServer(service, "127.0.0.1", 0, true, 0)
 	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
 	tagServer := httptest.NewServer(wrappedRouter)
 
@@ -403,7 +403,7 @@ func NewTestEnvironmentWithCacheHandler(upstreamHandler http.HandlerFunc) *TestE
 	service := proxy.NewService(forwarder, testCache, cfg)
 
 	xCacheTracker := NewXCacheTracker()
-	server := handlers.NewServer(service, "127.0.0.1", 0, true)
+	server := handlers.NewServer(service, "127.0.0.1", 0, true, 0)
 	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
 	tagServer := httptest.NewServer(wrappedRouter)
 
@@ -460,7 +460,7 @@ func newTestEnvironmentWithUpstream(upstream *httptest.Server, backend *s3mem.Ba
 	xCacheTracker := NewXCacheTracker()
 
 	// Create TAG server with X-Cache tracking middleware
-	server := handlers.NewServer(service, "127.0.0.1", 0, true)
+	server := handlers.NewServer(service, "127.0.0.1", 0, true, 0)
 	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
 
 	var tagServer *httptest.Server
@@ -1038,7 +1038,7 @@ func NewTestEnvironmentWithTransparentAuth(t *testing.T, upstreamHandler http.Ha
 	service := proxy.NewService(forwarder, testCache, cfg)
 
 	xCacheTracker := NewXCacheTracker()
-	server := handlers.NewServer(service, "127.0.0.1", 0, true)
+	server := handlers.NewServer(service, "127.0.0.1", 0, true, 0)
 	wrappedRouter := xCacheTrackingMiddleware(xCacheTracker)(server.Router())
 	tagServer := httptest.NewServer(wrappedRouter)
 
