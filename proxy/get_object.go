@@ -314,7 +314,7 @@ func (s *Service) streamFromUpstream(
 	var cacheErrCh chan error
 
 	if shouldCache {
-		cachePipeWriter, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster)
+		cachePipeWriter, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false)
 	}
 
 	// If an anonymous GET succeeded and Tigris didn't set an explicit per-object ACL,
