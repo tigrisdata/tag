@@ -20,6 +20,11 @@ const (
 	// DefaultBindIP is the default bind address.
 	DefaultBindIP = "0.0.0.0"
 
+	// DefaultServerMaxInflightRequests is the default ceiling on concurrently-served
+	// S3 requests. Sized so that, with streaming (per-request memory ~MiB), the
+	// worst case stays well within typical container memory limits.
+	DefaultServerMaxInflightRequests = 1024
+
 	// DefaultUpstreamEndpoint is the default Tigris S3 endpoint.
 	DefaultUpstreamEndpoint = "https://t3.storage.dev"
 
@@ -67,6 +72,10 @@ const (
 	// startup file recovery. Mirrors ocache storage.DefaultRecoveryWorkers; kept
 	// as a literal so the config package stays free of the cgo/RocksDB dependency.
 	DefaultCacheRecoveryWorkers = 16
+
+	// DefaultCacheMaxConcurrentWrites is the default ceiling on concurrent
+	// cache-populate operations.
+	DefaultCacheMaxConcurrentWrites = 256
 )
 
 // Config holds all configuration for TAG.
@@ -86,6 +95,11 @@ type ServerConfig struct {
 	PprofEnabled bool   `yaml:"pprof_enabled"` // Enable pprof endpoints (default: false)
 	TLSCertFile  string `yaml:"tls_cert_file"` // Path to TLS certificate file (PEM format)
 	TLSKeyFile   string `yaml:"tls_key_file"`  // Path to TLS private key file (PEM format)
+	// MaxInflightRequests bounds concurrently-served S3 requests; excess requests
+	// are shed with 503 SlowDown so overload becomes backpressure rather than
+	// unbounded goroutine/thread/memory growth. 0 or unset uses
+	// DefaultServerMaxInflightRequests; a negative value disables the limit.
+	MaxInflightRequests int `yaml:"max_inflight_requests"`
 }
 
 // TLSEnabled returns whether TLS is configured.
@@ -142,6 +156,12 @@ type CacheConfig struct {
 	// Advanced storage tuning (maps to ocache stor.StorageConfig).
 	DeleteBatchSize int `yaml:"delete_batch_size"` // File deletions processed per deletion-queue batch (default: DefaultCacheDeleteBatchSize)
 	RecoveryWorkers int `yaml:"recovery_workers"`  // Parallel workers for startup file recovery (default: DefaultCacheRecoveryWorkers)
+	// MaxConcurrentWrites bounds concurrent cache-populate operations (upstream
+	// fetch + streaming write). When saturated, the object is still served from
+	// upstream but not cached, so the memory/I/O-heavy write path can't grow
+	// unbounded. 0 or unset uses DefaultCacheMaxConcurrentWrites; a negative
+	// value disables the limit.
+	MaxConcurrentWrites int `yaml:"max_concurrent_writes"`
 }
 
 // IsEnabled returns whether caching is enabled.
@@ -231,6 +251,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Server.BindIP == "" {
 		cfg.Server.BindIP = DefaultBindIP
 	}
+	if cfg.Server.MaxInflightRequests == 0 {
+		cfg.Server.MaxInflightRequests = DefaultServerMaxInflightRequests
+	}
 	// PprofEnabled defaults to false (disabled for security)
 	// Use TAG_PPROF_ENABLED=true to enable
 
@@ -269,6 +292,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Cache.RecoveryWorkers == 0 {
 		cfg.Cache.RecoveryWorkers = DefaultCacheRecoveryWorkers
+	}
+	if cfg.Cache.MaxConcurrentWrites == 0 {
+		cfg.Cache.MaxConcurrentWrites = DefaultCacheMaxConcurrentWrites
 	}
 
 	// Broadcast defaults
@@ -355,6 +381,12 @@ func applyEnvOverrides(cfg *Config) {
 				cfg.Cache.RecoveryWorkers = workers
 			}
 		}
+		// Override concurrent cache-write limit from environment
+		if val := os.Getenv("TAG_CACHE_MAX_CONCURRENT_WRITES"); val != "" {
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				cfg.Cache.MaxConcurrentWrites = n
+			}
+		}
 	}
 
 	// Override log level from environment
@@ -371,6 +403,13 @@ func applyEnvOverrides(cfg *Config) {
 	if port := os.Getenv("TAG_HTTP_PORT"); port != "" {
 		if p, err := strconv.Atoi(port); err == nil && p > 0 {
 			cfg.Server.HTTPPort = p
+		}
+	}
+
+	// Override the ingress in-flight request limit from environment
+	if val := os.Getenv("TAG_MAX_INFLIGHT_REQUESTS"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			cfg.Server.MaxInflightRequests = n
 		}
 	}
 

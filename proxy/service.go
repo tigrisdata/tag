@@ -16,9 +16,6 @@ import (
 )
 
 const (
-	// maxConcurrentCacheWrites limits the number of concurrent background cache operations.
-	maxConcurrentCacheWrites = 100
-
 	// X-Cache header constants for indicating cache status.
 	XCacheHeader   = "X-Cache"
 	XCacheHit      = "HIT"
@@ -33,7 +30,7 @@ type Service struct {
 	forwarder              RequestForwarder
 	cache                  *cache.Cache
 	config                 *config.Config
-	cacheSemaphore         chan struct{}      // Limits concurrent cache writes
+	cacheSemaphore         chan struct{}      // Bounds concurrent cache-populate operations (nil = unlimited)
 	broadcastManager       *broadcast.Manager // For streaming request coalescing
 	activeBackgroundFetches sync.Map          // Dedup for background full-object fetches (range caching)
 }
@@ -45,13 +42,43 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		channelBuf = broadcast.DefaultChannelBuffer
 	}
 
+	var cacheSem chan struct{}
+	if cfg.Cache.MaxConcurrentWrites > 0 {
+		cacheSem = make(chan struct{}, cfg.Cache.MaxConcurrentWrites)
+	}
+
 	return &Service{
 		forwarder:        forwarder,
 		cache:            cache,
 		config:           cfg,
-		cacheSemaphore:   make(chan struct{}, maxConcurrentCacheWrites),
+		cacheSemaphore:   cacheSem,
 		broadcastManager: broadcast.NewManager(channelBuf),
 	}
+}
+
+// acquireCacheSlot tries to reserve a cache-populate slot without blocking. It
+// returns true (and must be paired with releaseCacheSlot) when a slot is
+// reserved, or when the limiter is disabled (nil semaphore). It returns false
+// when the concurrent-cache-write limit is saturated, in which case the caller
+// should skip caching rather than block or spawn unbounded work.
+func (s *Service) acquireCacheSlot() bool {
+	if s.cacheSemaphore == nil {
+		return true
+	}
+	select {
+	case s.cacheSemaphore <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// releaseCacheSlot releases a slot previously reserved by acquireCacheSlot.
+func (s *Service) releaseCacheSlot() {
+	if s.cacheSemaphore == nil {
+		return
+	}
+	<-s.cacheSemaphore
 }
 
 // HandlePutObject handles PUT requests for objects.

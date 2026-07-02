@@ -304,7 +304,7 @@ func main() {
 	service := proxy.NewService(forwarder, objectCache, cfg)
 
 	// 6. Initialize HTTP server
-	server := handlers.NewServer(service, cfg.Server.BindIP, cfg.Server.HTTPPort, cfg.Server.PprofEnabled)
+	server := handlers.NewServer(service, cfg.Server.BindIP, cfg.Server.HTTPPort, cfg.Server.PprofEnabled, cfg.Server.MaxInflightRequests)
 	if cfg.Server.TLSEnabled() {
 		server.SetTLS(cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile)
 	}

@@ -59,6 +59,12 @@ const (
 	minCacheWriteThroughput = 5 * 1024 * 1024 // 5 MB/s
 )
 
+// errCachePopulateDeclined signals that a background cache populate was
+// deliberately skipped because the concurrent-cache-write limit was saturated.
+// It is distinct from a fetch failure so callers do not record it as either a
+// success or a failure.
+var errCachePopulateDeclined = errors.New("cache populate declined: concurrent write limit reached")
+
 // cacheWriteTimeoutForSize returns a timeout scaled to contentLength.
 // Returns at least cacheWriteTimeout (60s), scaling up for large objects.
 func cacheWriteTimeoutForSize(contentLength int64) time.Duration {
@@ -88,12 +94,30 @@ func (s *Service) setupCacheListener(
 	ctx context.Context,
 	bucket, key string,
 	broadcaster *broadcast.Broadcaster,
+	slotHeld bool,
 ) (*io.PipeWriter, chan error) {
+	// Bound concurrent cache-populate operations. When the limit is saturated,
+	// skip caching entirely: the object is still served/forwarded from upstream,
+	// we just don't populate the cache this time. This keeps the memory- and
+	// I/O-heavy write pipeline (pipe + goroutines + streaming RocksDB write) from
+	// growing without bound under load. slotHeld is true when the caller has
+	// already reserved a slot (the background path reserves it before the upstream
+	// request); once past this point the slot is owned by this function and is
+	// released on the no-listener path below or by the populate goroutine.
+	if !slotHeld {
+		if !s.acquireCacheSlot() {
+			metrics.CachePopulateSkipped.Inc()
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping cache populate - concurrent write limit reached")
+			return nil, nil
+		}
+	}
+
 	// Record when this write started - used to check against tombstones
 	writeStartTime := time.Now().UnixNano()
 
 	listener := broadcaster.Subscribe()
 	if listener == nil {
+		s.releaseCacheSlot()
 		return nil, nil
 	}
 
@@ -103,6 +127,7 @@ func (s *Service) setupCacheListener(
 
 	// Start goroutine to consume chunks, build metadata, and write to cache
 	go func() {
+		defer s.releaseCacheSlot()
 		defer close(errCh)
 
 		// Wait for headers to build metadata
@@ -261,6 +286,23 @@ func (s *Service) fetchFullObjectToCache(
 	publicACL bool,
 	broadcaster *broadcast.Broadcaster,
 ) error {
+	// This is a background fetch whose only purpose is to populate the cache, so
+	// reserve a cache-populate slot up front. If the concurrent-write limit is
+	// saturated, skip the whole operation — including the upstream request —
+	// rather than fetch and then discard the result under the very pressure the
+	// limit is meant to relieve. errCachePopulateDeclined distinguishes this
+	// deliberate skip from a real fetch success/failure for the caller's metrics.
+	if !s.acquireCacheSlot() {
+		metrics.CachePopulateSkipped.Inc()
+		return errCachePopulateDeclined
+	}
+	slotOwned := true
+	defer func() {
+		if slotOwned {
+			s.releaseCacheSlot()
+		}
+	}()
+
 	// Execute full object request (no Range header)
 	resp, err := s.forwarder.DoFullObjectRequest(ctx, bucket, key, accessKey, secretKey)
 	if err != nil {
@@ -289,8 +331,16 @@ func (s *Service) fetchFullObjectToCache(
 		return nil
 	}
 
-	// Set up cache listener (streams to cache via pipe)
-	cachePipeWriter, cacheErrCh := s.setupCacheListener(ctx, bucket, key, broadcaster)
+	// Hand the reserved slot to the cache listener (streams to cache via pipe).
+	// Ownership of releasing the slot transfers to setupCacheListener, so drop
+	// our own release regardless of the result.
+	cachePipeWriter, cacheErrCh := s.setupCacheListener(ctx, bucket, key, broadcaster, true)
+	slotOwned = false
+	if cachePipeWriter == nil {
+		// No listener could be created; nothing to populate.
+		broadcaster.Complete(nil)
+		return errCachePopulateDeclined
+	}
 
 	// If the original request was anonymous and succeeded, the object is publicly
 	// accessible. Tigris omits X-Amz-Acl for objects inheriting bucket-level access,
@@ -396,10 +446,15 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 
 		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, publicACL, broadcaster)
 
-		if err != nil {
+		switch {
+		case errors.Is(err, errCachePopulateDeclined):
+			// Deliberately skipped because the cache-write limit was saturated —
+			// not a fetch success or failure (already counted as a populate skip).
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background cache fetch skipped - concurrent write limit reached")
+		case err != nil:
 			log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background cache fetch failed")
 			metrics.RecordBackgroundFetchFailed()
-		} else {
+		default:
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background cache fetch completed")
 			metrics.RecordBackgroundFetchSucceeded()
 		}

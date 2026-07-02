@@ -121,21 +121,6 @@ func TestCache_IsClosed(t *testing.T) {
 func TestCache_DisabledOperationsReturnNil(t *testing.T) {
 	cache := &Cache{enabled: false}
 
-	// GetWithMeta should return not found for disabled cache
-	meta, reader, found, err := cache.GetWithMeta(t.Context(), "bucket", "key")
-	if err != nil {
-		t.Errorf("GetWithMeta() error = %v, want nil", err)
-	}
-	if found {
-		t.Error("GetWithMeta() found = true, want false")
-	}
-	if reader != nil {
-		t.Error("GetWithMeta() reader != nil, want nil")
-	}
-	if meta != nil {
-		t.Error("GetWithMeta() meta != nil, want nil")
-	}
-
 	// PutWithMeta should succeed silently
 	testMeta := &CachedObjectMeta{Bucket: "bucket", Key: "key"}
 	if err := cache.PutWithMeta(t.Context(), "bucket", "key", testMeta, []byte("data"), 60); err != nil {

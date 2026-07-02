@@ -27,14 +27,21 @@ type Server struct {
 	pprofEnabled bool
 	tlsCertFile  string
 	tlsKeyFile   string
+	// admissionSem bounds concurrently-served S3 requests. nil disables admission
+	// control (unlimited).
+	admissionSem chan struct{}
 }
 
 // NewServer creates a new HTTP server.
-func NewServer(service *proxy.Service, bindIP string, port int, pprofEnabled bool) *Server {
+func NewServer(service *proxy.Service, bindIP string, port int, pprofEnabled bool, maxInflight int) *Server {
 	s := &Server{
 		service:      service,
 		bindAddr:     fmt.Sprintf("%s:%d", bindIP, port),
 		pprofEnabled: pprofEnabled,
+	}
+
+	if maxInflight > 0 {
+		s.admissionSem = make(chan struct{}, maxInflight)
 	}
 
 	s.router = s.setupRouter()
@@ -57,6 +64,56 @@ func (s *Server) connectionTrackingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// admissionMiddleware bounds the number of concurrently-served S3 requests. When
+// the limit is saturated it sheds with 503 SlowDown so that overload becomes
+// backpressure instead of unbounded goroutine/OS-thread/memory growth (the
+// thread-exhaustion / OOM failure mode). Operational endpoints (health, metrics,
+// pprof) are exempt so probes and observability keep working under load.
+func (s *Server) admissionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.admissionSem == nil || isExemptFromAdmission(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		select {
+		case s.admissionSem <- struct{}{}:
+			metrics.InflightRequests.Inc()
+			defer func() {
+				<-s.admissionSem
+				metrics.InflightRequests.Dec()
+			}()
+			next.ServeHTTP(w, r)
+		default:
+			metrics.AdmissionShed.Inc()
+			s3err.WriteError(w, r, s3err.ErrSlowDown)
+		}
+	})
+}
+
+// isExemptFromAdmission reports whether a request is a non-S3 operational
+// endpoint that must not be subject to admission control. It is a positive
+// allowlist of the operational routes (/health, /metrics, /debug/pprof/*); every
+// other route — including S3 object, bucket, and service-level ListBuckets ("/")
+// operations — is subject to admission.
+//
+// The decision is made on the matched route's *path template*, not the request
+// path. Templates are fixed at registration (e.g. "/{bucket}/{object:.+}",
+// "/debug/pprof/heap"), so arbitrary S3 object keys cannot forge an exempt path:
+// a request to /debug/pprof/large-key matches the object route whose template is
+// "/{bucket}/{object:.+}", so it is correctly subject to admission.
+func isExemptFromAdmission(r *http.Request) bool {
+	route := mux.CurrentRoute(r)
+	if route == nil {
+		return false
+	}
+	tmpl, err := route.GetPathTemplate()
+	if err != nil {
+		return false
+	}
+	return tmpl == "/health" || tmpl == "/metrics" || strings.HasPrefix(tmpl, "/debug/pprof/")
+}
+
 // setupRouter configures the S3-compatible routes.
 func (s *Server) setupRouter() *mux.Router {
 	r := mux.NewRouter()
@@ -64,6 +121,9 @@ func (s *Server) setupRouter() *mux.Router {
 
 	// Apply connection tracking middleware
 	r.Use(s.connectionTrackingMiddleware)
+
+	// Bound concurrently-served S3 requests (sheds with 503 SlowDown when full)
+	r.Use(s.admissionMiddleware)
 
 	// Health check endpoint
 	r.HandleFunc("/health", s.handleHealth).Methods("GET")

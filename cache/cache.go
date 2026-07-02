@@ -181,61 +181,6 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 	return nil
 }
 
-// GetWithMeta retrieves object metadata and body from cache.
-// Returns metadata, body reader, found flag, and any error.
-func (c *Cache) GetWithMeta(ctx context.Context, bucket, key string) (*CachedObjectMeta, io.Reader, bool, error) {
-	if !c.IsEnabled() {
-		return nil, nil, false, nil
-	}
-
-	metaKey := MakeMetaKey(bucket, key)
-	bodyKey := MakeBodyKey(bucket, key)
-
-	// Get metadata first
-	metaBytes, err := c.client.Get(ctx, metaKey)
-	if err != nil {
-		if isNotFoundError(err) {
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (meta)")
-			return nil, nil, false, nil
-		}
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta get error")
-		return nil, nil, false, err
-	}
-
-	if metaBytes == nil {
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (meta nil)")
-		return nil, nil, false, nil
-	}
-
-	// Decode metadata
-	meta, err := DecodeMeta(metaBytes)
-	if err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta decode error")
-		return nil, nil, false, err
-	}
-
-	// Get body as stream
-	var buf bytes.Buffer
-	err = c.client.GetStream(ctx, bodyKey, &buf)
-	if err != nil {
-		if isNotFoundError(err) {
-			// Metadata exists but body doesn't - inconsistent state
-			log.Warn().Str("bucket", bucket).Str("key", key).Msg("Cache inconsistent: meta without body")
-			return nil, nil, false, nil
-		}
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body get error")
-		return nil, nil, false, err
-	}
-
-	log.Debug().
-		Str("bucket", bucket).
-		Str("key", key).
-		Int("meta_size", len(metaBytes)).
-		Int("body_size", buf.Len()).
-		Msg("Cache hit with metadata")
-	return meta, &buf, true, nil
-}
-
 // GetMeta retrieves only object metadata from cache (no body).
 // Use this for HEAD requests to avoid fetching the body.
 func (c *Cache) GetMeta(ctx context.Context, bucket, key string) (*CachedObjectMeta, bool, error) {
