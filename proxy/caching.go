@@ -305,6 +305,17 @@ func (s *Service) fetchFullObjectToCache(
 	// Set up cache listener (streams to cache via pipe)
 	cachePipeWriter, cacheErrCh := s.setupCacheListener(ctx, bucket, key, broadcaster)
 
+	// The cache populate was declined (concurrent-cache-write limit saturated, or
+	// no listener). This is a background fetch whose only purpose is to populate
+	// the cache — no client is waiting on this broadcaster — so downloading and
+	// broadcasting the full object would add upstream and CPU load under the very
+	// pressure the limit is meant to relieve. Abort instead.
+	if cachePipeWriter == nil {
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping background cache fetch - cache populate declined")
+		broadcaster.Complete(nil)
+		return nil
+	}
+
 	// If the original request was anonymous and succeeded, the object is publicly
 	// accessible. Tigris omits X-Amz-Acl for objects inheriting bucket-level access,
 	// so inject public-read to ensure the cached metadata allows anonymous reads.
