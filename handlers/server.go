@@ -71,7 +71,7 @@ func (s *Server) connectionTrackingMiddleware(next http.Handler) http.Handler {
 // pprof) are exempt so probes and observability keep working under load.
 func (s *Server) admissionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.admissionSem == nil || !isS3Request(r) {
+		if s.admissionSem == nil || isExemptFromAdmission(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -91,19 +91,27 @@ func (s *Server) admissionMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// isS3Request reports whether the matched route is an S3 bucket/object
-// operation, identified by a {bucket} path variable. Admission control applies
-// only to these; the static operational endpoints (/health, /metrics,
-// /debug/pprof/*) carry no route variables and are exempt.
+// isExemptFromAdmission reports whether a request is a non-S3 operational
+// endpoint that must not be subject to admission control. It is a positive
+// allowlist of the operational routes (/health, /metrics, /debug/pprof/*); every
+// other route — including S3 object, bucket, and service-level ListBuckets ("/")
+// operations — is subject to admission.
 //
-// Exemption is decided by the matched route, not by string-matching the request
-// path, because S3 object keys are arbitrary. A path like /debug/pprof/large-key
-// does not match the exact pprof handlers, so mux routes it to the object
-// handler (bucket "debug", key "pprof/large-key") — with a {bucket} var set — and
-// it is correctly subject to admission rather than bypassing it.
-func isS3Request(r *http.Request) bool {
-	_, hasBucket := mux.Vars(r)["bucket"]
-	return hasBucket
+// The decision is made on the matched route's *path template*, not the request
+// path. Templates are fixed at registration (e.g. "/{bucket}/{object:.+}",
+// "/debug/pprof/heap"), so arbitrary S3 object keys cannot forge an exempt path:
+// a request to /debug/pprof/large-key matches the object route whose template is
+// "/{bucket}/{object:.+}", so it is correctly subject to admission.
+func isExemptFromAdmission(r *http.Request) bool {
+	route := mux.CurrentRoute(r)
+	if route == nil {
+		return false
+	}
+	tmpl, err := route.GetPathTemplate()
+	if err != nil {
+		return false
+	}
+	return tmpl == "/health" || tmpl == "/metrics" || strings.HasPrefix(tmpl, "/debug/pprof/")
 }
 
 // setupRouter configures the S3-compatible routes.

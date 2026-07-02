@@ -26,6 +26,7 @@ func buildAdmissionTestRouter(s *Server, sentinel http.HandlerFunc) http.Handler
 	}
 	r.HandleFunc("/{bucket}/{object:.+}", sentinel).Methods("GET", "HEAD", "PUT", "DELETE")
 	r.HandleFunc("/{bucket}", sentinel).Methods("GET")
+	r.HandleFunc("/", sentinel).Methods("GET") // ListBuckets (service-level)
 	return r
 }
 
@@ -82,6 +83,23 @@ func TestAdmission_PprofLikeS3KeyNotExempt(t *testing.T) {
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/pprof/large-object", nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 for S3 object /debug/pprof/large-object, got %d", rec.Code)
+	}
+}
+
+// TestAdmission_ListBucketsSubjectToAdmission verifies the service-level
+// ListBuckets route ("/") is bounded by admission — it proxies upstream and has
+// no {bucket} var, so it must not be treated as an exempt operational endpoint.
+func TestAdmission_ListBucketsSubjectToAdmission(t *testing.T) {
+	s := &Server{admissionSem: make(chan struct{}, 1)}
+	s.admissionSem <- struct{}{} // fully occupied
+
+	router := buildAdmissionTestRouter(s, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("ListBuckets (GET /) must be subject to admission")
+	})
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for ListBuckets when admission full, got %d", rec.Code)
 	}
 }
 
