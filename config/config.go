@@ -75,7 +75,7 @@ const (
 
 	// DefaultCacheMaxConcurrentWrites is the default ceiling on concurrent
 	// cache-populate operations.
-	DefaultCacheMaxConcurrentWrites = 100
+	DefaultCacheMaxConcurrentWrites = 256
 )
 
 // Config holds all configuration for TAG.
@@ -381,6 +381,12 @@ func applyEnvOverrides(cfg *Config) {
 				cfg.Cache.RecoveryWorkers = workers
 			}
 		}
+		// Override concurrent cache-write limit from environment
+		if val := os.Getenv("TAG_CACHE_MAX_CONCURRENT_WRITES"); val != "" {
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				cfg.Cache.MaxConcurrentWrites = n
+			}
+		}
 	}
 
 	// Override log level from environment
@@ -397,6 +403,13 @@ func applyEnvOverrides(cfg *Config) {
 	if port := os.Getenv("TAG_HTTP_PORT"); port != "" {
 		if p, err := strconv.Atoi(port); err == nil && p > 0 {
 			cfg.Server.HTTPPort = p
+		}
+	}
+
+	// Override the ingress in-flight request limit from environment
+	if val := os.Getenv("TAG_MAX_INFLIGHT_REQUESTS"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			cfg.Server.MaxInflightRequests = n
 		}
 	}
 

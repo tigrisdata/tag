@@ -21,6 +21,8 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_SEED_NODES`        | Comma-separated seed nodes for cluster discovery                                | (none)                   |
 | `TAG_CACHE_DELETE_BATCH_SIZE` | File deletions processed per deletion-queue batch                               | `1000`                   |
 | `TAG_CACHE_RECOVERY_WORKERS`  | Parallel workers for startup file recovery                                      | `16`                     |
+| `TAG_CACHE_MAX_CONCURRENT_WRITES` | Max concurrent cache-populate operations                                    | `256`                    |
+| `TAG_MAX_INFLIGHT_REQUESTS`   | Max concurrently-served S3 requests before shedding with 503 SlowDown           | `1024`                   |
 | `TAG_LOG_LEVEL`               | Log level: `debug`, `info`, `warn`, `error`                                     | `info`                   |
 | `TAG_LOG_FORMAT`              | Log format: `json` or `console`                                                 | `json`                   |
 | `TAG_TRANSPARENT_PROXY`       | Disable transparent proxy mode (`false` or `0`)                                 | `true`                   |
@@ -52,6 +54,13 @@ server:
   # Enable pprof profiling endpoints
   # Default: false (disabled for security)
   pprof_enabled: false
+
+  # Max concurrently-served S3 requests; excess is shed with 503 SlowDown so
+  # overload becomes backpressure instead of unbounded goroutine/memory growth.
+  # Operational endpoints (/health, /metrics, /debug/pprof/*) are exempt.
+  # Default: 1024 (0 or unset = default; negative = disabled)
+  # Override with TAG_MAX_INFLIGHT_REQUESTS env var
+  max_inflight_requests: 1024
 
   # Path to TLS certificate file (PEM format)
   # When both tls_cert_file and tls_key_file are set, TAG serves HTTPS
@@ -141,6 +150,13 @@ cache:
   # Override with TAG_CACHE_RECOVERY_WORKERS env var
   recovery_workers: 16
 
+  # Max concurrent cache-populate operations (upstream fetch + streaming write).
+  # When saturated, objects are served from upstream without being cached, so the
+  # memory/I/O-heavy write path can't grow unbounded.
+  # Default: 256 (0 or unset = default; negative = disabled)
+  # Override with TAG_CACHE_MAX_CONCURRENT_WRITES env var
+  max_concurrent_writes: 256
+
 # Broadcast configuration (request coalescing)
 broadcast:
   # Chunk size for streaming (in bytes)
@@ -176,6 +192,7 @@ Controls the HTTP server settings.
 | `pprof_enabled` | bool   | `false`     | Enable pprof profiling endpoints   |
 | `tls_cert_file` | string | `""`        | Path to TLS certificate file (PEM) |
 | `tls_key_file`  | string | `""`        | Path to TLS private key file (PEM) |
+| `max_inflight_requests` | int | `1024` | Max concurrently-served S3 requests before shedding with 503 SlowDown (`0`/unset = default, negative = disabled). `/health`, `/metrics`, `/debug/pprof/*` are exempt. |
 
 ### Upstream
 
@@ -231,20 +248,21 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -node
 
 Controls the embedded cache behavior. TAG uses an embedded OCache instance with RocksDB storage.
 
-| Field                  | Type     | Default          | Description                             |
-| ---------------------- | -------- | ---------------- | --------------------------------------- |
-| `enabled`              | bool     | `true`           | Enable caching                          |
-| `ttl`                  | duration | `24h`            | Default TTL for cached objects          |
-| `size_threshold`       | int64    | `1073741824`     | Max object size to cache (bytes)        |
-| `disk_path`            | string   | `/var/cache/tag` | Path to cache data directory            |
-| `max_disk_usage_bytes` | int64    | `0`              | Max disk usage (0 = unlimited)          |
-| `node_id`              | string   | `""`             | Unique node identifier for cluster mode |
-| `cluster_addr`         | string   | `:7000`          | Address for memberlist gossip           |
-| `grpc_addr`            | string   | `:9000`          | Address for gRPC server                 |
-| `advertise_addr`       | string   | `""`             | Address advertised to other nodes       |
-| `seed_nodes`           | []string | `[]`             | Seed nodes for cluster discovery        |
+| Field                  | Type     | Default          | Description                                       |
+| ---------------------- | -------- | ---------------- | ------------------------------------------------- |
+| `enabled`              | bool     | `true`           | Enable caching                                    |
+| `ttl`                  | duration | `24h`            | Default TTL for cached objects                    |
+| `size_threshold`       | int64    | `1073741824`     | Max object size to cache (bytes)                  |
+| `disk_path`            | string   | `/var/cache/tag` | Path to cache data directory                      |
+| `max_disk_usage_bytes` | int64    | `0`              | Max disk usage (0 = unlimited)                    |
+| `node_id`              | string   | `""`             | Unique node identifier for cluster mode           |
+| `cluster_addr`         | string   | `:7000`          | Address for memberlist gossip                     |
+| `grpc_addr`            | string   | `:9000`          | Address for gRPC server                           |
+| `advertise_addr`       | string   | `""`             | Address advertised to other nodes                 |
+| `seed_nodes`           | []string | `[]`             | Seed nodes for cluster discovery                  |
 | `delete_batch_size`    | int      | `1000`           | File deletions processed per deletion-queue batch |
 | `recovery_workers`     | int      | `16`             | Parallel workers for startup file recovery        |
+| `max_concurrent_writes` | int     | `256`            | Max concurrent cache-populate operations (`0`/unset = default, negative = disabled) |
 
 **TTL Format:**
 
