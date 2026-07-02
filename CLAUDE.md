@@ -64,7 +64,8 @@ This covers all private repos under the `tigrisdata` org (e.g., `ocache`). Witho
 - **Broadcast/Subscriber Pattern**: Request coalescing via `proxy/broadcast/` - streams chunks to multiple listeners simultaneously
 - **Two-Key Cache Storage**: Objects stored as `meta|bucket|key` (headers/ETag) and `body|bucket|key` (raw bytes)
 - **Tombstone Invalidation**: Writes tombstone marker before DELETE to prevent stale async cache writes
-- **Semaphore-Gated Background Ops**: `cacheSemaphore` (100 concurrent) limits background cache writes
+- **Ingress Admission**: `server.max_inflight_requests` (default 1024) bounds concurrently-served S3 requests; excess is shed with 503 SlowDown. Operational endpoints (`/health`, `/metrics`, `/debug/pprof/*`) are exempt. `0`/unset = default, negative = disabled.
+- **Semaphore-Gated Cache Writes**: `cache.max_concurrent_writes` (default 100) bounds concurrent cache-populate operations; when saturated, objects are served from upstream without being cached. `0`/unset = default, negative = disabled.
 
 ## Key Dependencies
 
