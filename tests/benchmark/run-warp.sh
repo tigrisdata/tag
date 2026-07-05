@@ -65,11 +65,19 @@ HOST="${WARP_HOST:-localhost:${TAG_HTTP_PORT:-8080}}"
 BUCKET="${WARP_BUCKET:-tag-warp-benchmark}"
 REGION="${WARP_REGION:-auto}"
 DURATION="${WARP_DURATION:-30s}"
-CONCURRENT="${WARP_CONCURRENT:-4}"
+# Concurrency is duration-bounded (more in-flight, not longer runtime). 64 gives
+# realistic contention through the ingress-admission and cache-populate paths
+# while staying well under their limits (default 1024 / 256), so results measure
+# throughput cleanly without triggering 503 shedding.
+CONCURRENT="${WARP_CONCURRENT:-64}"
 OBJ_SIZE="${WARP_OBJ_SIZE:-4MiB}"
 OBJECTS="${WARP_OBJECTS:-100}"
-RANGE_OBJ_SIZE="${WARP_RANGE_OBJ_SIZE:-100MiB}"
-RANGE_SIZE="${WARP_RANGE_SIZE:-4MiB}"
+# GET RANGE mirrors the SlateDB-fronting workload: small block-sized reads at
+# random offsets from large (SST-sized) objects. Reading only KiBs per request
+# keeps bandwidth low even at high concurrency while exercising TAG's
+# serve-a-small-range-from-a-large-cached-object path (SectionReader seek).
+RANGE_OBJ_SIZE="${WARP_RANGE_OBJ_SIZE:-256MiB}"
+RANGE_SIZE="${WARP_RANGE_SIZE:-64KiB}"
 RANGE_OBJECTS="${WARP_RANGE_OBJECTS:-8}"
 
 # Flags shared by every operation. TAG is plain HTTP locally, so no --tls.
@@ -112,8 +120,9 @@ run_op() {
     fi
 }
 
-# Core operations. All use 4MiB objects except GET RANGE, which reads 4MiB
-# ranges from 100MiB objects (--range-size implies ranged GETs).
+# Core operations. All use 4MiB objects except GET RANGE, which reads small
+# (64KiB) ranges from large 256MiB objects — the SlateDB read pattern — where
+# --range-size implies ranged GETs.
 run_op "get"       get    --obj.size="$OBJ_SIZE"       --objects="$OBJECTS"
 run_op "get-range" get    --obj.size="$RANGE_OBJ_SIZE" --objects="$RANGE_OBJECTS" --range-size="$RANGE_SIZE"
 run_op "put"       put    --obj.size="$OBJ_SIZE"
