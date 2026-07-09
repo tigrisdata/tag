@@ -54,12 +54,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
         run: |
           VERSION=${{ steps.version.outputs.version }}
-          mkdir -p deploy/docker/bin/amd64 deploy/docker/bin/arm64
+          mkdir -p docker/bin/amd64 docker/bin/arm64
 
-          gh release download "$VERSION" -p "tag-linux-amd64" -O deploy/docker/bin/amd64/tag
-          gh release download "$VERSION" -p "tag-linux-arm64" -O deploy/docker/bin/arm64/tag
+          gh release download "$VERSION" -p "tag-linux-amd64" -O docker/bin/amd64/tag
+          gh release download "$VERSION" -p "tag-linux-arm64" -O docker/bin/arm64/tag
 
-          chmod +x deploy/docker/bin/*/tag
+          chmod +x docker/bin/*/tag
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -86,8 +86,8 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          context: deploy/docker
-          file: deploy/docker/Dockerfile
+          context: docker
+          file: docker/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
