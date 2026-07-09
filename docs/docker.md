@@ -1,0 +1,88 @@
+# Docker
+
+Run TAG using Docker Compose. For all configuration options, see the [Configuration Reference](configuration.md).
+
+## Prerequisites
+
+Create a `.env` file in the `deploy/docker/` directory with your Tigris credentials:
+
+```bash
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
+```
+
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` are TAG's own Tigris credentials with read-only access to all buckets accessed through TAG (required). Clients use their own credentials directly.
+
+## Build-from-source vs. released image
+
+Two Compose variants ship under `deploy/docker/`:
+
+- **`docker-compose.yml`** / **`docker-compose-cluster.yml`** — build the image from the local `Dockerfile`. Use these when developing against source.
+- **`docker-compose.release.yml`** / **`docker-compose-cluster.release.yml`** — pull the published `tigrisdata/tag` image. Use these to run a released version without building. Pass them with `-f`, e.g. `docker-compose -f docker-compose.release.yml up -d`.
+
+The examples below use the build-from-source defaults.
+
+## Single Node
+
+```bash
+cd deploy/docker
+docker-compose up -d
+```
+
+TAG will be available at `http://localhost:8080`.
+
+```bash
+# View logs
+docker-compose logs -f tag
+
+# Stop
+docker-compose down
+```
+
+## Cluster Mode
+
+Run 3 TAG nodes with an embedded distributed cache cluster:
+
+```bash
+cd deploy/docker
+docker-compose -f docker-compose-cluster.yml up -d
+```
+
+TAG endpoints:
+
+- `http://localhost:8081` (tag-1)
+- `http://localhost:8082` (tag-2)
+- `http://localhost:8083` (tag-3)
+
+Each node discovers the others via gossip and shares cached objects across the cluster.
+
+```bash
+# View logs
+docker-compose -f docker-compose-cluster.yml logs -f
+
+# Stop and remove volumes
+docker-compose -f docker-compose-cluster.yml down -v
+```
+
+## Environment Variables
+
+You can add optional environment variables to the `.env` file:
+
+```bash
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
+TAG_LOG_LEVEL=info
+```
+
+See the full [Configuration Reference](configuration.md) for all options.
+
+## Test
+
+```bash
+# Health check
+curl http://localhost:8080/health
+
+# Download an object using AWS CLI
+aws s3 cp s3://your-bucket/your-key ./local-file \
+  --endpoint-url http://localhost:8080
+```

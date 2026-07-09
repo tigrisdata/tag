@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tag
+  labels:
+    app: tag
+spec:
+  serviceName: tag-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: tag
+  template:
+    metadata:
+      labels:
+        app: tag
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: tag
+          image: tigrisdata/tag:v1.9.4
+          imagePullPolicy: Always
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: tag-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: tag-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: TAG_CACHE_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TAG_CACHE_DISK_PATH
+              value: "/data/cache"
+            - name: TAG_CACHE_CLUSTER_ADDR
+              value: ":7000"
+            - name: TAG_CACHE_GRPC_ADDR
+              value: ":9000"
+            - name: TAG_CACHE_ADVERTISE_ADDR
+              value: "$(POD_NAME).tag-headless:9000"
+            - name: TAG_CACHE_SEED_NODES
+              value: "tag-headless:7000"
+            - name: TAG_CACHE_MAX_DISK_USAGE
+              value: "429496729600"
+            - name: TAG_LOG_LEVEL
+              value: "info"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: grpc
+              containerPort: 9000
+              protocol: TCP
+            - name: cluster
+              containerPort: 7000
+              protocol: TCP
+          volumeMounts:
+            - name: cache-data
+              mountPath: /data/cache
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+            limits:
+              memory: "8Gi"
+              cpu: "4"
+          # Gate liveness/readiness until the process is actually serving. On a
+          # warm-cache boot the on-disk store is opened before the HTTP server
+          # starts listening, and on a large cache that can take longer than the
+          # liveness failureThreshold window -- without a startupProbe, k8s
+          # liveness-kills the pod mid-boot and crashloops it. The boot budget is
+          # failureThreshold x periodSeconds (here 10m); scale it up for larger
+          # on-disk caches.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: tag
+                topologyKey: kubernetes.io/hostname
+  volumeClaimTemplates:
+    - metadata:
+        name: cache-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 400Gi

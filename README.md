@@ -129,9 +129,13 @@ See [docs/security.md](docs/security.md) for authentication, access control, and
 
 ## Deployment
 
-TAG can be deployed to Kubernetes, Docker, or standalone mode.
+TAG can be deployed to Kubernetes, Docker, or standalone mode. Deployment manifests and scripts live under [`deploy/`](deploy/):
 
-See [tigrisdata/tag-deploy](https://github.com/tigrisdata/tag-deploy) for complete deployment guide and manifests.
+- **Kubernetes** — Kustomize manifests in [`deploy/kubernetes/`](deploy/kubernetes/); see [docs/deploy.md](docs/deploy.md).
+- **Docker** — Compose files in [`deploy/docker/`](deploy/docker/) (build-from-source and released-image variants); see [docs/docker.md](docs/docker.md).
+- **Native binary** — install/run scripts in [`deploy/native/`](deploy/native/).
+- **TLS/HTTPS** — see [docs/tls.md](docs/tls.md).
+- **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
 
 ## API Reference
 

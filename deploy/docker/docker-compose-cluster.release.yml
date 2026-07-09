@@ -1,0 +1,112 @@
+# Docker Compose for TAG Cluster — released image
+#
+# Pulls the published tigrisdata/tag image instead of building from source.
+# For the build-from-source variant, use docker-compose-cluster.yml.
+#
+# TAG uses embedded OCache - each TAG node has its own embedded cache that
+# forms a distributed cluster via gossip protocol and gRPC for routing.
+#
+# Usage:
+#   export AWS_ACCESS_KEY_ID=<your-key>
+#   export AWS_SECRET_ACCESS_KEY=<your-secret>
+#   docker compose -f docker-compose-cluster.release.yml up -d
+
+x-tag-common: &tag-common
+  image: tigrisdata/tag:v1.9.4
+  user: root
+  restart: unless-stopped
+  networks:
+    - tag-cluster
+
+x-tag-healthcheck: &tag-healthcheck
+  test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+  # Longer start_period to accommodate warm-cache boot on a populated cache volume.
+  start_period: 60s
+
+services:
+  # TAG Node 1 (with embedded cache)
+  tag-1:
+    <<: *tag-common
+    container_name: tag-1
+    hostname: tag-1
+    ports:
+      - "8081:8080"
+      - "9001:9000"  # gRPC for cache routing
+      - "7001:7000"  # Cluster gossip
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - TAG_UPSTREAM_ENDPOINT=${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev}
+      - TAG_CACHE_NODE_ID=tag-1
+      - TAG_CACHE_DISK_PATH=/data/cache
+      - TAG_CACHE_CLUSTER_ADDR=:7000
+      - TAG_CACHE_GRPC_ADDR=:9000
+      - TAG_CACHE_ADVERTISE_ADDR=tag-1:9000
+      - TAG_CACHE_SEED_NODES=tag-1:7000,tag-2:7000,tag-3:7000
+      - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-info}
+    volumes:
+      - tag-1-cache:/data/cache
+    healthcheck: *tag-healthcheck
+
+  # TAG Node 2 (with embedded cache)
+  tag-2:
+    <<: *tag-common
+    container_name: tag-2
+    hostname: tag-2
+    ports:
+      - "8082:8080"
+      - "9002:9000"  # gRPC for cache routing
+      - "7002:7000"  # Cluster gossip
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - TAG_UPSTREAM_ENDPOINT=${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev}
+      - TAG_CACHE_NODE_ID=tag-2
+      - TAG_CACHE_DISK_PATH=/data/cache
+      - TAG_CACHE_CLUSTER_ADDR=:7000
+      - TAG_CACHE_GRPC_ADDR=:9000
+      - TAG_CACHE_ADVERTISE_ADDR=tag-2:9000
+      - TAG_CACHE_SEED_NODES=tag-1:7000,tag-2:7000,tag-3:7000
+      - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-info}
+    volumes:
+      - tag-2-cache:/data/cache
+    healthcheck: *tag-healthcheck
+    depends_on:
+      - tag-1
+
+  # TAG Node 3 (with embedded cache)
+  tag-3:
+    <<: *tag-common
+    container_name: tag-3
+    hostname: tag-3
+    ports:
+      - "8083:8080"
+      - "9003:9000"  # gRPC for cache routing
+      - "7003:7000"  # Cluster gossip
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - TAG_UPSTREAM_ENDPOINT=${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev}
+      - TAG_CACHE_NODE_ID=tag-3
+      - TAG_CACHE_DISK_PATH=/data/cache
+      - TAG_CACHE_CLUSTER_ADDR=:7000
+      - TAG_CACHE_GRPC_ADDR=:9000
+      - TAG_CACHE_ADVERTISE_ADDR=tag-3:9000
+      - TAG_CACHE_SEED_NODES=tag-1:7000,tag-2:7000,tag-3:7000
+      - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-info}
+    volumes:
+      - tag-3-cache:/data/cache
+    healthcheck: *tag-healthcheck
+    depends_on:
+      - tag-2
+
+networks:
+  tag-cluster:
+
+volumes:
+  tag-1-cache:
+  tag-2-cache:
+  tag-3-cache:
