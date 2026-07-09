@@ -133,7 +133,15 @@ TAG can be deployed to Kubernetes, Docker, or standalone mode. Deployment manife
 
 - **Kubernetes** — Kustomize manifests in [`deploy/kubernetes/`](deploy/kubernetes/); see [docs/deploy.md](docs/deploy.md).
 - **Docker** — released-image Compose files in [`deploy/docker/`](deploy/docker/) for pulling a published `tigrisdata/tag` image; see [docs/docker.md](docs/docker.md). For local development against source, use the build-from-source Compose files in [`docker/`](docker/).
-- **Native binary** — install/run scripts in [`deploy/native/`](deploy/native/).
+- **Native binary** — install/run scripts in [`deploy/native/`](deploy/native/). Each release also publishes these scripts and a matching `config.yaml` next to the binaries, so you can install without cloning the repo:
+
+  ```bash
+  # Latest release
+  curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
+
+  # A specific release
+  curl -fsSL https://tag-releases.t3.storage.dev/v1.10.0/install.sh | bash
+  ```
 - **TLS/HTTPS** — see [docs/tls.md](docs/tls.md).
 - **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
 

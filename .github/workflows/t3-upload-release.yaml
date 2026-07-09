@@ -111,6 +111,48 @@ jobs:
 
           echo "Versioned upload complete"
 
+      - name: Stage native install assets
+        id: native
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          # Take the native assets from the exact release tag so they match the
+          # uploaded binary. Older releases predating deploy/native/ are skipped.
+          git fetch --tags --force
+          if ! git cat-file -e "${VERSION}:deploy/native/config.yaml" 2>/dev/null; then
+            echo "Native assets not present at ${VERSION}; skipping native upload"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git checkout "${VERSION}" -- deploy/native/config.yaml deploy/native/install.sh deploy/native/run.sh
+
+          # Produce two flavors: version-pinned (for /<version>/) and latest (for
+          # /latest/), by rewriting each script's default TAG_VERSION. This makes
+          # `curl .../<dir>/install.sh | bash` install the matching version.
+          mkdir -p native/versioned native/latest
+          cp deploy/native/config.yaml native/versioned/config.yaml
+          cp deploy/native/config.yaml native/latest/config.yaml
+          for f in install.sh run.sh; do
+            sed -E "s|TAG_VERSION:-[^}]*|TAG_VERSION:-${VERSION}|" "deploy/native/$f" > "native/versioned/$f"
+            sed -E "s|TAG_VERSION:-[^}]*|TAG_VERSION:-latest|"     "deploy/native/$f" > "native/latest/$f"
+          done
+          echo "present=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload native install assets to T3 (versioned directory)
+        if: steps.native.outputs.present == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RELEASE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASE_AWS_SECRET_ACCESS_KEY }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          aws s3 cp native/versioned/config.yaml "s3://$S3_BUCKET/$VERSION/config.yaml" \
+            --endpoint-url "$S3_ENDPOINT" --content-type "text/yaml"
+          aws s3 cp native/versioned/install.sh "s3://$S3_BUCKET/$VERSION/install.sh" \
+            --endpoint-url "$S3_ENDPOINT" --content-type "text/x-shellscript"
+          aws s3 cp native/versioned/run.sh "s3://$S3_BUCKET/$VERSION/run.sh" \
+            --endpoint-url "$S3_ENDPOINT" --content-type "text/x-shellscript"
+          echo "Native assets uploaded to $VERSION/"
+
       - name: Update latest directory
         # Only update 'latest' when triggered by release workflow, not manual dispatch
         if: github.event_name == 'workflow_run'
@@ -129,6 +171,16 @@ jobs:
               --endpoint-url "$S3_ENDPOINT" \
               --content-type "application/octet-stream"
           done
+
+          if [ "${{ steps.native.outputs.present }}" = "true" ]; then
+            echo "Updating latest/ native assets..."
+            aws s3 cp native/latest/config.yaml "s3://$S3_BUCKET/latest/config.yaml" \
+              --endpoint-url "$S3_ENDPOINT" --content-type "text/yaml"
+            aws s3 cp native/latest/install.sh "s3://$S3_BUCKET/latest/install.sh" \
+              --endpoint-url "$S3_ENDPOINT" --content-type "text/x-shellscript"
+            aws s3 cp native/latest/run.sh "s3://$S3_BUCKET/latest/run.sh" \
+              --endpoint-url "$S3_ENDPOINT" --content-type "text/x-shellscript"
+          fi
 
           echo "Latest directory updated"
 
