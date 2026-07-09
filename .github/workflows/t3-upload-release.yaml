@@ -119,8 +119,15 @@ jobs:
           # Take the native assets from the exact release tag so they match the
           # uploaded binary. Older releases predating deploy/native/ are skipped.
           git fetch --tags --force
-          if ! git cat-file -e "${VERSION}:deploy/native/config.yaml" 2>/dev/null; then
-            echo "Native assets not present at ${VERSION}; skipping native upload"
+          missing=false
+          for asset in config.yaml install.sh run.sh; do
+            if ! git cat-file -e "${VERSION}:deploy/native/${asset}" 2>/dev/null; then
+              echo "deploy/native/${asset} not present at ${VERSION}"
+              missing=true
+            fi
+          done
+          if [ "$missing" = "true" ]; then
+            echo "Native assets incomplete at ${VERSION}; skipping native upload"
             echo "present=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi

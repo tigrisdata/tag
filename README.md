@@ -142,6 +142,7 @@ TAG can be deployed to Kubernetes, Docker, or standalone mode. Deployment manife
   # A specific release
   curl -fsSL https://tag-releases.t3.storage.dev/v1.10.0/install.sh | bash
   ```
+
 - **TLS/HTTPS** — see [docs/tls.md](docs/tls.md).
 - **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
 
