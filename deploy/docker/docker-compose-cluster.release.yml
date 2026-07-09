@@ -10,9 +10,13 @@
 #   export AWS_ACCESS_KEY_ID=<your-key>
 #   export AWS_SECRET_ACCESS_KEY=<your-secret>
 #   docker compose -f docker-compose-cluster.release.yml up -d
+#
+# Defaults to the latest published image. For reproducible deployments, pin a
+# specific release by setting TAG_VERSION (e.g. TAG_VERSION=v1.9.4) in your .env.
+# All nodes share this variable, so the cluster stays on a single version.
 
 x-tag-common: &tag-common
-  image: tigrisdata/tag:v1.9.4
+  image: tigrisdata/tag:${TAG_VERSION:-latest}
   user: root
   restart: unless-stopped
   networks:

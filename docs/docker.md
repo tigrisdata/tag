@@ -9,7 +9,7 @@ Two sets of Compose files ship in this repo:
 - **`docker/docker-compose.yml`** / **`docker/docker-compose-cluster.yml`** — build the image from the local `Dockerfile`. Use these for local development against source.
 - **`deploy/docker/docker-compose.release.yml`** / **`deploy/docker/docker-compose-cluster.release.yml`** — pull the published `tigrisdata/tag` image. Use these to run a released version without building, e.g. `docker-compose -f docker-compose.release.yml up -d`.
 
-The examples below use the build-from-source files in `docker/`. To run a released image instead, `cd deploy/docker` and pass the `*.release.yml` files with `-f`.
+The examples below use the build-from-source files in `docker/`. To run a released image instead, `cd deploy/docker` and pass the `*.release.yml` files with `-f`. The released-image files default to the `latest` published image; to pin a specific release, set `TAG_VERSION` (e.g. `TAG_VERSION=v1.9.4`) in your `.env`.
 
 ## Prerequisites
 
