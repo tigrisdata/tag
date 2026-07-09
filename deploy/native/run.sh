@@ -39,6 +39,9 @@ TAG_CACHE_CLUSTER_ADDR="${TAG_CACHE_CLUSTER_ADDR:-:17000}"
 TAG_CACHE_GRPC_ADDR="${TAG_CACHE_GRPC_ADDR:-:19000}"
 
 # TAG settings
+# Config file passed to the binary when it exists; install.sh writes this path.
+# Set to an empty string to run with built-in defaults and env overrides only.
+TAG_CONFIG_FILE="${TAG_CONFIG_FILE-/etc/tag/config.yaml}"
 TAG_LOG_LEVEL="${TAG_LOG_LEVEL:-info}"
 TAG_PPROF_ENABLED="${TAG_PPROF_ENABLED:-false}"
 TAG_MAX_IDLE_CONNS_PER_HOST="${TAG_MAX_IDLE_CONNS_PER_HOST:-100}"
@@ -94,7 +97,9 @@ download_binary() {
     local url="$3"
     local dest="${BIN_DIR}/${name}-${version}"
 
-    if [ -x "${dest}" ]; then
+    # "latest" is a moving tag, so a cached .bin/<name>-latest can be stale after
+    # a new release. Re-download it every start; only cache pinned versions.
+    if [ -x "${dest}" ] && [ "${version}" != "latest" ]; then
         echo "${name} ${version} already downloaded"
         return 0
     fi
@@ -210,6 +215,14 @@ cmd_start() {
 
     local tag_bin="${BIN_DIR}/tag-${TAG_VERSION}"
 
+    # Pass the installed config file to the binary when present, so edits to
+    # /etc/tag/config.yaml (TLS, upstream, cache) actually take effect.
+    local config_args=()
+    if [ -n "${TAG_CONFIG_FILE}" ] && [ -f "${TAG_CONFIG_FILE}" ]; then
+        config_args=(--config "${TAG_CONFIG_FILE}")
+        echo "Using config file: ${TAG_CONFIG_FILE}"
+    fi
+
     # Start TAG with embedded cache
     echo "Starting TAG with embedded cache..."
     TAG_HTTP_PORT="${TAG_PORT}" \
@@ -221,7 +234,7 @@ cmd_start() {
     TAG_LOG_LEVEL="${TAG_LOG_LEVEL}" \
     TAG_PPROF_ENABLED="${TAG_PPROF_ENABLED}" \
     TAG_MAX_IDLE_CONNS_PER_HOST="${TAG_MAX_IDLE_CONNS_PER_HOST}" \
-    "${tag_bin}" \
+    "${tag_bin}" ${config_args[@]+"${config_args[@]}"} \
         > "${LOG_DIR}/tag.log" 2>&1 &
     local tag_pid=$!
     echo "${tag_pid}" > "${TAG_PID_FILE}"
@@ -322,6 +335,7 @@ cmd_help() {
     echo "  TAG_MAX_IDLE_CONNS_PER_HOST  Max idle connections per host (default: ${TAG_MAX_IDLE_CONNS_PER_HOST})"
     echo "  TAG_PORT               TAG HTTP port (default: ${TAG_PORT})"
     echo "  TAG_START_TIMEOUT      Seconds to wait for /health on start (default: ${TAG_START_TIMEOUT})"
+    echo "  TAG_CONFIG_FILE        Config file passed to tag if it exists; empty to disable (default: ${TAG_CONFIG_FILE})"
     echo "  TAG_CACHE_MAX_DISK_USAGE  Max cache disk usage in bytes (default: ${TAG_CACHE_MAX_DISK_USAGE})"
     echo "  TAG_CACHE_CLUSTER_ADDR Cluster gossip address (default: ${TAG_CACHE_CLUSTER_ADDR})"
     echo "  TAG_CACHE_GRPC_ADDR    gRPC server address (default: ${TAG_CACHE_GRPC_ADDR})"

@@ -55,8 +55,12 @@ spec:
               value: ":9000"
             - name: TAG_CACHE_ADVERTISE_ADDR
               value: "$(POD_NAME).tag-headless:9000"
+            # Seed from stable per-pod DNS names (StatefulSet ordinals 0-2 via the
+            # headless service), not the headless service name itself -- the latter
+            # resolves to a rotating set of pod IPs and gives gossip no deterministic
+            # peer list. Scaled-up replicas join by gossiping to these seeds.
             - name: TAG_CACHE_SEED_NODES
-              value: "tag-headless:7000"
+              value: "tag-0.tag-headless:7000,tag-1.tag-headless:7000,tag-2.tag-headless:7000"
             - name: TAG_CACHE_MAX_DISK_USAGE
               value: "429496729600"
             - name: TAG_LOG_LEVEL
