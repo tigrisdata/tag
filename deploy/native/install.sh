@@ -56,11 +56,9 @@ chmod +x "${DEST}" 2>/dev/null || sudo chmod +x "${DEST}"
 # Install default configuration file
 CONFIG_DIR="/etc/tag"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
-# Pin the config to the same release as the binary so native installs are
-# reproducible. Fall back to main only for versions predating the config's move
-# into this repo (e.g. <= v1.9.4, whose git tag has no deploy/native/config.yaml).
-CONFIG_URL="https://raw.githubusercontent.com/tigrisdata/tag/refs/tags/${TAG_VERSION}/deploy/native/config.yaml"
-CONFIG_FALLBACK_URL="https://raw.githubusercontent.com/tigrisdata/tag/main/deploy/native/config.yaml"
+# Config ships in the same versioned release directory as the binary, so it is
+# always matched to the installed version and needs no GitHub access.
+CONFIG_URL="${TAG_RELEASES_URL}/${TAG_VERSION}/config.yaml"
 
 if [ ! -d "${CONFIG_DIR}" ]; then
     echo "Creating ${CONFIG_DIR} (may require sudo)..."
@@ -73,13 +71,9 @@ if [ ! -f "${CONFIG_FILE}" ]; then
     if curl -fsSL "${CONFIG_URL}" -o "${TMPCONFIG}"; then
         cp "${TMPCONFIG}" "${CONFIG_FILE}" 2>/dev/null || sudo cp "${TMPCONFIG}" "${CONFIG_FILE}"
         chmod 644 "${CONFIG_FILE}" 2>/dev/null || sudo chmod 644 "${CONFIG_FILE}"
-    elif curl -fsSL "${CONFIG_FALLBACK_URL}" -o "${TMPCONFIG}"; then
-        echo "Warning: no config for ${TAG_VERSION}; using the config from main," \
-             "which may not match this release."
-        cp "${TMPCONFIG}" "${CONFIG_FILE}" 2>/dev/null || sudo cp "${TMPCONFIG}" "${CONFIG_FILE}"
-        chmod 644 "${CONFIG_FILE}" 2>/dev/null || sudo chmod 644 "${CONFIG_FILE}"
     else
-        echo "Warning: Could not download default config, skipping"
+        echo "Warning: no config found at ${CONFIG_URL}; skipping." \
+             "TAG can also be configured entirely via environment variables."
     fi
 else
     echo "Config already exists at ${CONFIG_FILE}, skipping"
