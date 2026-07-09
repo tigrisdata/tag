@@ -1,0 +1,47 @@
+# Docker Compose for TAG (Tigris Access Gateway) — released image
+#
+# Pulls the published tigrisdata/tag image instead of building from source.
+# For the build-from-source variant, use docker-compose.yml.
+#
+# TAG uses embedded OCache - no separate cache server needed.
+#
+# Usage:
+#   export AWS_ACCESS_KEY_ID=<your-key>
+#   export AWS_SECRET_ACCESS_KEY=<your-secret>
+#   docker compose -f docker-compose.release.yml up -d
+#
+# Defaults to the latest published image. For reproducible deployments, pin a
+# specific release by setting TAG_VERSION (e.g. TAG_VERSION=v1.9.4) in your .env.
+
+services:
+  tag:
+    image: tigrisdata/tag:${TAG_VERSION:-latest}
+    container_name: tag
+    user: root
+    ports:
+      - "8080:8080"
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - TAG_UPSTREAM_ENDPOINT=${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev}
+      - TAG_CACHE_NODE_ID=tag-standalone
+      - TAG_CACHE_DISK_PATH=/data/cache
+      - TAG_LOG_LEVEL=${TAG_LOG_LEVEL:-info}
+    volumes:
+      - tag-cache:/data/cache
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      # Longer start_period to accommodate warm-cache boot on a populated cache volume.
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - tag-network
+
+networks:
+  tag-network:
+
+volumes:
+  tag-cache:

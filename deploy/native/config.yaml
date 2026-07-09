@@ -1,0 +1,71 @@
+# Default TAG configuration
+# Installed to /etc/tag/config.yaml by install.sh
+#
+# Override any setting via environment variables (see docs/configuration.md).
+# Environment variables take precedence over this file.
+
+# Server configuration
+server:
+  # HTTP port for the S3 API
+  # Default: 8080
+  http_port: 8080
+
+  # IP address to bind to
+  # Default: "0.0.0.0" (all interfaces)
+  bind_ip: "0.0.0.0"
+
+  # Path to TLS certificate file (PEM format)
+  # When both tls_cert_file and tls_key_file are set, TAG serves HTTPS
+  # Default: "" (TLS disabled, serves HTTP)
+  tls_cert_file: ""
+
+  # Path to TLS private key file (PEM format)
+  # Must be set together with tls_cert_file
+  # Default: "" (TLS disabled, serves HTTP)
+  tls_key_file: ""
+
+# Cache configuration
+cache:
+  # Enable caching (set to false for pass-through mode)
+  # Default: true
+  enabled: true
+
+  # Default TTL for cached objects
+  # Default: 24h (24 hours)
+  ttl: 24h
+
+  # Maximum object size to cache (in bytes)
+  # Objects larger than this are not cached
+  # Default: 1073741824 (1GB)
+  size_threshold: 1073741824
+
+  # Path to cache data directory
+  # /var/tmp/tag works on both macOS and Linux without root
+  disk_path: "/var/tmp/tag"
+
+  # Max disk usage in bytes (0 = unlimited)
+  # Default: 0
+  max_disk_usage_bytes: 0
+
+  # Unique node identifier for cluster mode
+  # Required for multi-node deployments
+  node_id: "tag-node-1"
+
+  # Address for memberlist gossip protocol
+  # Default: :7000
+  # port 7000 conflicts on macOS with AirPlay Receiver, so we use 17000 by default
+  cluster_addr: ":17000"
+
+  # Address for gRPC server (cache cluster routing)
+  # Default: :9000
+  grpc_addr: ":19000"
+
+# Logging configuration
+log:
+  # Log level: debug, info, warn, error
+  # Default: "info"
+  level: "info"
+
+  # Log format: json (structured) or console (human-readable)
+  # Default: "json"
+  format: "json"
