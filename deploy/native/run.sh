@@ -43,6 +43,12 @@ TAG_LOG_LEVEL="${TAG_LOG_LEVEL:-info}"
 TAG_PPROF_ENABLED="${TAG_PPROF_ENABLED:-false}"
 TAG_MAX_IDLE_CONNS_PER_HOST="${TAG_MAX_IDLE_CONNS_PER_HOST:-100}"
 
+# Seconds to wait for /health during start. Warm-cache boots open the on-disk
+# store before the HTTP server listens, which on a large cache can take minutes
+# (cf. the Kubernetes startupProbe budget); scale this up for larger caches. The
+# wait exits as soon as /health responds, so this only bounds a failed start.
+TAG_START_TIMEOUT="${TAG_START_TIMEOUT:-600}"
+
 # Release URLs
 TAG_RELEASES_URL="https://tag-releases.t3.storage.dev"
 
@@ -220,7 +226,7 @@ cmd_start() {
     local tag_pid=$!
     echo "${tag_pid}" > "${TAG_PID_FILE}"
 
-    if ! wait_for_health "TAG" "${TAG_HEALTH_SCHEME}://localhost:${TAG_PORT}/health"; then
+    if ! wait_for_health "TAG" "${TAG_HEALTH_SCHEME}://localhost:${TAG_PORT}/health" "${TAG_START_TIMEOUT}"; then
         echo "TAG logs:"
         tail -20 "${LOG_DIR}/tag.log"
         exit 1
@@ -315,6 +321,7 @@ cmd_help() {
     echo "  TAG_PPROF_ENABLED      Enable pprof profiling: true, false (default: ${TAG_PPROF_ENABLED})"
     echo "  TAG_MAX_IDLE_CONNS_PER_HOST  Max idle connections per host (default: ${TAG_MAX_IDLE_CONNS_PER_HOST})"
     echo "  TAG_PORT               TAG HTTP port (default: ${TAG_PORT})"
+    echo "  TAG_START_TIMEOUT      Seconds to wait for /health on start (default: ${TAG_START_TIMEOUT})"
     echo "  TAG_CACHE_MAX_DISK_USAGE  Max cache disk usage in bytes (default: ${TAG_CACHE_MAX_DISK_USAGE})"
     echo "  TAG_CACHE_CLUSTER_ADDR Cluster gossip address (default: ${TAG_CACHE_CLUSTER_ADDR})"
     echo "  TAG_CACHE_GRPC_ADDR    gRPC server address (default: ${TAG_CACHE_GRPC_ADDR})"
