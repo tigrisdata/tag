@@ -6,10 +6,26 @@ Run TAG using Docker Compose. For all configuration options, see the [Configurat
 
 Two sets of Compose files ship in this repo:
 
-- **`docker/docker-compose.yml`** / **`docker/docker-compose-cluster.yml`** — build the image from the local `Dockerfile`. Use these for local development against source.
-- **`deploy/docker/docker-compose.release.yml`** / **`deploy/docker/docker-compose-cluster.release.yml`** — pull the published `tigrisdata/tag` image. Use these to run a released version without building, e.g. `docker-compose -f docker-compose.release.yml up -d`.
+- **`docker/docker-compose.yml`** / **`docker/docker-compose-cluster.yml`** — package a locally built binary into the image via the local `Dockerfile`. Use these for local development against source. The `Dockerfile` does not compile TAG; it copies a pre-built **Linux** binary from `docker/bin/<arch>/tag` (`<arch>` is `amd64` or `arm64`), so you must stage that binary before building — see [Building the local image](#building-the-local-image) below.
+- **`deploy/docker/docker-compose.release.yml`** / **`deploy/docker/docker-compose-cluster.release.yml`** — pull the published `tigrisdata/tag` image. Use these to run a released version without building anything, e.g. `docker-compose -f docker-compose.release.yml up -d`.
 
 The examples below use the build-from-source files in `docker/`. To run a released image instead, `cd deploy/docker` and pass the `*.release.yml` files with `-f`. The released-image files default to the `latest` published image; to pin a specific release, set `TAG_VERSION` (e.g. `TAG_VERSION=v1.9.4`) in your `.env`.
+
+### Building the local image
+
+The `docker/` Compose files expect a Linux binary staged at `docker/bin/<arch>/tag`. Build (or cross-compile) it first, then bring the stack up:
+
+```bash
+# From the repo root — produce a linux/amd64 binary and stage it for the build
+mkdir -p docker/bin/amd64
+GOOS=linux GOARCH=amd64 make build   # or: go build -o docker/bin/amd64/tag ./cmd/tag
+cp tag docker/bin/amd64/tag           # if 'make build' wrote ./tag
+
+cd docker
+docker-compose up -d
+```
+
+If you just want to run TAG without a local toolchain, use the released-image files under `deploy/docker/` instead.
 
 ## Prerequisites
 

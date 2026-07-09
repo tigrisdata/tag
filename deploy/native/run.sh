@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # Configuration (can be overridden via environment variables)
-TAG_VERSION="${TAG_VERSION:-v1.9.3}"
+TAG_VERSION="${TAG_VERSION:-v1.9.4}"
 
 # Directories
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +21,16 @@ CACHE_DATA_DIR="${TAG_DATA_DIR}/cache-data"
 
 # Ports
 TAG_PORT="${TAG_PORT:-8080}"
+
+# Health-check scheme follows TLS config: TAG serves HTTPS when both a cert and a
+# key are set, so probe over HTTPS (and skip cert verification for self-signed).
+if [ -n "${TAG_TLS_CERT_FILE:-}" ] && [ -n "${TAG_TLS_KEY_FILE:-}" ]; then
+    TAG_HEALTH_SCHEME="https"
+    TAG_HEALTH_CURL_OPTS="-k"
+else
+    TAG_HEALTH_SCHEME="http"
+    TAG_HEALTH_CURL_OPTS=""
+fi
 
 # Cache settings
 TAG_CACHE_MAX_DISK_USAGE="${TAG_CACHE_MAX_DISK_USAGE:-429496729600}"  # 400GB
@@ -144,7 +154,7 @@ wait_for_health() {
 
     echo "Waiting for ${name} to be ready..."
     local count=0
-    while ! curl -sf "${url}" > /dev/null 2>&1; do
+    while ! curl -sf ${TAG_HEALTH_CURL_OPTS} "${url}" > /dev/null 2>&1; do
         sleep 1
         count=$((count + 1))
         if [ ${count} -ge ${timeout} ]; then
@@ -196,6 +206,7 @@ cmd_start() {
 
     # Start TAG with embedded cache
     echo "Starting TAG with embedded cache..."
+    TAG_HTTP_PORT="${TAG_PORT}" \
     TAG_CACHE_NODE_ID="tag-native" \
     TAG_CACHE_DISK_PATH="${CACHE_DATA_DIR}" \
     TAG_CACHE_MAX_DISK_USAGE="${TAG_CACHE_MAX_DISK_USAGE}" \
@@ -209,7 +220,7 @@ cmd_start() {
     local tag_pid=$!
     echo "${tag_pid}" > "${TAG_PID_FILE}"
 
-    if ! wait_for_health "TAG" "http://localhost:${TAG_PORT}/health"; then
+    if ! wait_for_health "TAG" "${TAG_HEALTH_SCHEME}://localhost:${TAG_PORT}/health"; then
         echo "TAG logs:"
         tail -20 "${LOG_DIR}/tag.log"
         exit 1
@@ -217,7 +228,7 @@ cmd_start() {
 
     echo ""
     echo "TAG started successfully with embedded cache!"
-    echo "  TAG:   http://localhost:${TAG_PORT}"
+    echo "  TAG:   ${TAG_HEALTH_SCHEME}://localhost:${TAG_PORT}"
     echo "  Cache: ${CACHE_DATA_DIR}"
     echo ""
     echo "Logs: ${LOG_DIR}"
@@ -260,7 +271,7 @@ cmd_status() {
 
     if check_port "${TAG_PORT}"; then
         echo "  TAG (port ${TAG_PORT}): RUNNING${tag_pid:+ (PID: ${tag_pid})}"
-        if curl -sf "http://localhost:${TAG_PORT}/health" > /dev/null 2>&1; then
+        if curl -sf ${TAG_HEALTH_CURL_OPTS} "${TAG_HEALTH_SCHEME}://localhost:${TAG_PORT}/health" > /dev/null 2>&1; then
             echo "    Health: OK"
         else
             echo "    Health: UNHEALTHY"
