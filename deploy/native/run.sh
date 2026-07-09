@@ -125,13 +125,20 @@ download_binary() {
     echo "Downloading ${name} ${version} for ${OS}-${ARCH}..."
     mkdir -p "${BIN_DIR}"
 
+    # Download to a temp file in the same dir and atomically rename on success, so
+    # a failed/partial download never truncates a previously working binary (which
+    # would block offline starts, esp. for the always-refreshed "latest").
     local download_url="${url}/${version}/${name}-${OS}-${ARCH}"
-    if ! curl -fsSL "${download_url}" -o "${dest}"; then
+    local tmp
+    tmp="$(mktemp "${BIN_DIR}/.${name}-${version}.XXXXXX")"
+    if ! curl -fsSL "${download_url}" -o "${tmp}"; then
+        rm -f "${tmp}"
         echo "Error: Failed to download ${name} from ${download_url}"
         exit 1
     fi
 
-    chmod +x "${dest}"
+    chmod +x "${tmp}"
+    mv -f "${tmp}" "${dest}"
     echo "${name} ${version} downloaded successfully"
 }
 
