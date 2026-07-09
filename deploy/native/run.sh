@@ -22,9 +22,30 @@ CACHE_DATA_DIR="${TAG_DATA_DIR}/cache-data"
 # Ports
 TAG_PORT="${TAG_PORT:-8080}"
 
+# Config file passed to the binary when it exists; install.sh writes this path.
+# Set to an empty string to run with built-in defaults and env overrides only.
+TAG_CONFIG_FILE="${TAG_CONFIG_FILE-/etc/tag/config.yaml}"
+
+# True when the config file enables TLS (both tls_cert_file and tls_key_file set
+# to a non-empty value). Mirrors the binary, which serves HTTPS only when both
+# are set, so the health probe picks the right scheme even when TLS is configured
+# via the file rather than TAG_TLS_CERT_FILE / TAG_TLS_KEY_FILE.
+config_enables_tls() {
+    local file="$1"
+    [ -n "${file}" ] && [ -f "${file}" ] || return 1
+    local cert key
+    cert=$(sed -n 's/^[[:space:]]*tls_cert_file:[[:space:]]*//p' "${file}" \
+        | sed 's/#.*$//; s/["'\'']//g; s/[[:space:]]*$//' | tail -n1)
+    key=$(sed -n 's/^[[:space:]]*tls_key_file:[[:space:]]*//p' "${file}" \
+        | sed 's/#.*$//; s/["'\'']//g; s/[[:space:]]*$//' | tail -n1)
+    [ -n "${cert}" ] && [ -n "${key}" ]
+}
+
 # Health-check scheme follows TLS config: TAG serves HTTPS when both a cert and a
-# key are set, so probe over HTTPS (and skip cert verification for self-signed).
-if [ -n "${TAG_TLS_CERT_FILE:-}" ] && [ -n "${TAG_TLS_KEY_FILE:-}" ]; then
+# key are set (via env vars or the config file), so probe over HTTPS (and skip
+# cert verification for self-signed).
+if { [ -n "${TAG_TLS_CERT_FILE:-}" ] && [ -n "${TAG_TLS_KEY_FILE:-}" ]; } \
+    || config_enables_tls "${TAG_CONFIG_FILE}"; then
     TAG_HEALTH_SCHEME="https"
     TAG_HEALTH_CURL_OPTS="-k"
 else
@@ -39,9 +60,6 @@ TAG_CACHE_CLUSTER_ADDR="${TAG_CACHE_CLUSTER_ADDR:-:17000}"
 TAG_CACHE_GRPC_ADDR="${TAG_CACHE_GRPC_ADDR:-:19000}"
 
 # TAG settings
-# Config file passed to the binary when it exists; install.sh writes this path.
-# Set to an empty string to run with built-in defaults and env overrides only.
-TAG_CONFIG_FILE="${TAG_CONFIG_FILE-/etc/tag/config.yaml}"
 TAG_LOG_LEVEL="${TAG_LOG_LEVEL:-info}"
 TAG_PPROF_ENABLED="${TAG_PPROF_ENABLED:-false}"
 TAG_MAX_IDLE_CONNS_PER_HOST="${TAG_MAX_IDLE_CONNS_PER_HOST:-100}"
