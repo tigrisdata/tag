@@ -54,7 +54,7 @@ Pull and run the published image with Docker Compose:
 
 ```bash
 cd deploy/docker
-docker-compose -f docker-compose.release.yml up -d
+docker compose -f docker-compose.release.yml up -d
 ```
 
 See [docs/docker.md](docs/docker.md) for single-node and cluster setups. To build the image from source instead, use the Compose files in [`docker/`](docker/).
@@ -64,7 +64,7 @@ See [docs/docker.md](docs/docker.md) for single-node and cluster setups. To buil
 Deploy as a StatefulSet with an embedded distributed cache using the Kustomize manifests in [`deploy/kubernetes/`](deploy/kubernetes/):
 
 ```bash
-kubectl apply -k deploy/kubernetes/base/ -n tag
+kubectl apply -k deploy/kubernetes/base/
 ```
 
 See [docs/deploy.md](docs/deploy.md) for the full guide.
