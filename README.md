@@ -46,7 +46,7 @@ curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
 curl -fsSL https://tag-releases.t3.storage.dev/v1.10.0/install.sh | bash
 ```
 
-The script installs the `tag` binary to `/usr/local/bin` and a default config to `/etc/tag/config.yaml`. Manage the process with the companion `run.sh` in [`deploy/native/`](deploy/native/).
+The script installs the `tag` binary to `/usr/local/bin` and a default config to `/etc/tag/config.yaml`.
 
 ### Docker
 
