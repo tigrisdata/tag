@@ -4,31 +4,31 @@ TAG can be configured via a YAML configuration file and/or environment variables
 
 ## Environment Variables
 
-| Variable                      | Description                                                                     | Default                  |
-| ----------------------------- | ------------------------------------------------------------------------------- | ------------------------ |
-| `AWS_ACCESS_KEY_ID`           | S3 access key (must have read-only access for all buckets accessed through TAG) | (required)               |
-| `AWS_SECRET_ACCESS_KEY`       | S3 secret key for authentication                                                | (required)               |
-| `TAG_UPSTREAM_ENDPOINT`       | Tigris S3 endpoint URL                                                          | `https://t3.storage.dev` |
-| `TAG_MAX_IDLE_CONNS_PER_HOST` | HTTP connection pool size per upstream host                                     | `100`                    |
-| `TAG_CACHE_TTL`               | Default TTL for cached objects (Go duration, e.g. `12h`, `30m`)                 | `24h`                    |
-| `TAG_CACHE_DISABLED`          | Disable caching (`true` or `1`)                                                 | `false`                  |
-| `TAG_CACHE_DISK_PATH`         | Path to cache data directory                                                    | `/var/cache/tag`         |
-| `TAG_CACHE_MAX_DISK_USAGE`    | Max disk usage in bytes (0 = unlimited)                                         | `0`                      |
-| `TAG_CACHE_NODE_ID`           | Unique node identifier for cluster mode                                         | (none)                   |
-| `TAG_CACHE_CLUSTER_ADDR`      | Address for memberlist gossip                                                   | `:7000`                  |
-| `TAG_CACHE_GRPC_ADDR`         | Address for gRPC server                                                         | `:9000`                  |
-| `TAG_CACHE_ADVERTISE_ADDR`    | Address advertised to other nodes                                               | (defaults to GRPC addr)  |
-| `TAG_CACHE_SEED_NODES`        | Comma-separated seed nodes for cluster discovery                                | (none)                   |
-| `TAG_CACHE_DELETE_BATCH_SIZE` | File deletions processed per deletion-queue batch                               | `1000`                   |
-| `TAG_CACHE_RECOVERY_WORKERS`  | Parallel workers for startup file recovery                                      | `16`                     |
-| `TAG_CACHE_MAX_CONCURRENT_WRITES` | Max concurrent cache-populate operations                                    | `256`                    |
-| `TAG_MAX_INFLIGHT_REQUESTS`   | Max concurrently-served S3 requests before shedding with 503 SlowDown           | `1024`                   |
-| `TAG_LOG_LEVEL`               | Log level: `debug`, `info`, `warn`, `error`                                     | `info`                   |
-| `TAG_LOG_FORMAT`              | Log format: `json` or `console`                                                 | `json`                   |
-| `TAG_TRANSPARENT_PROXY`       | Disable transparent proxy mode (`false` or `0`)                                 | `true`                   |
-| `TAG_TLS_CERT_FILE`           | Path to TLS certificate file (PEM format)                                       | (none)                   |
-| `TAG_TLS_KEY_FILE`            | Path to TLS private key file (PEM format)                                       | (none)                   |
-| `TAG_PPROF_ENABLED`           | Enable pprof endpoints (`true` or `1`)                                          | `false`                  |
+| Variable                          | Description                                                                     | Default                  |
+| --------------------------------- | ------------------------------------------------------------------------------- | ------------------------ |
+| `AWS_ACCESS_KEY_ID`               | S3 access key (must have read-only access for all buckets accessed through TAG) | (required)               |
+| `AWS_SECRET_ACCESS_KEY`           | S3 secret key for authentication                                                | (required)               |
+| `TAG_UPSTREAM_ENDPOINT`           | Tigris S3 endpoint URL                                                          | `https://t3.storage.dev` |
+| `TAG_MAX_IDLE_CONNS_PER_HOST`     | HTTP connection pool size per upstream host                                     | `100`                    |
+| `TAG_CACHE_TTL`                   | Default TTL for cached objects (Go duration, e.g. `12h`, `30m`)                 | `24h`                    |
+| `TAG_CACHE_DISABLED`              | Disable caching (`true` or `1`)                                                 | `false`                  |
+| `TAG_CACHE_DISK_PATH`             | Path to cache data directory                                                    | `/var/cache/tag`         |
+| `TAG_CACHE_MAX_DISK_USAGE`        | Max disk usage in bytes (0 = unlimited)                                         | `0`                      |
+| `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
+| `TAG_CACHE_CLUSTER_ADDR`          | Address for memberlist gossip                                                   | `:7000`                  |
+| `TAG_CACHE_GRPC_ADDR`             | Address for gRPC server                                                         | `:9000`                  |
+| `TAG_CACHE_ADVERTISE_ADDR`        | Address advertised to other nodes                                               | (defaults to GRPC addr)  |
+| `TAG_CACHE_SEED_NODES`            | Comma-separated seed nodes for cluster discovery                                | (none)                   |
+| `TAG_CACHE_DELETE_BATCH_SIZE`     | File deletions processed per deletion-queue batch                               | `1000`                   |
+| `TAG_CACHE_RECOVERY_WORKERS`      | Parallel workers for startup file recovery                                      | `16`                     |
+| `TAG_CACHE_MAX_CONCURRENT_WRITES` | Max concurrent cache-populate operations                                        | `256`                    |
+| `TAG_MAX_INFLIGHT_REQUESTS`       | Max concurrently-served S3 requests before shedding with 503 SlowDown           | `1024`                   |
+| `TAG_LOG_LEVEL`                   | Log level: `debug`, `info`, `warn`, `error`                                     | `info`                   |
+| `TAG_LOG_FORMAT`                  | Log format: `json` or `console`                                                 | `json`                   |
+| `TAG_TRANSPARENT_PROXY`           | Disable transparent proxy mode (`false` or `0`)                                 | `true`                   |
+| `TAG_TLS_CERT_FILE`               | Path to TLS certificate file (PEM format)                                       | (none)                   |
+| `TAG_TLS_KEY_FILE`                | Path to TLS private key file (PEM format)                                       | (none)                   |
+| `TAG_PPROF_ENABLED`               | Enable pprof endpoints (`true` or `1`)                                          | `false`                  |
 
 ## Configuration File
 
@@ -185,14 +185,14 @@ log:
 
 Controls the HTTP server settings.
 
-| Field           | Type   | Default     | Description                        |
-| --------------- | ------ | ----------- | ---------------------------------- |
-| `http_port`     | int    | `8080`      | Port for the S3 API                |
-| `bind_ip`       | string | `"0.0.0.0"` | IP address to bind to              |
-| `pprof_enabled` | bool   | `false`     | Enable pprof profiling endpoints   |
-| `tls_cert_file` | string | `""`        | Path to TLS certificate file (PEM) |
-| `tls_key_file`  | string | `""`        | Path to TLS private key file (PEM) |
-| `max_inflight_requests` | int | `1024` | Max concurrently-served S3 requests before shedding with 503 SlowDown (`0`/unset = default, negative = disabled). `/health`, `/metrics`, `/debug/pprof/*` are exempt. |
+| Field                   | Type   | Default     | Description                                                                                                                                                           |
+| ----------------------- | ------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `http_port`             | int    | `8080`      | Port for the S3 API                                                                                                                                                   |
+| `bind_ip`               | string | `"0.0.0.0"` | IP address to bind to                                                                                                                                                 |
+| `pprof_enabled`         | bool   | `false`     | Enable pprof profiling endpoints                                                                                                                                      |
+| `tls_cert_file`         | string | `""`        | Path to TLS certificate file (PEM)                                                                                                                                    |
+| `tls_key_file`          | string | `""`        | Path to TLS private key file (PEM)                                                                                                                                    |
+| `max_inflight_requests` | int    | `1024`      | Max concurrently-served S3 requests before shedding with 503 SlowDown (`0`/unset = default, negative = disabled). `/health`, `/metrics`, `/debug/pprof/*` are exempt. |
 
 ### Upstream
 
@@ -248,21 +248,21 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -node
 
 Controls the embedded cache behavior. TAG uses an embedded OCache instance with RocksDB storage.
 
-| Field                  | Type     | Default          | Description                                       |
-| ---------------------- | -------- | ---------------- | ------------------------------------------------- |
-| `enabled`              | bool     | `true`           | Enable caching                                    |
-| `ttl`                  | duration | `24h`            | Default TTL for cached objects                    |
-| `size_threshold`       | int64    | `1073741824`     | Max object size to cache (bytes)                  |
-| `disk_path`            | string   | `/var/cache/tag` | Path to cache data directory                      |
-| `max_disk_usage_bytes` | int64    | `0`              | Max disk usage (0 = unlimited)                    |
-| `node_id`              | string   | `""`             | Unique node identifier for cluster mode           |
-| `cluster_addr`         | string   | `:7000`          | Address for memberlist gossip                     |
-| `grpc_addr`            | string   | `:9000`          | Address for gRPC server                           |
-| `advertise_addr`       | string   | `""`             | Address advertised to other nodes                 |
-| `seed_nodes`           | []string | `[]`             | Seed nodes for cluster discovery                  |
-| `delete_batch_size`    | int      | `1000`           | File deletions processed per deletion-queue batch |
-| `recovery_workers`     | int      | `16`             | Parallel workers for startup file recovery        |
-| `max_concurrent_writes` | int     | `256`            | Max concurrent cache-populate operations (`0`/unset = default, negative = disabled) |
+| Field                   | Type     | Default          | Description                                                                         |
+| ----------------------- | -------- | ---------------- | ----------------------------------------------------------------------------------- |
+| `enabled`               | bool     | `true`           | Enable caching                                                                      |
+| `ttl`                   | duration | `24h`            | Default TTL for cached objects                                                      |
+| `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
+| `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |
+| `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |
+| `node_id`               | string   | `""`             | Unique node identifier for cluster mode                                             |
+| `cluster_addr`          | string   | `:7000`          | Address for memberlist gossip                                                       |
+| `grpc_addr`             | string   | `:9000`          | Address for gRPC server                                                             |
+| `advertise_addr`        | string   | `""`             | Address advertised to other nodes                                                   |
+| `seed_nodes`            | []string | `[]`             | Seed nodes for cluster discovery                                                    |
+| `delete_batch_size`     | int      | `1000`           | File deletions processed per deletion-queue batch                                   |
+| `recovery_workers`      | int      | `16`             | Parallel workers for startup file recovery                                          |
+| `max_concurrent_writes` | int      | `256`            | Max concurrent cache-populate operations (`0`/unset = default, negative = disabled) |
 
 **TTL Format:**
 
