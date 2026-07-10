@@ -37,8 +37,15 @@ jobs:
           WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           if [ -n "$INPUT_VERSION" ]; then
-            echo "version=$INPUT_VERSION" >> $GITHUB_OUTPUT
-            echo "Using manual version: $INPUT_VERSION"
+            # Normalize to the v-prefixed tag so the S3 directory, gh release
+            # lookups, and the native-asset git ref all reference the same tag
+            # (release tags are always vX.Y.Z). Entering "1.10.0" -> "v1.10.0".
+            case "$INPUT_VERSION" in
+              v*) VERSION="$INPUT_VERSION" ;;
+              *)  VERSION="v$INPUT_VERSION" ;;
+            esac
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "Using manual version: $VERSION"
           else
             # Get the tag pointing to the workflow_run commit SHA
             git fetch --tags

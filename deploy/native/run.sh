@@ -22,9 +22,30 @@ CACHE_DATA_DIR="${TAG_DATA_DIR}/cache-data"
 # Ports
 TAG_PORT="${TAG_PORT:-8080}"
 
+# Config file passed to the binary when it exists; install.sh writes this path.
+# Set to an empty string to run with built-in defaults and env overrides only.
+TAG_CONFIG_FILE="${TAG_CONFIG_FILE-/etc/tag/config.yaml}"
+
+# True when the config file enables TLS (both tls_cert_file and tls_key_file set
+# to a non-empty value). Mirrors the binary, which serves HTTPS only when both
+# are set, so the health probe picks the right scheme even when TLS is configured
+# via the file rather than TAG_TLS_CERT_FILE / TAG_TLS_KEY_FILE.
+config_enables_tls() {
+    local file="$1"
+    [ -n "${file}" ] && [ -f "${file}" ] || return 1
+    local cert key
+    cert=$(sed -n 's/^[[:space:]]*tls_cert_file:[[:space:]]*//p' "${file}" \
+        | sed 's/#.*$//; s/["'\'']//g; s/[[:space:]]*$//' | tail -n1)
+    key=$(sed -n 's/^[[:space:]]*tls_key_file:[[:space:]]*//p' "${file}" \
+        | sed 's/#.*$//; s/["'\'']//g; s/[[:space:]]*$//' | tail -n1)
+    [ -n "${cert}" ] && [ -n "${key}" ]
+}
+
 # Health-check scheme follows TLS config: TAG serves HTTPS when both a cert and a
-# key are set, so probe over HTTPS (and skip cert verification for self-signed).
-if [ -n "${TAG_TLS_CERT_FILE:-}" ] && [ -n "${TAG_TLS_KEY_FILE:-}" ]; then
+# key are set (via env vars or the config file), so probe over HTTPS (and skip
+# cert verification for self-signed).
+if { [ -n "${TAG_TLS_CERT_FILE:-}" ] && [ -n "${TAG_TLS_KEY_FILE:-}" ]; } \
+    || config_enables_tls "${TAG_CONFIG_FILE}"; then
     TAG_HEALTH_SCHEME="https"
     TAG_HEALTH_CURL_OPTS="-k"
 else
@@ -94,7 +115,9 @@ download_binary() {
     local url="$3"
     local dest="${BIN_DIR}/${name}-${version}"
 
-    if [ -x "${dest}" ]; then
+    # "latest" is a moving tag, so a cached .bin/<name>-latest can be stale after
+    # a new release. Re-download it every start; only cache pinned versions.
+    if [ -x "${dest}" ] && [ "${version}" != "latest" ]; then
         echo "${name} ${version} already downloaded"
         return 0
     fi
@@ -102,13 +125,20 @@ download_binary() {
     echo "Downloading ${name} ${version} for ${OS}-${ARCH}..."
     mkdir -p "${BIN_DIR}"
 
+    # Download to a temp file in the same dir and atomically rename on success, so
+    # a failed/partial download never truncates a previously working binary (which
+    # would block offline starts, esp. for the always-refreshed "latest").
     local download_url="${url}/${version}/${name}-${OS}-${ARCH}"
-    if ! curl -fsSL "${download_url}" -o "${dest}"; then
+    local tmp
+    tmp="$(mktemp "${BIN_DIR}/.${name}-${version}.XXXXXX")"
+    if ! curl -fsSL "${download_url}" -o "${tmp}"; then
+        rm -f "${tmp}"
         echo "Error: Failed to download ${name} from ${download_url}"
         exit 1
     fi
 
-    chmod +x "${dest}"
+    chmod +x "${tmp}"
+    mv -f "${tmp}" "${dest}"
     echo "${name} ${version} downloaded successfully"
 }
 
@@ -210,6 +240,14 @@ cmd_start() {
 
     local tag_bin="${BIN_DIR}/tag-${TAG_VERSION}"
 
+    # Pass the installed config file to the binary when present, so edits to
+    # /etc/tag/config.yaml (TLS, upstream, cache) actually take effect.
+    local config_args=()
+    if [ -n "${TAG_CONFIG_FILE}" ] && [ -f "${TAG_CONFIG_FILE}" ]; then
+        config_args=(--config "${TAG_CONFIG_FILE}")
+        echo "Using config file: ${TAG_CONFIG_FILE}"
+    fi
+
     # Start TAG with embedded cache
     echo "Starting TAG with embedded cache..."
     TAG_HTTP_PORT="${TAG_PORT}" \
@@ -221,7 +259,7 @@ cmd_start() {
     TAG_LOG_LEVEL="${TAG_LOG_LEVEL}" \
     TAG_PPROF_ENABLED="${TAG_PPROF_ENABLED}" \
     TAG_MAX_IDLE_CONNS_PER_HOST="${TAG_MAX_IDLE_CONNS_PER_HOST}" \
-    "${tag_bin}" \
+    "${tag_bin}" ${config_args[@]+"${config_args[@]}"} \
         > "${LOG_DIR}/tag.log" 2>&1 &
     local tag_pid=$!
     echo "${tag_pid}" > "${TAG_PID_FILE}"
@@ -322,6 +360,7 @@ cmd_help() {
     echo "  TAG_MAX_IDLE_CONNS_PER_HOST  Max idle connections per host (default: ${TAG_MAX_IDLE_CONNS_PER_HOST})"
     echo "  TAG_PORT               TAG HTTP port (default: ${TAG_PORT})"
     echo "  TAG_START_TIMEOUT      Seconds to wait for /health on start (default: ${TAG_START_TIMEOUT})"
+    echo "  TAG_CONFIG_FILE        Config file passed to tag if it exists; empty to disable (default: ${TAG_CONFIG_FILE})"
     echo "  TAG_CACHE_MAX_DISK_USAGE  Max cache disk usage in bytes (default: ${TAG_CACHE_MAX_DISK_USAGE})"
     echo "  TAG_CACHE_CLUSTER_ADDR Cluster gossip address (default: ${TAG_CACHE_CLUSTER_ADDR})"
     echo "  TAG_CACHE_GRPC_ADDR    gRPC server address (default: ${TAG_CACHE_GRPC_ADDR})"
