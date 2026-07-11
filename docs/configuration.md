@@ -207,19 +207,35 @@ Configures the connection to upstream Tigris storage.
 
 **Endpoint Validation:**
 
-The upstream endpoint must be one of the following allowed hosts:
+In **transparent proxy mode** (the default), the upstream endpoint must be one of the following allowed hosts, and TAG will refuse to start otherwise:
 
 - `localhost` (for local development)
 - `*.tigris.dev` (e.g., `fly.storage.tigris.dev`)
 - `*.storage.dev` (e.g., `t3.storage.dev`)
 
-TAG will refuse to start if the endpoint host does not match one of these patterns.
+This restriction exists because transparent mode adds `X-Tigris-Proxy-*` identity headers that are only meaningful to Tigris. In **signing mode** (`transparent_proxy: false`) the endpoint is not restricted — see below.
 
 **Transparent Proxy Mode:**
 
-When `transparent_proxy` is `true` (default), TAG forwards client requests to Tigris as-is, preserving the original Authorization header and adding proxy headers so Tigris validates the signature against the original host. No local credential store is needed.
+When `transparent_proxy` is `true` (default), TAG forwards client requests to Tigris as-is, preserving the original Authorization header and adding proxy headers so Tigris validates the signature against the original host. No local credential store is needed. This mode works only with Tigris.
 
 When `transparent_proxy` is `false`, TAG validates incoming request signatures against its local credential store and re-signs requests for the upstream endpoint (signing mode). This is useful when TAG needs to perform credential translation.
+
+**Using TAG with other S3-compatible services:**
+
+Signing mode re-signs requests with standard AWS SigV4, so it works against any S3-compatible endpoint (AWS S3, MinIO, Ceph, etc.), not just Tigris. To point TAG at a non-Tigris backend:
+
+```yaml
+upstream:
+  transparent_proxy: false
+  endpoint: "https://s3.us-east-1.amazonaws.com"
+```
+
+Notes:
+
+- Transparent proxy mode and its zero-config, no-double-auth experience are Tigris-only. Third-party backends are supported on a best-effort, community-supported basis.
+- TAG logs a warning at startup when signing mode runs against a non-Tigris endpoint.
+- Configure the upstream credentials (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) for the backend TAG signs requests to.
 
 **TLS / HTTPS:**
 

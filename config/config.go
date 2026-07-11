@@ -442,8 +442,14 @@ func applyEnvOverrides(cfg *Config) {
 
 // validate checks that the final configuration is valid.
 func validate(cfg *Config) error {
-	if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint); err != nil {
-		return err
+	// The upstream-endpoint allowlist is enforced only in transparent proxy
+	// mode, where the X-Tigris-Proxy-* identity headers are meaningful only to
+	// Tigris. Signing mode re-signs with standard SigV4 and works against any
+	// S3-compatible service, so any endpoint is permitted there.
+	if cfg.Upstream.IsTransparentProxy() {
+		if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint); err != nil {
+			return err
+		}
 	}
 	if err := validateTLS(&cfg.Server); err != nil {
 		return err
@@ -465,22 +471,33 @@ func validateTLS(server *ServerConfig) error {
 	return nil
 }
 
-// validateUpstreamEndpoint ensures the upstream endpoint is an allowed Tigris domain or localhost.
-func validateUpstreamEndpoint(endpoint string) error {
+// IsTigrisEndpoint reports whether the endpoint host is localhost or a Tigris
+// domain (*.tigris.dev, *.storage.dev). Transparent proxy mode requires a Tigris
+// endpoint; signing mode works with any S3-compatible endpoint. Returns false if
+// the endpoint cannot be parsed.
+func IsTigrisEndpoint(endpoint string) bool {
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return fmt.Errorf("invalid upstream endpoint %q: %w", endpoint, err)
+		return false
 	}
 
 	host := u.Hostname() // strips port if present
 	if host == "localhost" {
-		return nil
+		return true
 	}
-	if strings.HasSuffix(host, ".tigris.dev") || strings.HasSuffix(host, ".storage.dev") {
-		return nil
-	}
+	return strings.HasSuffix(host, ".tigris.dev") || strings.HasSuffix(host, ".storage.dev")
+}
 
-	return fmt.Errorf("upstream endpoint %q is not allowed: host must be localhost, *.tigris.dev, or *.storage.dev", endpoint)
+// validateUpstreamEndpoint ensures the upstream endpoint is an allowed Tigris
+// domain or localhost. Enforced only in transparent proxy mode (see validate).
+func validateUpstreamEndpoint(endpoint string) error {
+	if _, err := url.Parse(endpoint); err != nil {
+		return fmt.Errorf("invalid upstream endpoint %q: %w", endpoint, err)
+	}
+	if IsTigrisEndpoint(endpoint) {
+		return nil
+	}
+	return fmt.Errorf("upstream endpoint %q is not allowed in transparent proxy mode: host must be localhost, *.tigris.dev, or *.storage.dev (use signing mode for other S3-compatible services)", endpoint)
 }
 
 // splitEndpoints splits a comma-separated string into a slice of endpoints.

@@ -542,6 +542,74 @@ upstream:
 	}
 }
 
+func TestIsTigrisEndpoint(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		want     bool
+	}{
+		{"tigris.dev domain", "https://fly.storage.tigris.dev", true},
+		{"storage.dev domain", "https://t3.storage.dev", true},
+		{"localhost", "http://localhost:8080", true},
+		{"localhost no port", "http://localhost", true},
+		{"third-party s3", "https://s3.amazonaws.com", false},
+		{"minio", "http://minio.internal:9000", false},
+		{"not a suffix match", "https://nottrigris.dev", false},
+		{"lookalike host", "https://evil.tigris.dev.attacker.com", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsTigrisEndpoint(tt.endpoint); got != tt.want {
+				t.Errorf("IsTigrisEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.want)
+			}
+		})
+	}
+}
+
+// Signing mode re-signs with standard SigV4 and works against any S3-compatible
+// service, so the Tigris endpoint allowlist must not be enforced there.
+func TestLoad_SigningModeAllowsNonTigrisEndpoint(t *testing.T) {
+	content := `
+upstream:
+  transparent_proxy: false
+  endpoint: "https://s3.amazonaws.com"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() should allow a non-Tigris endpoint in signing mode, got error: %v", err)
+	}
+	if cfg.Upstream.IsTransparentProxy() {
+		t.Error("expected signing mode (transparent proxy disabled)")
+	}
+	if cfg.Upstream.Endpoint != "https://s3.amazonaws.com" {
+		t.Errorf("Upstream.Endpoint = %q, want https://s3.amazonaws.com", cfg.Upstream.Endpoint)
+	}
+}
+
+// Transparent proxy mode still requires a Tigris endpoint, since the
+// X-Tigris-Proxy-* identity headers are only meaningful to Tigris.
+func TestLoad_TransparentModeRejectsNonTigrisEndpoint(t *testing.T) {
+	content := `
+upstream:
+  transparent_proxy: true
+  endpoint: "https://s3.amazonaws.com"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	if _, err := Load(tmpFile); err == nil {
+		t.Error("Load() should reject a non-Tigris endpoint in transparent proxy mode")
+	}
+}
+
 func TestCacheDefaultValues(t *testing.T) {
 	cfg := NewDefault()
 
