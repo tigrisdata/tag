@@ -229,10 +229,16 @@ Signing mode re-signs requests with standard AWS SigV4, so it works against any 
 upstream:
   transparent_proxy: false
   endpoint: "https://s3.us-east-1.amazonaws.com"
+  # Set the backend's region; the default "auto" only works with Tigris. AWS and
+  # other region-sensitive services reject signatures whose credential scope
+  # region does not match the endpoint.
+  region: "us-east-1"
 ```
 
 Notes:
 
+- The `endpoint` must be an absolute `http://` or `https://` URL with a host; TAG refuses to start otherwise (in any mode).
+- Set `region` to match the backend. The default `auto` is Tigris-specific; region-sensitive services such as AWS S3 return signature errors unless the region matches the endpoint (e.g., `us-east-1` for `s3.us-east-1.amazonaws.com`).
 - Transparent proxy mode and its zero-config, no-double-auth experience are Tigris-only. Third-party backends are supported on a best-effort, community-supported basis.
 - TAG logs a warning at startup when signing mode runs against a non-Tigris endpoint.
 - Configure the upstream credentials (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) for the backend TAG signs requests to.

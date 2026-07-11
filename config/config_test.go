@@ -503,24 +503,36 @@ func TestTransparentProxy_DisabledByEnv_NumericZero(t *testing.T) {
 
 func TestValidateUpstreamEndpoint(t *testing.T) {
 	tests := []struct {
-		name     string
-		endpoint string
-		wantErr  bool
+		name        string
+		endpoint    string
+		transparent bool
+		wantErr     bool
 	}{
-		{"tigris.dev domain", "https://fly.storage.tigris.dev", false},
-		{"storage.dev domain", "https://t3.storage.dev", false},
-		{"localhost", "http://localhost:8080", false},
-		{"localhost no port", "http://localhost", false},
-		{"disallowed domain", "https://evil.example.com", true},
-		{"subdomain of tigris.dev", "https://sub.tigris.dev", false},
-		{"not a suffix match", "https://nottrigris.dev", true},
+		// Transparent mode: Tigris allowlist enforced.
+		{"tigris.dev domain", "https://fly.storage.tigris.dev", true, false},
+		{"storage.dev domain", "https://t3.storage.dev", true, false},
+		{"localhost", "http://localhost:8080", true, false},
+		{"localhost no port", "http://localhost", true, false},
+		{"disallowed domain", "https://evil.example.com", true, true},
+		{"subdomain of tigris.dev", "https://sub.tigris.dev", true, false},
+		{"not a suffix match", "https://nottrigris.dev", true, true},
+		// Signing mode: any well-formed http(s) URL is allowed.
+		{"third-party s3 signing", "https://s3.amazonaws.com", false, false},
+		{"minio signing", "http://minio.internal:9000", false, false},
+		{"tigris signing", "https://t3.storage.dev", false, false},
+		// Well-formedness is enforced in both modes.
+		{"hostless signing", "s3.amazonaws.com", false, true},
+		{"hostless transparent", "s3.amazonaws.com", true, true},
+		{"host:port without scheme", "host:9000", false, true},
+		{"empty endpoint", "", false, true},
+		{"non-http scheme", "ftp://example.com", false, true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateUpstreamEndpoint(tt.endpoint)
+			err := validateUpstreamEndpoint(tt.endpoint, tt.transparent)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("validateUpstreamEndpoint(%q) error = %v, wantErr %v", tt.endpoint, err, tt.wantErr)
+				t.Errorf("validateUpstreamEndpoint(%q, transparent=%v) error = %v, wantErr %v", tt.endpoint, tt.transparent, err, tt.wantErr)
 			}
 		})
 	}
@@ -607,6 +619,24 @@ upstream:
 
 	if _, err := Load(tmpFile); err == nil {
 		t.Error("Load() should reject a non-Tigris endpoint in transparent proxy mode")
+	}
+}
+
+// Even in signing mode a hostless/malformed endpoint must fail at startup rather
+// than passing and breaking every proxied request when the upstream URL is built.
+func TestLoad_SigningModeRejectsHostlessEndpoint(t *testing.T) {
+	content := `
+upstream:
+  transparent_proxy: false
+  endpoint: "s3.amazonaws.com"
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	if _, err := Load(tmpFile); err == nil {
+		t.Error("Load() should reject a hostless endpoint (no scheme/host) even in signing mode")
 	}
 }
 

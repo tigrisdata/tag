@@ -442,14 +442,8 @@ func applyEnvOverrides(cfg *Config) {
 
 // validate checks that the final configuration is valid.
 func validate(cfg *Config) error {
-	// The upstream-endpoint allowlist is enforced only in transparent proxy
-	// mode, where the X-Tigris-Proxy-* identity headers are meaningful only to
-	// Tigris. Signing mode re-signs with standard SigV4 and works against any
-	// S3-compatible service, so any endpoint is permitted there.
-	if cfg.Upstream.IsTransparentProxy() {
-		if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint); err != nil {
-			return err
-		}
+	if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint, cfg.Upstream.IsTransparentProxy()); err != nil {
+		return err
 	}
 	if err := validateTLS(&cfg.Server); err != nil {
 		return err
@@ -488,16 +482,27 @@ func IsTigrisEndpoint(endpoint string) bool {
 	return strings.HasSuffix(host, ".tigris.dev") || strings.HasSuffix(host, ".storage.dev")
 }
 
-// validateUpstreamEndpoint ensures the upstream endpoint is an allowed Tigris
-// domain or localhost. Enforced only in transparent proxy mode (see validate).
-func validateUpstreamEndpoint(endpoint string) error {
-	if _, err := url.Parse(endpoint); err != nil {
+// validateUpstreamEndpoint ensures the upstream endpoint is a well-formed
+// absolute http(s) URL with a host (checked in every mode, since the signing
+// path builds upstream requests from it). In transparent proxy mode it must
+// additionally be a Tigris domain or localhost, because the X-Tigris-Proxy-*
+// identity headers are meaningful only to Tigris; signing mode permits any
+// S3-compatible host.
+func validateUpstreamEndpoint(endpoint string, transparent bool) error {
+	u, err := url.Parse(endpoint)
+	if err != nil {
 		return fmt.Errorf("invalid upstream endpoint %q: %w", endpoint, err)
 	}
-	if IsTigrisEndpoint(endpoint) {
-		return nil
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("upstream endpoint %q must be an absolute http:// or https:// URL", endpoint)
 	}
-	return fmt.Errorf("upstream endpoint %q is not allowed in transparent proxy mode: host must be localhost, *.tigris.dev, or *.storage.dev (use signing mode for other S3-compatible services)", endpoint)
+	if u.Hostname() == "" {
+		return fmt.Errorf("upstream endpoint %q must include a host", endpoint)
+	}
+	if transparent && !IsTigrisEndpoint(endpoint) {
+		return fmt.Errorf("upstream endpoint %q is not allowed in transparent proxy mode: host must be localhost, *.tigris.dev, or *.storage.dev (use signing mode for other S3-compatible services)", endpoint)
+	}
+	return nil
 }
 
 // splitEndpoints splits a comma-separated string into a slice of endpoints.
