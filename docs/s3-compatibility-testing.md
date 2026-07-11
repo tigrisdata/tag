@@ -30,7 +30,7 @@ The S3 compatibility tests validate that TAG correctly implements the S3 API by 
 
 ## Running Tests Locally (Recommended)
 
-The recommended approach runs TAG on your host machine with its embedded cache. This avoids needing a GitHub token for private module access.
+The recommended approach runs TAG on your host machine with its embedded cache.
 
 ```bash
 # 1. Set credentials
