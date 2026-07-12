@@ -193,6 +193,12 @@ func main() {
 		}
 		proxySigner = auth.NewProxySigner(accessKey, secretKey)
 		log.Info().Msg("Transparent proxy mode enabled")
+	} else {
+		log.Info().Str("endpoint", cfg.Upstream.Endpoint).Msg("Signing mode enabled")
+		if !config.IsTigrisEndpoint(cfg.Upstream.Endpoint) {
+			log.Warn().Str("endpoint", cfg.Upstream.Endpoint).
+				Msg("Running against a non-Tigris S3 endpoint; transparent-proxy features are unavailable and third-party backends are community-supported")
+		}
 	}
 
 	if credStore.Count() == 0 && !cfg.Upstream.IsTransparentProxy() {
