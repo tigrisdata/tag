@@ -19,9 +19,29 @@ Tigris independently validates both the client's SigV4 signature and TAG's proxy
 
 ### Signing Mode
 
-TAG validates incoming request signatures against a local credential store, then re-signs requests for the upstream endpoint using standard AWS SigV4. This mode is used when TAG needs to perform credential translation (e.g., clients use different credentials than the upstream account). Because it re-signs with standard SigV4, signing mode works against any S3-compatible service, not only Tigris (see [Endpoint Validation](#endpoint-validation)).
+In signing mode, TAG terminates the client signature and re-issues the upstream one itself:
+
+1. The client signs its request with its own SigV4 credentials.
+2. TAG looks up the secret for the client's access key in its **local credential store** and cryptographically validates the incoming signature.
+3. TAG re-signs the (possibly transformed) request for the upstream endpoint using standard AWS SigV4 with **the same access key and secret**, then streams it upstream.
+
+TAG re-signs rather than forwarding the original signature because it may transform the request — for example decoding AWS chunked transfer encoding to `UNSIGNED-PAYLOAD` — which would otherwise invalidate the client's signature. The upstream sees the **same identity** as the client; this is not identity translation.
+
+Because TAG must know the secret for every access key it serves, those credentials must be present in its local credential store. In production the store is populated only from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (a single pair), so **clients must authenticate with those same credentials**, and TAG re-signs upstream with them. If the store is empty, TAG rejects all requests.
+
+Because it re-signs with standard SigV4, signing mode works against any S3-compatible service, not only Tigris (see [Endpoint Validation](#endpoint-validation)).
 
 Set `TAG_TRANSPARENT_PROXY=false` or `upstream.transparent_proxy: false` in YAML to enable signing mode.
+
+### Credential Handling by Mode
+
+| Aspect | Transparent proxy (default) | Signing mode |
+| --- | --- | --- |
+| Upstream request signature | Client's original signature, forwarded unchanged | Re-signed by TAG with the client's own credentials |
+| Does TAG need client secret keys? | No — cache hits are validated locally using signing keys learned from Tigris | Yes — the secret for each client access key must be in TAG's local store |
+| Role of `AWS_*` credentials | TAG's own identity: signs `X-Tigris-Proxy-*` headers and background cache fetches (read-only) | The credential store's contents: clients present it and TAG re-signs every request (reads **and** writes) with it |
+| Client credentials | Any credentials in the same Tigris org; secrets never stored | Must match a credential in TAG's store (by default the `AWS_*` pair) |
+| Works with non-Tigris backends | No (Tigris only) | Yes (any S3-compatible service) |
 
 ## Local Authentication
 
@@ -169,22 +189,18 @@ Any other host causes a fatal startup error in transparent mode.
 
 ## Credential Requirements
 
-TAG requires its own Tigris credentials via environment variables:
+TAG loads credentials from environment variables at startup:
 
 ```bash
-export AWS_ACCESS_KEY_ID=<TAG's access key>
-export AWS_SECRET_ACCESS_KEY=<TAG's secret key>
+export AWS_ACCESS_KEY_ID=<access key>
+export AWS_SECRET_ACCESS_KEY=<secret key>
 ```
 
-These credentials must have **read-only access** to all buckets accessed through TAG. This is required for:
+How they are used, and what permissions they need, depends on the mode (see [Credential Handling by Mode](#credential-handling-by-mode)).
 
-- Signing proxy headers (transparent mode)
-- Background cache fetches (e.g., fetching full objects after a range request cache miss)
-- Re-signing requests for upstream (signing mode)
+**Transparent proxy mode:** these are TAG's *own* Tigris credentials, used only to sign the `X-Tigris-Proxy-*` identity headers and to perform background cache fetches (fetching full objects after a range-request cache miss). Because TAG never re-signs client requests in this mode, **read-only** access to the cached buckets is sufficient. TAG's access key must belong to the same Tigris organization as client access keys; clients use their own credentials directly and TAG does not store their secret keys.
 
-In transparent proxy mode, TAG's access key must belong to the same Tigris organization as client access keys. Clients use their own credentials directly — TAG does not need or store client secret keys.
-
-In signing mode, these are the credentials for the configured upstream — the Tigris account, or the third-party S3 account when running against another service. Set `upstream.region` to match that backend (the default `auto` is Tigris-specific); see the "Using TAG with other S3-compatible services" section in [configuration.md](configuration.md).
+**Signing mode:** this pair populates TAG's local credential store — clients must authenticate with it, and TAG re-signs *every* forwarded request with it. Its permissions must therefore cover whatever operations clients perform: **read-only is not sufficient if clients issue writes** (PUT/DELETE) — grant the access needed for those operations. Set `upstream.region` to match the backend (the default `auto` is Tigris-specific); see the "Using TAG with other S3-compatible services" section in [configuration.md](configuration.md).
 
 ## Error Mapping
 

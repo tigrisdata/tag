@@ -219,7 +219,7 @@ This restriction exists because transparent mode adds `X-Tigris-Proxy-*` identit
 
 When `transparent_proxy` is `true` (default), TAG forwards client requests to Tigris as-is, preserving the original Authorization header and adding proxy headers so Tigris validates the signature against the original host. No local credential store is needed. This mode works only with Tigris.
 
-When `transparent_proxy` is `false`, TAG validates incoming request signatures against its local credential store and re-signs requests for the upstream endpoint (signing mode). This is useful when TAG needs to perform credential translation.
+When `transparent_proxy` is `false` (signing mode), TAG validates incoming request signatures against its local credential store, then re-signs each request for the upstream endpoint with the same credentials. The store is populated from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, so clients must authenticate with those credentials and TAG re-signs upstream with them. See [Credential Handling by Mode](security.md#credential-handling-by-mode) in the security docs.
 
 **Using TAG with other S3-compatible services:**
 
@@ -241,7 +241,7 @@ Notes:
 - Set `region` to match the backend. The default `auto` is Tigris-specific; region-sensitive services such as AWS S3 return signature errors unless the region matches the endpoint (e.g., `us-east-1` for `s3.us-east-1.amazonaws.com`).
 - Transparent proxy mode and its zero-config, no-double-auth experience are Tigris-only. Third-party backends are supported on a best-effort, community-supported basis.
 - TAG logs a warning at startup when signing mode runs against a non-Tigris endpoint.
-- Configure the upstream credentials (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) for the backend TAG signs requests to.
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` are the credentials for the backend TAG signs requests to; clients must present these same credentials, and they need permissions covering whatever operations clients perform (read-only is insufficient if clients write).
 - `upstream.endpoint` is trusted operator configuration and TAG only ever forwards to that single host (never a client-chosen one) — see [Endpoint Validation](security.md#endpoint-validation) in the security docs.
 
 **TLS / HTTPS:**
