@@ -19,7 +19,7 @@ Tigris independently validates both the client's SigV4 signature and TAG's proxy
 
 ### Signing Mode
 
-TAG validates incoming request signatures against a local credential store, then re-signs requests for the upstream Tigris endpoint. This mode is used when TAG needs to perform credential translation (e.g., clients use different credentials than the upstream Tigris account).
+TAG validates incoming request signatures against a local credential store, then re-signs requests for the upstream endpoint using standard AWS SigV4. This mode is used when TAG needs to perform credential translation (e.g., clients use different credentials than the upstream account). Because it re-signs with standard SigV4, signing mode works against any S3-compatible service, not only Tigris (see [Endpoint Validation](#endpoint-validation)).
 
 Set `TAG_TRANSPARENT_PROXY=false` or `upstream.transparent_proxy: false` in YAML to enable signing mode.
 
@@ -153,9 +153,9 @@ The `X-Tigris-Proxy-Signing-Keys` response header contains encrypted signing key
 
 ## Endpoint Validation
 
-TAG validates the upstream endpoint at startup to prevent misconfiguration and SSRF attacks.
+TAG validates the upstream endpoint at startup. In **every mode**, the endpoint must be a well-formed absolute `http://` or `https://` URL with a host; anything else (a hostless value like `s3.amazonaws.com`, a `host:port` string, a non-http scheme) is a fatal startup error.
 
-**Allowed hosts:**
+**Transparent proxy mode** additionally restricts the host to the Tigris allowlist below, because the `X-Tigris-Proxy-*` identity headers TAG adds are only meaningful to Tigris:
 
 | Pattern         | Example                          | Use Case                  |
 | --------------- | -------------------------------- | ------------------------- |
@@ -163,7 +163,9 @@ TAG validates the upstream endpoint at startup to prevent misconfiguration and S
 | `*.tigris.dev`  | `https://fly.storage.tigris.dev` | Tigris production domains |
 | `*.storage.dev` | `https://t3.storage.dev`         | Tigris storage domains    |
 
-Any other endpoint causes a fatal startup error. This prevents TAG from being used as an open proxy to arbitrary services.
+Any other host causes a fatal startup error in transparent mode.
+
+**Signing mode** (`transparent_proxy: false`) does not apply the Tigris allowlist — it re-signs with standard SigV4 and can front any S3-compatible service. The upstream is a single, operator-configured value; TAG forwards only to that endpoint and never lets clients choose the upstream, so this is not an open proxy. The SSRF surface is limited to operator misconfiguration of `upstream.endpoint`, so treat that value as trusted configuration and set it explicitly. TAG logs a warning at startup when signing mode targets a non-Tigris host; third-party backends are community-supported.
 
 ## Credential Requirements
 
@@ -181,6 +183,8 @@ These credentials must have **read-only access** to all buckets accessed through
 - Re-signing requests for upstream (signing mode)
 
 In transparent proxy mode, TAG's access key must belong to the same Tigris organization as client access keys. Clients use their own credentials directly — TAG does not need or store client secret keys.
+
+In signing mode, these are the credentials for the configured upstream — the Tigris account, or the third-party S3 account when running against another service. Set `upstream.region` to match that backend (the default `auto` is Tigris-specific); see the "Using TAG with other S3-compatible services" section in [configuration.md](configuration.md).
 
 ## Error Mapping
 
