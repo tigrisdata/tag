@@ -43,12 +43,13 @@ jobs:
         github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'))
     steps:
       - name: CLA Assistant
-        # Pinned to the v2.6.1 commit SHA. Upstream is archived and v2.6.1 is its
-        # final release, so pin to an immutable SHA (not the mutable tag) since no
-        # further security/runtime fixes will come from upstream. If stronger
-        # guarantees are needed, fork the action into the org and/or scope the
-        # signatures token down to just the cla-signatures repo.
-        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
+        # tigrisdata/cla-action is our fork of the archived
+        # contributor-assistant/github-action (Apache-2.0), pinned to the v2.6.1
+        # commit SHA. We own the fork so we can apply security fixes and bump the
+        # action runtime (it targets node20, which GitHub is deprecating) when
+        # needed — upstream is archived and will not. Update the pinned SHA here
+        # after changes land in the fork.
+        uses: tigrisdata/cla-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # tigrisdata-argocd-bot token with write access to tigrisdata/cla-signatures.
