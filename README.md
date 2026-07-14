@@ -152,6 +152,19 @@ When multiple concurrent requests arrive for the same uncached object:
 
 See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
 
+## Performance
+
+A single TAG node saturates a 100 Gbps NIC at **~85+ Gbps** for objects 1 MiB and larger, serves **~75K ops/sec** for small objects at sub-millisecond p50, and holds low single-digit-millisecond TTFB — all while using around **12% of available CPU**.
+
+| Object size | OPS (64 threads) | Throughput | TTFB p50 |
+| ----------- | ---------------- | ---------- | -------- |
+| 1 KiB       | ~75,700          | 74 MiB/s   | < 1 ms   |
+| 100 KiB     | ~33,300          | 3.2 GiB/s  | 1 ms     |
+| 1 MiB       | ~11,000          | 10.7 GiB/s | 1 ms     |
+| 4 MiB       | ~2,800           | 10.8 GiB/s | 1 ms     |
+
+Measured with [warp](https://github.com/minio/warp) against a single `i3en.24xlarge` node over a 100 Gbps link. See [docs/benchmarks.md](docs/benchmarks.md) for the full methodology, go-ycsb results, and limitations.
+
 ## Metrics
 
 TAG exposes Prometheus metrics at `/metrics` including request counts, latencies, cache hit/miss rates, and broadcast statistics.
