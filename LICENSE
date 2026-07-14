@@ -1,193 +1,202 @@
-TIGRIS DATA, INC.
-END-USER LICENSE AGREEMENT
 
-Copyright (c) 2026 Tigris Data, Inc. All Rights Reserved.
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
 
-IMPORTANT: PLEASE READ THIS END-USER LICENSE AGREEMENT ("AGREEMENT") CAREFULLY
-BEFORE USING THE SOFTWARE. BY DOWNLOADING, INSTALLING, COPYING, OR OTHERWISE
-USING THE SOFTWARE, YOU AGREE TO BE BOUND BY THE TERMS OF THIS AGREEMENT. IF YOU
-DO NOT AGREE TO THE TERMS OF THIS AGREEMENT, DO NOT DOWNLOAD, INSTALL, COPY, OR
-USE THE SOFTWARE.
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
 
-This Agreement is a legal agreement between you (either an individual or an entity,
-referred to herein as "You" or "User") and Tigris Data, Inc., a Delaware corporation
-("Tigris Data," "we," "us," or "our"), for the use of Tigris Data's proprietary
-software, including any associated documentation, updates, and upgrades (collectively,
-the "Software").
+   1. Definitions.
 
-1. ACCEPTANCE OF TERMS
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
 
-By downloading, installing, accessing, or using the Software, You acknowledge that
-You have read, understood, and agree to be bound by this Agreement. If You are
-accepting this Agreement on behalf of a company or other legal entity, You represent
-and warrant that You have the authority to bind such entity to this Agreement.
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
 
-2. LICENSE GRANT
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
 
-Subject to the terms and conditions of this Agreement and Your compliance with all
-applicable subscription terms, Tigris Data grants You a limited, non-exclusive,
-non-transferable, non-sublicensable, revocable license to use the Software solely
-in binary executable form for Your internal business purposes during the applicable
-subscription term.
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
 
-This license does not include any right to:
-(a) use the Software beyond the scope of Your subscription;
-(b) receive or access the source code of the Software;
-(c) use the Software on behalf of any third party; or
-(d) use the Software in any manner not expressly permitted by this Agreement.
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
 
-3. RESTRICTIONS
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
 
-You shall not, and shall not permit any third party to:
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
 
-(a) distribute, sell, rent, lease, sublicense, assign, or otherwise transfer the
-    Software or any rights therein to any third party;
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
 
-(b) reverse engineer, decompile, disassemble, translate, or otherwise attempt to
-    derive the source code, underlying ideas, algorithms, structure, or organization
-    of the Software, except to the extent such activities are expressly permitted by
-    applicable law notwithstanding this limitation;
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
 
-(c) modify, adapt, alter, translate, or create derivative works based on the Software;
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
 
-(d) copy the Software except as expressly authorized under this Agreement;
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
 
-(e) remove, alter, or obscure any proprietary notices, labels, or marks on the Software;
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
 
-(f) use the Software to develop a competing product or service, or to assist any third
-    party in developing a competing product or service;
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
 
-(g) circumvent or attempt to circumvent any access restrictions, security measures,
-    or technological protection measures in the Software;
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
 
-(h) conduct any security testing, vulnerability testing, penetration testing, or
-    similar assessments of the Software without Tigris Data's prior written consent;
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
 
-(i) use the Software in any manner that violates any applicable law or regulation;
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
 
-(j) use the Software in any manner that could damage, disable, overburden, or impair
-    Tigris Data's systems or interfere with any other party's use of the Software;
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
 
-(k) transmit any viruses, worms, defects, Trojan horses, malware, or any items of a
-    destructive nature through the Software; or
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
 
-(l) use the Software for any purpose other than as expressly permitted under this
-    Agreement.
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
 
-4. INTELLECTUAL PROPERTY
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
 
-The Software and all copies thereof are proprietary to Tigris Data and title thereto
-remains exclusively with Tigris Data. The Software is protected by copyright laws
-and international treaty provisions. You acknowledge that the Software contains
-valuable trade secrets and proprietary information of Tigris Data.
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
 
-All rights in and to the Software not expressly granted to You in this Agreement are
-reserved by Tigris Data. No implied licenses are granted under this Agreement.
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
 
-You agree not to claim any ownership interest in or to the Software or any portion
-thereof, including any modifications, improvements, or derivative works. Any feedback,
-suggestions, or ideas You provide to Tigris Data regarding the Software may be used
-by Tigris Data without any obligation to You.
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
 
-5. DISCLAIMER OF WARRANTIES
+   END OF TERMS AND CONDITIONS
 
-THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE" WITHOUT WARRANTY OF ANY KIND.
-TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, TIGRIS DATA DISCLAIMS ALL
-WARRANTIES, WHETHER EXPRESS, IMPLIED, STATUTORY, OR OTHERWISE, INCLUDING BUT NOT
-LIMITED TO:
+   APPENDIX: How to apply the Apache License to your work.
 
-(a) IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
-    TITLE, AND NON-INFRINGEMENT;
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
 
-(b) ANY WARRANTY THAT THE SOFTWARE WILL MEET YOUR REQUIREMENTS OR EXPECTATIONS;
+   Copyright [yyyy] [name of copyright owner]
 
-(c) ANY WARRANTY THAT THE SOFTWARE WILL BE UNINTERRUPTED, TIMELY, SECURE, OR
-    ERROR-FREE;
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
 
-(d) ANY WARRANTY THAT THE RESULTS OBTAINED FROM THE USE OF THE SOFTWARE WILL BE
-    ACCURATE OR RELIABLE;
+       http://www.apache.org/licenses/LICENSE-2.0
 
-(e) ANY WARRANTY THAT ANY ERRORS IN THE SOFTWARE WILL BE CORRECTED.
-
-YOU ASSUME ALL RISK ARISING FROM YOUR USE OF THE SOFTWARE.
-
-6. LIMITATION OF LIABILITY
-
-TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW:
-
-(a) IN NO EVENT SHALL TIGRIS DATA BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL,
-    CONSEQUENTIAL, PUNITIVE, OR EXEMPLARY DAMAGES, INCLUDING BUT NOT LIMITED TO
-    DAMAGES FOR LOSS OF PROFITS, GOODWILL, USE, DATA, OR OTHER INTANGIBLE LOSSES,
-    ARISING OUT OF OR IN CONNECTION WITH THIS AGREEMENT OR THE USE OR INABILITY TO
-    USE THE SOFTWARE, REGARDLESS OF THE THEORY OF LIABILITY (CONTRACT, TORT,
-    NEGLIGENCE, STRICT LIABILITY, OR OTHERWISE) AND EVEN IF TIGRIS DATA HAS BEEN
-    ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
-
-(b) IN NO EVENT SHALL TIGRIS DATA'S TOTAL AGGREGATE LIABILITY ARISING OUT OF OR IN
-    CONNECTION WITH THIS AGREEMENT OR THE SOFTWARE EXCEED THE GREATER OF (I) THE
-    AMOUNTS PAID BY YOU TO TIGRIS DATA FOR THE SOFTWARE IN THE TWELVE (12) MONTHS
-    PRECEDING THE CLAIM, OR (II) ONE HUNDRED DOLLARS (US$100).
-
-(c) THE LIMITATIONS IN THIS SECTION SHALL APPLY NOTWITHSTANDING ANY FAILURE OF THE
-    ESSENTIAL PURPOSE OF ANY LIMITED REMEDY.
-
-7. TERMINATION
-
-(a) This Agreement is effective until terminated. Your rights under this Agreement
-    will terminate automatically and without notice if You fail to comply with any
-    term of this Agreement.
-
-(b) This Agreement will terminate upon expiration or termination of Your subscription
-    with Tigris Data.
-
-(c) Upon termination, You must immediately cease all use of the Software and destroy
-    or delete all copies of the Software in Your possession or control.
-
-(d) Sections 3, 4, 5, 6, 7, 8, and 9 shall survive any termination of this Agreement.
-
-8. GOVERNING LAW AND JURISDICTION
-
-This Agreement is governed by the laws of the State of California without regard to
-conflict of law principles. You and Tigris Data submit to the personal and exclusive
-jurisdiction of the state courts and federal courts located within Santa Clara County,
-California for resolution of any lawsuit or court proceeding permitted under this
-Agreement.
-
-9. GENERAL PROVISIONS
-
-(a) Entire Agreement. This Agreement constitutes the entire agreement between You and
-    Tigris Data with respect to the Software and supersedes all prior or contemporaneous
-    communications, representations, or agreements, whether oral or written, regarding
-    the subject matter hereof.
-
-(b) Severability. If any provision of this Agreement is held to be invalid or
-    unenforceable, such provision shall be struck and the remaining provisions shall
-    remain in full force and effect.
-
-(c) No Waiver. The failure of Tigris Data to enforce any right or provision of this
-    Agreement shall not constitute a waiver of such right or provision.
-
-(d) Assignment. You may not assign or transfer this Agreement or any rights granted
-    hereunder without the prior written consent of Tigris Data. Tigris Data may
-    assign this Agreement without restriction.
-
-(e) Export Compliance. You agree to comply with all applicable export and import
-    laws and regulations in Your use of the Software.
-
-(f) U.S. Government Rights. If You are a U.S. Government end user, the Software is
-    a "commercial item" as defined in 48 C.F.R. 2.101, consisting of "commercial
-    computer software" and "commercial computer software documentation" as such
-    terms are used in 48 C.F.R. 12.212 and 48 C.F.R. 227.7202. The Software is
-    licensed to U.S. Government end users only as commercial items and with only
-    those rights as are granted to all other end users under this Agreement.
-
-(g) Contact Information. If You have any questions about this Agreement, please
-    contact Tigris Data at:
-
-    Tigris Data, Inc.
-    1250 Borregas Ave, #87
-    Sunnyvale, CA 94089
-    Email: legal@tigrisdata.com
-
-BY USING THE SOFTWARE, YOU ACKNOWLEDGE THAT YOU HAVE READ THIS AGREEMENT, UNDERSTAND
-IT, AND AGREE TO BE BOUND BY ITS TERMS AND CONDITIONS.
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
