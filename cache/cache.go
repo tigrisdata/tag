@@ -32,7 +32,7 @@ type Cache struct {
 // This allows tests to use an in-memory cache implementation like cacheclient.NewMemoryCache().
 func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig) *Cache {
 	ttl := int64(config.DefaultCacheTTL.Seconds())
-	enabled := true    // Default to enabled
+	enabled := true // Default to enabled
 	if cfg != nil {
 		if cfg.TTL > 0 {
 			ttl = int64(cfg.TTL.Seconds())
