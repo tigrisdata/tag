@@ -1,6 +1,6 @@
 # Contributor License Agreement
 
-Thank you for your interest in contributing to TAG (Tigris Access Gateway),
+Thank you for your interest in contributing to TAG (Tigris Acceleration Gateway),
 a project of Tigris Data, Inc. ("Tigris"). This Contributor License Agreement
 ("Agreement") documents the rights granted by contributors to Tigris. This is a
 legally binding document, so please read it carefully before agreeing to it.

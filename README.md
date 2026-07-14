@@ -1,4 +1,4 @@
-# TAG (Tigris Access Gateway)
+# TAG (Tigris Acceleration Gateway)
 
 TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigris.dev) object storage. It provides transparent caching with request coalescing to reduce upstream load and improve latency for frequently accessed objects.
 

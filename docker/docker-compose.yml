@@ -1,4 +1,4 @@
-# Docker Compose for TAG (Tigris Access Gateway)
+# Docker Compose for TAG (Tigris Acceleration Gateway)
 #
 # TAG uses embedded OCache - no separate cache server needed.
 #
