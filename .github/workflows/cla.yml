@@ -1,18 +1,6 @@
-# CLA Assistant — requires first-time contributors to sign the Contributor
-# License Agreement (docs/CLA.md) before their pull request can be merged.
-#
-# Signatures are stored in the private repo tigrisdata/cla-signatures, written by
-# the tigrisdata-argocd-bot account via the GH_BOT_ACCESS_TOKEN org secret. This
-# keeps signature commits (and contributor PII) out of this repo, and lets one
-# store serve multiple Tigris projects.
-#
-# REMAINING SETUP before this is fully enforced:
-#   1. Enforcement. This action publishes a "CLA Assistant" commit status on the
-#      PR but does not block merges by itself. Add that status as a REQUIRED
-#      status check in the branch protection rule for `main` so an unsigned CLA
-#      actually blocks the merge button.
-#
-# Contributors sign by commenting the exact phrase in `custom-pr-sign-comment`.
+# CLA Assistant — first-time contributors must sign docs/CLA.md before a PR is
+# merged. This only publishes a status; enforcement requires adding it as a
+# required check in main's branch protection.
 
 name: CLA Assistant
 
@@ -24,8 +12,8 @@ on:
 
 permissions:
   actions: write
-  # read is sufficient: signatures are written to the remote signatures repo via
-  # PERSONAL_ACCESS_TOKEN, not to this repo.
+  # read suffices: signatures are written to the remote signatures repo via the
+  # scoped token below, not to this repo.
   contents: read
   pull-requests: write
   statuses: write
@@ -33,8 +21,7 @@ permissions:
 jobs:
   cla:
     runs-on: ubuntu-latest
-    # Run on PR events, and on issue comments ONLY when the comment is on a pull
-    # request (issue_comment fires for plain issues too, which have no PR context).
+    # issue_comment also fires for plain issues; only run it for PR comments.
     if: >-
       github.event_name == 'pull_request_target' ||
       (github.event_name == 'issue_comment' &&
@@ -43,30 +30,21 @@ jobs:
         github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'))
     steps:
       - name: CLA Assistant
-        # tigrisdata/cla-action is our fork of the archived
-        # contributor-assistant/github-action (Apache-2.0), pinned to the v2.6.1
-        # commit SHA. We own the fork so we can apply security fixes and bump the
-        # action runtime (it targets node20, which GitHub is deprecating) when
-        # needed — upstream is archived and will not. Update the pinned SHA here
-        # after changes land in the fork.
+        # Org fork of the archived contributor-assistant/github-action, pinned to
+        # an immutable commit SHA.
         uses: tigrisdata/cla-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Token scoped to ONLY tigrisdata/cla-signatures (contents: write) —
-          # least privilege, so a compromise of this pull_request_target job
-          # cannot reach other repos.
+          # Scoped to only tigrisdata/cla-signatures (least privilege).
           PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_BOT_CLA_ACCESS_TOKEN }}
         with:
-          # Path within the signatures repo (on the branch below).
           path-to-signatures: 'signatures/version1/cla.json'
           path-to-document: 'https://github.com/tigrisdata/tag/blob/main/docs/CLA.md'
-          # Store signatures in the dedicated private repo, not this one.
           remote-organization-name: tigrisdata
           remote-repository-name: cla-signatures
           branch: 'main'
-          # Bots never sign. List each by its exact login — wildcards like
-          # "*[bot]" are interpreted as a regex where [bot] is a character class
-          # (matching any name ending in b, o, or t), which is incorrect.
+          # Exact logins only — a "*[bot]" wildcard becomes a regex where [bot] is
+          # a character class, which does not match bot accounts.
           allowlist: 'dependabot[bot],github-actions[bot]'
           custom-notsigned-prcomment: 'Thank you for your contribution! Before we can merge this, please sign our [Contributor License Agreement](https://github.com/tigrisdata/tag/blob/main/docs/CLA.md) by posting the comment below.'
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
