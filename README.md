@@ -16,64 +16,92 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 
 ## Quick Start
 
-### Prerequisites
-
-- Go 1.24 or later
-- Tigris account with access credentials
-
-### Developer Setup (One-Time)
-
-This project depends on private Tigris repositories. Configure Go and Git to access them:
+Install the latest release and run it against Tigris:
 
 ```bash
-# Tell Go to fetch tigrisdata repos directly (not via proxy)
-export GOPRIVATE=github.com/tigrisdata
+# Install the tag binary to /usr/local/bin and a default config to /etc/tag/config.yaml
+curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
 
-# Configure Git to use SSH for tigrisdata repos
-git config --global url."git@github.com:tigrisdata/".insteadOf "https://github.com/tigrisdata/"
-```
-
-Add the `GOPRIVATE` export to your shell profile (e.g., `~/.bashrc` or `~/.zshrc`) for persistence.
-
-### Build
-
-```bash
-make build
-```
-
-### Run
-
-```bash
-# Set credentials via environment variables
+# TAG uses its own Tigris credentials with read-only access to the buckets it caches
 export AWS_ACCESS_KEY_ID=your_access_key
 export AWS_SECRET_ACCESS_KEY=your_secret_key
 
-# Run with default configuration
-./tag
-
-# Run with debug logging
-TAG_LOG_LEVEL=debug ./tag
+# Run (transparent proxy mode by default; clients use their own credentials)
+tag --config /etc/tag/config.yaml
 ```
 
-### Test
+TAG listens on `http://localhost:8080`. Point any S3 client at it using path-style addressing — see [Usage](#usage). Prefer Docker or Kubernetes? See [Installation](#installation).
+
+## Installation
+
+### Install script (native binary)
+
+Each release publishes the install script, run script, and a matching `config.yaml` to the release bucket, so you can install without cloning the repo:
 
 ```bash
-# Run all tests
-make test
+# Latest release
+curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
 
-# Run specific package tests
-make test-auth
-make test-cache
-make test-proxy
-
-# Run with race detector
-make test-race
-
-# Run S3 compatibility tests (requires AWS credentials)
-make s3-test-local && make s3-tests
+# A specific release
+curl -fsSL https://tag-releases.t3.storage.dev/v1.10.0/install.sh | bash
 ```
 
-See [docs/s3-compatibility-testing.md](docs/s3-compatibility-testing.md) for detailed S3 compatibility testing guide.
+The script installs the `tag` binary to `/usr/local/bin` and a default config to `/etc/tag/config.yaml`.
+
+### Docker
+
+Pull and run the published image with Docker Compose:
+
+```bash
+cd deploy/docker
+docker compose -f docker-compose.release.yml up -d
+```
+
+See [docs/docker.md](docs/docker.md) for single-node and cluster setups. To build the image from source instead, use the Compose files in [`docker/`](docker/).
+
+### Kubernetes
+
+Deploy as a StatefulSet with an embedded distributed cache using the Kustomize manifests in [`deploy/kubernetes/`](deploy/kubernetes/):
+
+```bash
+kubectl apply -k deploy/kubernetes/base/
+```
+
+See [docs/deploy.md](docs/deploy.md) for the full guide.
+
+### Build from source
+
+Building TAG requires the Go toolchain and access to Tigris modules — see [Contributing](#contributing).
+
+## Usage
+
+TAG supports all S3 API endpoints supported by Tigris, including bucket operations, object operations, multipart uploads, and more. See the [Tigris S3 API documentation](https://www.tigrisdata.com/docs/api/s3/) for the complete list of supported operations.
+
+### S3 Client Usage
+
+TAG supports **path-style** S3 access only. Virtual-hosted style requests are not supported.
+
+| Style          | URL Format                         | Supported |
+| -------------- | ---------------------------------- | --------- |
+| Path-style     | `http://localhost:8080/bucket/key` | Yes       |
+| Virtual-hosted | `http://bucket.localhost:8080/key` | No        |
+
+When configuring S3 clients, ensure path-style addressing is enabled. See [docs/usage.md](docs/usage.md) for SDK-specific configuration.
+
+### Response Headers
+
+| Header    | Description                                          |
+| --------- | ---------------------------------------------------- |
+| `X-Cache` | Cache status: `HIT`, `MISS`, `BYPASS`, or `DISABLED` |
+
+### Cache Behavior
+
+- Objects larger than `size_threshold` are not cached
+- Objects with `Cache-Control: no-store` or `private` are not cached
+- Range requests trigger background fetch of full object (if within threshold)
+- PUT/DELETE operations invalidate the cache entry
+
+See [docs/cache-control.md](docs/cache-control.md) for detailed cache control and revalidation documentation.
 
 ## Configuration
 
@@ -85,6 +113,15 @@ TAG can be configured via YAML file or environment variables. Key settings:
 - `TAG_LOG_LEVEL` - Log level: debug, info, warn, error
 
 See [docs/configuration.md](docs/configuration.md) for full configuration reference.
+
+## Deployment
+
+For production, TAG ships manifests, Compose files, and guides under [`deploy/`](deploy/) and [`docs/`](docs/). The [Installation](#installation) section covers getting a single instance running; the guides below cover production concerns:
+
+- **Kubernetes** — StatefulSet, HPA, and services in [`deploy/kubernetes/`](deploy/kubernetes/); high availability, scaling, and probes in [docs/deploy.md](docs/deploy.md).
+- **Docker** — single-node and cluster Compose in [`deploy/docker/`](deploy/docker/); see [docs/docker.md](docs/docker.md).
+- **TLS/HTTPS** — see [docs/tls.md](docs/tls.md).
+- **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Architecture
 
@@ -127,56 +164,56 @@ TAG supports transparent proxy mode (default) with local SigV4 validation and pe
 
 See [docs/security.md](docs/security.md) for authentication, access control, and security architecture.
 
-## Deployment
+## Contributing
 
-TAG can be deployed to Kubernetes, Docker, or standalone mode. Deployment manifests and scripts live under [`deploy/`](deploy/):
+### Prerequisites
 
-- **Kubernetes** — Kustomize manifests in [`deploy/kubernetes/`](deploy/kubernetes/); see [docs/deploy.md](docs/deploy.md).
-- **Docker** — released-image Compose files in [`deploy/docker/`](deploy/docker/) for pulling a published `tigrisdata/tag` image; see [docs/docker.md](docs/docker.md). For local development against source, use the build-from-source Compose files in [`docker/`](docker/).
-- **Native binary** — install/run scripts in [`deploy/native/`](deploy/native/). Each release also publishes these scripts and a matching `config.yaml` next to the binaries, so you can install without cloning the repo:
+- Go 1.24 or later
+- Tigris account with access credentials (for running TAG and integration tests)
 
-  ```bash
-  # Latest release
-  curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
+All dependencies, including Tigris's [`ocache`](https://github.com/tigrisdata/ocache) modules, are public and fetched normally by the Go toolchain — no extra configuration required.
 
-  # A specific release
-  curl -fsSL https://tag-releases.t3.storage.dev/v1.10.0/install.sh | bash
-  ```
+### Build
 
-- **TLS/HTTPS** — see [docs/tls.md](docs/tls.md).
-- **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
+```bash
+make build
+```
 
-## API Reference
+### Run
 
-TAG supports all S3 API endpoints supported by Tigris, including bucket operations, object operations, multipart uploads, and more. See the [Tigris S3 API documentation](https://www.tigrisdata.com/docs/api/s3/) for the complete list of supported operations.
+```bash
+# Set credentials via environment variables
+export AWS_ACCESS_KEY_ID=your_access_key
+export AWS_SECRET_ACCESS_KEY=your_secret_key
 
-### S3 Client Usage
+# Run with default configuration
+./tag
 
-TAG supports **path-style** S3 access only. Virtual-hosted style requests are not supported.
+# Run with debug logging
+TAG_LOG_LEVEL=debug ./tag
+```
 
-| Style          | URL Format                         | Supported |
-| -------------- | ---------------------------------- | --------- |
-| Path-style     | `http://localhost:8080/bucket/key` | Yes       |
-| Virtual-hosted | `http://bucket.localhost:8080/key` | No        |
+### Test
 
-When configuring S3 clients, ensure path-style addressing is enabled. See [docs/usage.md](docs/usage.md) for SDK-specific configuration.
+```bash
+# Run all tests
+make test
 
-### Response Headers
+# Run specific package tests
+make test-auth
+make test-cache
+make test-proxy
 
-| Header    | Description                                          |
-| --------- | ---------------------------------------------------- |
-| `X-Cache` | Cache status: `HIT`, `MISS`, `BYPASS`, or `DISABLED` |
+# Run with race detector
+make test-race
 
-### Cache Behavior
+# Run S3 compatibility tests (requires AWS credentials)
+make s3-test-local && make s3-tests
+```
 
-- Objects larger than `size_threshold` are not cached
-- Objects with `Cache-Control: no-store` or `private` are not cached
-- Range requests trigger background fetch of full object (if within threshold)
-- PUT/DELETE operations invalidate the cache entry
+See [docs/s3-compatibility-testing.md](docs/s3-compatibility-testing.md) for detailed S3 compatibility testing guide.
 
-See [docs/cache-control.md](docs/cache-control.md) for detailed cache control and revalidation documentation.
-
-## Development
+### Code Quality
 
 ```bash
 # Format code
@@ -194,4 +231,6 @@ make test-coverage
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+TAG is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Contributors are required to sign the [Contributor License Agreement](docs/CLA.md).

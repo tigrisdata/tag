@@ -14,7 +14,7 @@
 - Transparent mode is default (`TAG_TRANSPARENT_PROXY` / `upstream.transparent_proxy`)
 - `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are TAG's own Tigris credentials with read-only access for all buckets (background cache fetches). Missing in transparent mode = fatal startup error.
 - Local auth enabled implicitly when transparent proxy is active
-- Endpoint validation: only `localhost`, `*.tigris.dev`, `*.storage.dev` allowed. Startup fatal on mismatch.
+- Endpoint validation: enforced only in transparent proxy mode (proxy HMAC headers are Tigris-specific) — only `localhost`, `*.tigris.dev`, `*.storage.dev` allowed, startup fatal on mismatch. Signing mode re-signs with standard SigV4 and permits any S3-compatible endpoint (`config.IsTigrisEndpoint` gates this; non-Tigris signing endpoints log a startup warning).
 
 ## Proxy Headers
 

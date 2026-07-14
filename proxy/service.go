@@ -17,9 +17,9 @@ import (
 
 const (
 	// X-Cache header constants for indicating cache status.
-	XCacheHeader   = "X-Cache"
-	XCacheHit      = "HIT"
-	XCacheMiss     = "MISS"
+	XCacheHeader      = "X-Cache"
+	XCacheHit         = "HIT"
+	XCacheMiss        = "MISS"
 	XCacheBypass      = "BYPASS"      // Cache-Control: no-store bypassed cache
 	XCacheDisabled    = "DISABLED"    // Cache is disabled
 	XCacheRevalidated = "REVALIDATED" // Object revalidated with upstream
@@ -27,12 +27,12 @@ const (
 
 // Service provides the core caching proxy logic.
 type Service struct {
-	forwarder              RequestForwarder
-	cache                  *cache.Cache
-	config                 *config.Config
-	cacheSemaphore         chan struct{}      // Bounds concurrent cache-populate operations (nil = unlimited)
-	broadcastManager       *broadcast.Manager // For streaming request coalescing
-	activeBackgroundFetches sync.Map          // Dedup for background full-object fetches (range caching)
+	forwarder               RequestForwarder
+	cache                   *cache.Cache
+	config                  *config.Config
+	cacheSemaphore          chan struct{}      // Bounds concurrent cache-populate operations (nil = unlimited)
+	broadcastManager        *broadcast.Manager // For streaming request coalescing
+	activeBackgroundFetches sync.Map           // Dedup for background full-object fetches (range caching)
 }
 
 // NewService creates a new proxy service.

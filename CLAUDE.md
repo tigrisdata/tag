@@ -49,13 +49,7 @@ TESTRUN="TestBroadcast" make test-proxy
 
 ## Developer Setup
 
-This project depends on private Go modules under `github.com/tigrisdata`. Configure Go to bypass the public module proxy (one-time setup per machine):
-
-```bash
-go env -w GOPRIVATE=github.com/tigrisdata
-```
-
-This covers all private repos under the `tigrisdata` org (e.g., `ocache`). Without this, `go mod tidy` and `go get` will fail with 404 errors from the Go module proxy. If you see such errors, check that `GOPRIVATE` is set: `go env GOPRIVATE`.
+All dependencies are public, including the Tigris `ocache` modules (`github.com/tigrisdata/ocache/*`). No `GOPRIVATE` or Git URL rewriting is required — `make build`, `go mod tidy`, and `go get` work with a stock Go toolchain.
 
 ## Core Architecture
 

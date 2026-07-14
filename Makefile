@@ -201,9 +201,9 @@ test-integration-coverage: rocksdb-static
 
 # Code quality targets
 .PHONY: lint
-lint:
+lint: rocksdb-static
 	@echo "Running go vet..."
-	go vet ./...
+	$(CGO_ENV) go vet $(BUILD_TAGS) ./...
 	@echo "Running gofmt check..."
 	@gofmt -l -d $$(find . -name '*.go')
 	@echo "Running go mod tidy..."
@@ -225,8 +225,8 @@ lint-fix:
 	go mod tidy
 
 .PHONY: vet
-vet:
-	go vet ./...
+vet: rocksdb-static
+	$(CGO_ENV) go vet $(BUILD_TAGS) ./...
 
 .PHONY: fmt
 fmt:
