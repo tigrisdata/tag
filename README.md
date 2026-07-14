@@ -71,7 +71,7 @@ See [docs/deploy.md](docs/deploy.md) for the full guide.
 
 ### Build from source
 
-Building TAG requires the Go toolchain and access to the Tigris modules — see [Contributing](#contributing).
+Building TAG requires the Go toolchain and access to Tigris modules — see [Contributing](#contributing).
 
 ## Usage
 
@@ -171,7 +171,7 @@ See [docs/security.md](docs/security.md) for authentication, access control, and
 - Go 1.24 or later
 - Tigris account with access credentials (for running TAG and integration tests)
 
-All dependencies, including the Tigris [`ocache`](https://github.com/tigrisdata/ocache) modules, are public and fetched normally by the Go toolchain — no extra configuration required.
+All dependencies, including Tigris's [`ocache`](https://github.com/tigrisdata/ocache) modules, are public and fetched normally by the Go toolchain — no extra configuration required.
 
 ### Build
 

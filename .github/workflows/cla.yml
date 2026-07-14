@@ -2,17 +2,19 @@
 # License Agreement (docs/CLA.md) before their pull request can be merged.
 #
 # SETUP REQUIRED before this is functional:
-#   1. Create a Personal Access Token (or GitHub App token) with write access to
-#      the repository chosen to store signatures, and add it as the repo secret
-#      CLA_SIGNATURES_TOKEN. The default GITHUB_TOKEN cannot push to a separate
-#      signatures repo.
-#   2. Decide where signatures are stored: either in this repo (default below) or
-#      a dedicated private repo via remote-organization-name/remote-repository-name.
-#   3. Confirm the CLA text in docs/CLA.md is finalized by legal, then remove the
-#      DRAFT banner in that file.
+#   1. Finalize docs/CLA.md with legal and remove its DRAFT banner.
+#   2. Signature storage. By default signatures are committed to THIS repo on the
+#      `main` branch (needs `contents: write`, provided below, via GITHUB_TOKEN).
+#      To keep `main` clean, store them in a dedicated repo instead: set
+#      remote-organization-name / remote-repository-name below, change
+#      `contents:` back to `read`, and provide a PAT with write access to that
+#      repo as the CLA_SIGNATURES_TOKEN secret (uncomment PERSONAL_ACCESS_TOKEN).
+#   3. Enforcement. This action publishes a "CLA Assistant" commit status on the
+#      PR but does not block merges by itself. Add that status as a REQUIRED
+#      status check in the branch protection rule for `main` so an unsigned CLA
+#      actually blocks the merge button.
 #
-# Contributors sign by commenting the exact phrase configured in
-# `custom-pr-sign-comment` on their PR.
+# Contributors sign by commenting the exact phrase in `custom-pr-sign-comment`.
 
 name: CLA Assistant
 
@@ -24,27 +26,38 @@ on:
 
 permissions:
   actions: write
-  contents: read
+  # write is required to commit signatures to this repo (default storage).
+  # Switch to `read` only if signatures are stored in a separate remote repo.
+  contents: write
   pull-requests: write
   statuses: write
 
 jobs:
   cla:
     runs-on: ubuntu-latest
+    # Run on PR events, and on issue comments ONLY when the comment is on a pull
+    # request (issue_comment fires for plain issues too, which have no PR context).
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       (github.event.comment.body == 'recheck' ||
+        github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'))
     steps:
       - name: CLA Assistant
-        if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Required to persist signatures. See SETUP above.
-          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
+          # Only needed when storing signatures in a separate remote repo:
+          # PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
         with:
           path-to-signatures: 'signatures/version1/cla.json'
           path-to-document: 'https://github.com/tigrisdata/tag/blob/main/docs/CLA.md'
           branch: 'main'
-          # Bots never sign; exempt them.
-          allowlist: 'dependabot[bot],*[bot]'
+          # Bots never sign. List each by its exact login — wildcards like
+          # "*[bot]" are interpreted as a regex where [bot] is a character class
+          # (matching any name ending in b, o, or t), which is incorrect.
+          allowlist: 'dependabot[bot],github-actions[bot]'
           custom-notsigned-prcomment: 'Thank you for your contribution! Before we can merge this, please sign our [Contributor License Agreement](https://github.com/tigrisdata/tag/blob/main/docs/CLA.md) by posting the comment below.'
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
           custom-allsigned-prcomment: 'All contributors have signed the CLA. ✅'

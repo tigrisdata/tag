@@ -24,7 +24,7 @@ Prerequisites, build, run, test, and code-quality commands are documented in the
 - Test: `make test` (and the `test-*` targets for specific packages)
 - Format & lint: `make fmt`, `make lint`, `make check`
 
-All dependencies — including the Tigris [`ocache`](https://github.com/tigrisdata/ocache)
+All dependencies — including Tigris's [`ocache`](https://github.com/tigrisdata/ocache)
 modules — are public, so a stock Go toolchain works with no extra configuration.
 
 ## Commit and pull request conventions
