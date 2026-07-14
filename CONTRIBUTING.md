@@ -1,6 +1,6 @@
 # Contributing to TAG
 
-Thanks for your interest in contributing to TAG (Tigris Access Gateway)! This
+Thanks for your interest in contributing to TAG (Tigris Acceleration Gateway)! This
 document covers how to get set up, our conventions, and the contribution
 process.
 

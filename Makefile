@@ -1,4 +1,4 @@
-# TAG (Tigris Access Gateway) Makefile
+# TAG (Tigris Acceleration Gateway) Makefile
 
 # Variables
 BINARY_NAME := tag
@@ -262,7 +262,7 @@ clean-all: clean rocksdb-static-clean
 # Help target
 .PHONY: help
 help:
-	@echo "TAG (Tigris Access Gateway) Makefile targets:"
+	@echo "TAG (Tigris Acceleration Gateway) Makefile targets:"
 	@echo ""
 	@echo "Build targets:"
 	@echo "  all             - Build the binary (default)"

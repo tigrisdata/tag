@@ -1,4 +1,4 @@
-// Package main is the entry point for TAG (Tigris Access Gateway).
+// Package main is the entry point for TAG (Tigris Acceleration Gateway).
 package main
 
 import (
@@ -49,7 +49,7 @@ func main() {
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: tag [options]\n\n")
-		fmt.Fprintf(os.Stderr, "TAG (Tigris Access Gateway) - S3-compatible caching proxy for Tigris\n\n")
+		fmt.Fprintf(os.Stderr, "TAG (Tigris Acceleration Gateway) - S3-compatible caching proxy for Tigris\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fmt.Fprintf(os.Stderr, "  --version              Print version information and exit\n")
 		fmt.Fprintf(os.Stderr, "  --config PATH          Path to YAML configuration file\n")
@@ -65,7 +65,7 @@ func main() {
 
 	// Handle --version before any config loading
 	if *showVersion {
-		fmt.Printf("TAG (Tigris Access Gateway)\n")
+		fmt.Printf("TAG (Tigris Acceleration Gateway)\n")
 		fmt.Printf("  Version:    %s\n", Version)
 		fmt.Printf("  Build Time: %s\n", BuildTime)
 		fmt.Printf("  Git Commit: %s\n", GitCommit)
@@ -169,7 +169,7 @@ func main() {
 			Str("level", cfg.Log.Level).
 			Str("format", cfg.Log.Format),
 		).
-		Msg("Starting TAG (Tigris Access Gateway)")
+		Msg("Starting TAG (Tigris Acceleration Gateway)")
 
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
