@@ -43,7 +43,7 @@ Each release publishes the install script, run script, and a matching `config.ya
 curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
 
 # A specific release
-curl -fsSL https://tag-releases.t3.storage.dev/v1.10.0/install.sh | bash
+curl -fsSL https://tag-releases.t3.storage.dev/v1.11.0/install.sh | bash
 ```
 
 The script installs the `tag` binary to `/usr/local/bin` and a default config to `/etc/tag/config.yaml`.
