@@ -1,15 +1,14 @@
 # CLA Assistant — requires first-time contributors to sign the Contributor
 # License Agreement (docs/CLA.md) before their pull request can be merged.
 #
-# SETUP REQUIRED before this is functional:
+# Signatures are stored in the private repo tigrisdata/cla-signatures, written by
+# the tigrisdata-argocd-bot account via the GH_BOT_ACCESS_TOKEN org secret. This
+# keeps signature commits (and contributor PII) out of this repo, and lets one
+# store serve multiple Tigris projects.
+#
+# REMAINING SETUP before this is fully enforced:
 #   1. Finalize docs/CLA.md with legal and remove its DRAFT banner.
-#   2. Signature storage. By default signatures are committed to THIS repo on the
-#      `main` branch (needs `contents: write`, provided below, via GITHUB_TOKEN).
-#      To keep `main` clean, store them in a dedicated repo instead: set
-#      remote-organization-name / remote-repository-name below, change
-#      `contents:` back to `read`, and provide a PAT with write access to that
-#      repo as the CLA_SIGNATURES_TOKEN secret (uncomment PERSONAL_ACCESS_TOKEN).
-#   3. Enforcement. This action publishes a "CLA Assistant" commit status on the
+#   2. Enforcement. This action publishes a "CLA Assistant" commit status on the
 #      PR but does not block merges by itself. Add that status as a REQUIRED
 #      status check in the branch protection rule for `main` so an unsigned CLA
 #      actually blocks the merge button.
@@ -26,9 +25,9 @@ on:
 
 permissions:
   actions: write
-  # write is required to commit signatures to this repo (default storage).
-  # Switch to `read` only if signatures are stored in a separate remote repo.
-  contents: write
+  # read is sufficient: signatures are written to the remote signatures repo via
+  # PERSONAL_ACCESS_TOKEN, not to this repo.
+  contents: read
   pull-requests: write
   statuses: write
 
@@ -48,11 +47,15 @@ jobs:
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Only needed when storing signatures in a separate remote repo:
-          # PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
+          # tigrisdata-argocd-bot token with write access to tigrisdata/cla-signatures.
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
         with:
+          # Path within the signatures repo (on the branch below).
           path-to-signatures: 'signatures/version1/cla.json'
           path-to-document: 'https://github.com/tigrisdata/tag/blob/main/docs/CLA.md'
+          # Store signatures in the dedicated private repo, not this one.
+          remote-organization-name: tigrisdata
+          remote-repository-name: cla-signatures
           branch: 'main'
           # Bots never sign. List each by its exact login — wildcards like
           # "*[bot]" are interpreted as a regex where [bot] is a character class
@@ -61,6 +64,3 @@ jobs:
           custom-notsigned-prcomment: 'Thank you for your contribution! Before we can merge this, please sign our [Contributor License Agreement](https://github.com/tigrisdata/tag/blob/main/docs/CLA.md) by posting the comment below.'
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
           custom-allsigned-prcomment: 'All contributors have signed the CLA. ✅'
-          # To store signatures in a dedicated repo instead of this one, set:
-          # remote-organization-name: tigrisdata
-          # remote-repository-name: cla-signatures
