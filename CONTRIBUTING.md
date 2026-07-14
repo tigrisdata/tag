@@ -22,7 +22,8 @@ Prerequisites, build, run, test, and code-quality commands are documented in the
 
 - Build: `make build`
 - Test: `make test` (and the `test-*` targets for specific packages)
-- Format & lint: `make fmt`, `make lint`, `make check`
+- Format: `make fmt`
+- Lint (matches CI): `make lint-ci` (gofmt check + `go mod tidy` check)
 
 All dependencies — including Tigris's [`ocache`](https://github.com/tigrisdata/ocache)
 modules — are public, so a stock Go toolchain works with no extra configuration.
@@ -35,7 +36,7 @@ modules — are public, so a stock Go toolchain works with no extra configuratio
   `revert` (e.g. `feat: add chunked transfer encoding support`). PR titles are
   enforced by CI.
 - **Scope.** Keep PRs focused; unrelated changes belong in separate PRs.
-- **Tests.** Add or update tests for behavior changes. `make check` must pass.
+- **Tests.** Add or update tests for behavior changes. `make lint-ci` and `make test` must pass.
 - **Docs.** Update the relevant docs under `docs/` and the README when behavior
   or configuration changes.
 
@@ -43,7 +44,7 @@ modules — are public, so a stock Go toolchain works with no extra configuratio
 
 1. Fork the repository and create a feature branch.
 2. Make your change with tests and docs.
-3. Ensure `make check` passes locally.
+3. Ensure `make lint-ci` and `make test` pass locally (these mirror CI, which also runs `make test-integration`, `make test-race`, and `make test-coverage`).
 4. Open a pull request with a Conventional Commits title and a clear
    description of the change and its motivation.
 5. Sign the CLA when prompted (first-time contributors).
