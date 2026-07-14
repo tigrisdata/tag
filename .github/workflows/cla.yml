@@ -7,8 +7,7 @@
 # store serve multiple Tigris projects.
 #
 # REMAINING SETUP before this is fully enforced:
-#   1. Finalize docs/CLA.md with legal and remove its DRAFT banner.
-#   2. Enforcement. This action publishes a "CLA Assistant" commit status on the
+#   1. Enforcement. This action publishes a "CLA Assistant" commit status on the
 #      PR but does not block merges by itself. Add that status as a REQUIRED
 #      status check in the branch protection rule for `main` so an unsigned CLA
 #      actually blocks the merge button.

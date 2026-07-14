@@ -1,11 +1,5 @@
 # Contributor License Agreement
 
-> **DRAFT — pending legal review.** This template is adapted from the Apache
-> Software Foundation Individual Contributor License Agreement. Tigris Data's
-> legal counsel must review and finalize this text (and provide a corporate CLA,
-> if needed) before it is relied upon. Do not treat this draft as final legal
-> terms.
-
 Thank you for your interest in contributing to TAG (Tigris Access Gateway),
 a project of Tigris Data, Inc. ("Tigris"). This Contributor License Agreement
 ("Agreement") documents the rights granted by contributors to Tigris. This is a
