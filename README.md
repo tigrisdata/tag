@@ -231,4 +231,6 @@ make test-coverage
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+TAG is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Contributors are required to sign the [Contributor License Agreement](docs/CLA.md).
