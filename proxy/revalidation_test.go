@@ -551,6 +551,42 @@ func TestServeFromCache_LengthMismatch_ReturnsError(t *testing.T) {
 	}
 }
 
+func TestServeStaleFromCache_LengthMismatch_FailsClosed(t *testing.T) {
+	// When upstream is unreachable, revalidateAndServe falls back to
+	// serveStaleFromCache. A torn meta/body pair (concurrent rewrite) must fail
+	// closed — return an error and commit no response — rather than serve a
+	// wrong-length body during the outage.
+	mock := &mockForwarder{}
+	cfg := config.NewDefault()
+	memCache := cacheclient.NewMemoryCache()
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	ctx := context.Background()
+	bucket, key := "b", "k"
+
+	body := []byte("original body v1")
+	meta := &cache.CachedObjectMeta{
+		Bucket:        bucket,
+		Key:           key,
+		ContentType:   "text/plain",
+		ContentLength: int64(len(body)),
+		StatusCode:    http.StatusOK,
+	}
+	_ = c.PutWithMeta(ctx, bucket, key, meta, body, 0)
+	_ = memCache.Put(ctx, cache.MakeBodyKey(bucket, key), []byte("v2"), 60)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
+	err := svc.serveStaleFromCache(ctx, w, r, bucket, key, meta, "", time.Now())
+	if err == nil {
+		t.Fatal("serveStaleFromCache() error = nil, want fail-closed on torn pair during outage")
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("body length = %d, want 0 (nothing served on mismatch)", w.Body.Len())
+	}
+}
+
 func TestRevalidation304_CacheBodyLengthMismatch_FallsThrough(t *testing.T) {
 	// Setup: mock upstream returns 304, but the cached body no longer matches
 	// the cached metadata (concurrent rewrite). Forward should be called as

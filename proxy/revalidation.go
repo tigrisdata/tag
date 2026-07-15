@@ -350,7 +350,18 @@ func (s *Service) handleRevalidation206Range(
 	return copyErr
 }
 
-// serveStaleFromCache serves stale content from cache, handling both full and range requests.
+// serveStaleFromCache serves stale content from cache when upstream is
+// unreachable (or returned an unexpected status), handling both full and range
+// requests.
+//
+// Fail-closed by design: if the cached pair is unavailable or inconsistent
+// (e.g. a torn meta/body from a concurrent rewrite, detected by the length
+// guard in serveFromCache), this returns an error and commits no response, so
+// the handler surfaces a 5xx rather than emitting a wrong-length or
+// version-skewed body during an outage. We deliberately prefer failing over
+// serving corruption; the availability cost is limited to the rare
+// torn-pair-during-outage window, which the ETag-versioned-body root fix
+// (issue #92 follow-up) removes entirely.
 func (s *Service) serveStaleFromCache(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -360,10 +371,17 @@ func (s *Service) serveStaleFromCache(
 	rangeHeader string,
 	start time.Time,
 ) error {
+	var err error
 	if rangeHeader != "" {
-		return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		err = s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+	} else {
+		err = s.serveFromCache(ctx, w, bucket, key, meta, start)
 	}
-	return s.serveFromCache(ctx, w, bucket, key, meta, start)
+	if err != nil {
+		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).
+			Msg("Stale cache serve failed during upstream outage; failing closed")
+	}
+	return err
 }
 
 // revalidateAndServeHead sends a conditional HEAD to upstream for a HEAD request.
