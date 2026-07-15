@@ -94,41 +94,32 @@ func TestETagVersionedBody_DeleteRemovesMetaNotBody(t *testing.T) {
 	}
 }
 
-// Migration window: a body written by a pre-versioning build lives at the
-// unversioned key while its metadata already carries an ETag. Reads must fall
-// back to the unversioned key so the object is still served (and, crucially, a
-// Range GET does not stream a truncated body under an already-committed 206).
-func TestETagVersionedBody_VersionedMissFallsBackToLegacyBody(t *testing.T) {
+// A versioned (non-empty ETag) read must NEVER serve bytes from the legacy
+// unversioned key. Overwrites and invalidation leave that legacy entry in place
+// until TTL, so falling back to it could return older, unrelated bytes under
+// metadata that describes a newer version. A versioned-key miss must surface as
+// ErrNotFound so the caller refetches from upstream instead of serving stale data.
+func TestETagVersionedBody_VersionedMissDoesNotServeLegacyBody(t *testing.T) {
 	c, mem := newVersioningTestCache(t)
 	ctx := context.Background()
 	bucket, key := "b", "k"
 
-	// Seed only the legacy unversioned body (as a pre-versioning build would),
-	// with no versioned body present.
-	if err := mem.Put(ctx, MakeBodyKey(bucket, key, ""), []byte("legacy-body"), 60); err != nil {
+	// Seed a stale legacy unversioned body, with no matching versioned body.
+	if err := mem.Put(ctx, MakeBodyKey(bucket, key, ""), []byte("STALE-LEGACY"), 60); err != nil {
 		t.Fatalf("seed legacy body: %v", err)
 	}
 
-	// Full-object read via the versioned ETag resolves the legacy body.
 	var buf bytes.Buffer
-	if err := c.GetBodyStream(ctx, bucket, key, `"v1"`, &buf); err != nil {
-		t.Fatalf("GetBodyStream fallback: %v", err)
+	if err := c.GetBodyStream(ctx, bucket, key, `"v1"`, &buf); err != ErrNotFound {
+		t.Errorf("GetBodyStream returned err=%v body=%q, want ErrNotFound (no legacy fallback)", err, buf.String())
 	}
-	if buf.String() != "legacy-body" {
-		t.Errorf("GetBodyStream got %q, want %q (fallback failed)", buf.String(), "legacy-body")
-	}
-
-	// Range read via the versioned ETag also resolves the legacy body.
 	buf.Reset()
-	if err := c.GetRangeStream(ctx, bucket, key, `"v1"`, 0, 5, &buf); err != nil {
-		t.Fatalf("GetRangeStream fallback: %v", err)
-	}
-	if buf.String() != "legacy" {
-		t.Errorf("GetRangeStream got %q, want %q (fallback failed)", buf.String(), "legacy")
+	if err := c.GetRangeStream(ctx, bucket, key, `"v1"`, 0, 5, &buf); err != ErrNotFound {
+		t.Errorf("GetRangeStream returned err=%v body=%q, want ErrNotFound (no legacy fallback)", err, buf.String())
 	}
 }
 
-// Objects with no ETag fall back to the unversioned body key and round-trip.
+// Objects with no ETag use the unversioned body key and round-trip.
 func TestETagVersionedBody_EmptyETagFallsBackToFixedKey(t *testing.T) {
 	c, mem := newVersioningTestCache(t)
 	ctx := context.Background()

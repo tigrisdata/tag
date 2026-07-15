@@ -103,8 +103,10 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 	// Store metadata AFTER body is complete
 	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
-		// Try to clean up body on metadata failure
-		_ = c.client.Delete(ctx, bodyKey)
+		// Leave the versioned body to age out via TTL rather than deleting it
+		// synchronously: a concurrent populate of the same ETag could have a reader
+		// streaming this exact body key, and deleting it would truncate that reader.
+		// Without a visible meta entry the orphaned body is unreachable until it expires.
 		return err
 	}
 
@@ -241,27 +243,24 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w i
 		return ErrCacheDisabled
 	}
 
-	// Try the versioned key first, then the legacy unversioned key. A NotFound
-	// from GetStream writes nothing to w, so falling through to the next candidate
-	// is safe.
-	var err error
-	for _, bodyKey := range bodyKeyCandidates(bucket, key, etag) {
-		err = c.client.GetStream(ctx, bodyKey, w)
-		if err == nil {
-			log.Debug().
-				Str("bucket", bucket).
-				Str("key", key).
-				Msg("Cache hit (body streamed)")
-			return nil
+	bodyKey := MakeBodyKey(bucket, key, etag)
+
+	// Stream body directly to writer - no intermediate buffer
+	err := c.client.GetStream(ctx, bodyKey, w)
+	if err != nil {
+		if isNotFoundError(err) {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (body stream)")
+			return ErrNotFound
 		}
-		if !isNotFoundError(err) {
-			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body stream error")
-			return err
-		}
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body stream error")
+		return err
 	}
 
-	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (body stream)")
-	return ErrNotFound
+	log.Debug().
+		Str("bucket", bucket).
+		Str("key", key).
+		Msg("Cache hit (body streamed)")
+	return nil
 }
 
 // DeleteWithMeta removes both metadata and body from cache.
@@ -316,14 +315,14 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 		return ErrCacheDisabled
 	}
 
-	candidates := bodyKeyCandidates(bucket, key, etag)
+	bodyKey := MakeBodyKey(bucket, key, etag)
 
 	// Handle ocache quirk: reading byte 0 alone requires reading 2 bytes
 	// and discarding the last byte
 	if start == 0 && end == 0 {
 		// Single byte at position 0 - need to read 2 bytes and discard last
 		var buf bytes.Buffer
-		err := c.rangeFromCandidates(ctx, candidates, 0, 1, &buf)
+		err := c.client.GetRangeStream(ctx, bodyKey, 0, 1, &buf)
 		if err != nil {
 			if isNotFoundError(err) {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
@@ -339,7 +338,7 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 	}
 
 	// ocache now uses inclusive end (same as HTTP Range semantics)
-	err := c.rangeFromCandidates(ctx, candidates, start, end, w)
+	err := c.client.GetRangeStream(ctx, bodyKey, start, end, w)
 	if err != nil {
 		if isNotFoundError(err) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
@@ -362,25 +361,6 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 		Int64("length", end-start+1).
 		Msg("Cache hit (range)")
 	return nil
-}
-
-// rangeFromCandidates reads the given byte range from the first body key that
-// exists, trying each candidate in order. A NotFound from the underlying range
-// read writes nothing to w, so falling through to the next candidate is safe.
-// It returns the underlying error from the last candidate when all miss (a
-// NotFound that the caller maps to ErrNotFound).
-func (c *Cache) rangeFromCandidates(ctx context.Context, candidates []string, start, end int64, w io.Writer) error {
-	var err error
-	for _, bodyKey := range candidates {
-		err = c.client.GetRangeStream(ctx, bodyKey, start, end, w)
-		if err == nil {
-			return nil
-		}
-		if !isNotFoundError(err) {
-			return err
-		}
-	}
-	return err
 }
 
 // ============================================================================

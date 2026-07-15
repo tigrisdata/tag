@@ -113,7 +113,13 @@ func (s *Service) handleRevalidation304(
 
 	// Serve range or full body from cache
 	if rangeHeader != "" {
-		return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		if served, err := s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start); served {
+			return err
+		}
+		// Range body not resolvable from cache; serve the full cached object
+		// instead of a truncated 206 (serveFromCache probes the body and errors
+		// cleanly if it too is gone).
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range cache body unavailable on revalidation - serving full cached object")
 	}
 	return s.serveFromCache(ctx, w, bucket, key, meta, start)
 }
@@ -349,7 +355,12 @@ func (s *Service) serveStaleFromCache(
 	start time.Time,
 ) error {
 	if rangeHeader != "" {
-		return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		if served, err := s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start); served {
+			return err
+		}
+		// Range body not resolvable from cache; serve the full cached object
+		// instead of a truncated 206.
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range cache body unavailable on stale-serve - serving full cached object")
 	}
 	return s.serveFromCache(ctx, w, bucket, key, meta, start)
 }

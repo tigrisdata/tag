@@ -124,7 +124,13 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				// serve the range from the cached object
 				if rangeHeader != "" {
 					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving range from cached full object")
-					return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+					if served, rangeErr := s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start); served {
+						return rangeErr
+					}
+					// Cached body not resolvable - forward the range to upstream and
+					// warm the full object in the background (same as a range miss).
+					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range cache body unavailable - forwarding with background cache")
+					return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start)
 				}
 
 				// Check conditional request: If-None-Match
@@ -560,6 +566,12 @@ func parseRangeHeader(rangeHeader string, totalSize int64) ([]byteRange, error) 
 }
 
 // serveRangeFromCache serves a Range request from the cached full object.
+// It returns served=true when it has produced a complete client response (a range
+// body, or a definitive error response like 416). It returns served=false, without
+// touching the response, when the cached body cannot be resolved (e.g. the body was
+// independently evicted while its metadata survived, or was written by a
+// pre-versioning build under a different key) — the caller then falls through to the
+// upstream range path rather than emitting a truncated 206.
 func (s *Service) serveRangeFromCache(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -568,15 +580,15 @@ func (s *Service) serveRangeFromCache(
 	meta *cache.CachedObjectMeta,
 	rangeHeader string,
 	startTime time.Time,
-) error {
+) (served bool, err error) {
 	// Parse Range header
-	ranges, err := parseRangeHeader(rangeHeader, meta.ContentLength)
-	if err != nil || len(ranges) == 0 {
+	ranges, parseErr := parseRangeHeader(rangeHeader, meta.ContentLength)
+	if parseErr != nil || len(ranges) == 0 {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
 		w.Header().Set(XCacheHeader, XCacheHit)
 		s3err.WriteError(w, r, s3err.ErrInvalidRange)
 		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
-		return nil
+		return true, nil
 	}
 
 	// Only support single range (multi-range is complex and rare)
@@ -586,10 +598,35 @@ func (s *Service) serveRangeFromCache(
 		w.Header().Set(XCacheHeader, XCacheHit)
 		s3err.WriteError(w, r, s3err.ErrInvalidRange)
 		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
-		return nil
+		return true, nil
 	}
 
 	rng := ranges[0]
+
+	// Probe the body BEFORE committing 206 status + headers: stream the range
+	// through a pipe and read the first byte. If the versioned body is not
+	// resolvable, no headers have been sent yet, so we report served=false and let
+	// the caller forward to upstream instead of streaming a truncated 206 that the
+	// client cannot distinguish from a valid short read.
+	pr, pw := io.Pipe()
+	go func() {
+		streamErr := s.cache.GetRangeStream(ctx, bucket, key, meta.ETag, rng.start, rng.end, pw)
+		if streamErr != nil {
+			pw.CloseWithError(streamErr)
+		} else {
+			pw.Close()
+		}
+	}()
+
+	firstByte := make([]byte, 1)
+	n, readErr := pr.Read(firstByte)
+	if readErr != nil {
+		pr.Close()
+		log.Debug().Err(readErr).Str("bucket", bucket).Str("key", key).
+			Int64("start", rng.start).Int64("end", rng.end).
+			Msg("Range cache body unavailable before headers - falling through to upstream")
+		return false, nil
+	}
 
 	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
 	w.Header().Set(XCacheHeader, XCacheHit)
@@ -597,24 +634,26 @@ func (s *Service) serveRangeFromCache(
 
 	// Stream range from cache using counting writer to track actual bytes
 	cw := &countingWriter{w: w}
-	streamErr := s.cache.GetRangeStream(ctx, bucket, key, meta.ETag, rng.start, rng.end, cw)
+	cw.Write(firstByte[:n])
+	_, copyErr := io.Copy(cw, pr)
+	pr.Close()
 
 	// Track bytes out (even on error, some bytes may have been written)
 	if cw.written > 0 {
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
 	}
 
-	if streamErr != nil {
-		log.Warn().Err(streamErr).Str("bucket", bucket).Str("key", key).
+	if copyErr != nil {
+		log.Warn().Err(copyErr).Str("bucket", bucket).Str("key", key).
 			Int64("start", rng.start).Int64("end", rng.end).
 			Msg("Failed to stream range from cache")
 		// Headers already sent, can't return error to client
-		return streamErr
+		return true, copyErr
 	}
 
 	metrics.RecordRangeFromCacheHit()
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
-	return nil
+	return true, nil
 }
 
 // handleRangeWithBackgroundCache handles a Range request on cache miss.
