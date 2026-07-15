@@ -246,6 +246,21 @@ func MakeBodyKey(bucket, key, etag string) string {
 	return bodyKeyPrefix + bucket + "|" + key + "|" + normalizeETag(etag)
 }
 
+// bodyKeyCandidates returns the body keys to try when reading, in priority order.
+// For a versioned (non-empty ETag) object it appends the legacy unversioned key as
+// a fallback: bodies written by a pre-versioning build are still on disk at the
+// unversioned key after an upgrade, while their metadata already carries an ETag.
+// Without this fallback, the first Range GET for such an object after upgrade would
+// resolve the versioned key, miss, and stream a truncated body under a committed 206
+// for the entire cache-migration window.
+func bodyKeyCandidates(bucket, key, etag string) []string {
+	versioned := MakeBodyKey(bucket, key, etag)
+	if etag == "" {
+		return []string{versioned}
+	}
+	return []string{versioned, MakeBodyKey(bucket, key, "")}
+}
+
 // MakeTombstoneKey creates the cache key for invalidation tombstones.
 func MakeTombstoneKey(bucket, key string) string {
 	return tombKeyPrefix + bucket + "|" + key

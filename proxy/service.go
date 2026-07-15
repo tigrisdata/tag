@@ -104,9 +104,10 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// this second invalidation writes a tombstone newer than that write's start
 	// time, so the tombstone-aware cache write skips the stale repopulation —
 	// restoring read-after-write semantics.
+	// The metric is recorded once on the pre-forward invalidation above; this
+	// second Delete is the same logical invalidation, so it is not counted again.
 	if err == nil && s.cache.IsEnabled() {
 		s.cache.Delete(context.Background(), bucket, key)
-		metrics.RecordCacheOperation("delete", "success")
 	}
 
 	status := "success"
@@ -140,9 +141,10 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// read-after-write reason as HandlePutObject: a GET racing the in-flight
 	// DELETE may have re-cached the not-yet-deleted object; this second
 	// tombstone blocks that stale repopulation.
+	// The metric is recorded once on the pre-forward invalidation above; this
+	// second Delete is the same logical invalidation, so it is not counted again.
 	if err == nil && s.cache.IsEnabled() {
 		s.cache.Delete(context.Background(), bucket, key)
-		metrics.RecordCacheOperation("delete", "success")
 	}
 
 	status := "success"
@@ -238,7 +240,17 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	}
 
 	// Forward to upstream
-	return s.forwarder.Forward(r.Context(), w, r)
+	err := s.forwarder.Forward(r.Context(), w, r)
+
+	// Re-invalidate the destination AFTER upstream confirms the copy, for the same
+	// read-after-write reason as HandlePutObject: a GET racing the in-flight copy
+	// may have re-cached the pre-copy destination object; this second tombstone
+	// blocks that stale repopulation.
+	if err == nil && s.cache.IsEnabled() {
+		s.cache.Delete(context.Background(), bucket, key)
+	}
+
+	return err
 }
 
 // HandlePassthrough handles requests that are passed through without caching.

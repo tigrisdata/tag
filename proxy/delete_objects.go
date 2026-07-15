@@ -46,12 +46,14 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 
 	// Parse request to get keys being deleted and invalidate cache BEFORE forwarding
 	// This ensures cache consistency even if forwarding fails after cache invalidation
+	var deletedKeys []string
 	if s.cache.IsEnabled() {
 		var deleteReq deleteObjectsRequest
 		if xmlErr := xml.Unmarshal(bodyBytes, &deleteReq); xmlErr == nil {
 			for _, obj := range deleteReq.Objects {
 				s.cache.Delete(context.Background(), bucket, obj.Key)
 				metrics.RecordCacheOperation("delete", "success")
+				deletedKeys = append(deletedKeys, obj.Key)
 				log.Debug().
 					Str("bucket", bucket).
 					Str("key", obj.Key).
@@ -62,6 +64,17 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 
 	// Forward request to upstream
 	err = s.forwarder.Forward(r.Context(), w, r)
+
+	// Re-invalidate AFTER upstream confirms the deletes, for the same
+	// read-after-write reason as HandleDeleteObject: a GET racing the in-flight
+	// bulk delete may have re-cached a not-yet-deleted object; this second
+	// tombstone blocks that stale repopulation. The metric is recorded once on
+	// the pre-forward invalidation above, so it is not counted again here.
+	if err == nil && s.cache.IsEnabled() {
+		for _, key := range deletedKeys {
+			s.cache.Delete(context.Background(), bucket, key)
+		}
+	}
 
 	// Record metrics
 	status := "success"

@@ -167,14 +167,19 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 			Int64("tombstone_ts", tombTs).
 			Int64("write_start", writeStartTime).
 			Msg("Skipping meta write - tombstone detected after body stream")
-		_ = c.client.Delete(ctx, bodyKey) // Clean up orphaned body
+		// The just-written versioned body is left to age out via TTL rather than
+		// deleted synchronously: a concurrent populate of the same ETag could have
+		// a reader streaming this exact body key, and deleting it would truncate
+		// that reader. Without a visible meta entry the orphaned body is unreachable
+		// and harmless until it expires.
 		return nil
 	}
 
 	// Write metadata AFTER body (makes entry visible)
 	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
-		_ = c.client.Delete(ctx, bodyKey)
+		// Same rationale as the tombstone branch: leave the versioned body to TTL
+		// rather than risk truncating a concurrent same-version reader.
 		return err
 	}
 
@@ -236,24 +241,27 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w i
 		return ErrCacheDisabled
 	}
 
-	bodyKey := MakeBodyKey(bucket, key, etag)
-
-	// Stream body directly to writer - no intermediate buffer
-	err := c.client.GetStream(ctx, bodyKey, w)
-	if err != nil {
-		if isNotFoundError(err) {
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (body stream)")
-			return ErrNotFound
+	// Try the versioned key first, then the legacy unversioned key. A NotFound
+	// from GetStream writes nothing to w, so falling through to the next candidate
+	// is safe.
+	var err error
+	for _, bodyKey := range bodyKeyCandidates(bucket, key, etag) {
+		err = c.client.GetStream(ctx, bodyKey, w)
+		if err == nil {
+			log.Debug().
+				Str("bucket", bucket).
+				Str("key", key).
+				Msg("Cache hit (body streamed)")
+			return nil
 		}
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body stream error")
-		return err
+		if !isNotFoundError(err) {
+			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body stream error")
+			return err
+		}
 	}
 
-	log.Debug().
-		Str("bucket", bucket).
-		Str("key", key).
-		Msg("Cache hit (body streamed)")
-	return nil
+	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (body stream)")
+	return ErrNotFound
 }
 
 // DeleteWithMeta removes both metadata and body from cache.
@@ -308,14 +316,14 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 		return ErrCacheDisabled
 	}
 
-	bodyKey := MakeBodyKey(bucket, key, etag)
+	candidates := bodyKeyCandidates(bucket, key, etag)
 
 	// Handle ocache quirk: reading byte 0 alone requires reading 2 bytes
 	// and discarding the last byte
 	if start == 0 && end == 0 {
 		// Single byte at position 0 - need to read 2 bytes and discard last
 		var buf bytes.Buffer
-		err := c.client.GetRangeStream(ctx, bodyKey, 0, 1, &buf)
+		err := c.rangeFromCandidates(ctx, candidates, 0, 1, &buf)
 		if err != nil {
 			if isNotFoundError(err) {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
@@ -331,7 +339,7 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 	}
 
 	// ocache now uses inclusive end (same as HTTP Range semantics)
-	err := c.client.GetRangeStream(ctx, bodyKey, start, end, w)
+	err := c.rangeFromCandidates(ctx, candidates, start, end, w)
 	if err != nil {
 		if isNotFoundError(err) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
@@ -354,6 +362,25 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 		Int64("length", end-start+1).
 		Msg("Cache hit (range)")
 	return nil
+}
+
+// rangeFromCandidates reads the given byte range from the first body key that
+// exists, trying each candidate in order. A NotFound from the underlying range
+// read writes nothing to w, so falling through to the next candidate is safe.
+// It returns the underlying error from the last candidate when all miss (a
+// NotFound that the caller maps to ErrNotFound).
+func (c *Cache) rangeFromCandidates(ctx context.Context, candidates []string, start, end int64, w io.Writer) error {
+	var err error
+	for _, bodyKey := range candidates {
+		err = c.client.GetRangeStream(ctx, bodyKey, start, end, w)
+		if err == nil {
+			return nil
+		}
+		if !isNotFoundError(err) {
+			return err
+		}
+	}
+	return err
 }
 
 // ============================================================================
