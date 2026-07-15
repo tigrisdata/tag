@@ -68,36 +68,12 @@ func (c *Cache) IsEnabled() bool {
 // IMPORTANT: Body is written BEFORE metadata to ensure metadata presence
 // guarantees body availability. This prevents race conditions where a reader
 // finds metadata but body hasn't been written yet.
-// currentBodyETag returns the ETag of the currently-cached metadata for the key
-// and whether such metadata exists. Used to locate a superseded body version for
-// eviction on overwrite.
-func (c *Cache) currentBodyETag(ctx context.Context, bucket, key string) (string, bool) {
-	m, ok, _ := c.GetMeta(ctx, bucket, key)
-	if !ok {
-		return "", false
-	}
-	return m.ETag, true
-}
-
-// evictSupersededBody deletes the body of a previously cached version once a new
-// version with a different ETag has been committed, bounding disk usage for keys
-// that are rewritten frequently. It runs after the new meta+body are live, so new
-// readers already resolve to the new version; an in-flight reader that resolved
-// the old meta reads its body via an atomic Get and therefore either completes
-// before this delete or cleanly misses and falls through to upstream.
-func (c *Cache) evictSupersededBody(ctx context.Context, bucket, key, prevETag string, hadPrev bool, newETag string) {
-	if !hadPrev {
-		return
-	}
-	prevBodyKey := MakeBodyKey(bucket, key, prevETag)
-	if prevBodyKey == MakeBodyKey(bucket, key, newETag) {
-		return // same ETag — body was overwritten in place, nothing to evict
-	}
-	if err := c.client.Delete(ctx, prevBodyKey); err != nil && !isNotFoundError(err) {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Failed to evict superseded body")
-	}
-}
-
+// Body lifecycle note: bodies are addressed by ETag and are never deleted
+// synchronously (not on overwrite, not on invalidation). Each version is an
+// immutable entry that ages out via TTL, so a reader that resolved a given
+// metadata version always finds its exact body — no delete-during-read can
+// truncate an in-flight response. Invalidation removes only the metadata (plus a
+// tombstone), which is enough to make subsequent reads miss and refetch.
 func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *CachedObjectMeta, body []byte, ttl int) error {
 	if !c.IsEnabled() {
 		return nil
@@ -106,10 +82,6 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 	if ttl == 0 {
 		ttl = int(c.defaultTTL)
 	}
-
-	// Capture the currently-cached version's ETag (if any) so we can evict its
-	// body after the new version is committed — see evictSupersededBody.
-	prevETag, hadPrev := c.currentBodyETag(ctx, bucket, key)
 
 	metaKey := MakeMetaKey(bucket, key)
 	bodyKey := MakeBodyKey(bucket, key, meta.ETag)
@@ -135,8 +107,6 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 		_ = c.client.Delete(ctx, bodyKey)
 		return err
 	}
-
-	c.evictSupersededBody(ctx, bucket, key, prevETag, hadPrev, meta.ETag)
 
 	log.Debug().
 		Str("bucket", bucket).
@@ -169,8 +139,6 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 	if ttl == 0 {
 		ttl = int(c.defaultTTL)
 	}
-
-	prevETag, hadPrev := c.currentBodyETag(ctx, bucket, key)
 
 	metaKey := MakeMetaKey(bucket, key)
 	bodyKey := MakeBodyKey(bucket, key, meta.ETag)
@@ -209,8 +177,6 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		_ = c.client.Delete(ctx, bodyKey)
 		return err
 	}
-
-	c.evictSupersededBody(ctx, bucket, key, prevETag, hadPrev, meta.ETag)
 
 	log.Debug().
 		Str("bucket", bucket).
@@ -305,23 +271,17 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 
 	metaKey := MakeMetaKey(bucket, key)
 
-	// Resolve the current version's body key from meta before deleting meta, so
-	// we can reclaim the matching body. Older superseded body versions (if any)
-	// are orphaned and age out via TTL.
-	etag, _ := c.currentBodyETag(ctx, bucket, key)
-	bodyKey := MakeBodyKey(bucket, key, etag)
-
-	// Delete metadata (ignore not found)
+	// Delete only the metadata. That is sufficient to make subsequent reads miss
+	// (a read resolves the body from meta.ETag, so with meta gone there is no body
+	// lookup), and the tombstone above blocks any in-flight repopulation. The
+	// versioned body is intentionally left to age out via TTL rather than deleted
+	// synchronously — deleting it could truncate an in-flight reader still
+	// streaming that exact version.
 	if err := c.client.Delete(ctx, metaKey); err != nil && !isNotFoundError(err) {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta delete error")
 	}
 
-	// Delete body (ignore not found)
-	if err := c.client.Delete(ctx, bodyKey); err != nil && !isNotFoundError(err) {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body delete error")
-	}
-
-	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Deleted from cache (meta+body)")
+	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidated cache metadata (body ages out via TTL)")
 	return nil
 }
 

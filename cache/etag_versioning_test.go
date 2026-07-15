@@ -44,8 +44,10 @@ func TestETagVersionedBody_MetaResolvesToItsOwnBody(t *testing.T) {
 	}
 }
 
-// Overwriting a key with a new ETag eagerly evicts the superseded body.
-func TestETagVersionedBody_EagerEvictionOnOverwrite(t *testing.T) {
+// Bodies are never deleted synchronously: after an overwrite, the superseded
+// version's body still exists (it ages out via TTL), so an in-flight reader that
+// resolved the old meta can still stream it without truncation.
+func TestETagVersionedBody_VersionsCoexistUntilTTL(t *testing.T) {
 	c, _ := newVersioningTestCache(t)
 	ctx := context.Background()
 	bucket, key := "b", "k"
@@ -55,15 +57,40 @@ func TestETagVersionedBody_EagerEvictionOnOverwrite(t *testing.T) {
 	meta2 := &CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"v2"`, ContentLength: 2, StatusCode: 200}
 	_ = c.PutWithMeta(ctx, bucket, key, meta2, []byte("v2"), 60)
 
-	// Superseded v1 body is gone.
+	// Both versions' bodies remain readable — the old one is not evicted.
 	var buf bytes.Buffer
-	if err := c.GetBodyStream(ctx, bucket, key, `"v1"`, &buf); err != ErrNotFound {
-		t.Errorf("v1 body after overwrite: err=%v, want ErrNotFound (evicted)", err)
+	if err := c.GetBodyStream(ctx, bucket, key, `"v1"`, &buf); err != nil || buf.String() != "v1" {
+		t.Errorf("v1 body after overwrite: err=%v body=%q, want it to still exist", err, buf.String())
 	}
-	// Current v2 body is served.
 	buf.Reset()
 	if err := c.GetBodyStream(ctx, bucket, key, `"v2"`, &buf); err != nil || buf.String() != "v2" {
 		t.Errorf("v2 body: err=%v body=%q", err, buf.String())
+	}
+}
+
+// Invalidation removes only metadata; the body is left to age out via TTL so it
+// cannot truncate an in-flight reader still streaming that version.
+func TestETagVersionedBody_DeleteRemovesMetaNotBody(t *testing.T) {
+	c, _ := newVersioningTestCache(t)
+	ctx := context.Background()
+	bucket, key := "b", "k"
+
+	meta := &CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"v1"`, ContentLength: 2, StatusCode: 200}
+	_ = c.PutWithMeta(ctx, bucket, key, meta, []byte("v1"), 60)
+
+	if err := c.DeleteWithMeta(ctx, bucket, key); err != nil {
+		t.Fatalf("DeleteWithMeta: %v", err)
+	}
+
+	// Meta is gone -> reads miss.
+	if _, ok, _ := c.GetMeta(ctx, bucket, key); ok {
+		t.Error("meta still present after DeleteWithMeta")
+	}
+	// Body still resolvable by its ETag (ages out via TTL) — a reader that
+	// resolved this version before the invalidation is not truncated.
+	var buf bytes.Buffer
+	if err := c.GetBodyStream(ctx, bucket, key, `"v1"`, &buf); err != nil || buf.String() != "v1" {
+		t.Errorf("body after DeleteWithMeta: err=%v body=%q, want it to survive", err, buf.String())
 	}
 }
 
