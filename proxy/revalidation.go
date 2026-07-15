@@ -239,7 +239,13 @@ func (s *Service) serveFromCache(
 		bodyBuf.Reset()
 
 		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, bodyBuf)
-		if bodyErr == nil && bodyBuf.Len() > 0 {
+		// Serve only if the body length matches the metadata's Content-Length.
+		// Meta and body are separate cache entries with no atomicity between
+		// them, so a concurrent overwrite/delete of a hot key can pair one
+		// version's metadata with another version's body. Serving that pair
+		// emits a wrong Content-Length (truncated or over-read response), so
+		// treat any mismatch as a cache miss and fall through to upstream.
+		if bodyErr == nil && int64(bodyBuf.Len()) == meta.ContentLength {
 			metrics.RecordCacheHit()
 			meta.WriteHeaders(w)
 			w.Header().Set(XCacheHeader, XCacheHit)
@@ -250,12 +256,18 @@ func (s *Service) serveFromCache(
 			putBuffer(bodyBuf)
 			return nil
 		}
+		bodyLen := bodyBuf.Len()
 		putBuffer(bodyBuf)
-		// Body unavailable — return error (caller may fall through to upstream)
+		// Body unavailable or inconsistent — return error (caller may fall
+		// through to upstream)
 		if bodyErr != nil {
 			return fmt.Errorf("cache body read failed: %w", bodyErr)
 		}
-		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
+		if bodyLen == 0 {
+			return fmt.Errorf("cache body empty for %s/%s", bucket, key)
+		}
+		return fmt.Errorf("cache body length mismatch for %s/%s: meta says %d, body is %d",
+			bucket, key, meta.ContentLength, bodyLen)
 	}
 
 	// Large objects: stream via pipe

@@ -507,6 +507,111 @@ func TestServeFromCache_SmallObject(t *testing.T) {
 	}
 }
 
+func TestServeFromCache_LengthMismatch_ReturnsError(t *testing.T) {
+	// A concurrent overwrite of a hot key can pair one version's metadata with
+	// another version's body (meta and body are separate cache entries).
+	// serveFromCache must detect the mismatch and return an error instead of
+	// serving a truncated/over-read response with the wrong Content-Length.
+	mock := &mockForwarder{}
+	cfg := config.NewDefault()
+	memCache := cacheclient.NewMemoryCache()
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	ctx := context.Background()
+	bucket, key := "b", "k"
+
+	// Cache a consistent meta+body pair, then overwrite the body key with a
+	// different-length payload to simulate a concurrent rewrite of the object.
+	body := []byte("original body v1")
+	meta := &cache.CachedObjectMeta{
+		Bucket:        bucket,
+		Key:           key,
+		ContentType:   "text/plain",
+		ContentLength: int64(len(body)),
+		StatusCode:    http.StatusOK,
+	}
+	_ = c.PutWithMeta(ctx, bucket, key, meta, body, 0)
+	_ = memCache.Put(ctx, cache.MakeBodyKey(bucket, key), []byte("v2"), 60)
+
+	w := httptest.NewRecorder()
+	err := svc.serveFromCache(ctx, w, bucket, key, meta, time.Now())
+	if err == nil {
+		t.Fatal("serveFromCache() error = nil, want length-mismatch error")
+	}
+	if !strings.Contains(err.Error(), "length mismatch") {
+		t.Errorf("error = %q, want it to mention length mismatch", err.Error())
+	}
+	// No response must be committed so the caller can fall through to upstream.
+	if w.Body.Len() != 0 {
+		t.Errorf("body length = %d, want 0 (nothing written on mismatch)", w.Body.Len())
+	}
+	if got := w.Header().Get("Content-Length"); got != "" {
+		t.Errorf("Content-Length = %q, want unset on mismatch", got)
+	}
+}
+
+func TestRevalidation304_CacheBodyLengthMismatch_FallsThrough(t *testing.T) {
+	// Setup: mock upstream returns 304, but the cached body no longer matches
+	// the cached metadata (concurrent rewrite). Forward should be called as
+	// fallback to serve fresh content instead of a truncated body.
+	freshBody := "fresh from upstream"
+	mock := &mockForwarder{
+		conditionalResp: &http.Response{
+			StatusCode: http.StatusNotModified,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     http.Header{},
+		},
+		forwardFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(freshBody))
+			return nil
+		},
+	}
+
+	cfg := config.NewDefault()
+	memCache := cacheclient.NewMemoryCache()
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	ctx := context.Background()
+	bucket, key := "test-bucket", "test-key"
+
+	meta := &cache.CachedObjectMeta{
+		Bucket:        bucket,
+		Key:           key,
+		ETag:          `"abc123"`,
+		ContentType:   "text/plain",
+		ContentLength: 12,
+		StatusCode:    http.StatusOK,
+	}
+	_ = c.PutWithMeta(ctx, bucket, key, meta, []byte("hello world!"), 0)
+
+	// Overwrite only the body key with a shorter payload to simulate a
+	// concurrent rewrite racing this read.
+	_ = memCache.Put(ctx, cache.MakeBodyKey(bucket, key), []byte("short"), 60)
+
+	// Execute revalidation — should fall through to Forward
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
+	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now())
+	if err != nil {
+		t.Fatalf("revalidateAndServe() error = %v (expected fallback to upstream)", err)
+	}
+
+	// Verify: fresh response from upstream, not the mismatched cached pair
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get(XCacheHeader); got != XCacheMiss {
+		t.Errorf("X-Cache = %q, want %q (upstream fallback)", got, XCacheMiss)
+	}
+	if w.Body.String() != freshBody {
+		t.Errorf("body = %q, want %q", w.Body.String(), freshBody)
+	}
+}
+
 func TestRevalidationRange304_ServesCachedRange(t *testing.T) {
 	// Setup: mock upstream returns 304 Not Modified (object unchanged)
 	mock := &mockForwarder{
