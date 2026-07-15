@@ -99,6 +99,16 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// Forward to Tigris
 	err := s.forwarder.Forward(r.Context(), w, r)
 
+	// Re-invalidate AFTER upstream confirms the write. A GET that raced the
+	// in-flight PUT may have fetched the pre-PUT object and begun re-caching it;
+	// this second invalidation writes a tombstone newer than that write's start
+	// time, so the tombstone-aware cache write skips the stale repopulation —
+	// restoring read-after-write semantics.
+	if err == nil && s.cache.IsEnabled() {
+		s.cache.Delete(context.Background(), bucket, key)
+		metrics.RecordCacheOperation("delete", "success")
+	}
+
 	status := "success"
 	if err != nil {
 		status = "error"
@@ -125,6 +135,15 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 
 	// Forward to upstream
 	err := s.forwarder.Forward(r.Context(), w, r)
+
+	// Re-invalidate AFTER upstream confirms the delete, for the same
+	// read-after-write reason as HandlePutObject: a GET racing the in-flight
+	// DELETE may have re-cached the not-yet-deleted object; this second
+	// tombstone blocks that stale repopulation.
+	if err == nil && s.cache.IsEnabled() {
+		s.cache.Delete(context.Background(), bucket, key)
+		metrics.RecordCacheOperation("delete", "success")
+	}
 
 	status := "success"
 	if err != nil {

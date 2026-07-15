@@ -233,9 +233,17 @@ func MakeMetaKey(bucket, key string) string {
 	return metaKeyPrefix + bucket + "|" + key
 }
 
-// MakeBodyKey creates the cache key for object body.
-func MakeBodyKey(bucket, key string) string {
-	return bodyKeyPrefix + bucket + "|" + key
+// MakeBodyKey creates the cache key for an object body. Bodies are addressed by
+// the object's ETag ("body|bucket|key|<etag>") so a served metadata entry always
+// maps to the exact body version it describes: a concurrent overwrite writes a
+// new meta plus a new body key and never clobbers the version an in-flight reader
+// resolved. Objects with no ETag fall back to the unversioned key (there is no
+// version discriminator available for them).
+func MakeBodyKey(bucket, key, etag string) string {
+	if etag == "" {
+		return bodyKeyPrefix + bucket + "|" + key
+	}
+	return bodyKeyPrefix + bucket + "|" + key + "|" + normalizeETag(etag)
 }
 
 // MakeTombstoneKey creates the cache key for invalidation tombstones.

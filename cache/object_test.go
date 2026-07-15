@@ -177,10 +177,15 @@ func TestMakeMetaKey(t *testing.T) {
 }
 
 func TestMakeBodyKey(t *testing.T) {
+	// No ETag falls back to the unversioned key.
 	expected := "body|my-bucket|path/to/object.txt"
-	result := MakeBodyKey("my-bucket", "path/to/object.txt")
+	result := MakeBodyKey("my-bucket", "path/to/object.txt", "")
 	if result != expected {
 		t.Errorf("MakeBodyKey() = %q, want %q", result, expected)
+	}
+	// With an ETag the body key is version-qualified (quotes/weak prefix stripped).
+	if got := MakeBodyKey("my-bucket", "path/to/object.txt", `"abc123"`); got != "body|my-bucket|path/to/object.txt|abc123" {
+		t.Errorf("MakeBodyKey(etag) = %q, want %q", got, "body|my-bucket|path/to/object.txt|abc123")
 	}
 }
 

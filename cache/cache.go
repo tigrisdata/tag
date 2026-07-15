@@ -68,6 +68,36 @@ func (c *Cache) IsEnabled() bool {
 // IMPORTANT: Body is written BEFORE metadata to ensure metadata presence
 // guarantees body availability. This prevents race conditions where a reader
 // finds metadata but body hasn't been written yet.
+// currentBodyETag returns the ETag of the currently-cached metadata for the key
+// and whether such metadata exists. Used to locate a superseded body version for
+// eviction on overwrite.
+func (c *Cache) currentBodyETag(ctx context.Context, bucket, key string) (string, bool) {
+	m, ok, _ := c.GetMeta(ctx, bucket, key)
+	if !ok {
+		return "", false
+	}
+	return m.ETag, true
+}
+
+// evictSupersededBody deletes the body of a previously cached version once a new
+// version with a different ETag has been committed, bounding disk usage for keys
+// that are rewritten frequently. It runs after the new meta+body are live, so new
+// readers already resolve to the new version; an in-flight reader that resolved
+// the old meta reads its body via an atomic Get and therefore either completes
+// before this delete or cleanly misses and falls through to upstream.
+func (c *Cache) evictSupersededBody(ctx context.Context, bucket, key, prevETag string, hadPrev bool, newETag string) {
+	if !hadPrev {
+		return
+	}
+	prevBodyKey := MakeBodyKey(bucket, key, prevETag)
+	if prevBodyKey == MakeBodyKey(bucket, key, newETag) {
+		return // same ETag — body was overwritten in place, nothing to evict
+	}
+	if err := c.client.Delete(ctx, prevBodyKey); err != nil && !isNotFoundError(err) {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Failed to evict superseded body")
+	}
+}
+
 func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *CachedObjectMeta, body []byte, ttl int) error {
 	if !c.IsEnabled() {
 		return nil
@@ -77,8 +107,12 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 		ttl = int(c.defaultTTL)
 	}
 
+	// Capture the currently-cached version's ETag (if any) so we can evict its
+	// body after the new version is committed — see evictSupersededBody.
+	prevETag, hadPrev := c.currentBodyETag(ctx, bucket, key)
+
 	metaKey := MakeMetaKey(bucket, key)
-	bodyKey := MakeBodyKey(bucket, key)
+	bodyKey := MakeBodyKey(bucket, key, meta.ETag)
 
 	// Encode metadata as JSON
 	metaBytes, err := meta.Encode()
@@ -101,6 +135,8 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 		_ = c.client.Delete(ctx, bodyKey)
 		return err
 	}
+
+	c.evictSupersededBody(ctx, bucket, key, prevETag, hadPrev, meta.ETag)
 
 	log.Debug().
 		Str("bucket", bucket).
@@ -134,8 +170,10 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		ttl = int(c.defaultTTL)
 	}
 
+	prevETag, hadPrev := c.currentBodyETag(ctx, bucket, key)
+
 	metaKey := MakeMetaKey(bucket, key)
-	bodyKey := MakeBodyKey(bucket, key)
+	bodyKey := MakeBodyKey(bucket, key, meta.ETag)
 
 	// Encode metadata first (fail fast if encoding fails)
 	metaBytes, err := meta.Encode()
@@ -171,6 +209,8 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		_ = c.client.Delete(ctx, bodyKey)
 		return err
 	}
+
+	c.evictSupersededBody(ctx, bucket, key, prevETag, hadPrev, meta.ETag)
 
 	log.Debug().
 		Str("bucket", bucket).
@@ -222,14 +262,15 @@ func (c *Cache) GetMeta(ctx context.Context, bucket, key string) (*CachedObjectM
 
 // GetBodyStream streams the cached object body directly to the provided writer.
 // This avoids buffering the entire object in memory, which is critical for large objects.
-// Use this after GetMeta() to stream the body directly to the HTTP response.
-// Returns ErrNotFound if the body is not in cache.
-func (c *Cache) GetBodyStream(ctx context.Context, bucket, key string, w io.Writer) error {
+// Use this after GetMeta(), passing the meta's ETag so the body read resolves to
+// the exact version the metadata describes. Returns ErrNotFound if the body for
+// that version is not in cache.
+func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w io.Writer) error {
 	if !c.IsEnabled() {
 		return ErrCacheDisabled
 	}
 
-	bodyKey := MakeBodyKey(bucket, key)
+	bodyKey := MakeBodyKey(bucket, key, etag)
 
 	// Stream body directly to writer - no intermediate buffer
 	err := c.client.GetStream(ctx, bodyKey, w)
@@ -263,7 +304,12 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	}
 
 	metaKey := MakeMetaKey(bucket, key)
-	bodyKey := MakeBodyKey(bucket, key)
+
+	// Resolve the current version's body key from meta before deleting meta, so
+	// we can reclaim the matching body. Older superseded body versions (if any)
+	// are orphaned and age out via TTL.
+	etag, _ := c.currentBodyETag(ctx, bucket, key)
+	bodyKey := MakeBodyKey(bucket, key, etag)
 
 	// Delete metadata (ignore not found)
 	if err := c.client.Delete(ctx, metaKey); err != nil && !isNotFoundError(err) {
@@ -295,13 +341,14 @@ func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
 // GetRangeStream retrieves a byte range from the cached object body.
 // Uses ocache's GetRangeStream for efficient partial reads from disk.
 // start and end are inclusive byte positions (HTTP Range semantics).
+// Pass the meta's ETag so the range resolves to the exact cached version.
 // Returns ErrNotFound if the object is not in cache.
-func (c *Cache) GetRangeStream(ctx context.Context, bucket, key string, start, end int64, w io.Writer) error {
+func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, start, end int64, w io.Writer) error {
 	if !c.IsEnabled() {
 		return ErrCacheDisabled
 	}
 
-	bodyKey := MakeBodyKey(bucket, key)
+	bodyKey := MakeBodyKey(bucket, key, etag)
 
 	// Handle ocache quirk: reading byte 0 alone requires reading 2 bytes
 	// and discarding the last byte

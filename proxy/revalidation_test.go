@@ -703,7 +703,7 @@ func TestRevalidation304_CacheBodyUnavailable_FallsThrough(t *testing.T) {
 	_ = c.PutWithMeta(ctx, bucket, key, meta, []byte("hello world!"), 0)
 
 	// Delete only the body key to simulate cache body eviction
-	_ = memCache.Delete(ctx, cache.MakeBodyKey(bucket, key))
+	_ = memCache.Delete(ctx, cache.MakeBodyKey(bucket, key, meta.ETag))
 
 	// Execute revalidation — should fall through to Forward
 	w := httptest.NewRecorder()

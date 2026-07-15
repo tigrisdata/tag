@@ -597,7 +597,7 @@ func (s *Service) serveRangeFromCache(
 
 	// Stream range from cache using counting writer to track actual bytes
 	cw := &countingWriter{w: w}
-	streamErr := s.cache.GetRangeStream(ctx, bucket, key, rng.start, rng.end, cw)
+	streamErr := s.cache.GetRangeStream(ctx, bucket, key, meta.ETag, rng.start, rng.end, cw)
 
 	// Track bytes out (even on error, some bytes may have been written)
 	if cw.written > 0 {

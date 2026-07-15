@@ -238,7 +238,7 @@ func (s *Service) serveFromCache(
 		bodyBuf := bufferPool.Get().(*bytes.Buffer)
 		bodyBuf.Reset()
 
-		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, bodyBuf)
+		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.ETag, bodyBuf)
 		if bodyErr == nil && bodyBuf.Len() > 0 {
 			metrics.RecordCacheHit()
 			meta.WriteHeaders(w)
@@ -261,7 +261,7 @@ func (s *Service) serveFromCache(
 	// Large objects: stream via pipe
 	pr, pw := io.Pipe()
 	go func() {
-		err := s.cache.GetBodyStream(ctx, bucket, key, pw)
+		err := s.cache.GetBodyStream(ctx, bucket, key, meta.ETag, pw)
 		if err != nil {
 			pw.CloseWithError(err)
 		} else {
