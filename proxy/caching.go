@@ -295,10 +295,12 @@ func (s *Service) fetchFullObjectToCache(
 	// limit is meant to relieve. errCachePopulateDeclined distinguishes this
 	// deliberate skip from a real fetch success/failure for the caller's metrics.
 	// Background fetches warm the full object and the size isn't known until the
-	// response arrives, so reserve the per-populate buffer ceiling up front. This
-	// is what throttles a burst of large-object warms to keep buffered memory
-	// bounded (small objects, cached inline, reserve their actual size instead).
-	weight := s.perPopulateCap
+	// response arrives, so reserve the per-populate buffer ceiling up front (via
+	// populateWeight, which clamps to the budget so warming still runs — one at a
+	// time — when the budget is smaller than the ceiling). This throttles a burst of
+	// large-object warms to keep buffered memory bounded (small objects, cached
+	// inline, reserve their actual size instead).
+	weight := s.populateWeight(-1)
 	if !s.acquireCacheSlot(weight) {
 		metrics.CachePopulateSkipped.Inc()
 		return errCachePopulateDeclined

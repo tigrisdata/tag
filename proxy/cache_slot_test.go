@@ -118,6 +118,36 @@ func TestPopulateWeight(t *testing.T) {
 	}
 }
 
+// TestService_BackgroundReservationClampedToBudget guards against the background
+// path reserving the raw ceiling: when the budget is smaller than the per-populate
+// ceiling, a background populate (unknown size) must still admit — one at a time —
+// via populateWeight's budget clamp, not fail admission entirely.
+func TestService_BackgroundReservationClampedToBudget(t *testing.T) {
+	const budget = 8 << 20 // 8MB budget, below the 80MB ceiling
+	s := &Service{
+		cacheSemaphore: make(chan struct{}, 256),
+		populateBudget: newByteBudget(budget),
+		perPopulateCap: 80 << 20,
+		config:         &config.Config{},
+	}
+	s.config.Cache.MaxPopulateMemoryBytes = budget
+
+	w := s.populateWeight(-1) // what fetchFullObjectToCache reserves
+	if w != budget {
+		t.Fatalf("populateWeight(-1) = %d, want %d (clamped to budget)", w, budget)
+	}
+	if !s.acquireCacheSlot(w) {
+		t.Fatal("background populate should admit one-at-a-time when budget < ceiling")
+	}
+	if s.acquireCacheSlot(s.populateWeight(-1)) {
+		t.Fatal("second concurrent background populate should be throttled by the full budget")
+	}
+	s.releaseCacheSlot(w)
+	if !s.acquireCacheSlot(s.populateWeight(-1)) {
+		t.Fatal("after release the next background populate should admit")
+	}
+}
+
 // TestPerPopulateBufferBytes verifies the per-populate ceiling accounts for the
 // broadcast listener channel plus the cache-write queue's 64-chunk floor.
 func TestPerPopulateBufferBytes(t *testing.T) {
