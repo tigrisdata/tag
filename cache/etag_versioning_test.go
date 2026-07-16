@@ -119,6 +119,29 @@ func TestETagVersionedBody_VersionedMissDoesNotServeLegacyBody(t *testing.T) {
 	}
 }
 
+// The streaming write path (the primary populate path) must also refuse empty-ETag
+// objects, and must drain the body so the producer side of the pipe doesn't block.
+func TestETagVersionedBody_EmptyETagNotCachedViaStream(t *testing.T) {
+	c, mem := newVersioningTestCache(t)
+	ctx := context.Background()
+	bucket, key := "b", "k"
+
+	body := bytes.NewReader([]byte("body-bytes"))
+	meta := &CachedObjectMeta{Bucket: bucket, Key: key, ETag: "", ContentLength: 10, StatusCode: 200}
+	if err := c.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, body, 60, 1); err != nil {
+		t.Fatalf("PutWithMetaStreamTombstoneAware: %v", err)
+	}
+	if _, found, _ := c.GetMeta(ctx, bucket, key); found {
+		t.Error("empty-ETag object should not be cached via the streaming path (meta present)")
+	}
+	if _, err := mem.Get(ctx, MakeBodyKey(bucket, key, "")); err == nil {
+		t.Error("empty-ETag object should not be cached via the streaming path (body present)")
+	}
+	if body.Len() != 0 {
+		t.Errorf("body not drained: %d bytes remain (producer pipe would block)", body.Len())
+	}
+}
+
 // Objects with no ETag are not cached at all: there is no version discriminator,
 // so caching them at a single unversioned key would reintroduce the in-place
 // overwrite / truncation hazard the ETag versioning was introduced to prevent.

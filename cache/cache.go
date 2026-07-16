@@ -146,6 +146,17 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		return nil
 	}
 
+	// Objects without an ETag are not cached: they would share a single
+	// unversioned body key (MakeBodyKey(..., "")) that a concurrent overwrite could
+	// clobber in place, truncating an in-flight reader — the hazard ETag-versioned
+	// bodies exist to prevent. Callers gate on IsCacheable (which excludes empty
+	// ETags) before building the stream; this is a backstop matching PutWithMeta.
+	// Drain the body first so the producer side of the pipe never blocks.
+	if meta.ETag == "" {
+		_, _ = io.Copy(io.Discard, body)
+		return nil
+	}
+
 	if ttl == 0 {
 		ttl = int(c.defaultTTL)
 	}
