@@ -628,6 +628,11 @@ func TestRevalidationRange304_BodyEvictedForwardsUpstream(t *testing.T) {
 	if got := w.Header().Get(XCacheHeader); got != XCacheMiss {
 		t.Errorf("X-Cache = %q, want %q", got, XCacheMiss)
 	}
+	// The orphaned meta (body gone) must be invalidated so subsequent requests are
+	// clean misses that repopulate, rather than looping through this same path.
+	if _, found, _ := c.GetMeta(ctx, bucket, key); found {
+		t.Error("orphaned metadata should be invalidated after body-gone upstream forward")
+	}
 }
 
 func TestRevalidationRange206_StreamsRangeFromUpstream(t *testing.T) {

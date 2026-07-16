@@ -127,9 +127,12 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					if served, rangeErr := s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start); served {
 						return rangeErr
 					}
-					// Cached body not resolvable - forward the range to upstream and
-					// warm the full object in the background (same as a range miss).
-					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range cache body unavailable - forwarding with background cache")
+					// Cached metadata survived but its versioned body is gone. Invalidate
+					// the orphaned meta so the background re-warm below is not blocked by
+					// its GetMeta(!found) gate — otherwise every range read for this key
+					// would forward to upstream until the meta TTL expires (cold-miss loop).
+					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range cache body unavailable - invalidating orphaned meta and forwarding with background cache")
+					s.cache.Delete(context.Background(), bucket, key)
 					return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start)
 				}
 
