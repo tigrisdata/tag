@@ -200,3 +200,43 @@ func TestHandleDeleteObjects_MixedVersionSuccessReinvalidatesKey(t *testing.T) {
 		t.Error("key with a succeeded version-delete kept its stale refill — should be re-invalidated")
 	}
 }
+
+// A failed unqualified delete may be reported with a VersionId the request never
+// sent ("null" on a version-suspended bucket, or a concrete id the server
+// resolved). Counting errors by key (not matching version tuples) keeps such a
+// failed key's valid refill instead of over-invalidating it.
+func TestHandleDeleteObjects_VersionIdMismatchFailureKeepsRefill(t *testing.T) {
+	for _, respVersion := range []string{"null", "concrete-v3"} {
+		t.Run(respVersion, func(t *testing.T) {
+			var c *cache.Cache
+			const key = "unqualified-key"
+
+			repopulateThenFail := func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+				b, _ := ParseBucketKey(r)
+				meta := &cache.CachedObjectMeta{Bucket: b, Key: key, ETag: `"refill"`, ContentLength: 6, StatusCode: 200}
+				_ = c.PutWithMeta(context.Background(), b, key, meta, []byte("refill"), 60)
+				// Request sent no VersionId; response errors with a different representation.
+				body := []byte(`<DeleteResult><Error><Key>unqualified-key</Key><VersionId>` + respVersion + `</VersionId><Code>AccessDenied</Code></Error></DeleteResult>`)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(body)
+				return &ResponseCapture{StatusCode: http.StatusOK, Body: body, Complete: true}, nil
+			}
+
+			var svc *Service
+			svc, c = newTestService(&mockForwarder{captureFunc: repopulateThenFail}, true)
+
+			// Request omits VersionId entirely.
+			reqBody := `<Delete><Object><Key>unqualified-key</Key></Object></Delete>`
+			r := httptest.NewRequest(http.MethodPost, "/bulk-bucket?delete", strings.NewReader(reqBody))
+			w := httptest.NewRecorder()
+			if err := svc.HandleDeleteObjects(w, r); err != nil {
+				t.Fatalf("HandleDeleteObjects: %v", err)
+			}
+
+			b, _ := ParseBucketKey(r)
+			if _, found, _ := c.GetMeta(context.Background(), b, key); !found {
+				t.Errorf("failed delete (response VersionId=%q) over-invalidated the key — valid refill discarded", respVersion)
+			}
+		})
+	}
+}
