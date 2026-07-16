@@ -54,7 +54,7 @@ func (s *Service) revalidateAndServe(
 		}
 		// No stale bytes available (versioned body gone) and nothing written yet —
 		// last-resort direct fetch so the client gets a real response.
-		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, start)
+		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, staleErr, start)
 	}
 	defer resp.Body.Close()
 
@@ -72,7 +72,7 @@ func (s *Service) revalidateAndServe(
 		// returns the correct 206; this unifies the full-object and range paths.
 		log.Warn().Err(revalErr).Str("bucket", bucket).Str("key", key).
 			Msg("Revalidation 304 cache body unavailable, fetching from upstream")
-		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, start)
+		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, revalErr, start)
 	case http.StatusOK:
 		// Full-object response (no range or upstream ignored range)
 		return s.handleRevalidation200(ctx, w, bucket, key, resp, start)
@@ -93,7 +93,7 @@ func (s *Service) revalidateAndServe(
 			metrics.RecordRevalidationStaleServed()
 			return staleErr
 		}
-		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, start)
+		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, staleErr, start)
 	}
 }
 
@@ -103,13 +103,17 @@ func (s *Service) revalidateAndServe(
 // survived). No response headers have been written yet, so this is safe for both
 // full-object and range requests — the Range header on r makes upstream return
 // the correct 206.
-func (s *Service) forwardAfterCacheMiss(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string, start time.Time) error {
-	// Invalidate the orphaned metadata whose body was unresolvable. Without this
-	// the meta entry survives and every subsequent request is a meta-hit whose
-	// body probe fails and re-forwards to upstream — a persistent cold-miss loop,
+// bodyErr is why the cache could not serve; it decides whether the metadata is
+// invalidated (see bodyGone).
+func (s *Service) forwardAfterCacheMiss(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string, bodyErr error, start time.Time) error {
+	// Invalidate the metadata only when its body is genuinely gone. Otherwise the
+	// meta entry survives and every subsequent request is a meta-hit whose body
+	// probe fails and re-forwards to upstream — a persistent cold-miss loop,
 	// because the normal re-warm paths are gated on the metadata being absent.
 	// Deleting it makes the next request a clean miss that repopulates the cache.
-	if s.cache.IsEnabled() {
+	// A transient failure (e.g. a canceled context from a disconnected client) must
+	// not evict a still-valid entry, so bodyGone gates the delete.
+	if s.cache.IsEnabled() && bodyGone(bodyErr) {
 		s.cache.Delete(context.Background(), bucket, key)
 	}
 	w.Header().Set(XCacheHeader, XCacheMiss)
@@ -290,7 +294,7 @@ func (s *Service) serveFromCache(
 		if bodyErr != nil {
 			return fmt.Errorf("cache body read failed: %w", bodyErr)
 		}
-		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
+		return fmt.Errorf("cache body empty for %s/%s: %w", bucket, key, errCacheBodyEmpty)
 	}
 
 	// Large objects: stream via pipe

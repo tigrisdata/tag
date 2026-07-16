@@ -124,15 +124,20 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				// serve the range from the cached object
 				if rangeHeader != "" {
 					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving range from cached full object")
-					if served, rangeErr := s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start); served {
+					served, rangeErr := s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+					if served {
 						return rangeErr
 					}
-					// Cached metadata survived but its versioned body is gone. Invalidate
-					// the orphaned meta so the background re-warm below is not blocked by
-					// its GetMeta(!found) gate — otherwise every range read for this key
-					// would forward to upstream until the meta TTL expires (cold-miss loop).
-					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range cache body unavailable - invalidating orphaned meta and forwarding with background cache")
-					s.cache.Delete(context.Background(), bucket, key)
+					// Only invalidate when the body is genuinely gone: the metadata is then
+					// orphaned, and clearing it both heals the entry and unblocks the
+					// background re-warm below (gated on GetMeta(!found)) — otherwise every
+					// range read for this key forwards upstream until the meta TTL expires
+					// (cold-miss loop). A transient failure (e.g. the client disconnected
+					// mid-probe) leaves the still-valid entry cached.
+					if bodyGone(rangeErr) {
+						log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range cache body missing - invalidating orphaned meta and forwarding with background cache")
+						s.cache.Delete(context.Background(), bucket, key)
+					}
 					return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start)
 				}
 
@@ -164,14 +169,16 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 
 				// Serve full response from cache
 				if cacheBodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); cacheBodyErr != nil {
-					log.Warn().Err(cacheBodyErr).Str("bucket", bucket).Str("key", key).Msg("Cache body unavailable, invalidating orphaned meta and falling through to upstream")
-					// Metadata survived but its versioned body is gone. Invalidate the
-					// orphaned meta (same as the range and revalidation paths) so this
-					// does not become a meta-hit/body-miss loop that repeats the failed
-					// cache read on every request before refetching from upstream.
-					// serveFromCache errored before committing headers, so falling
-					// through to the miss path below is safe.
-					s.cache.Delete(context.Background(), bucket, key)
+					log.Warn().Err(cacheBodyErr).Str("bucket", bucket).Str("key", key).Msg("Cache body unavailable, falling through to upstream")
+					// Invalidate only when the body is genuinely gone: the metadata is then
+					// orphaned, and clearing it stops a meta-hit/body-miss loop that repeats
+					// the failed cache read on every request before refetching. A transient
+					// failure (e.g. the client disconnected mid-read) must not evict a
+					// still-valid hot entry. serveFromCache errors before committing
+					// headers, so falling through to the miss path below is safe either way.
+					if bodyGone(cacheBodyErr) {
+						s.cache.Delete(context.Background(), bucket, key)
+					}
 					// Fall through to cache miss path
 				} else {
 					return nil
@@ -638,7 +645,10 @@ func (s *Service) serveRangeFromCache(
 		log.Debug().Err(readErr).Str("bucket", bucket).Str("key", key).
 			Int64("start", rng.start).Int64("end", rng.end).
 			Msg("Range cache body unavailable before headers - falling through to upstream")
-		return false, nil
+		// Report the underlying error, not just served=false: the caller uses it to
+		// tell a genuinely-missing body (invalidate the orphaned meta) from a
+		// transient failure like a canceled client (leave the entry alone).
+		return false, readErr
 	}
 
 	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))

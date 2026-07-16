@@ -407,6 +407,15 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 // copyObjectSucceeded reports whether a captured CopyObject response indicates the
 // copy actually happened: a 2xx status whose body is not an S3 <Error> document
 // (S3 can return 200 OK with an error body for copies that fail mid-operation).
+//
+// It deliberately does NOT gate on capture.Complete. The two ways to be wrong are
+// not symmetric: treating a failed copy as successful only re-invalidates a
+// destination that didn't change (an extra cache miss), while treating a successful
+// copy as failed skips the invalidation and can leave a racing refill of the OLD
+// destination cached — serving stale data. So an unconfirmable outcome must be
+// assumed successful. An incomplete capture still detects a failure whenever the
+// <Error> root element was captured (isS3ErrorBody only reads the first element);
+// only a body truncated before that root reads as success, which is the safe side.
 func copyObjectSucceeded(capture *ResponseCapture) bool {
 	if capture == nil || capture.StatusCode < 200 || capture.StatusCode >= 300 {
 		return false

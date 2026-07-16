@@ -65,6 +65,24 @@ const (
 // success or a failure.
 var errCachePopulateDeclined = errors.New("cache populate declined: concurrent write limit reached")
 
+// errCacheBodyEmpty marks a cached entry whose metadata claims a non-zero body but
+// whose body read returned no bytes — an inconsistent entry, like a missing body.
+var errCacheBodyEmpty = errors.New("cache body empty")
+
+// bodyGone reports whether a failed cache-body read means the body is genuinely
+// missing or inconsistent — the orphaned-metadata case, where invalidating the meta
+// is what lets the entry heal (and unblocks the GetMeta(!found)-gated re-warm).
+//
+// It deliberately returns false for every other failure. A read can also fail
+// transiently — most commonly a canceled context when the client disconnects
+// mid-stream, or an I/O error — and in those cases the cached body may be perfectly
+// valid. Evicting on those would let a burst of client disconnects tombstone hot
+// entries and force needless upstream refetches, so transient errors leave the
+// entry alone.
+func bodyGone(err error) bool {
+	return errors.Is(err, cache.ErrNotFound) || errors.Is(err, errCacheBodyEmpty)
+}
+
 // cacheWriteTimeoutForSize returns a timeout scaled to contentLength.
 // Returns at least cacheWriteTimeout (60s), scaling up for large objects.
 func cacheWriteTimeoutForSize(contentLength int64) time.Duration {
