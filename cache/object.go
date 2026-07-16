@@ -168,6 +168,16 @@ func (m *CachedObjectMeta) IsPublicRead() bool {
 
 // IsCacheable returns true if the object should be cached based on headers.
 func (m *CachedObjectMeta) IsCacheable(maxSize int64) bool {
+	// Don't cache objects without an ETag. Bodies are addressed by ETag so each
+	// version gets an immutable key; without one, all versions would share a single
+	// unversioned body key that a concurrent overwrite could clobber in place,
+	// truncating an in-flight reader. Objects Tigris serves always carry an ETag, so
+	// this only excludes rare ETag-less responses (e.g. some non-Tigris upstreams in
+	// signing mode), which are forwarded uncached rather than cached unsafely.
+	if m.ETag == "" {
+		return false
+	}
+
 	// Don't cache if Cache-Control says not to
 	cc := strings.ToLower(m.CacheControl)
 	if strings.Contains(cc, "no-store") || strings.Contains(cc, "private") {
@@ -207,10 +217,26 @@ func (m *CachedObjectMeta) IsModifiedSince(since time.Time) bool {
 	return objTime.After(since.Truncate(time.Second))
 }
 
-// normalizeETag strips quotes from ETag for comparison.
+// normalizeETag strips the weak prefix and quotes from an ETag for comparison.
+// This is a weak comparison (W/"abc" matches "abc"), used for conditional requests.
 func normalizeETag(etag string) string {
 	etag = strings.TrimPrefix(etag, "W/") // Remove weak validator prefix
 	etag = strings.Trim(etag, "\"")
+	return etag
+}
+
+// etagKeyComponent normalizes an ETag for use in a body cache key while PRESERVING
+// the weak/strong distinction. A weak validator (W/"abc") only asserts semantic
+// equivalence, so it can label different bytes than the strong validator "abc";
+// collapsing them (as normalizeETag does) would map both to one body key, letting a
+// later populate clobber the other version's bytes under an in-flight reader. Quotes
+// are stripped (they are only delimiters) but the weak marker is kept.
+func etagKeyComponent(etag string) string {
+	weak := strings.HasPrefix(etag, "W/")
+	etag = strings.Trim(strings.TrimPrefix(etag, "W/"), "\"")
+	if weak {
+		return "W/" + etag
+	}
 	return etag
 }
 
@@ -233,9 +259,18 @@ func MakeMetaKey(bucket, key string) string {
 	return metaKeyPrefix + bucket + "|" + key
 }
 
-// MakeBodyKey creates the cache key for object body.
-func MakeBodyKey(bucket, key string) string {
-	return bodyKeyPrefix + bucket + "|" + key
+// MakeBodyKey creates the cache key for an object body. Bodies are addressed by
+// the object's ETag ("body|bucket|key|<etag>") so a served metadata entry always
+// maps to the exact body version it describes: a concurrent overwrite writes a
+// new meta plus a new body key and never clobbers the version an in-flight reader
+// resolved. The ETag is normalized with etagKeyComponent, which keeps the
+// weak/strong distinction so different validators never collide on one key. Objects
+// with no ETag fall back to the unversioned key (no version discriminator exists).
+func MakeBodyKey(bucket, key, etag string) string {
+	if etag == "" {
+		return bodyKeyPrefix + bucket + "|" + key
+	}
+	return bodyKeyPrefix + bucket + "|" + key + "|" + etagKeyComponent(etag)
 }
 
 // MakeTombstoneKey creates the cache key for invalidation tombstones.

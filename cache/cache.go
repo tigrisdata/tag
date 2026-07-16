@@ -68,8 +68,22 @@ func (c *Cache) IsEnabled() bool {
 // IMPORTANT: Body is written BEFORE metadata to ensure metadata presence
 // guarantees body availability. This prevents race conditions where a reader
 // finds metadata but body hasn't been written yet.
+// Body lifecycle note: bodies are addressed by ETag and are never deleted
+// synchronously (not on overwrite, not on invalidation). Each version is an
+// immutable entry that ages out via TTL, so a reader that resolved a given
+// metadata version always finds its exact body — no delete-during-read can
+// truncate an in-flight response. Invalidation removes only the metadata (plus a
+// tombstone), which is enough to make subsequent reads miss and refetch.
 func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *CachedObjectMeta, body []byte, ttl int) error {
 	if !c.IsEnabled() {
+		return nil
+	}
+
+	// Objects without an ETag are not cached: bodies are addressed by ETag, and an
+	// ETag-less object would share a single unversioned body key that a concurrent
+	// overwrite could clobber in place. Callers gate on IsCacheable (which also
+	// excludes empty ETags); this is a defensive backstop for direct callers.
+	if meta.ETag == "" {
 		return nil
 	}
 
@@ -78,7 +92,7 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 	}
 
 	metaKey := MakeMetaKey(bucket, key)
-	bodyKey := MakeBodyKey(bucket, key)
+	bodyKey := MakeBodyKey(bucket, key, meta.ETag)
 
 	// Encode metadata as JSON
 	metaBytes, err := meta.Encode()
@@ -97,8 +111,10 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 	// Store metadata AFTER body is complete
 	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
-		// Try to clean up body on metadata failure
-		_ = c.client.Delete(ctx, bodyKey)
+		// Leave the versioned body to age out via TTL rather than deleting it
+		// synchronously: a concurrent populate of the same ETag could have a reader
+		// streaming this exact body key, and deleting it would truncate that reader.
+		// Without a visible meta entry the orphaned body is unreachable until it expires.
 		return err
 	}
 
@@ -130,12 +146,23 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		return nil
 	}
 
+	// Objects without an ETag are not cached: they would share a single
+	// unversioned body key (MakeBodyKey(..., "")) that a concurrent overwrite could
+	// clobber in place, truncating an in-flight reader — the hazard ETag-versioned
+	// bodies exist to prevent. Callers gate on IsCacheable (which excludes empty
+	// ETags) before building the stream; this is a backstop matching PutWithMeta.
+	// Drain the body first so the producer side of the pipe never blocks.
+	if meta.ETag == "" {
+		_, _ = io.Copy(io.Discard, body)
+		return nil
+	}
+
 	if ttl == 0 {
 		ttl = int(c.defaultTTL)
 	}
 
 	metaKey := MakeMetaKey(bucket, key)
-	bodyKey := MakeBodyKey(bucket, key)
+	bodyKey := MakeBodyKey(bucket, key, meta.ETag)
 
 	// Encode metadata first (fail fast if encoding fails)
 	metaBytes, err := meta.Encode()
@@ -161,14 +188,19 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 			Int64("tombstone_ts", tombTs).
 			Int64("write_start", writeStartTime).
 			Msg("Skipping meta write - tombstone detected after body stream")
-		_ = c.client.Delete(ctx, bodyKey) // Clean up orphaned body
+		// The just-written versioned body is left to age out via TTL rather than
+		// deleted synchronously: a concurrent populate of the same ETag could have
+		// a reader streaming this exact body key, and deleting it would truncate
+		// that reader. Without a visible meta entry the orphaned body is unreachable
+		// and harmless until it expires.
 		return nil
 	}
 
 	// Write metadata AFTER body (makes entry visible)
 	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
-		_ = c.client.Delete(ctx, bodyKey)
+		// Same rationale as the tombstone branch: leave the versioned body to TTL
+		// rather than risk truncating a concurrent same-version reader.
 		return err
 	}
 
@@ -222,14 +254,15 @@ func (c *Cache) GetMeta(ctx context.Context, bucket, key string) (*CachedObjectM
 
 // GetBodyStream streams the cached object body directly to the provided writer.
 // This avoids buffering the entire object in memory, which is critical for large objects.
-// Use this after GetMeta() to stream the body directly to the HTTP response.
-// Returns ErrNotFound if the body is not in cache.
-func (c *Cache) GetBodyStream(ctx context.Context, bucket, key string, w io.Writer) error {
+// Use this after GetMeta(), passing the meta's ETag so the body read resolves to
+// the exact version the metadata describes. Returns ErrNotFound if the body for
+// that version is not in cache.
+func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w io.Writer) error {
 	if !c.IsEnabled() {
 		return ErrCacheDisabled
 	}
 
-	bodyKey := MakeBodyKey(bucket, key)
+	bodyKey := MakeBodyKey(bucket, key, etag)
 
 	// Stream body directly to writer - no intermediate buffer
 	err := c.client.GetStream(ctx, bodyKey, w)
@@ -263,19 +296,18 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	}
 
 	metaKey := MakeMetaKey(bucket, key)
-	bodyKey := MakeBodyKey(bucket, key)
 
-	// Delete metadata (ignore not found)
+	// Delete only the metadata. That is sufficient to make subsequent reads miss
+	// (a read resolves the body from meta.ETag, so with meta gone there is no body
+	// lookup), and the tombstone above blocks any in-flight repopulation. The
+	// versioned body is intentionally left to age out via TTL rather than deleted
+	// synchronously — deleting it could truncate an in-flight reader still
+	// streaming that exact version.
 	if err := c.client.Delete(ctx, metaKey); err != nil && !isNotFoundError(err) {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta delete error")
 	}
 
-	// Delete body (ignore not found)
-	if err := c.client.Delete(ctx, bodyKey); err != nil && !isNotFoundError(err) {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body delete error")
-	}
-
-	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Deleted from cache (meta+body)")
+	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidated cache metadata (body ages out via TTL)")
 	return nil
 }
 
@@ -295,13 +327,14 @@ func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
 // GetRangeStream retrieves a byte range from the cached object body.
 // Uses ocache's GetRangeStream for efficient partial reads from disk.
 // start and end are inclusive byte positions (HTTP Range semantics).
+// Pass the meta's ETag so the range resolves to the exact cached version.
 // Returns ErrNotFound if the object is not in cache.
-func (c *Cache) GetRangeStream(ctx context.Context, bucket, key string, start, end int64, w io.Writer) error {
+func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, start, end int64, w io.Writer) error {
 	if !c.IsEnabled() {
 		return ErrCacheDisabled
 	}
 
-	bodyKey := MakeBodyKey(bucket, key)
+	bodyKey := MakeBodyKey(bucket, key, etag)
 
 	// Handle ocache quirk: reading byte 0 alone requires reading 2 bytes
 	// and discarding the last byte

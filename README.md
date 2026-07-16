@@ -1,4 +1,4 @@
-# TAG (Tigris Access Gateway)
+# TAG (Tigris Acceleration Gateway)
 
 TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigris.dev) object storage. It provides transparent caching with request coalescing to reduce upstream load and improve latency for frequently accessed objects.
 
@@ -43,7 +43,7 @@ Each release publishes the install script, run script, and a matching `config.ya
 curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
 
 # A specific release
-curl -fsSL https://tag-releases.t3.storage.dev/v1.10.0/install.sh | bash
+curl -fsSL https://tag-releases.t3.storage.dev/v1.11.0/install.sh | bash
 ```
 
 The script installs the `tag` binary to `/usr/local/bin` and a default config to `/etc/tag/config.yaml`.
@@ -151,6 +151,19 @@ When multiple concurrent requests arrive for the same uncached object:
 4. Only one upstream request is made, regardless of concurrent client count
 
 See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
+
+## Performance
+
+A single TAG node saturates a 100 Gbps NIC at **~85+ Gbps** for objects 1 MiB and larger, serves **~75K ops/sec** for small objects at sub-millisecond p50, and holds low single-digit-millisecond TTFB — all while using around **12% of available CPU**.
+
+| Object size | OPS (64 threads) | Throughput | TTFB p50 |
+| ----------- | ---------------- | ---------- | -------- |
+| 1 KiB       | ~75,700          | 74 MiB/s   | < 1 ms   |
+| 100 KiB     | ~33,300          | 3.2 GiB/s  | 1 ms     |
+| 1 MiB       | ~11,000          | 10.7 GiB/s | 1 ms     |
+| 4 MiB       | ~2,800           | 10.8 GiB/s | 1 ms     |
+
+Measured with [warp](https://github.com/minio/warp) against a single `i3en.24xlarge` node over a 100 Gbps link. See [docs/benchmarks.md](docs/benchmarks.md) for the full methodology, go-ycsb results, and limitations.
 
 ## Metrics
 

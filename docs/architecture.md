@@ -1,6 +1,6 @@
 # TAG Architecture
 
-This document describes the architecture of TAG (Tigris Access Gateway), a high-performance S3-compatible caching proxy with an embedded distributed cache.
+This document describes the architecture of TAG (Tigris Acceleration Gateway), a high-performance S3-compatible caching proxy with an embedded distributed cache.
 
 ## System Overview
 

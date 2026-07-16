@@ -30,7 +30,9 @@ type Service struct {
 	forwarder               RequestForwarder
 	cache                   *cache.Cache
 	config                  *config.Config
-	cacheSemaphore          chan struct{}      // Bounds concurrent cache-populate operations (nil = unlimited)
+	cacheSemaphore          chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
+	populateBudget          *byteBudget        // Byte budget bounding aggregate populate buffering (nil = unlimited)
+	perPopulateCap          int64              // Max bytes a single populate can buffer (reservation ceiling)
 	broadcastManager        *broadcast.Manager // For streaming request coalescing
 	activeBackgroundFetches sync.Map           // Dedup for background full-object fetches (range caching)
 }
@@ -42,43 +44,181 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		channelBuf = broadcast.DefaultChannelBuffer
 	}
 
+	// Concurrent cache-populate operations are bounded two independent ways, and a
+	// populate must pass both:
+	//   1. A hard COUNT ceiling (MaxConcurrentWrites) — caps total in-flight populates.
+	//   2. A BYTE budget (MaxPopulateMemoryBytes) — caps aggregate buffered memory.
+	// The byte budget is what prevents the OOM failure mode: each populate reserves
+	// min(object size, per-populate buffer ceiling), so many small objects populate
+	// concurrently while a burst of large objects is throttled to keep buffered
+	// memory bounded (a byte-unaware count alone can pin many GB — e.g. 256 large
+	// populates × ~64–80MB ≈ 16–20GB).
 	var cacheSem chan struct{}
 	if cfg.Cache.MaxConcurrentWrites > 0 {
 		cacheSem = make(chan struct{}, cfg.Cache.MaxConcurrentWrites)
 	}
+
+	perPopulateCap := perPopulateBufferBytes(cfg)
+
+	var populateBudget *byteBudget
+	if cfg.Cache.MaxPopulateMemoryBytes > 0 {
+		populateBudget = newByteBudget(cfg.Cache.MaxPopulateMemoryBytes)
+	}
+
+	log.Info().
+		Int("max_concurrent_writes", cfg.Cache.MaxConcurrentWrites).
+		Int64("max_populate_memory_bytes", cfg.Cache.MaxPopulateMemoryBytes).
+		Int64("per_populate_buffer_cap_bytes", perPopulateCap).
+		Msg("Cache-populate limits configured")
 
 	return &Service{
 		forwarder:        forwarder,
 		cache:            cache,
 		config:           cfg,
 		cacheSemaphore:   cacheSem,
+		populateBudget:   populateBudget,
+		perPopulateCap:   perPopulateCap,
 		broadcastManager: broadcast.NewManager(channelBuf),
 	}
 }
 
-// acquireCacheSlot tries to reserve a cache-populate slot without blocking. It
-// returns true (and must be paired with releaseCacheSlot) when a slot is
-// reserved, or when the limiter is disabled (nil semaphore). It returns false
-// when the concurrent-cache-write limit is saturated, in which case the caller
-// should skip caching rather than block or spawn unbounded work.
-func (s *Service) acquireCacheSlot() bool {
-	if s.cacheSemaphore == nil {
-		return true
+// perPopulateBufferBytes returns the maximum bytes a single cache-populate can
+// buffer: the broadcast listener channel (channel_buffer chunks) plus the
+// cache-write queue in setupCacheListener (channel_buffer/4 chunks, floored at 64).
+// Each queued chunk retains at least a pooled DefaultChunkSize backing array
+// (broadcast.GetChunkBuf pools DefaultChunkSize buffers), so a smaller configured
+// chunk_size still holds that much per chunk — charge the larger of the two. This
+// is the ceiling a populate ever reserves; smaller objects reserve their actual size.
+func perPopulateBufferBytes(cfg *config.Config) int64 {
+	chunkSize := int64(cfg.Broadcast.ChunkSize)
+	if chunkSize < broadcast.DefaultChunkSize {
+		chunkSize = broadcast.DefaultChunkSize
 	}
-	select {
-	case s.cacheSemaphore <- struct{}{}:
-		return true
-	default:
+	channelBuf := int64(cfg.Broadcast.ChannelBuffer)
+	if channelBuf <= 0 {
+		channelBuf = broadcast.DefaultChannelBuffer
+	}
+	queue := channelBuf / 4
+	if queue < 64 {
+		queue = 64 // matches setupCacheListener's cacheQueueSize floor
+	}
+	return (channelBuf + queue) * chunkSize
+}
+
+// populateWeight is the byte weight a populate reserves against the memory budget:
+// the object's size, capped at the per-populate buffer ceiling (a populate never
+// buffers more than the pipeline can hold). Unknown/negative sizes (e.g. chunked
+// responses) reserve the full ceiling. It never exceeds the total budget, so an
+// object larger than the whole budget can still populate one-at-a-time. Always ≥ 1.
+func (s *Service) populateWeight(contentLength int64) int64 {
+	w := s.perPopulateCap
+	if contentLength > 0 && contentLength < w {
+		w = contentLength
+	}
+	if w < 1 {
+		w = 1
+	}
+	if budget := s.config.Cache.MaxPopulateMemoryBytes; budget > 0 && w > budget {
+		w = budget
+	}
+	return w
+}
+
+// byteBudget is a non-blocking weighted semaphore bounding the aggregate bytes
+// reserved by concurrent cache-populate operations.
+type byteBudget struct {
+	mu        sync.Mutex
+	remaining int64
+}
+
+func newByteBudget(total int64) *byteBudget {
+	return &byteBudget{remaining: total}
+}
+
+func (b *byteBudget) tryAcquire(n int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.remaining < n {
 		return false
+	}
+	b.remaining -= n
+	return true
+}
+
+func (b *byteBudget) release(n int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.remaining += n
+}
+
+// acquireCacheSlot tries to reserve a cache-populate slot without blocking,
+// reserving `weight` bytes against the memory budget. It returns true (and must be
+// paired with releaseCacheSlot passing the SAME weight) when both the count slot
+// and the byte budget are reserved, or when a limiter is disabled (nil). It returns
+// false when either the count limit or the memory budget is saturated, in which
+// case the caller should skip caching rather than block or spawn unbounded work.
+func (s *Service) acquireCacheSlot(weight int64) bool {
+	if s.cacheSemaphore != nil {
+		select {
+		case s.cacheSemaphore <- struct{}{}:
+		default:
+			return false
+		}
+	}
+	if s.populateBudget != nil && !s.populateBudget.tryAcquire(weight) {
+		if s.cacheSemaphore != nil {
+			<-s.cacheSemaphore // hand back the count slot we just took
+		}
+		return false
+	}
+	return true
+}
+
+// releaseCacheSlot releases a slot reserved by acquireCacheSlot. `weight` must
+// match the value passed to the paired acquireCacheSlot.
+func (s *Service) releaseCacheSlot(weight int64) {
+	if s.populateBudget != nil {
+		s.populateBudget.release(weight)
+	}
+	if s.cacheSemaphore != nil {
+		<-s.cacheSemaphore
 	}
 }
 
-// releaseCacheSlot releases a slot previously reserved by acquireCacheSlot.
-func (s *Service) releaseCacheSlot() {
-	if s.cacheSemaphore == nil {
-		return
+// statusRecorder wraps http.ResponseWriter to capture the response status code
+// written while forwarding an upstream response. Forward() returns nil even when
+// upstream responds 4xx/5xx (the response streamed successfully), so mutating
+// handlers use this to gate post-forward cache re-invalidation on an actual 2xx —
+// otherwise a rejected PUT/DELETE/COPY would still tombstone the destination and
+// discard a valid racing refill, causing later reads to miss unnecessarily.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rec *statusRecorder) WriteHeader(code int) {
+	rec.status = code
+	rec.ResponseWriter.WriteHeader(code)
+}
+
+func (rec *statusRecorder) Write(b []byte) (int, error) {
+	if rec.status == 0 {
+		rec.status = http.StatusOK
 	}
-	<-s.cacheSemaphore
+	return rec.ResponseWriter.Write(b)
+}
+
+// Flush delegates to the underlying writer when it supports flushing, so wrapping
+// never disables streaming for handlers that rely on http.Flusher.
+func (rec *statusRecorder) Flush() {
+	if f, ok := rec.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// wroteSuccess reports whether upstream returned a 2xx status.
+func (rec *statusRecorder) wroteSuccess() bool {
+	return rec.status >= 200 && rec.status < 300
 }
 
 // HandlePutObject handles PUT requests for objects.
@@ -96,8 +236,22 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 		metrics.RecordCacheOperation("delete", "success")
 	}
 
-	// Forward to Tigris
-	err := s.forwarder.Forward(r.Context(), w, r)
+	// Forward to Tigris, recording the upstream status.
+	rec := &statusRecorder{ResponseWriter: w}
+	err := s.forwarder.Forward(r.Context(), rec, r)
+
+	// Re-invalidate AFTER upstream confirms the write. A GET that raced the
+	// in-flight PUT may have fetched the pre-PUT object and begun re-caching it;
+	// this second invalidation writes a tombstone newer than that write's start
+	// time, so the tombstone-aware cache write skips the stale repopulation —
+	// restoring read-after-write semantics.
+	// Gated on a 2xx: a rejected PUT leaves the object unchanged, so re-invalidating
+	// would only discard a valid racing refill and cause an unnecessary later miss.
+	// The metric is recorded once on the pre-forward invalidation above; this
+	// second Delete is the same logical invalidation, so it is not counted again.
+	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
+		s.cache.Delete(context.Background(), bucket, key)
+	}
 
 	status := "success"
 	if err != nil {
@@ -123,8 +277,21 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 		metrics.RecordCacheOperation("delete", "success")
 	}
 
-	// Forward to upstream
-	err := s.forwarder.Forward(r.Context(), w, r)
+	// Forward to upstream, recording the upstream status.
+	rec := &statusRecorder{ResponseWriter: w}
+	err := s.forwarder.Forward(r.Context(), rec, r)
+
+	// Re-invalidate AFTER upstream confirms the delete, for the same
+	// read-after-write reason as HandlePutObject: a GET racing the in-flight
+	// DELETE may have re-cached the not-yet-deleted object; this second
+	// tombstone blocks that stale repopulation.
+	// Gated on a 2xx: a rejected DELETE leaves the object present, so re-invalidating
+	// would only discard a valid racing refill and cause an unnecessary later miss.
+	// The metric is recorded once on the pre-forward invalidation above; this
+	// second Delete is the same logical invalidation, so it is not counted again.
+	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
+		s.cache.Delete(context.Background(), bucket, key)
+	}
 
 	status := "success"
 	if err != nil {
@@ -218,8 +385,42 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 		s.cache.Delete(context.Background(), bucket, key)
 	}
 
-	// Forward to upstream
-	return s.forwarder.Forward(r.Context(), w, r)
+	// Forward to upstream, capturing the response so we can confirm the copy
+	// actually succeeded. CopyObject signals failure either with a non-2xx status
+	// or — famously — a 200 OK carrying an <Error> body, and Forward would report
+	// neither.
+	capture, err := s.forwarder.ForwardWithCapture(r.Context(), w, r)
+
+	// Re-invalidate the destination AFTER upstream confirms the copy, for the same
+	// read-after-write reason as HandlePutObject: a GET racing the in-flight copy
+	// may have re-cached the pre-copy destination object; this second tombstone
+	// blocks that stale repopulation.
+	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
+	// unchanged, so re-invalidating would only discard a valid racing refill.
+	if err == nil && copyObjectSucceeded(capture) && s.cache.IsEnabled() {
+		s.cache.Delete(context.Background(), bucket, key)
+	}
+
+	return err
+}
+
+// copyObjectSucceeded reports whether a captured CopyObject response indicates the
+// copy actually happened: a 2xx status whose body is not an S3 <Error> document
+// (S3 can return 200 OK with an error body for copies that fail mid-operation).
+//
+// It deliberately does NOT gate on capture.Complete. The two ways to be wrong are
+// not symmetric: treating a failed copy as successful only re-invalidates a
+// destination that didn't change (an extra cache miss), while treating a successful
+// copy as failed skips the invalidation and can leave a racing refill of the OLD
+// destination cached — serving stale data. So an unconfirmable outcome must be
+// assumed successful. An incomplete capture still detects a failure whenever the
+// <Error> root element was captured (isS3ErrorBody only reads the first element);
+// only a body truncated before that root reads as success, which is the safe side.
+func copyObjectSucceeded(capture *ResponseCapture) bool {
+	if capture == nil || capture.StatusCode < 200 || capture.StatusCode >= 300 {
+		return false
+	}
+	return !isS3ErrorBody(capture.Body)
 }
 
 // HandlePassthrough handles requests that are passed through without caching.

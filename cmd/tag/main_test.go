@@ -31,7 +31,7 @@ func TestVersionFlag(t *testing.T) {
 
 	output := string(out)
 	for _, expected := range []string{
-		"TAG (Tigris Access Gateway)",
+		"TAG (Tigris Acceleration Gateway)",
 		"Version:",
 		"Build Time:",
 		"Git Commit:",

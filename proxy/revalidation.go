@@ -47,35 +47,32 @@ func (s *Service) revalidateAndServe(
 		// Upstream error — serve stale from cache
 		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Revalidation failed, serving stale")
 		metrics.RecordRevalidationFailed()
-		metrics.RecordRevalidationStaleServed()
-		return s.serveStaleFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		served, staleErr := s.serveStaleFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		if served {
+			metrics.RecordRevalidationStaleServed()
+			return staleErr
+		}
+		// No stale bytes available (versioned body gone) and nothing written yet —
+		// last-resort direct fetch so the client gets a real response.
+		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, staleErr, start)
 	}
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
 	case http.StatusNotModified:
-		revalErr := s.handleRevalidation304(ctx, w, r, bucket, key, meta, rangeHeader, start)
-		if revalErr == nil {
-			return nil
-		}
-		// Cache body unavailable despite 304 — fall through to upstream.
-		// serveFromCache returns errors before committing headers, so we can
-		// safely write a new response. Range errors may have partial headers
-		// committed (serveRangeFromCache writes headers before streaming), so
-		// we return those directly.
-		if rangeHeader != "" {
+		served, revalErr := s.handleRevalidation304(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		if served {
+			// A response (full body, range, or a committed-then-failed stream) was
+			// produced; propagate its result. Headers are already sent on error, so
+			// we cannot safely forward.
 			return revalErr
 		}
+		// Cache body unavailable despite 304 and no response bytes written yet —
+		// fetch from upstream. The Range header (if any) is still on r, so upstream
+		// returns the correct 206; this unifies the full-object and range paths.
 		log.Warn().Err(revalErr).Str("bucket", bucket).Str("key", key).
 			Msg("Revalidation 304 cache body unavailable, fetching from upstream")
-		w.Header().Set(XCacheHeader, XCacheMiss)
-		forwardErr := s.forwarder.Forward(ctx, w, r)
-		status := "success"
-		if forwardErr != nil {
-			status = "error"
-		}
-		metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
-		return forwardErr
+		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, revalErr, start)
 	case http.StatusOK:
 		// Full-object response (no range or upstream ignored range)
 		return s.handleRevalidation200(ctx, w, bucket, key, resp, start)
@@ -91,14 +88,51 @@ func (s *Service) revalidateAndServe(
 			Str("key", key).
 			Msg("Revalidation got unexpected status, serving stale")
 		metrics.RecordRevalidationFailed()
-		metrics.RecordRevalidationStaleServed()
-		return s.serveStaleFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		served, staleErr := s.serveStaleFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		if served {
+			metrics.RecordRevalidationStaleServed()
+			return staleErr
+		}
+		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, staleErr, start)
 	}
+}
+
+// forwardAfterCacheMiss fetches the object fresh from upstream when a
+// revalidation or stale-serve path could not produce any response bytes from
+// cache (typically the ETag-versioned body was evicted while its metadata
+// survived). No response headers have been written yet, so this is safe for both
+// full-object and range requests — the Range header on r makes upstream return
+// the correct 206.
+// bodyErr is why the cache could not serve; it decides whether the metadata is
+// invalidated (see bodyGone).
+func (s *Service) forwardAfterCacheMiss(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string, bodyErr error, start time.Time) error {
+	// Invalidate the metadata only when its body is genuinely gone. Otherwise the
+	// meta entry survives and every subsequent request is a meta-hit whose body
+	// probe fails and re-forwards to upstream — a persistent cold-miss loop,
+	// because the normal re-warm paths are gated on the metadata being absent.
+	// Deleting it makes the next request a clean miss that repopulates the cache.
+	// A transient failure (e.g. a canceled context from a disconnected client) must
+	// not evict a still-valid entry, so bodyGone gates the delete.
+	if s.cache.IsEnabled() && bodyGone(bodyErr) {
+		s.cache.Delete(context.Background(), bucket, key)
+	}
+	w.Header().Set(XCacheHeader, XCacheMiss)
+	forwardErr := s.forwarder.Forward(ctx, w, r)
+	status := "success"
+	if forwardErr != nil {
+		status = "error"
+	}
+	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	return forwardErr
 }
 
 // handleRevalidation304 handles a 304 Not Modified revalidation response.
 // Serves from cached body (or range if requested). Does not refresh cache TTL
 // because ocache has no TTL-refresh operation and re-writing data is inefficient.
+// It returns served=true when a client response was produced (a full body, a
+// range, or a committed stream that then failed). It returns served=false,
+// without writing any response bytes, when the cached body cannot be resolved —
+// the caller then fetches from upstream.
 func (s *Service) handleRevalidation304(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -107,15 +141,20 @@ func (s *Service) handleRevalidation304(
 	meta *cache.CachedObjectMeta,
 	rangeHeader string,
 	start time.Time,
-) error {
+) (served bool, err error) {
 	metrics.RecordRevalidationNotModified()
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Revalidation 304 - object unchanged")
 
-	// Serve range or full body from cache
+	// Serve range or full body from cache. Both serveRangeFromCache (via its
+	// pre-header probe) and serveFromCache report an unresolvable body without
+	// writing headers, so the caller can safely forward to upstream.
 	if rangeHeader != "" {
 		return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
 	}
-	return s.serveFromCache(ctx, w, bucket, key, meta, start)
+	if bodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); bodyErr != nil {
+		return false, bodyErr
+	}
+	return true, nil
 }
 
 // handleRevalidation200 handles a 200 OK revalidation response (object changed).
@@ -238,7 +277,7 @@ func (s *Service) serveFromCache(
 		bodyBuf := bufferPool.Get().(*bytes.Buffer)
 		bodyBuf.Reset()
 
-		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, bodyBuf)
+		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.ETag, bodyBuf)
 		if bodyErr == nil && bodyBuf.Len() > 0 {
 			metrics.RecordCacheHit()
 			meta.WriteHeaders(w)
@@ -261,7 +300,7 @@ func (s *Service) serveFromCache(
 	// Large objects: stream via pipe
 	pr, pw := io.Pipe()
 	go func() {
-		err := s.cache.GetBodyStream(ctx, bucket, key, pw)
+		err := s.cache.GetBodyStream(ctx, bucket, key, meta.ETag, pw)
 		if err != nil {
 			pw.CloseWithError(err)
 		} else {
@@ -338,7 +377,10 @@ func (s *Service) handleRevalidation206Range(
 	return copyErr
 }
 
-// serveStaleFromCache serves stale content from cache, handling both full and range requests.
+// serveStaleFromCache serves stale content from cache, handling both full and
+// range requests. It returns served=false, without writing any response bytes,
+// when the cached body cannot be resolved so the caller can fall back to a direct
+// upstream fetch instead of emitting a truncated or empty response.
 func (s *Service) serveStaleFromCache(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -347,11 +389,14 @@ func (s *Service) serveStaleFromCache(
 	meta *cache.CachedObjectMeta,
 	rangeHeader string,
 	start time.Time,
-) error {
+) (served bool, err error) {
 	if rangeHeader != "" {
 		return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
 	}
-	return s.serveFromCache(ctx, w, bucket, key, meta, start)
+	if bodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); bodyErr != nil {
+		return false, bodyErr
+	}
+	return true, nil
 }
 
 // revalidateAndServeHead sends a conditional HEAD to upstream for a HEAD request.

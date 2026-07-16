@@ -1,4 +1,4 @@
-# Docker Compose for TAG (Tigris Access Gateway) — released image
+# Docker Compose for TAG (Tigris Acceleration Gateway) — released image
 #
 # Pulls the published tigrisdata/tag image instead of building from source.
 # For the build-from-source variant, use docker-compose.yml.

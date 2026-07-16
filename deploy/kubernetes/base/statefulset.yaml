@@ -22,7 +22,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: tag
-          image: tigrisdata/tag:v1.9.4
+          image: tigrisdata/tag:v1.11.0
           imagePullPolicy: Always
           env:
             - name: POD_NAME
