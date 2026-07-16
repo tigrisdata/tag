@@ -95,6 +95,7 @@ func (s *Service) setupCacheListener(
 	bucket, key string,
 	broadcaster *broadcast.Broadcaster,
 	slotHeld bool,
+	weight int64,
 ) (*io.PipeWriter, chan error) {
 	// Bound concurrent cache-populate operations. When the limit is saturated,
 	// skip caching entirely: the object is still served/forwarded from upstream,
@@ -103,9 +104,10 @@ func (s *Service) setupCacheListener(
 	// growing without bound under load. slotHeld is true when the caller has
 	// already reserved a slot (the background path reserves it before the upstream
 	// request); once past this point the slot is owned by this function and is
-	// released on the no-listener path below or by the populate goroutine.
+	// released on the no-listener path below or by the populate goroutine. weight is
+	// the byte reservation (matching what was/should be acquired) to release.
 	if !slotHeld {
-		if !s.acquireCacheSlot() {
+		if !s.acquireCacheSlot(weight) {
 			metrics.CachePopulateSkipped.Inc()
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping cache populate - concurrent write limit reached")
 			return nil, nil
@@ -117,7 +119,7 @@ func (s *Service) setupCacheListener(
 
 	listener := broadcaster.Subscribe()
 	if listener == nil {
-		s.releaseCacheSlot()
+		s.releaseCacheSlot(weight)
 		return nil, nil
 	}
 
@@ -127,7 +129,7 @@ func (s *Service) setupCacheListener(
 
 	// Start goroutine to consume chunks, build metadata, and write to cache
 	go func() {
-		defer s.releaseCacheSlot()
+		defer s.releaseCacheSlot(weight)
 		defer close(errCh)
 
 		// Wait for headers to build metadata
@@ -292,14 +294,19 @@ func (s *Service) fetchFullObjectToCache(
 	// rather than fetch and then discard the result under the very pressure the
 	// limit is meant to relieve. errCachePopulateDeclined distinguishes this
 	// deliberate skip from a real fetch success/failure for the caller's metrics.
-	if !s.acquireCacheSlot() {
+	// Background fetches warm the full object and the size isn't known until the
+	// response arrives, so reserve the per-populate buffer ceiling up front. This
+	// is what throttles a burst of large-object warms to keep buffered memory
+	// bounded (small objects, cached inline, reserve their actual size instead).
+	weight := s.perPopulateCap
+	if !s.acquireCacheSlot(weight) {
 		metrics.CachePopulateSkipped.Inc()
 		return errCachePopulateDeclined
 	}
 	slotOwned := true
 	defer func() {
 		if slotOwned {
-			s.releaseCacheSlot()
+			s.releaseCacheSlot(weight)
 		}
 	}()
 
@@ -334,7 +341,7 @@ func (s *Service) fetchFullObjectToCache(
 	// Hand the reserved slot to the cache listener (streams to cache via pipe).
 	// Ownership of releasing the slot transfers to setupCacheListener, so drop
 	// our own release regardless of the result.
-	cachePipeWriter, cacheErrCh := s.setupCacheListener(ctx, bucket, key, broadcaster, true)
+	cachePipeWriter, cacheErrCh := s.setupCacheListener(ctx, bucket, key, broadcaster, true, weight)
 	slotOwned = false
 	if cachePipeWriter == nil {
 		// No listener could be created; nothing to populate.

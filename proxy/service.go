@@ -30,7 +30,9 @@ type Service struct {
 	forwarder               RequestForwarder
 	cache                   *cache.Cache
 	config                  *config.Config
-	cacheSemaphore          chan struct{}      // Bounds concurrent cache-populate operations (nil = unlimited)
+	cacheSemaphore          chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
+	populateBudget          *byteBudget        // Byte budget bounding aggregate populate buffering (nil = unlimited)
+	perPopulateCap          int64              // Max bytes a single populate can buffer (reservation ceiling)
 	broadcastManager        *broadcast.Manager // For streaming request coalescing
 	activeBackgroundFetches sync.Map           // Dedup for background full-object fetches (range caching)
 }
@@ -42,49 +44,50 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		channelBuf = broadcast.DefaultChannelBuffer
 	}
 
-	// Bound concurrent cache-populate operations. MaxConcurrentWrites is a hard
-	// count ceiling; on top of it we cap concurrency so the memory buffered by
-	// in-flight populates stays under MaxPopulateMemoryBytes. Each populate buffers
-	// up to ~channel_buffer × chunk_size bytes, so a count alone can pin many GB
-	// (e.g. 256 × ~64MB ≈ 16GB) under large-object fan-out — the memory budget is
-	// what actually prevents that.
-	writeLimit := effectiveCacheWriteLimit(cfg)
+	// Concurrent cache-populate operations are bounded two independent ways, and a
+	// populate must pass both:
+	//   1. A hard COUNT ceiling (MaxConcurrentWrites) — caps total in-flight populates.
+	//   2. A BYTE budget (MaxPopulateMemoryBytes) — caps aggregate buffered memory.
+	// The byte budget is what prevents the OOM failure mode: each populate reserves
+	// min(object size, per-populate buffer ceiling), so many small objects populate
+	// concurrently while a burst of large objects is throttled to keep buffered
+	// memory bounded (a byte-unaware count alone can pin many GB — e.g. 256 large
+	// populates × ~64–80MB ≈ 16–20GB).
 	var cacheSem chan struct{}
-	if writeLimit > 0 {
-		cacheSem = make(chan struct{}, writeLimit)
+	if cfg.Cache.MaxConcurrentWrites > 0 {
+		cacheSem = make(chan struct{}, cfg.Cache.MaxConcurrentWrites)
+	}
+
+	perPopulateCap := perPopulateBufferBytes(cfg)
+
+	var populateBudget *byteBudget
+	if cfg.Cache.MaxPopulateMemoryBytes > 0 {
+		populateBudget = newByteBudget(cfg.Cache.MaxPopulateMemoryBytes)
 	}
 
 	log.Info().
 		Int("max_concurrent_writes", cfg.Cache.MaxConcurrentWrites).
 		Int64("max_populate_memory_bytes", cfg.Cache.MaxPopulateMemoryBytes).
-		Int("effective_cache_populate_slots", writeLimit).
-		Msg("Cache-populate concurrency configured")
+		Int64("per_populate_buffer_cap_bytes", perPopulateCap).
+		Msg("Cache-populate limits configured")
 
 	return &Service{
 		forwarder:        forwarder,
 		cache:            cache,
 		config:           cfg,
 		cacheSemaphore:   cacheSem,
+		populateBudget:   populateBudget,
+		perPopulateCap:   perPopulateCap,
 		broadcastManager: broadcast.NewManager(channelBuf),
 	}
 }
 
-// effectiveCacheWriteLimit returns the number of concurrent cache-populate slots,
-// combining the count ceiling (MaxConcurrentWrites) with the memory budget
-// (MaxPopulateMemoryBytes). A non-positive count returns 0 (limiter disabled /
-// unbounded), preserving the explicit-disable contract. Otherwise the count is
-// reduced so that count × per-populate-buffer-bytes stays within the budget; a
-// non-positive budget disables the memory cap. At least one slot is always allowed.
-func effectiveCacheWriteLimit(cfg *config.Config) int {
-	count := cfg.Cache.MaxConcurrentWrites
-	if count <= 0 {
-		return 0 // limiter disabled — unbounded (matches prior negative-value semantics)
-	}
-	budget := cfg.Cache.MaxPopulateMemoryBytes
-	if budget <= 0 {
-		return count // memory cap disabled
-	}
-
+// perPopulateBufferBytes returns the maximum bytes a single cache-populate can
+// buffer: the broadcast listener channel (channel_buffer chunks) plus the
+// cache-write queue in setupCacheListener (channel_buffer/4 chunks, floored at 64),
+// each chunk up to chunk_size bytes. This is the ceiling a populate ever reserves;
+// smaller objects reserve their actual size.
+func perPopulateBufferBytes(cfg *config.Config) int64 {
 	chunkSize := int64(cfg.Broadcast.ChunkSize)
 	if chunkSize <= 0 {
 		chunkSize = broadcast.DefaultChunkSize
@@ -93,42 +96,91 @@ func effectiveCacheWriteLimit(cfg *config.Config) int {
 	if channelBuf <= 0 {
 		channelBuf = broadcast.DefaultChannelBuffer
 	}
-	// Per-populate buffering: the broadcast listener channel (channelBuf chunks)
-	// plus the cache-write queue in setupCacheListener (~channelBuf/4 chunks).
-	perPopulate := (channelBuf + channelBuf/4) * chunkSize
-	if perPopulate <= 0 {
-		return count
+	queue := channelBuf / 4
+	if queue < 64 {
+		queue = 64 // matches setupCacheListener's cacheQueueSize floor
 	}
-	memCap := max(int(budget/perPopulate), 1) // always allow at least one populate
-	if memCap < count {
-		return memCap
-	}
-	return count
+	return (channelBuf + queue) * chunkSize
 }
 
-// acquireCacheSlot tries to reserve a cache-populate slot without blocking. It
-// returns true (and must be paired with releaseCacheSlot) when a slot is
-// reserved, or when the limiter is disabled (nil semaphore). It returns false
-// when the concurrent-cache-write limit is saturated, in which case the caller
-// should skip caching rather than block or spawn unbounded work.
-func (s *Service) acquireCacheSlot() bool {
-	if s.cacheSemaphore == nil {
-		return true
+// populateWeight is the byte weight a populate reserves against the memory budget:
+// the object's size, capped at the per-populate buffer ceiling (a populate never
+// buffers more than the pipeline can hold). Unknown/negative sizes (e.g. chunked
+// responses) reserve the full ceiling. It never exceeds the total budget, so an
+// object larger than the whole budget can still populate one-at-a-time. Always ≥ 1.
+func (s *Service) populateWeight(contentLength int64) int64 {
+	w := s.perPopulateCap
+	if contentLength > 0 && contentLength < w {
+		w = contentLength
 	}
-	select {
-	case s.cacheSemaphore <- struct{}{}:
-		return true
-	default:
+	if w < 1 {
+		w = 1
+	}
+	if budget := s.config.Cache.MaxPopulateMemoryBytes; budget > 0 && w > budget {
+		w = budget
+	}
+	return w
+}
+
+// byteBudget is a non-blocking weighted semaphore bounding the aggregate bytes
+// reserved by concurrent cache-populate operations.
+type byteBudget struct {
+	mu        sync.Mutex
+	remaining int64
+}
+
+func newByteBudget(total int64) *byteBudget {
+	return &byteBudget{remaining: total}
+}
+
+func (b *byteBudget) tryAcquire(n int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.remaining < n {
 		return false
 	}
+	b.remaining -= n
+	return true
 }
 
-// releaseCacheSlot releases a slot previously reserved by acquireCacheSlot.
-func (s *Service) releaseCacheSlot() {
-	if s.cacheSemaphore == nil {
-		return
+func (b *byteBudget) release(n int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.remaining += n
+}
+
+// acquireCacheSlot tries to reserve a cache-populate slot without blocking,
+// reserving `weight` bytes against the memory budget. It returns true (and must be
+// paired with releaseCacheSlot passing the SAME weight) when both the count slot
+// and the byte budget are reserved, or when a limiter is disabled (nil). It returns
+// false when either the count limit or the memory budget is saturated, in which
+// case the caller should skip caching rather than block or spawn unbounded work.
+func (s *Service) acquireCacheSlot(weight int64) bool {
+	if s.cacheSemaphore != nil {
+		select {
+		case s.cacheSemaphore <- struct{}{}:
+		default:
+			return false
+		}
 	}
-	<-s.cacheSemaphore
+	if s.populateBudget != nil && !s.populateBudget.tryAcquire(weight) {
+		if s.cacheSemaphore != nil {
+			<-s.cacheSemaphore // hand back the count slot we just took
+		}
+		return false
+	}
+	return true
+}
+
+// releaseCacheSlot releases a slot reserved by acquireCacheSlot. `weight` must
+// match the value passed to the paired acquireCacheSlot.
+func (s *Service) releaseCacheSlot(weight int64) {
+	if s.populateBudget != nil {
+		s.populateBudget.release(weight)
+	}
+	if s.cacheSemaphore != nil {
+		<-s.cacheSemaphore
+	}
 }
 
 // statusRecorder wraps http.ResponseWriter to capture the response status code

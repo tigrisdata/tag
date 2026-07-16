@@ -159,10 +159,12 @@ cache:
   max_concurrent_writes: 256
 
   # Aggregate memory budget for concurrent cache-populate buffering. Each populate
-  # buffers up to ~channel_buffer x chunk_size bytes, so the effective concurrency
-  # is capped so concurrency x per-populate-buffer stays within this budget (and
-  # never exceeds max_concurrent_writes). This is what actually bounds populate
-  # memory — a byte-unaware count can pin many GB under large-object fan-out.
+  # reserves its object size (capped at the per-populate buffer ceiling,
+  # ~(channel_buffer + max(channel_buffer/4, 64)) x chunk_size) against this budget;
+  # when it can't fit, the object is served from upstream uncached. Small objects
+  # reserve little (high concurrency) while a burst of large objects is throttled.
+  # Applied independently of max_concurrent_writes (both limits apply). This is what
+  # actually bounds populate memory — a byte-unaware count can pin many GB.
   # Default: 1073741824 (1 GiB) (0 or unset = default; negative = memory cap disabled)
   # Override with TAG_CACHE_MAX_POPULATE_MEMORY env var
   max_populate_memory_bytes: 1073741824
@@ -296,7 +298,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `delete_batch_size`     | int      | `1000`           | File deletions processed per deletion-queue batch                                   |
 | `recovery_workers`      | int      | `16`             | Parallel workers for startup file recovery                                          |
 | `max_concurrent_writes` | int      | `256`            | Max concurrent cache-populate operations (`0`/unset = default, negative = disabled) |
-| `max_populate_memory_bytes` | int  | `1073741824`     | Aggregate memory budget for concurrent cache-populate buffering; caps effective concurrency (`0`/unset = default 1 GiB, negative = memory cap disabled) |
+| `max_populate_memory_bytes` | int  | `1073741824`     | Aggregate memory budget for concurrent cache-populate buffering; each populate reserves its size (capped at the buffer ceiling), applied independently of `max_concurrent_writes` (`0`/unset = default 1 GiB, negative = memory cap disabled) |
 
 **TTL Format:**
 

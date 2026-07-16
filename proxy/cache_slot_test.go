@@ -6,86 +6,138 @@ import (
 	"github.com/tigrisdata/tag/config"
 )
 
-// TestEffectiveCacheWriteLimit verifies the cache-populate concurrency is capped
-// by the memory budget, not just the raw count — so a byte-unaware count can't pin
-// gigabytes of populate buffers under large-object fan-out.
-func TestEffectiveCacheWriteLimit(t *testing.T) {
-	// per-populate buffer with defaults = (1024 + 256) * 64KB ≈ 80MB.
-	const chunk = 64 * 1024
-	const channelBuf = 1024
-	newCfg := func(count int, budget int64) *config.Config {
+// TestService_CacheSlotCountLimit verifies the count ceiling admits up to its
+// capacity, rejects beyond it (so callers skip caching instead of spawning
+// unbounded populate work), and frees slots on release.
+func TestService_CacheSlotCountLimit(t *testing.T) {
+	s := &Service{cacheSemaphore: make(chan struct{}, 2)}
+
+	if !s.acquireCacheSlot(1) {
+		t.Fatal("1st acquire should succeed")
+	}
+	if !s.acquireCacheSlot(1) {
+		t.Fatal("2nd acquire should succeed")
+	}
+	if s.acquireCacheSlot(1) {
+		t.Fatal("3rd acquire should fail when the count limit (2) is reached")
+	}
+
+	s.releaseCacheSlot(1)
+	if !s.acquireCacheSlot(1) {
+		t.Fatal("acquire after release should succeed")
+	}
+}
+
+// TestService_CacheSlotUnlimited verifies nil limiters disable both caps.
+func TestService_CacheSlotUnlimited(t *testing.T) {
+	s := &Service{} // nil cacheSemaphore and nil populateBudget
+	for range 100 {
+		if !s.acquireCacheSlot(1 << 30) {
+			t.Fatal("nil limiters must always admit")
+		}
+	}
+	s.releaseCacheSlot(1 << 30) // must be a no-op, not panic
+}
+
+// TestService_CacheSlotByteBudget verifies the byte budget admits until the
+// aggregate reserved bytes would exceed it, independent of the count, and that
+// releasing bytes frees capacity.
+func TestService_CacheSlotByteBudget(t *testing.T) {
+	// Count effectively unlimited (large), budget = 100 bytes.
+	s := &Service{
+		cacheSemaphore: make(chan struct{}, 1000),
+		populateBudget: newByteBudget(100),
+	}
+
+	if !s.acquireCacheSlot(60) {
+		t.Fatal("reserve 60/100 should succeed")
+	}
+	if !s.acquireCacheSlot(40) {
+		t.Fatal("reserve 40 more (100/100) should succeed")
+	}
+	if s.acquireCacheSlot(1) {
+		t.Fatal("reserve beyond the byte budget should fail")
+	}
+	// A rejected acquire must not leak the count slot it briefly took.
+	s.releaseCacheSlot(40) // free 40 bytes
+	if !s.acquireCacheSlot(40) {
+		t.Fatal("acquire after releasing bytes should succeed")
+	}
+}
+
+// TestService_CacheSlotByteBudgetReleasesCountOnByteReject verifies that when the
+// byte budget rejects, the count slot taken first is handed back (no leak).
+func TestService_CacheSlotByteBudgetReleasesCountOnByteReject(t *testing.T) {
+	s := &Service{
+		cacheSemaphore: make(chan struct{}, 1),
+		populateBudget: newByteBudget(10),
+	}
+	// Byte budget too small — acquire must fail and free the single count slot.
+	if s.acquireCacheSlot(1000) {
+		t.Fatal("acquire should fail when weight exceeds the byte budget")
+	}
+	// The count slot must be available again.
+	if !s.acquireCacheSlot(5) {
+		t.Fatal("count slot leaked after byte-budget rejection")
+	}
+}
+
+// TestPopulateWeight verifies the reserved weight is the object size capped at the
+// per-populate buffer ceiling, with unknown sizes reserving the ceiling and a
+// budget clamp so an over-large object still populates one-at-a-time.
+func TestPopulateWeight(t *testing.T) {
+	s := &Service{
+		perPopulateCap: 80 << 20, // 80MB ceiling
+		config:         &config.Config{},
+	}
+	s.config.Cache.MaxPopulateMemoryBytes = 1 << 30 // 1 GiB budget
+
+	tests := []struct {
+		name          string
+		contentLength int64
+		want          int64
+	}{
+		{"small object reserves its size", 4096, 4096},
+		{"unknown size reserves the ceiling", -1, 80 << 20},
+		{"zero size reserves the ceiling", 0, 80 << 20},
+		{"large object capped at ceiling", 500 << 20, 80 << 20},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := s.populateWeight(tt.contentLength); got != tt.want {
+				t.Errorf("populateWeight(%d) = %d, want %d", tt.contentLength, got, tt.want)
+			}
+		})
+	}
+
+	// Budget smaller than the ceiling: an object bigger than the whole budget is
+	// clamped to the budget so it can still populate one at a time.
+	s.config.Cache.MaxPopulateMemoryBytes = 1 << 20 // 1 MiB budget < 80MB ceiling
+	if got := s.populateWeight(-1); got != 1<<20 {
+		t.Errorf("populateWeight(-1) with 1MiB budget = %d, want %d", got, 1<<20)
+	}
+}
+
+// TestPerPopulateBufferBytes verifies the per-populate ceiling accounts for the
+// broadcast listener channel plus the cache-write queue's 64-chunk floor.
+func TestPerPopulateBufferBytes(t *testing.T) {
+	mk := func(chunk, channelBuf int) *config.Config {
 		c := &config.Config{}
-		c.Cache.MaxConcurrentWrites = count
-		c.Cache.MaxPopulateMemoryBytes = budget
 		c.Broadcast.ChunkSize = chunk
 		c.Broadcast.ChannelBuffer = channelBuf
 		return c
 	}
 
-	tests := []struct {
-		name   string
-		count  int
-		budget int64
-		want   int
-	}{
-		{"memory budget reduces count", 256, 1 << 30, 12}, // 1GiB / ~80MB = 12
-		{"count is the binding cap", 4, 1 << 30, 4},       // budget allows more, count wins
-		{"tiny budget still allows one", 256, 1, 1},       // never zero
-		{"negative budget disables memory cap", 256, -1, 256},
-		{"negative count disables limiter", -1, 1 << 30, 0}, // unbounded
-		{"zero count disables limiter", 0, 1 << 30, 0},      // unbounded (finalize would set default first)
+	// Defaults: (1024 + 256) * 64KB.
+	if got, want := perPopulateBufferBytes(mk(64*1024, 1024)), int64(1024+256)*64*1024; got != want {
+		t.Errorf("perPopulateBufferBytes(default) = %d, want %d", got, want)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := effectiveCacheWriteLimit(newCfg(tt.count, tt.budget)); got != tt.want {
-				t.Errorf("effectiveCacheWriteLimit(count=%d, budget=%d) = %d, want %d", tt.count, tt.budget, got, tt.want)
-			}
-		})
+	// Small channel_buffer: queue is floored at 64, not channelBuf/4=4.
+	if got, want := perPopulateBufferBytes(mk(64*1024, 16)), int64(16+64)*64*1024; got != want {
+		t.Errorf("perPopulateBufferBytes(channelBuf=16) = %d, want %d (64-chunk floor)", got, want)
 	}
-}
-
-// TestEffectiveCacheWriteLimit_ZeroBroadcastFallsBackToDefaults verifies the
-// per-populate estimate falls back to broadcast defaults when unset, so the
-// memory cap still applies.
-func TestEffectiveCacheWriteLimit_ZeroBroadcastFallsBackToDefaults(t *testing.T) {
-	c := &config.Config{}
-	c.Cache.MaxConcurrentWrites = 256
-	c.Cache.MaxPopulateMemoryBytes = 1 << 30
-	// Broadcast fields left at zero — should use DefaultChunkSize/DefaultChannelBuffer.
-	if got := effectiveCacheWriteLimit(c); got != 12 {
-		t.Errorf("effectiveCacheWriteLimit with zero broadcast = %d, want 12 (defaults)", got)
+	// Zero broadcast values fall back to defaults.
+	if got, want := perPopulateBufferBytes(mk(0, 0)), int64(1024+256)*64*1024; got != want {
+		t.Errorf("perPopulateBufferBytes(zero) = %d, want %d (defaults)", got, want)
 	}
-}
-
-// TestService_CacheSlotLimit verifies the concurrent-cache-write limiter admits
-// up to its capacity, rejects beyond it (so callers skip caching instead of
-// spawning unbounded populate work), and frees slots on release.
-func TestService_CacheSlotLimit(t *testing.T) {
-	s := &Service{cacheSemaphore: make(chan struct{}, 2)}
-
-	if !s.acquireCacheSlot() {
-		t.Fatal("1st acquire should succeed")
-	}
-	if !s.acquireCacheSlot() {
-		t.Fatal("2nd acquire should succeed")
-	}
-	if s.acquireCacheSlot() {
-		t.Fatal("3rd acquire should fail when the limit (2) is reached")
-	}
-
-	s.releaseCacheSlot()
-	if !s.acquireCacheSlot() {
-		t.Fatal("acquire after release should succeed")
-	}
-}
-
-// TestService_CacheSlotUnlimited verifies a nil semaphore disables the limit.
-func TestService_CacheSlotUnlimited(t *testing.T) {
-	s := &Service{cacheSemaphore: nil}
-	for i := 0; i < 100; i++ {
-		if !s.acquireCacheSlot() {
-			t.Fatal("nil semaphore must always admit")
-		}
-	}
-	s.releaseCacheSlot() // must be a no-op, not panic
 }
