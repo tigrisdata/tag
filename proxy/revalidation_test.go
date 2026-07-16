@@ -24,6 +24,8 @@ type mockForwarder struct {
 	conditionalETag   string
 	// Optional Forward implementation for fallback tests
 	forwardFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request) error
+	// Optional ForwardWithCapture implementation for capture-gated tests
+	captureFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error)
 }
 
 func (m *mockForwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
@@ -34,6 +36,9 @@ func (m *mockForwarder) Forward(ctx context.Context, w http.ResponseWriter, r *h
 }
 
 func (m *mockForwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+	if m.captureFunc != nil {
+		return m.captureFunc(ctx, w, r)
+	}
 	return nil, nil
 }
 

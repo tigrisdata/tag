@@ -164,7 +164,14 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 
 				// Serve full response from cache
 				if cacheBodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); cacheBodyErr != nil {
-					log.Warn().Err(cacheBodyErr).Str("bucket", bucket).Str("key", key).Msg("Cache body unavailable, falling through to upstream")
+					log.Warn().Err(cacheBodyErr).Str("bucket", bucket).Str("key", key).Msg("Cache body unavailable, invalidating orphaned meta and falling through to upstream")
+					// Metadata survived but its versioned body is gone. Invalidate the
+					// orphaned meta (same as the range and revalidation paths) so this
+					// does not become a meta-hit/body-miss loop that repeats the failed
+					// cache read on every request before refetching from upstream.
+					// serveFromCache errored before committing headers, so falling
+					// through to the miss path below is safe.
+					s.cache.Delete(context.Background(), bucket, key)
 					// Fall through to cache miss path
 				} else {
 					return nil
