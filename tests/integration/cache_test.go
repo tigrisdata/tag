@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tigrisdata/tag/cache"
 )
 
 // TestCache_HitWithMetadata verifies that cache hits return proper headers.
@@ -395,6 +396,51 @@ func TestCache_RangeServedFromCache(t *testing.T) {
 
 	assert.Equal(t, []byte("ABCDEFGHIJ"), body4, "Second range request should return correct bytes")
 	env.AssertXCacheHit(t) // Second range request should also be served from cache
+}
+
+// TestCache_RangeBodyEvictedFallsThroughToUpstream verifies that when object
+// metadata is cached but its ETag-versioned body is gone (independently evicted,
+// or written by a pre-versioning build under a different key), a Range GET does
+// NOT emit a truncated 206 from cache — it forwards to upstream and returns the
+// correct bytes. Regression guard for the range-header-before-body-probe bug.
+func TestCache_RangeBodyEvictedFallsThroughToUpstream(t *testing.T) {
+	env := NewTestEnvironmentWithCache()
+	defer env.Close()
+
+	bucket := "cache-test-bucket"
+	key := "range-evicted.txt"
+	content := []byte("0123456789ABCDEFGHIJ") // 20 bytes
+	require.NoError(t, env.PutTestObject(bucket, key, content))
+
+	client := env.GetS3Client()
+	ctx := context.Background()
+
+	// Warm the cache with a full GET.
+	resp1, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+	require.NoError(t, err)
+	io.Copy(io.Discard, resp1.Body)
+	resp1.Body.Close()
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "object should be cached after first GET")
+
+	// Evict ONLY the versioned body, leaving metadata in place — the meta-present
+	// / body-absent state that made the range path commit a 206 over a truncated body.
+	meta, found, err := env.Cache.GetMeta(ctx, bucket, key)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NoError(t, env.EmbeddedCache.Delete(ctx, cache.MakeBodyKey(bucket, key, meta.ETag)))
+	require.True(t, env.IsCached(bucket, key), "metadata must still be present after body eviction")
+
+	// A Range GET must return the correct bytes (served from upstream), not a
+	// truncated or empty 206 from the cache.
+	resp2, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Range:  aws.String("bytes=5-14"),
+	})
+	require.NoError(t, err)
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	assert.Equal(t, []byte("56789ABCDE"), body2, "range must return correct bytes via upstream fallthrough")
 }
 
 // TestCache_RangeSingleByteAtZero verifies the byte-0 quirk handling.

@@ -104,6 +104,7 @@ func TestCachedObjectMeta_WriteHeaders(t *testing.T) {
 func TestCachedObjectMeta_IsCacheable(t *testing.T) {
 	tests := []struct {
 		name         string
+		etag         string
 		cacheControl string
 		contentLen   int64
 		maxSize      int64
@@ -111,13 +112,23 @@ func TestCachedObjectMeta_IsCacheable(t *testing.T) {
 	}{
 		{
 			name:         "cacheable object",
+			etag:         `"abc"`,
 			cacheControl: "max-age=3600",
 			contentLen:   1024,
 			maxSize:      1024 * 1024,
 			expected:     true,
 		},
 		{
+			name:         "no etag",
+			etag:         "",
+			cacheControl: "max-age=3600",
+			contentLen:   1024,
+			maxSize:      1024 * 1024,
+			expected:     false,
+		},
+		{
 			name:         "no-store",
+			etag:         `"abc"`,
 			cacheControl: "no-store",
 			contentLen:   1024,
 			maxSize:      1024 * 1024,
@@ -125,6 +136,7 @@ func TestCachedObjectMeta_IsCacheable(t *testing.T) {
 		},
 		{
 			name:         "private",
+			etag:         `"abc"`,
 			cacheControl: "private",
 			contentLen:   1024,
 			maxSize:      1024 * 1024,
@@ -132,6 +144,7 @@ func TestCachedObjectMeta_IsCacheable(t *testing.T) {
 		},
 		{
 			name:         "too large",
+			etag:         `"abc"`,
 			cacheControl: "max-age=3600",
 			contentLen:   10 * 1024 * 1024,
 			maxSize:      1024 * 1024,
@@ -139,6 +152,7 @@ func TestCachedObjectMeta_IsCacheable(t *testing.T) {
 		},
 		{
 			name:         "no cache control",
+			etag:         `"abc"`,
 			cacheControl: "",
 			contentLen:   1024,
 			maxSize:      1024 * 1024,
@@ -146,6 +160,7 @@ func TestCachedObjectMeta_IsCacheable(t *testing.T) {
 		},
 		{
 			name:         "public cache control",
+			etag:         `"abc"`,
 			cacheControl: "public, max-age=3600",
 			contentLen:   1024,
 			maxSize:      1024 * 1024,
@@ -156,6 +171,7 @@ func TestCachedObjectMeta_IsCacheable(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			obj := &CachedObjectMeta{
+				ETag:          tt.etag,
 				CacheControl:  tt.cacheControl,
 				ContentLength: tt.contentLen,
 			}
@@ -177,10 +193,15 @@ func TestMakeMetaKey(t *testing.T) {
 }
 
 func TestMakeBodyKey(t *testing.T) {
+	// No ETag falls back to the unversioned key.
 	expected := "body|my-bucket|path/to/object.txt"
-	result := MakeBodyKey("my-bucket", "path/to/object.txt")
+	result := MakeBodyKey("my-bucket", "path/to/object.txt", "")
 	if result != expected {
 		t.Errorf("MakeBodyKey() = %q, want %q", result, expected)
+	}
+	// With an ETag the body key is version-qualified (quotes/weak prefix stripped).
+	if got := MakeBodyKey("my-bucket", "path/to/object.txt", `"abc123"`); got != "body|my-bucket|path/to/object.txt|abc123" {
+		t.Errorf("MakeBodyKey(etag) = %q, want %q", got, "body|my-bucket|path/to/object.txt|abc123")
 	}
 }
 

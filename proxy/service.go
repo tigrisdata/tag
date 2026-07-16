@@ -81,6 +81,42 @@ func (s *Service) releaseCacheSlot() {
 	<-s.cacheSemaphore
 }
 
+// statusRecorder wraps http.ResponseWriter to capture the response status code
+// written while forwarding an upstream response. Forward() returns nil even when
+// upstream responds 4xx/5xx (the response streamed successfully), so mutating
+// handlers use this to gate post-forward cache re-invalidation on an actual 2xx —
+// otherwise a rejected PUT/DELETE/COPY would still tombstone the destination and
+// discard a valid racing refill, causing later reads to miss unnecessarily.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rec *statusRecorder) WriteHeader(code int) {
+	rec.status = code
+	rec.ResponseWriter.WriteHeader(code)
+}
+
+func (rec *statusRecorder) Write(b []byte) (int, error) {
+	if rec.status == 0 {
+		rec.status = http.StatusOK
+	}
+	return rec.ResponseWriter.Write(b)
+}
+
+// Flush delegates to the underlying writer when it supports flushing, so wrapping
+// never disables streaming for handlers that rely on http.Flusher.
+func (rec *statusRecorder) Flush() {
+	if f, ok := rec.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// wroteSuccess reports whether upstream returned a 2xx status.
+func (rec *statusRecorder) wroteSuccess() bool {
+	return rec.status >= 200 && rec.status < 300
+}
+
 // HandlePutObject handles PUT requests for objects.
 // Invalidates cache BEFORE forwarding to ensure consistency.
 func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error {
@@ -96,8 +132,22 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 		metrics.RecordCacheOperation("delete", "success")
 	}
 
-	// Forward to Tigris
-	err := s.forwarder.Forward(r.Context(), w, r)
+	// Forward to Tigris, recording the upstream status.
+	rec := &statusRecorder{ResponseWriter: w}
+	err := s.forwarder.Forward(r.Context(), rec, r)
+
+	// Re-invalidate AFTER upstream confirms the write. A GET that raced the
+	// in-flight PUT may have fetched the pre-PUT object and begun re-caching it;
+	// this second invalidation writes a tombstone newer than that write's start
+	// time, so the tombstone-aware cache write skips the stale repopulation —
+	// restoring read-after-write semantics.
+	// Gated on a 2xx: a rejected PUT leaves the object unchanged, so re-invalidating
+	// would only discard a valid racing refill and cause an unnecessary later miss.
+	// The metric is recorded once on the pre-forward invalidation above; this
+	// second Delete is the same logical invalidation, so it is not counted again.
+	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
+		s.cache.Delete(context.Background(), bucket, key)
+	}
 
 	status := "success"
 	if err != nil {
@@ -123,8 +173,21 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 		metrics.RecordCacheOperation("delete", "success")
 	}
 
-	// Forward to upstream
-	err := s.forwarder.Forward(r.Context(), w, r)
+	// Forward to upstream, recording the upstream status.
+	rec := &statusRecorder{ResponseWriter: w}
+	err := s.forwarder.Forward(r.Context(), rec, r)
+
+	// Re-invalidate AFTER upstream confirms the delete, for the same
+	// read-after-write reason as HandlePutObject: a GET racing the in-flight
+	// DELETE may have re-cached the not-yet-deleted object; this second
+	// tombstone blocks that stale repopulation.
+	// Gated on a 2xx: a rejected DELETE leaves the object present, so re-invalidating
+	// would only discard a valid racing refill and cause an unnecessary later miss.
+	// The metric is recorded once on the pre-forward invalidation above; this
+	// second Delete is the same logical invalidation, so it is not counted again.
+	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
+		s.cache.Delete(context.Background(), bucket, key)
+	}
 
 	status := "success"
 	if err != nil {
@@ -218,8 +281,33 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 		s.cache.Delete(context.Background(), bucket, key)
 	}
 
-	// Forward to upstream
-	return s.forwarder.Forward(r.Context(), w, r)
+	// Forward to upstream, capturing the response so we can confirm the copy
+	// actually succeeded. CopyObject signals failure either with a non-2xx status
+	// or — famously — a 200 OK carrying an <Error> body, and Forward would report
+	// neither.
+	capture, err := s.forwarder.ForwardWithCapture(r.Context(), w, r)
+
+	// Re-invalidate the destination AFTER upstream confirms the copy, for the same
+	// read-after-write reason as HandlePutObject: a GET racing the in-flight copy
+	// may have re-cached the pre-copy destination object; this second tombstone
+	// blocks that stale repopulation.
+	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
+	// unchanged, so re-invalidating would only discard a valid racing refill.
+	if err == nil && copyObjectSucceeded(capture) && s.cache.IsEnabled() {
+		s.cache.Delete(context.Background(), bucket, key)
+	}
+
+	return err
+}
+
+// copyObjectSucceeded reports whether a captured CopyObject response indicates the
+// copy actually happened: a 2xx status whose body is not an S3 <Error> document
+// (S3 can return 200 OK with an error body for copies that fail mid-operation).
+func copyObjectSucceeded(capture *ResponseCapture) bool {
+	if capture == nil || capture.StatusCode < 200 || capture.StatusCode >= 300 {
+		return false
+	}
+	return !isS3ErrorBody(capture.Body)
 }
 
 // HandlePassthrough handles requests that are passed through without caching.

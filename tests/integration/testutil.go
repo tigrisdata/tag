@@ -692,16 +692,19 @@ func (e *TestEnvironment) ResetUpstreamRequestCount() {
 // GetCachedObject reads an object directly from the cache for test verification.
 // Returns (body, found). If not found or cache is disabled, returns (nil, false).
 func (e *TestEnvironment) GetCachedObject(bucket, key string) ([]byte, bool) {
-	if e.EmbeddedCache == nil {
+	if e.Cache == nil {
 		return nil, false
 	}
 
-	// Use the same key format as the cache package
-	bodyKey := "body|" + bucket + "|" + key
-	// Body is stored via PutStream, so we need to use GetStream to retrieve it
+	// Bodies are addressed by the object's ETag ("body|bucket|key|<etag>"), so
+	// resolve the current metadata first and read the body version it describes.
+	ctx := context.Background()
+	meta, found, err := e.Cache.GetMeta(ctx, bucket, key)
+	if err != nil || !found || meta == nil {
+		return nil, false
+	}
 	var buf bytes.Buffer
-	err := e.EmbeddedCache.GetStream(context.Background(), bodyKey, &buf)
-	if err != nil {
+	if err := e.Cache.GetBodyStream(ctx, bucket, key, meta.ETag, &buf); err != nil {
 		return nil, false
 	}
 	return buf.Bytes(), true

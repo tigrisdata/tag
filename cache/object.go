@@ -168,6 +168,16 @@ func (m *CachedObjectMeta) IsPublicRead() bool {
 
 // IsCacheable returns true if the object should be cached based on headers.
 func (m *CachedObjectMeta) IsCacheable(maxSize int64) bool {
+	// Don't cache objects without an ETag. Bodies are addressed by ETag so each
+	// version gets an immutable key; without one, all versions would share a single
+	// unversioned body key that a concurrent overwrite could clobber in place,
+	// truncating an in-flight reader. Objects Tigris serves always carry an ETag, so
+	// this only excludes rare ETag-less responses (e.g. some non-Tigris upstreams in
+	// signing mode), which are forwarded uncached rather than cached unsafely.
+	if m.ETag == "" {
+		return false
+	}
+
 	// Don't cache if Cache-Control says not to
 	cc := strings.ToLower(m.CacheControl)
 	if strings.Contains(cc, "no-store") || strings.Contains(cc, "private") {
@@ -233,9 +243,17 @@ func MakeMetaKey(bucket, key string) string {
 	return metaKeyPrefix + bucket + "|" + key
 }
 
-// MakeBodyKey creates the cache key for object body.
-func MakeBodyKey(bucket, key string) string {
-	return bodyKeyPrefix + bucket + "|" + key
+// MakeBodyKey creates the cache key for an object body. Bodies are addressed by
+// the object's ETag ("body|bucket|key|<etag>") so a served metadata entry always
+// maps to the exact body version it describes: a concurrent overwrite writes a
+// new meta plus a new body key and never clobbers the version an in-flight reader
+// resolved. Objects with no ETag fall back to the unversioned key (there is no
+// version discriminator available for them).
+func MakeBodyKey(bucket, key, etag string) string {
+	if etag == "" {
+		return bodyKeyPrefix + bucket + "|" + key
+	}
+	return bodyKeyPrefix + bucket + "|" + key + "|" + normalizeETag(etag)
 }
 
 // MakeTombstoneKey creates the cache key for invalidation tombstones.
