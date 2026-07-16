@@ -565,6 +565,71 @@ func TestRevalidationRange304_ServesCachedRange(t *testing.T) {
 	}
 }
 
+// When a range revalidation gets a 304 but the ETag-versioned body has been
+// evicted (meta survives, body gone), the cache cannot serve the range. TAG must
+// forward the range to upstream — not return an error or a truncated 206.
+func TestRevalidationRange304_BodyEvictedForwardsUpstream(t *testing.T) {
+	const forwardBody = "UPSTREAM-RANGE"
+	forwarded := false
+	mock := &mockForwarder{
+		conditionalResp: &http.Response{
+			StatusCode: http.StatusNotModified,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     http.Header{},
+		},
+		forwardFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+			forwarded = true
+			w.Header().Set("Content-Range", "bytes 0-13/100")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte(forwardBody))
+			return nil
+		},
+	}
+
+	cfg := config.NewDefault()
+	memCache := cacheclient.NewMemoryCache()
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+	ctx := context.Background()
+	bucket, key := "test-bucket", "test-key"
+
+	meta := &cache.CachedObjectMeta{
+		Bucket:        bucket,
+		Key:           key,
+		ETag:          `"abc123"`,
+		ContentType:   "text/plain",
+		ContentLength: 12,
+		StatusCode:    http.StatusOK,
+	}
+	if err := c.PutWithMeta(ctx, bucket, key, meta, []byte("hello world!"), 0); err != nil {
+		t.Fatalf("PutWithMeta() error = %v", err)
+	}
+	// Evict ONLY the versioned body, keeping the metadata.
+	if err := memCache.Delete(ctx, cache.MakeBodyKey(bucket, key, meta.ETag)); err != nil {
+		t.Fatalf("evict body: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
+	r.Header.Set("Range", "bytes=0-4")
+	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now()); err != nil {
+		t.Fatalf("revalidateAndServe() error = %v", err)
+	}
+
+	if !forwarded {
+		t.Fatal("expected upstream Forward when the versioned body was evicted on a range 304")
+	}
+	if w.Code != http.StatusPartialContent {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusPartialContent)
+	}
+	if w.Body.String() != forwardBody {
+		t.Errorf("body = %q, want %q (served from upstream)", w.Body.String(), forwardBody)
+	}
+	if got := w.Header().Get(XCacheHeader); got != XCacheMiss {
+		t.Errorf("X-Cache = %q, want %q", got, XCacheMiss)
+	}
+}
+
 func TestRevalidationRange206_StreamsRangeFromUpstream(t *testing.T) {
 	// Setup: mock upstream returns 206 Partial Content (object changed, range returned)
 	rangeBody := "new range!"
