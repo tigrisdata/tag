@@ -76,6 +76,15 @@ const (
 	// DefaultCacheMaxConcurrentWrites is the default ceiling on concurrent
 	// cache-populate operations.
 	DefaultCacheMaxConcurrentWrites = 256
+
+	// DefaultCacheMaxPopulateMemoryBytes bounds the aggregate memory buffered by
+	// concurrent cache-populate operations (1 GiB). Each populate reserves the
+	// object's size, capped at the per-populate buffer ceiling (roughly
+	// (channel_buffer + max(channel_buffer/4, 64)) × chunk_size). A byte-unaware
+	// count alone (MaxConcurrentWrites) can pin gigabytes under large-object
+	// fan-out — e.g. 256 large populates × ~80 MB ≈ 20 GB — so this budget, not the
+	// count, is what actually bounds populate memory.
+	DefaultCacheMaxPopulateMemoryBytes = 1 << 30
 )
 
 // Config holds all configuration for TAG.
@@ -162,6 +171,17 @@ type CacheConfig struct {
 	// unbounded. 0 or unset uses DefaultCacheMaxConcurrentWrites; a negative
 	// value disables the limit.
 	MaxConcurrentWrites int `yaml:"max_concurrent_writes"`
+	// MaxPopulateMemoryBytes bounds the aggregate memory buffered by concurrent
+	// cache-populate operations. Each populate reserves its object size, capped at
+	// the per-populate buffer ceiling (~(channel_buffer + max(channel_buffer/4, 64))
+	// × chunk_size), against this budget; when it can't fit, the object is served
+	// from upstream uncached. Small objects reserve little (high concurrency) while
+	// a burst of large objects is throttled — this is what actually bounds populate
+	// memory, since a byte-unaware count can pin many GB under large-object fan-out.
+	// Applied independently of MaxConcurrentWrites (both limits apply). 0 or unset
+	// uses DefaultCacheMaxPopulateMemoryBytes; a negative value disables the memory
+	// cap (count-only, prior behavior).
+	MaxPopulateMemoryBytes int64 `yaml:"max_populate_memory_bytes"`
 }
 
 // IsEnabled returns whether caching is enabled.
@@ -195,7 +215,7 @@ func (c *CacheConfig) SetGRPCAuth(enabled bool) {
 // BroadcastConfig holds streaming broadcast configuration for request coalescing.
 type BroadcastConfig struct {
 	ChunkSize     int `yaml:"chunk_size"`     // Size of chunks for streaming (default: 64KB)
-	ChannelBuffer int `yaml:"channel_buffer"` // Buffer size per listener in chunks (default: 32)
+	ChannelBuffer int `yaml:"channel_buffer"` // Buffer size per listener in chunks (default: 1024, ~64MB at 64KB chunks)
 }
 
 // LogConfig holds logging configuration.
@@ -296,6 +316,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cache.MaxConcurrentWrites == 0 {
 		cfg.Cache.MaxConcurrentWrites = DefaultCacheMaxConcurrentWrites
 	}
+	if cfg.Cache.MaxPopulateMemoryBytes == 0 {
+		cfg.Cache.MaxPopulateMemoryBytes = DefaultCacheMaxPopulateMemoryBytes
+	}
 
 	// Broadcast defaults
 	if cfg.Broadcast.ChunkSize == 0 {
@@ -385,6 +408,12 @@ func applyEnvOverrides(cfg *Config) {
 		if val := os.Getenv("TAG_CACHE_MAX_CONCURRENT_WRITES"); val != "" {
 			if n, err := strconv.Atoi(val); err == nil && n > 0 {
 				cfg.Cache.MaxConcurrentWrites = n
+			}
+		}
+		// Override cache-populate memory budget from environment (negative disables)
+		if val := os.Getenv("TAG_CACHE_MAX_POPULATE_MEMORY"); val != "" {
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n != 0 {
+				cfg.Cache.MaxPopulateMemoryBytes = n
 			}
 		}
 	}

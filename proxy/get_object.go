@@ -330,7 +330,10 @@ func (s *Service) streamFromUpstream(
 	var cacheErrCh chan error
 
 	if shouldCache {
-		cachePipeWriter, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false)
+		// Reserve against the memory budget by the object's actual size (capped at
+		// the buffer ceiling), so small objects don't each reserve the worst case.
+		weight := s.populateWeight(resp.ContentLength)
+		cachePipeWriter, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight)
 	}
 
 	// If an anonymous GET succeeded and Tigris didn't set an explicit per-object ACL,
