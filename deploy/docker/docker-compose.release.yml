@@ -11,7 +11,7 @@
 #   docker compose -f docker-compose.release.yml up -d
 #
 # Defaults to the latest published image. For reproducible deployments, pin a
-# specific release by setting TAG_VERSION (e.g. TAG_VERSION=v1.9.4) in your .env.
+# specific release by setting TAG_VERSION (e.g. TAG_VERSION=v1.11.1) in your .env.
 
 services:
   tag:
