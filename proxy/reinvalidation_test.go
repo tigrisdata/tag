@@ -166,3 +166,37 @@ func TestHandleDeleteObjects_PartialFailureKeepsFailedKeyRefill(t *testing.T) {
 		t.Error("failed key's valid refill was discarded — failed keys must not be re-invalidated")
 	}
 }
+
+// A DeleteObjects request can list the same key under multiple version IDs. If one
+// version's delete succeeds and another fails, the key's current object may have
+// changed, so a racing refill must be dropped. Matching failures by key alone would
+// wrongly treat the key as fully failed and keep the stale refill.
+func TestHandleDeleteObjects_MixedVersionSuccessReinvalidatesKey(t *testing.T) {
+	var c *cache.Cache
+	const key = "versioned-key"
+
+	repopulateThenMixed := func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+		b, _ := ParseBucketKey(r)
+		meta := &cache.CachedObjectMeta{Bucket: b, Key: key, ETag: `"refill"`, ContentLength: 6, StatusCode: 200}
+		_ = c.PutWithMeta(context.Background(), b, key, meta, []byte("refill"), 60)
+		body := []byte(`<DeleteResult><Deleted><Key>versioned-key</Key><VersionId>v1</VersionId></Deleted><Error><Key>versioned-key</Key><VersionId>v2</VersionId><Code>AccessDenied</Code></Error></DeleteResult>`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+		return &ResponseCapture{StatusCode: http.StatusOK, Body: body, Complete: true}, nil
+	}
+
+	var svc *Service
+	svc, c = newTestService(&mockForwarder{captureFunc: repopulateThenMixed}, true)
+
+	reqBody := `<Delete><Object><Key>versioned-key</Key><VersionId>v1</VersionId></Object><Object><Key>versioned-key</Key><VersionId>v2</VersionId></Object></Delete>`
+	r := httptest.NewRequest(http.MethodPost, "/bulk-bucket?delete", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+	if err := svc.HandleDeleteObjects(w, r); err != nil {
+		t.Fatalf("HandleDeleteObjects: %v", err)
+	}
+
+	b, _ := ParseBucketKey(r)
+	if _, found, _ := c.GetMeta(context.Background(), b, key); found {
+		t.Error("key with a succeeded version-delete kept its stale refill — should be re-invalidated")
+	}
+}

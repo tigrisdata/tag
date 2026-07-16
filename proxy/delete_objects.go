@@ -30,28 +30,37 @@ type deleteObjectEntry struct {
 }
 
 // deleteObjectsResult represents the S3 DeleteObjects response. Only the per-object
-// <Error> entries are captured: successful deletes may be omitted (Quiet mode), so
-// success is derived as "requested minus errored".
+// <Error> entries are captured (with their VersionId): successful deletes may be
+// omitted (Quiet mode), but errors are always listed in both modes, so a requested
+// entry succeeded iff it is NOT in the errored set.
 type deleteObjectsResult struct {
 	XMLName xml.Name `xml:"DeleteResult"`
 	Errors  []struct {
-		Key string `xml:"Key"`
+		Key       string `xml:"Key"`
+		VersionId string `xml:"VersionId"`
 	} `xml:"Error"`
 }
 
-// failedDeleteKeys returns the set of keys upstream reported as NOT deleted. On a
-// parse failure it returns an empty set, so callers re-invalidate all requested
-// keys — the safe over-invalidation.
-func failedDeleteKeys(body []byte) map[string]struct{} {
-	failed := make(map[string]struct{})
+// deleteEntryID identifies a delete request/response entry by (key, versionId).
+// A DeleteObjects request may list the same key multiple times with different
+// version IDs, so entries must be matched by both, not by key alone.
+func deleteEntryID(key, versionID string) string {
+	return key + "\x00" + versionID
+}
+
+// erroredDeleteEntries returns the set of (key, versionId) entries upstream
+// reported as NOT deleted, and whether the response parsed. On a parse failure the
+// caller re-invalidates all requested keys (safe over-invalidation).
+func erroredDeleteEntries(body []byte) (map[string]struct{}, bool) {
 	var result deleteObjectsResult
 	if err := xml.Unmarshal(body, &result); err != nil {
-		return failed
+		return nil, false
 	}
+	errored := make(map[string]struct{}, len(result.Errors))
 	for _, e := range result.Errors {
-		failed[e.Key] = struct{}{}
+		errored[deleteEntryID(e.Key, e.VersionId)] = struct{}{}
 	}
-	return failed
+	return errored, true
 }
 
 // isS3ErrorBody reports whether an XML body's root element is <Error>, the shape S3
@@ -89,14 +98,14 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 
 	// Parse request to get keys being deleted and invalidate cache BEFORE forwarding
 	// This ensures cache consistency even if forwarding fails after cache invalidation
-	var deletedKeys []string
+	var requested []deleteObjectEntry
 	if s.cache.IsEnabled() {
 		var deleteReq deleteObjectsRequest
 		if xmlErr := xml.Unmarshal(bodyBytes, &deleteReq); xmlErr == nil {
 			for _, obj := range deleteReq.Objects {
 				s.cache.Delete(context.Background(), bucket, obj.Key)
 				metrics.RecordCacheOperation("delete", "success")
-				deletedKeys = append(deletedKeys, obj.Key)
+				requested = append(requested, obj)
 				log.Debug().
 					Str("bucket", bucket).
 					Str("key", obj.Key).
@@ -113,16 +122,25 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	// Re-invalidate AFTER upstream confirms the deletes, for the same
 	// read-after-write reason as HandleDeleteObject: a GET racing the in-flight
 	// bulk delete may have re-cached a not-yet-deleted object; this second
-	// tombstone blocks that stale repopulation. Only keys upstream actually deleted
-	// are re-invalidated — a key that failed is still present, so tombstoning it
-	// would discard a valid racing refill. The metric is recorded once on the
-	// pre-forward invalidation above, so it is not counted again here.
+	// tombstone blocks that stale repopulation. A key is re-invalidated if AT LEAST
+	// ONE of its requested entries succeeded — the request may list the same key
+	// under multiple version IDs, so matching failures by key alone would wrongly
+	// skip a key whose current version was deleted while an old version's delete
+	// failed, leaving a racing refill cached as stale. The metric is recorded once
+	// on the pre-forward invalidation above, so it is not counted again here.
 	if err == nil && capture != nil && capture.StatusCode >= 200 && capture.StatusCode < 300 && s.cache.IsEnabled() {
-		failed := failedDeleteKeys(capture.Body)
-		for _, key := range deletedKeys {
-			if _, bad := failed[key]; bad {
-				continue
+		errored, parsed := erroredDeleteEntries(capture.Body)
+		reinvalidate := make(map[string]struct{}, len(requested))
+		for _, obj := range requested {
+			// On a parse failure, over-invalidate every requested key (safe).
+			if parsed {
+				if _, failed := errored[deleteEntryID(obj.Key, obj.VersionId)]; failed {
+					continue // this entry failed; another entry for the same key may still succeed
+				}
 			}
+			reinvalidate[obj.Key] = struct{}{}
+		}
+		for key := range reinvalidate {
 			s.cache.Delete(context.Background(), bucket, key)
 		}
 	}
