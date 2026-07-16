@@ -119,8 +119,10 @@ func TestETagVersionedBody_VersionedMissDoesNotServeLegacyBody(t *testing.T) {
 	}
 }
 
-// Objects with no ETag use the unversioned body key and round-trip.
-func TestETagVersionedBody_EmptyETagFallsBackToFixedKey(t *testing.T) {
+// Objects with no ETag are not cached at all: there is no version discriminator,
+// so caching them at a single unversioned key would reintroduce the in-place
+// overwrite / truncation hazard the ETag versioning was introduced to prevent.
+func TestETagVersionedBody_EmptyETagIsNotCached(t *testing.T) {
 	c, mem := newVersioningTestCache(t)
 	ctx := context.Background()
 	bucket, key := "b", "k"
@@ -129,11 +131,11 @@ func TestETagVersionedBody_EmptyETagFallsBackToFixedKey(t *testing.T) {
 	if err := c.PutWithMeta(ctx, bucket, key, meta, []byte("body"), 60); err != nil {
 		t.Fatalf("PutWithMeta: %v", err)
 	}
-	if _, err := mem.Get(ctx, MakeBodyKey(bucket, key, "")); err != nil {
-		t.Errorf("empty-ETag body not stored at fixed key: %v", err)
+	// Neither meta nor body should have been written.
+	if _, found, _ := c.GetMeta(ctx, bucket, key); found {
+		t.Error("empty-ETag object should not be cached (meta present)")
 	}
-	var buf bytes.Buffer
-	if err := c.GetBodyStream(ctx, bucket, key, "", &buf); err != nil || buf.String() != "body" {
-		t.Errorf("read empty-ETag body: err=%v body=%q", err, buf.String())
+	if _, err := mem.Get(ctx, MakeBodyKey(bucket, key, "")); err == nil {
+		t.Error("empty-ETag object should not be cached (body present)")
 	}
 }

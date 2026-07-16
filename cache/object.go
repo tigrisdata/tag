@@ -168,6 +168,16 @@ func (m *CachedObjectMeta) IsPublicRead() bool {
 
 // IsCacheable returns true if the object should be cached based on headers.
 func (m *CachedObjectMeta) IsCacheable(maxSize int64) bool {
+	// Don't cache objects without an ETag. Bodies are addressed by ETag so each
+	// version gets an immutable key; without one, all versions would share a single
+	// unversioned body key that a concurrent overwrite could clobber in place,
+	// truncating an in-flight reader. Objects Tigris serves always carry an ETag, so
+	// this only excludes rare ETag-less responses (e.g. some non-Tigris upstreams in
+	// signing mode), which are forwarded uncached rather than cached unsafely.
+	if m.ETag == "" {
+		return false
+	}
+
 	// Don't cache if Cache-Control says not to
 	cc := strings.ToLower(m.CacheControl)
 	if strings.Contains(cc, "no-store") || strings.Contains(cc, "private") {

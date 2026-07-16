@@ -79,6 +79,14 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 		return nil
 	}
 
+	// Objects without an ETag are not cached: bodies are addressed by ETag, and an
+	// ETag-less object would share a single unversioned body key that a concurrent
+	// overwrite could clobber in place. Callers gate on IsCacheable (which also
+	// excludes empty ETags); this is a defensive backstop for direct callers.
+	if meta.ETag == "" {
+		return nil
+	}
+
 	if ttl == 0 {
 		ttl = int(c.defaultTTL)
 	}

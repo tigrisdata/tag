@@ -487,6 +487,7 @@ func TestServeFromCache_SmallObject(t *testing.T) {
 	meta := &cache.CachedObjectMeta{
 		Bucket:        bucket,
 		Key:           key,
+		ETag:          `"small"`,
 		ContentType:   "text/plain",
 		ContentLength: int64(len(body)),
 		StatusCode:    http.StatusOK,
