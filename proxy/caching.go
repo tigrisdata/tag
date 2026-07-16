@@ -14,6 +14,8 @@ import (
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy/broadcast"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // signalingReader wraps an io.Reader and signals when the first Read() is called.
@@ -65,22 +67,39 @@ const (
 // success or a failure.
 var errCachePopulateDeclined = errors.New("cache populate declined: concurrent write limit reached")
 
-// errCacheBodyEmpty marks a cached entry whose metadata claims a non-zero body but
-// whose body read returned no bytes — an inconsistent entry, like a missing body.
-var errCacheBodyEmpty = errors.New("cache body empty")
-
-// bodyGone reports whether a failed cache-body read means the body is genuinely
-// missing or inconsistent — the orphaned-metadata case, where invalidating the meta
-// is what lets the entry heal (and unblocks the GetMeta(!found)-gated re-warm).
+// bodyGone reports whether a failed cache-body read should invalidate the metadata
+// that pointed at it, letting the orphaned entry heal (and unblocking the
+// GetMeta(!found)-gated re-warm).
 //
-// It deliberately returns false for every other failure. A read can also fail
-// transiently — most commonly a canceled context when the client disconnects
-// mid-stream, or an I/O error — and in those cases the cached body may be perfectly
-// valid. Evicting on those would let a burst of client disconnects tombstone hot
-// entries and force needless upstream refetches, so transient errors leave the
-// entry alone.
+// It is deliberately a denylist of transient errors rather than an allowlist of
+// "body missing" ones. The cache signals an unusable body in more ways than can be
+// reliably enumerated — not-found, a stream that ends with no bytes (io.EOF), an
+// out-of-range read against a body shorter than its metadata claims (ocache returns
+// InvalidArgument) — and missing any one of them lets metadata outlive its body, so
+// every request re-probes, fails, and forwards upstream until the metadata TTL
+// expires (up to 24h). That cold-miss loop is the severe, persistent failure.
+//
+// The errors that must NOT evict are the transient ones, where the cached body is
+// probably fine and we merely could not finish reading it — overwhelmingly a
+// canceled context from a client that disconnected mid-stream (in cluster mode the
+// read is routed over gRPC, so it can arrive as a status code instead of a plain
+// context error), or a briefly unreachable peer. Those leave the entry alone.
+// Anything else heals the entry; the worst case is one extra miss on a rare I/O
+// error, which repopulates immediately — a far better trade than a 24h loop.
 func bodyGone(err error) bool {
-	return errors.Is(err, cache.ErrNotFound) || errors.Is(err, errCacheBodyEmpty)
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
+		case codes.Canceled, codes.DeadlineExceeded, codes.Unavailable:
+			return false
+		}
+	}
+	return true
 }
 
 // cacheWriteTimeoutForSize returns a timeout scaled to contentLength.

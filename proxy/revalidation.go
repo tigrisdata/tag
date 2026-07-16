@@ -294,7 +294,7 @@ func (s *Service) serveFromCache(
 		if bodyErr != nil {
 			return fmt.Errorf("cache body read failed: %w", bodyErr)
 		}
-		return fmt.Errorf("cache body empty for %s/%s: %w", bucket, key, errCacheBodyEmpty)
+		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
 	}
 
 	// Large objects: stream via pipe
