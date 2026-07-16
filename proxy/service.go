@@ -42,10 +42,23 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		channelBuf = broadcast.DefaultChannelBuffer
 	}
 
+	// Bound concurrent cache-populate operations. MaxConcurrentWrites is a hard
+	// count ceiling; on top of it we cap concurrency so the memory buffered by
+	// in-flight populates stays under MaxPopulateMemoryBytes. Each populate buffers
+	// up to ~channel_buffer × chunk_size bytes, so a count alone can pin many GB
+	// (e.g. 256 × ~64MB ≈ 16GB) under large-object fan-out — the memory budget is
+	// what actually prevents that.
+	writeLimit := effectiveCacheWriteLimit(cfg)
 	var cacheSem chan struct{}
-	if cfg.Cache.MaxConcurrentWrites > 0 {
-		cacheSem = make(chan struct{}, cfg.Cache.MaxConcurrentWrites)
+	if writeLimit > 0 {
+		cacheSem = make(chan struct{}, writeLimit)
 	}
+
+	log.Info().
+		Int("max_concurrent_writes", cfg.Cache.MaxConcurrentWrites).
+		Int64("max_populate_memory_bytes", cfg.Cache.MaxPopulateMemoryBytes).
+		Int("effective_cache_populate_slots", writeLimit).
+		Msg("Cache-populate concurrency configured")
 
 	return &Service{
 		forwarder:        forwarder,
@@ -54,6 +67,43 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		cacheSemaphore:   cacheSem,
 		broadcastManager: broadcast.NewManager(channelBuf),
 	}
+}
+
+// effectiveCacheWriteLimit returns the number of concurrent cache-populate slots,
+// combining the count ceiling (MaxConcurrentWrites) with the memory budget
+// (MaxPopulateMemoryBytes). A non-positive count returns 0 (limiter disabled /
+// unbounded), preserving the explicit-disable contract. Otherwise the count is
+// reduced so that count × per-populate-buffer-bytes stays within the budget; a
+// non-positive budget disables the memory cap. At least one slot is always allowed.
+func effectiveCacheWriteLimit(cfg *config.Config) int {
+	count := cfg.Cache.MaxConcurrentWrites
+	if count <= 0 {
+		return 0 // limiter disabled — unbounded (matches prior negative-value semantics)
+	}
+	budget := cfg.Cache.MaxPopulateMemoryBytes
+	if budget <= 0 {
+		return count // memory cap disabled
+	}
+
+	chunkSize := int64(cfg.Broadcast.ChunkSize)
+	if chunkSize <= 0 {
+		chunkSize = broadcast.DefaultChunkSize
+	}
+	channelBuf := int64(cfg.Broadcast.ChannelBuffer)
+	if channelBuf <= 0 {
+		channelBuf = broadcast.DefaultChannelBuffer
+	}
+	// Per-populate buffering: the broadcast listener channel (channelBuf chunks)
+	// plus the cache-write queue in setupCacheListener (~channelBuf/4 chunks).
+	perPopulate := (channelBuf + channelBuf/4) * chunkSize
+	if perPopulate <= 0 {
+		return count
+	}
+	memCap := max(int(budget/perPopulate), 1) // always allow at least one populate
+	if memCap < count {
+		return memCap
+	}
+	return count
 }
 
 // acquireCacheSlot tries to reserve a cache-populate slot without blocking. It

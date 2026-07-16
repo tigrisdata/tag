@@ -267,6 +267,56 @@ cache:
 	}
 }
 
+func TestLoad_CachePopulateMemoryDefault(t *testing.T) {
+	content := "cache:\n  enabled: true\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.MaxPopulateMemoryBytes != DefaultCacheMaxPopulateMemoryBytes {
+		t.Errorf("Cache.MaxPopulateMemoryBytes = %d, want %d", cfg.Cache.MaxPopulateMemoryBytes, DefaultCacheMaxPopulateMemoryBytes)
+	}
+}
+
+func TestLoad_CachePopulateMemoryOverrideByEnv(t *testing.T) {
+	content := "cache:\n  enabled: true\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	// A negative value disables the memory cap (count-only).
+	t.Setenv("TAG_CACHE_MAX_POPULATE_MEMORY", "-1")
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.MaxPopulateMemoryBytes != -1 {
+		t.Errorf("Cache.MaxPopulateMemoryBytes = %d, want -1 (disabled)", cfg.Cache.MaxPopulateMemoryBytes)
+	}
+}
+
+func TestLoad_CachePopulateMemoryFromYAML(t *testing.T) {
+	content := "cache:\n  enabled: true\n  max_populate_memory_bytes: 536870912\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.MaxPopulateMemoryBytes != 536870912 {
+		t.Errorf("Cache.MaxPopulateMemoryBytes = %d, want 536870912", cfg.Cache.MaxPopulateMemoryBytes)
+	}
+}
+
 func TestLoad_StorageTuningInvalidEnvIgnored(t *testing.T) {
 	content := `
 cache:
