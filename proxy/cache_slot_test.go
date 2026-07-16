@@ -166,6 +166,11 @@ func TestPerPopulateBufferBytes(t *testing.T) {
 	if got, want := perPopulateBufferBytes(mk(64*1024, 16)), int64(16+64)*64*1024; got != want {
 		t.Errorf("perPopulateBufferBytes(channelBuf=16) = %d, want %d (64-chunk floor)", got, want)
 	}
+	// chunk_size below the pool size is charged at DefaultChunkSize: queued chunks
+	// retain pooled 64KB backing arrays regardless of the configured chunk_size.
+	if got, want := perPopulateBufferBytes(mk(16*1024, 1024)), int64(1024+256)*64*1024; got != want {
+		t.Errorf("perPopulateBufferBytes(chunk=16KB) = %d, want %d (pool floor, not 16KB)", got, want)
+	}
 	// Zero broadcast values fall back to defaults.
 	if got, want := perPopulateBufferBytes(mk(0, 0)), int64(1024+256)*64*1024; got != want {
 		t.Errorf("perPopulateBufferBytes(zero) = %d, want %d (defaults)", got, want)

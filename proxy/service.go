@@ -84,12 +84,14 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 
 // perPopulateBufferBytes returns the maximum bytes a single cache-populate can
 // buffer: the broadcast listener channel (channel_buffer chunks) plus the
-// cache-write queue in setupCacheListener (channel_buffer/4 chunks, floored at 64),
-// each chunk up to chunk_size bytes. This is the ceiling a populate ever reserves;
-// smaller objects reserve their actual size.
+// cache-write queue in setupCacheListener (channel_buffer/4 chunks, floored at 64).
+// Each queued chunk retains at least a pooled DefaultChunkSize backing array
+// (broadcast.GetChunkBuf pools DefaultChunkSize buffers), so a smaller configured
+// chunk_size still holds that much per chunk — charge the larger of the two. This
+// is the ceiling a populate ever reserves; smaller objects reserve their actual size.
 func perPopulateBufferBytes(cfg *config.Config) int64 {
 	chunkSize := int64(cfg.Broadcast.ChunkSize)
-	if chunkSize <= 0 {
+	if chunkSize < broadcast.DefaultChunkSize {
 		chunkSize = broadcast.DefaultChunkSize
 	}
 	channelBuf := int64(cfg.Broadcast.ChannelBuffer)
