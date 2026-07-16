@@ -199,9 +199,19 @@ func TestMakeBodyKey(t *testing.T) {
 	if result != expected {
 		t.Errorf("MakeBodyKey() = %q, want %q", result, expected)
 	}
-	// With an ETag the body key is version-qualified (quotes/weak prefix stripped).
+	// With an ETag the body key is version-qualified (quotes stripped).
 	if got := MakeBodyKey("my-bucket", "path/to/object.txt", `"abc123"`); got != "body|my-bucket|path/to/object.txt|abc123" {
 		t.Errorf("MakeBodyKey(etag) = %q, want %q", got, "body|my-bucket|path/to/object.txt|abc123")
+	}
+	// A weak validator and a strong validator with the same value must NOT collide:
+	// they can describe different bytes, so they get distinct body keys.
+	strong := MakeBodyKey("b", "k", `"abc"`)
+	weak := MakeBodyKey("b", "k", `W/"abc"`)
+	if strong == weak {
+		t.Errorf("weak and strong ETag share a body key %q — different validators must differ", strong)
+	}
+	if weak != "body|b|k|W/abc" {
+		t.Errorf("MakeBodyKey(weak) = %q, want %q", weak, "body|b|k|W/abc")
 	}
 }
 
