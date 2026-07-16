@@ -217,10 +217,26 @@ func (m *CachedObjectMeta) IsModifiedSince(since time.Time) bool {
 	return objTime.After(since.Truncate(time.Second))
 }
 
-// normalizeETag strips quotes from ETag for comparison.
+// normalizeETag strips the weak prefix and quotes from an ETag for comparison.
+// This is a weak comparison (W/"abc" matches "abc"), used for conditional requests.
 func normalizeETag(etag string) string {
 	etag = strings.TrimPrefix(etag, "W/") // Remove weak validator prefix
 	etag = strings.Trim(etag, "\"")
+	return etag
+}
+
+// etagKeyComponent normalizes an ETag for use in a body cache key while PRESERVING
+// the weak/strong distinction. A weak validator (W/"abc") only asserts semantic
+// equivalence, so it can label different bytes than the strong validator "abc";
+// collapsing them (as normalizeETag does) would map both to one body key, letting a
+// later populate clobber the other version's bytes under an in-flight reader. Quotes
+// are stripped (they are only delimiters) but the weak marker is kept.
+func etagKeyComponent(etag string) string {
+	weak := strings.HasPrefix(etag, "W/")
+	etag = strings.Trim(strings.TrimPrefix(etag, "W/"), "\"")
+	if weak {
+		return "W/" + etag
+	}
 	return etag
 }
 
@@ -247,13 +263,14 @@ func MakeMetaKey(bucket, key string) string {
 // the object's ETag ("body|bucket|key|<etag>") so a served metadata entry always
 // maps to the exact body version it describes: a concurrent overwrite writes a
 // new meta plus a new body key and never clobbers the version an in-flight reader
-// resolved. Objects with no ETag fall back to the unversioned key (there is no
-// version discriminator available for them).
+// resolved. The ETag is normalized with etagKeyComponent, which keeps the
+// weak/strong distinction so different validators never collide on one key. Objects
+// with no ETag fall back to the unversioned key (no version discriminator exists).
 func MakeBodyKey(bucket, key, etag string) string {
 	if etag == "" {
 		return bodyKeyPrefix + bucket + "|" + key
 	}
-	return bodyKeyPrefix + bucket + "|" + key + "|" + normalizeETag(etag)
+	return bodyKeyPrefix + bucket + "|" + key + "|" + etagKeyComponent(etag)
 }
 
 // MakeTombstoneKey creates the cache key for invalidation tombstones.
