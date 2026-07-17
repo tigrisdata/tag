@@ -397,26 +397,27 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// blocks that stale repopulation.
 	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
 	// unchanged, so re-invalidating would only discard a valid racing refill.
-	if err == nil && copyObjectSucceeded(capture) && s.cache.IsEnabled() {
+	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
 		s.cache.Delete(context.Background(), bucket, key)
 	}
 
 	return err
 }
 
-// copyObjectSucceeded reports whether a captured CopyObject response indicates the
-// copy actually happened: a 2xx status whose body is not an S3 <Error> document
-// (S3 can return 200 OK with an error body for copies that fail mid-operation).
+// s3WriteSucceeded reports whether a captured mutation response indicates the write
+// actually happened: a 2xx status whose body is not an S3 <Error> document. Both
+// CopyObject and CompleteMultipartUpload can return 200 OK with an error body for an
+// operation that failed mid-flight, so status alone is not enough.
 //
 // It deliberately does NOT gate on capture.Complete. The two ways to be wrong are
-// not symmetric: treating a failed copy as successful only re-invalidates a
-// destination that didn't change (an extra cache miss), while treating a successful
-// copy as failed skips the invalidation and can leave a racing refill of the OLD
-// destination cached — serving stale data. So an unconfirmable outcome must be
-// assumed successful. An incomplete capture still detects a failure whenever the
-// <Error> root element was captured (isS3ErrorBody only reads the first element);
-// only a body truncated before that root reads as success, which is the safe side.
-func copyObjectSucceeded(capture *ResponseCapture) bool {
+// not symmetric: treating a failed write as successful only re-invalidates an object
+// that didn't change (an extra cache miss), while treating a successful write as
+// failed skips the invalidation and can leave a racing refill of the OLD object
+// cached — serving stale data. So an unconfirmable outcome must be assumed
+// successful. An incomplete capture still detects a failure whenever the <Error>
+// root element was captured (isS3ErrorBody only reads the first element); only a body
+// truncated before that root reads as success, which is the safe side.
+func s3WriteSucceeded(capture *ResponseCapture) bool {
 	if capture == nil || capture.StatusCode < 200 || capture.StatusCode >= 300 {
 		return false
 	}
@@ -438,7 +439,10 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Str("uploadId", uploadId).Msg("HandleCompleteMultipartUpload")
 
-	// Check ocache first for idempotent completion (works across TAG pods)
+	// Check ocache first for idempotent completion (works across TAG pods).
+	// A replay returns the already-completed response without touching upstream and
+	// without changing the object, so it needs no read-cache invalidation — the first
+	// completion (below) already invalidated it.
 	if s.cache.IsEnabled() {
 		entry, found, err := s.cache.GetCompletion(ctx, bucket, key, uploadId)
 		if err == nil && found {
@@ -452,15 +456,36 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		}
 	}
 
+	// Invalidate the object's read cache BEFORE forwarding. Completing a multipart
+	// upload overwrites the object, so any previously cached version is now stale;
+	// like PutObject/DeleteObject/CopyObject, invalidate up front so a forward that
+	// succeeds but whose post-invalidation fails can't leave stale data served.
+	if s.cache.IsEnabled() {
+		s.cache.Delete(context.Background(), bucket, key)
+		metrics.RecordCacheOperation("delete", "success")
+	}
+
 	// Forward to upstream with response capture
 	capture, err := s.forwarder.ForwardWithCapture(ctx, w, r)
 	if err != nil {
 		return err
 	}
 
-	// Cache successful completions (2xx status codes) in ocache
-	// Only cache if the body was fully captured to avoid storing corrupted responses
-	if capture.StatusCode >= 200 && capture.StatusCode < 300 && capture.Complete {
+	// Re-invalidate AFTER upstream confirms the completion, for the same
+	// read-after-write reason as HandlePutObject: a GET racing the in-flight
+	// completion may have re-cached the pre-overwrite object; this second tombstone
+	// blocks that stale repopulation. Gated on a confirmed-successful completion
+	// (2xx and not a 200-with-<Error> body) so a failed completion, which leaves the
+	// object unchanged, doesn't discard a valid racing refill.
+	completed := s3WriteSucceeded(capture)
+	if completed && s.cache.IsEnabled() {
+		s.cache.Delete(context.Background(), bucket, key)
+	}
+
+	// Cache successful completions in ocache for idempotent replays. Only cache a
+	// genuine success (not a 200-with-<Error> body) that was fully captured, so we
+	// never replay a corrupted or error response as a successful completion.
+	if completed && capture.Complete {
 		if cacheErr := s.cache.PutCompletion(ctx, bucket, key, uploadId, capture.StatusCode, capture.Headers, capture.Body); cacheErr != nil {
 			log.Debug().Err(cacheErr).Msg("Failed to cache completion response")
 			// Don't fail the request if caching fails
