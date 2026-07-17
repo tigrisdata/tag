@@ -104,24 +104,51 @@ func TestStreamFromUpstream_TombstoneDuringFetchBlocksPopulate(t *testing.T) {
 	})
 }
 
-// TestTombstoneTTLCoversPopulateWindow is a cross-package drift guard for issue
-// #97[2]: a tombstone must outlive any populate that could race it. The populate
-// window is bounded by this package's timeouts, while the TTL is derived in the
-// cache package — this fails if either side moves and reopens the race.
-func TestTombstoneTTLCoversPopulateWindow(t *testing.T) {
-	for _, threshold := range []int64{
-		config.DefaultCacheSizeThreshold, // 1 GiB default
-		64 * 1024 * 1024,                 // small threshold
-		10 * 1024 * 1024 * 1024,          // raised threshold: TTL must scale with it
-	} {
-		ttl := time.Duration(cache.TombstoneTTLSeconds(threshold)) * time.Second
+// populateWindow is the longest a populate can run before it checks the tombstone:
+// the upstream fetch plus the streaming write of the largest cacheable object.
+func populateWindow(threshold int64) time.Duration {
+	return cacheWriteTimeoutForSize(threshold) + backgroundFetchTimeout
+}
 
-		// Longest a populate can run before it checks the tombstone: the upstream
-		// fetch plus the streaming write of the largest cacheable object.
-		window := cacheWriteTimeoutForSize(threshold) + backgroundFetchTimeout
+// TestTombstoneTTLCoversPopulateWindow is a cross-package drift guard for issue
+// #97[2]: a tombstone must outlive any populate that could race it, or it expires
+// mid-write, the guard reads zero, and a stale populate lands.
+//
+// It SWEEPS thresholds rather than spot-checking a few. The TTL and the window grow
+// on independent curves, so they can cross in a narrow band that hand-picked points
+// step right over — an earlier multiplicative TTL kept a healthy margin at 64 MiB,
+// 1 GiB and 10 GiB while collapsing to zero at ~1.5 GiB, exactly between the
+// samples.
+func TestTombstoneTTLCoversPopulateWindow(t *testing.T) {
+	const (
+		step = 16 * 1024 * 1024        // 16 MiB
+		max  = 24 * 1024 * 1024 * 1024 // sweep well past any realistic threshold
+	)
+
+	worstMargin := time.Duration(1<<62 - 1)
+	var worstAt int64
+	for size := int64(0); size <= max; size += step {
+		ttl := time.Duration(cache.TombstoneTTLSeconds(size)) * time.Second
+		window := populateWindow(size)
+		if margin := ttl - window; margin < worstMargin {
+			worstMargin, worstAt = margin, size
+		}
 		if ttl <= window {
-			t.Errorf("size_threshold=%d: tombstone TTL %v does not outlive the populate window %v — a tombstone can expire mid-write, letting a stale populate through",
-				threshold, ttl, window)
+			t.Fatalf("size_threshold=%d (%.2f GiB): tombstone TTL %v does not outlive the populate window %v — a tombstone can expire mid-write, letting a stale populate through",
+				size, float64(size)/(1<<30), ttl, window)
+		}
+	}
+	t.Logf("smallest margin over the sweep: %v at size_threshold=%.2f GiB", worstMargin, float64(worstAt)/(1<<30))
+
+	// Explicitly pin the band where a multiplicative TTL used to collapse, and the
+	// configured default.
+	for _, size := range []int64{
+		config.DefaultCacheSizeThreshold,
+		300 * 5 * 1024 * 1024, // write time == the 300s fetch bound: the old crossing point
+	} {
+		ttl := time.Duration(cache.TombstoneTTLSeconds(size)) * time.Second
+		if window := populateWindow(size); ttl <= window {
+			t.Errorf("size_threshold=%d: TTL %v <= window %v", size, ttl, window)
 		}
 	}
 }

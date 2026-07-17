@@ -396,14 +396,26 @@ const (
 	// lives (10 minutes). It comfortably exceeds a small object's populate.
 	MinTombstoneTTLSeconds = 600
 
+	// The constants below mirror the proxy's cache-populate timeouts so the TTL can
+	// model the same window. They are kept honest by
+	// TestTombstoneTTLCoversPopulateWindow in the proxy package, which sweeps
+	// thresholds and fails if either side drifts.
+
 	// tombstoneWriteThroughput mirrors the conservative streaming-write throughput
-	// the proxy assumes when it sizes a cache-populate timeout (5 MB/s). Kept in
-	// sync by TestTombstoneTTLCoversPopulateWindow in the proxy package.
+	// the proxy assumes when sizing a cache-populate timeout (proxy:
+	// minCacheWriteThroughput, 5 MB/s).
 	tombstoneWriteThroughput = 5 * 1024 * 1024
 
-	// tombstoneSafetyFactor pads the derived window to cover the upstream fetch
-	// that precedes the write, plus scheduling slack.
-	tombstoneSafetyFactor = 2
+	// tombstoneMinWriteSeconds mirrors the proxy's floor on that write timeout
+	// (proxy: cacheWriteTimeout, 60s).
+	tombstoneMinWriteSeconds = 60
+
+	// tombstoneFetchSeconds mirrors the upstream fetch that precedes the write
+	// (proxy: backgroundFetchTimeout, 5m).
+	tombstoneFetchSeconds = 300
+
+	// tombstoneMarginSeconds is slack on top of the modeled window.
+	tombstoneMarginSeconds = 300
 )
 
 // TombstoneTTLSeconds returns how long an invalidation tombstone must live for a
@@ -414,18 +426,24 @@ const (
 // write, so if the tombstone expires first the guard reads zero and the racing
 // (stale) write proceeds — silently resurrecting invalidated content.
 //
-// The longest populate is bounded by the upstream fetch plus the streaming write of
+// The longest populate is bounded by the upstream fetch PLUS the streaming write of
 // the largest cacheable object, so this is derived from sizeThreshold rather than
 // fixed: raising cache.size_threshold must not silently reintroduce that race.
+//
+// The derivation mirrors that window's shape — write + fetch + margin — rather than
+// scaling the write time by a factor. That matters: a multiplicative approximation
+// (e.g. 2 x write) grows on a different curve than the additive window and crosses
+// it, collapsing the margin to zero where write time approaches the fetch bound
+// (~1.5 GiB) and silently reopening the race. Modeling the same shape keeps a
+// constant margin at every threshold.
 func TombstoneTTLSeconds(sizeThreshold int64) int64 {
-	ttl := int64(MinTombstoneTTLSeconds)
+	write := int64(tombstoneMinWriteSeconds)
 	if sizeThreshold > 0 {
-		derived := (sizeThreshold / tombstoneWriteThroughput) * tombstoneSafetyFactor
-		if derived > ttl {
-			ttl = derived
+		if w := sizeThreshold / tombstoneWriteThroughput; w > write {
+			write = w
 		}
 	}
-	return ttl
+	return max(write+tombstoneFetchSeconds+tombstoneMarginSeconds, MinTombstoneTTLSeconds)
 }
 
 // WriteTombstone writes an invalidation marker for a key.
