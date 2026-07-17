@@ -231,10 +231,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 
 	// Invalidate cache BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
-	if s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
-		metrics.RecordCacheOperation("delete", "success")
-	}
+	s.invalidateObject(context.Background(), bucket, key)
 
 	// Forward to Tigris, recording the upstream status.
 	rec := &statusRecorder{ResponseWriter: w}
@@ -272,10 +269,7 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 
 	// Invalidate cache BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
-	if s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
-		metrics.RecordCacheOperation("delete", "success")
-	}
+	s.invalidateObject(context.Background(), bucket, key)
 
 	// Forward to upstream, recording the upstream status.
 	rec := &statusRecorder{ResponseWriter: w}
@@ -424,6 +418,23 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 	return !isS3ErrorBody(capture.Body)
 }
 
+// invalidateObject removes an object's cached metadata (writing a tombstone) and
+// records the true outcome of the attempt. A failed backend invalidation is recorded
+// as an error rather than success: a false-green delete metric would hide the very
+// read-after-write hazard the invalidation exists to prevent, since the stale entry
+// is still in place. It is a no-op when the cache is disabled.
+func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
+	if !s.cache.IsEnabled() {
+		return
+	}
+	if err := s.cache.Delete(ctx, bucket, key); err != nil {
+		metrics.RecordCacheOperation("delete", "error")
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache invalidation failed")
+		return
+	}
+	metrics.RecordCacheOperation("delete", "success")
+}
+
 // HandlePassthrough handles requests that are passed through without caching.
 func (s *Service) HandlePassthrough(w http.ResponseWriter, r *http.Request) error {
 	return s.forwarder.Forward(r.Context(), w, r)
@@ -460,10 +471,7 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// upload overwrites the object, so any previously cached version is now stale;
 	// like PutObject/DeleteObject/CopyObject, invalidate up front so a forward that
 	// succeeds but whose post-invalidation fails can't leave stale data served.
-	if s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
-		metrics.RecordCacheOperation("delete", "success")
-	}
+	s.invalidateObject(context.Background(), bucket, key)
 
 	// Forward to upstream with response capture
 	capture, err := s.forwarder.ForwardWithCapture(ctx, w, r)
