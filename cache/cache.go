@@ -22,10 +22,11 @@ var ErrCacheDisabled = errors.New("cache is disabled")
 
 // Cache wraps ocache client for TAG.
 type Cache struct {
-	client     cacheclient.CacheClient
-	defaultTTL int64 // seconds
-	enabled    bool
-	closed     bool
+	client       cacheclient.CacheClient
+	defaultTTL   int64 // seconds
+	tombstoneTTL int64 // seconds; must outlive the longest racing cache-populate
+	enabled      bool
+	closed       bool
 }
 
 // NewCacheWithClient creates a cache with an injected client.
@@ -33,16 +34,19 @@ type Cache struct {
 func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig) *Cache {
 	ttl := int64(config.DefaultCacheTTL.Seconds())
 	enabled := true // Default to enabled
+	var sizeThreshold int64
 	if cfg != nil {
 		if cfg.TTL > 0 {
 			ttl = int64(cfg.TTL.Seconds())
 		}
 		enabled = cfg.IsEnabled()
+		sizeThreshold = cfg.SizeThreshold
 	}
 	return &Cache{
-		client:     client,
-		defaultTTL: ttl,
-		enabled:    enabled,
+		client:       client,
+		defaultTTL:   ttl,
+		tombstoneTTL: TombstoneTTLSeconds(sizeThreshold),
+		enabled:      enabled,
 	}
 }
 
@@ -50,7 +54,8 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 // All operations return successfully with "not found" or nil results.
 func NewDisabledCache() *Cache {
 	return &Cache{
-		enabled: false,
+		enabled:      false,
+		tombstoneTTL: MinTombstoneTTLSeconds,
 	}
 }
 
@@ -386,9 +391,60 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 // Tombstone methods for cache invalidation
 // ============================================================================
 
-// tombstoneTTL is the TTL for tombstone entries (60 seconds).
-// Tombstones only need to outlive in-flight cache writes.
-const tombstoneTTL = 60
+const (
+	// MinTombstoneTTLSeconds is the floor for how long an invalidation tombstone
+	// lives (10 minutes). It comfortably exceeds a small object's populate.
+	MinTombstoneTTLSeconds = 600
+
+	// The constants below mirror the proxy's cache-populate timeouts so the TTL can
+	// model the same window. They are kept honest by
+	// TestTombstoneTTLCoversPopulateWindow in the proxy package, which sweeps
+	// thresholds and fails if either side drifts.
+
+	// tombstoneWriteThroughput mirrors the conservative streaming-write throughput
+	// the proxy assumes when sizing a cache-populate timeout (proxy:
+	// minCacheWriteThroughput, 5 MB/s).
+	tombstoneWriteThroughput = 5 * 1024 * 1024
+
+	// tombstoneMinWriteSeconds mirrors the proxy's floor on that write timeout
+	// (proxy: cacheWriteTimeout, 60s).
+	tombstoneMinWriteSeconds = 60
+
+	// tombstoneFetchSeconds mirrors the upstream fetch that precedes the write
+	// (proxy: backgroundFetchTimeout, 5m).
+	tombstoneFetchSeconds = 300
+
+	// tombstoneMarginSeconds is slack on top of the modeled window.
+	tombstoneMarginSeconds = 300
+)
+
+// TombstoneTTLSeconds returns how long an invalidation tombstone must live for a
+// given cache size threshold.
+//
+// A tombstone's whole job is to outlive any cache-populate that could race it: a
+// populate is only compared against the tombstone immediately before its metadata
+// write, so if the tombstone expires first the guard reads zero and the racing
+// (stale) write proceeds — silently resurrecting invalidated content.
+//
+// The longest populate is bounded by the upstream fetch PLUS the streaming write of
+// the largest cacheable object, so this is derived from sizeThreshold rather than
+// fixed: raising cache.size_threshold must not silently reintroduce that race.
+//
+// The derivation mirrors that window's shape — write + fetch + margin — rather than
+// scaling the write time by a factor. That matters: a multiplicative approximation
+// (e.g. 2 x write) grows on a different curve than the additive window and crosses
+// it, collapsing the margin to zero where write time approaches the fetch bound
+// (~1.5 GiB) and silently reopening the race. Modeling the same shape keeps a
+// constant margin at every threshold.
+func TombstoneTTLSeconds(sizeThreshold int64) int64 {
+	write := int64(tombstoneMinWriteSeconds)
+	if sizeThreshold > 0 {
+		if w := sizeThreshold / tombstoneWriteThroughput; w > write {
+			write = w
+		}
+	}
+	return max(write+tombstoneFetchSeconds+tombstoneMarginSeconds, MinTombstoneTTLSeconds)
+}
 
 // WriteTombstone writes an invalidation marker for a key.
 // The value is the timestamp as 8 bytes (int64 big-endian).
@@ -401,7 +457,7 @@ func (c *Cache) WriteTombstone(ctx context.Context, bucket, key string) error {
 	ts := time.Now().UnixNano()
 	data := make([]byte, 8)
 	binary.BigEndian.PutUint64(data, uint64(ts))
-	return c.client.Put(ctx, tombKey, data, tombstoneTTL)
+	return c.client.Put(ctx, tombKey, data, c.tombstoneTTL)
 }
 
 // GetTombstoneTimestamp retrieves the tombstone timestamp for a key.

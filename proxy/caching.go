@@ -133,6 +133,7 @@ func (s *Service) setupCacheListener(
 	broadcaster *broadcast.Broadcaster,
 	slotHeld bool,
 	weight int64,
+	writeStartTime int64,
 ) (*io.PipeWriter, chan error) {
 	// Bound concurrent cache-populate operations. When the limit is saturated,
 	// skip caching entirely: the object is still served/forwarded from upstream,
@@ -150,9 +151,6 @@ func (s *Service) setupCacheListener(
 			return nil, nil
 		}
 	}
-
-	// Record when this write started - used to check against tombstones
-	writeStartTime := time.Now().UnixNano()
 
 	listener := broadcaster.Subscribe()
 	if listener == nil {
@@ -349,6 +347,12 @@ func (s *Service) fetchFullObjectToCache(
 		}
 	}()
 
+	// Stamp the cache-write start BEFORE the upstream request, for the same reason
+	// as the inline path: a timestamp taken after the response leaves the whole
+	// round-trip unguarded, letting an invalidation that landed mid-fetch look older
+	// than our write and pass the tombstone check.
+	writeStartTime := time.Now().UnixNano()
+
 	// Execute full object request (no Range header)
 	resp, err := s.forwarder.DoFullObjectRequest(ctx, bucket, key, accessKey, secretKey)
 	if err != nil {
@@ -380,7 +384,7 @@ func (s *Service) fetchFullObjectToCache(
 	// Hand the reserved slot to the cache listener (streams to cache via pipe).
 	// Ownership of releasing the slot transfers to setupCacheListener, so drop
 	// our own release regardless of the result.
-	cachePipeWriter, cacheErrCh := s.setupCacheListener(ctx, bucket, key, broadcaster, true, weight)
+	cachePipeWriter, cacheErrCh := s.setupCacheListener(ctx, bucket, key, broadcaster, true, weight, writeStartTime)
 	slotOwned = false
 	if cachePipeWriter == nil {
 		// No listener could be created; nothing to populate.
