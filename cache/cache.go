@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -289,15 +290,25 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w i
 
 // DeleteWithMeta removes both metadata and body from cache.
 // Writes a tombstone first to prevent in-flight cache writes from completing.
+//
+// Both steps are attempted even if the first fails (best-effort invalidation), but a
+// genuine backend failure of either is returned so callers don't report a successful
+// invalidation while stale metadata is still readable. A not-found metadata delete is
+// success — the entry is already gone.
 func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	if !c.IsEnabled() {
 		return nil
 	}
 
-	// Write tombstone FIRST - prevents in-flight writes from completing
+	var errs []error
+
+	// Write tombstone FIRST - prevents in-flight writes from completing. A failure
+	// here leaves the invalidation incomplete (an in-flight populate could resurrect
+	// the entry), so it is a real failure — but still continue to the meta delete.
 	if err := c.WriteTombstone(ctx, bucket, key); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).
 			Msg("Failed to write tombstone (continuing with delete)")
+		errs = append(errs, fmt.Errorf("write tombstone: %w", err))
 	}
 
 	metaKey := MakeMetaKey(bucket, key)
@@ -310,6 +321,11 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	// streaming that exact version.
 	if err := c.client.Delete(ctx, metaKey); err != nil && !isNotFoundError(err) {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta delete error")
+		errs = append(errs, fmt.Errorf("delete meta: %w", err))
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidated cache metadata (body ages out via TTL)")
