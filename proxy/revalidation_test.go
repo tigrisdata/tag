@@ -26,6 +26,8 @@ type mockForwarder struct {
 	forwardFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request) error
 	// Optional ForwardWithCapture implementation for capture-gated tests
 	captureFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error)
+	// Optional DoRequestWithCreds implementation for upstream-fetch tests
+	doRequestFunc func(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error)
 }
 
 func (m *mockForwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
@@ -47,6 +49,9 @@ func (m *mockForwarder) ValidateAndGetCredentials(r *http.Request) (AuthResult, 
 }
 
 func (m *mockForwarder) DoRequestWithCreds(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error) {
+	if m.doRequestFunc != nil {
+		return m.doRequestFunc(ctx, r, accessKey, secretKey)
+	}
 	return nil, nil
 }
 

@@ -162,3 +162,31 @@ func TestETagVersionedBody_EmptyETagIsNotCached(t *testing.T) {
 		t.Error("empty-ETag object should not be cached (body present)")
 	}
 }
+
+// A tombstone must outlive any cache-populate that could race it: the populate is
+// only compared against the tombstone right before its metadata write, so an
+// expired tombstone reads as zero and lets the stale write through. The TTL is
+// therefore derived from the size threshold, not fixed — raising size_threshold
+// must not silently shorten the guard relative to the write it has to outlive.
+func TestTombstoneTTLSeconds(t *testing.T) {
+	// Small/unset thresholds still get the floor.
+	if got := TombstoneTTLSeconds(0); got != MinTombstoneTTLSeconds {
+		t.Errorf("TombstoneTTLSeconds(0) = %d, want floor %d", got, MinTombstoneTTLSeconds)
+	}
+	if got := TombstoneTTLSeconds(1024); got != MinTombstoneTTLSeconds {
+		t.Errorf("TombstoneTTLSeconds(1KiB) = %d, want floor %d", got, MinTombstoneTTLSeconds)
+	}
+	// The 60s that shipped before was far shorter than a large object's write.
+	if MinTombstoneTTLSeconds <= 60 {
+		t.Errorf("floor %d is not meaningfully above the old 60s tombstone TTL", MinTombstoneTTLSeconds)
+	}
+	// A large threshold scales the TTL past the floor.
+	big := int64(10 * 1024 * 1024 * 1024) // 10 GiB
+	if got := TombstoneTTLSeconds(big); got <= MinTombstoneTTLSeconds {
+		t.Errorf("TombstoneTTLSeconds(10GiB) = %d, want > floor %d (must scale with size_threshold)", got, MinTombstoneTTLSeconds)
+	}
+	// Monotonic in the threshold.
+	if TombstoneTTLSeconds(big) <= TombstoneTTLSeconds(big/4) {
+		t.Error("TombstoneTTLSeconds must be non-decreasing in size_threshold")
+	}
+}

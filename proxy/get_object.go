@@ -319,6 +319,18 @@ func (s *Service) streamFromUpstream(
 	bucket, key, accessKey, secretKey string,
 	broadcaster *broadcast.Broadcaster,
 ) error {
+	// Stamp the cache-write start BEFORE issuing the upstream request, not after
+	// its headers arrive. The tombstone guard compares this against any invalidation
+	// that landed while we were fetching, and upstream takes its read snapshot at
+	// some point after we send. Stamping after the response would leave the whole
+	// upstream round-trip unguarded: a PUT that lands in that window writes a
+	// tombstone OLDER than our timestamp, the guard passes, and we cache the
+	// pre-PUT body we just read — stale. Stamping first makes the timestamp strictly
+	// earlier than the read snapshot, so any racing invalidation is provably newer
+	// and blocks the write. The cost is skipping an occasional still-fresh populate
+	// (a miss), never serving stale.
+	writeStartTime := time.Now().UnixNano()
+
 	// Execute upstream request
 	resp, err := s.forwarder.DoRequestWithCreds(ctx, r, accessKey, secretKey)
 	if err != nil {
@@ -340,7 +352,7 @@ func (s *Service) streamFromUpstream(
 		// Reserve against the memory budget by the object's actual size (capped at
 		// the buffer ceiling), so small objects don't each reserve the worst case.
 		weight := s.populateWeight(resp.ContentLength)
-		cachePipeWriter, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight)
+		cachePipeWriter, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, writeStartTime)
 	}
 
 	// If an anonymous GET succeeded and Tigris didn't set an explicit per-object ACL,
