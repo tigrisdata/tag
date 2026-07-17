@@ -101,8 +101,7 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		if xmlErr := xml.Unmarshal(bodyBytes, &deleteReq); xmlErr == nil {
 			requestedCounts = make(map[string]int)
 			for _, obj := range deleteReq.Objects {
-				s.cache.Delete(context.Background(), bucket, obj.Key)
-				metrics.RecordCacheOperation("delete", "success")
+				s.invalidateObject(context.Background(), bucket, obj.Key)
 				requestedCounts[obj.Key]++
 				log.Debug().
 					Str("bucket", bucket).
