@@ -14,6 +14,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_DISABLED`              | Disable caching (`true` or `1`)                                                 | `false`                  |
 | `TAG_CACHE_DISK_PATH`             | Path to cache data directory                                                    | `/var/cache/tag`         |
 | `TAG_CACHE_MAX_DISK_USAGE`        | Max disk usage in bytes (0 = unlimited)                                         | `0`                      |
+| `TAG_CACHE_EVICTION_POLICY`       | Eviction order when the disk cap is hit: `lru` or `fifo` (oldest-written first)  | `lru`                    |
 | `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
 | `TAG_CACHE_CLUSTER_ADDR`          | Address for memberlist gossip                                                   | `:7000`                  |
 | `TAG_CACHE_GRPC_ADDR`             | Address for gRPC server                                                         | `:9000`                  |
@@ -117,6 +118,15 @@ cache:
   # Max disk usage in bytes (0 = unlimited)
   # Default: 0
   max_disk_usage_bytes: 0
+
+  # Eviction order when the disk cap is reached: "lru" (default) or "fifo".
+  # "fifo" evicts oldest-written objects first — better for write-once workloads
+  # (e.g. dated parquet) where a rare read of an old object should not keep it
+  # resident at the expense of newer, hotter data.
+  # NOTE: eviction only runs when max_disk_usage_bytes > 0. With no disk cap the
+  # cache is never evicted and this setting has no effect.
+  # Override with TAG_CACHE_EVICTION_POLICY env var
+  eviction_policy: lru
 
   # Unique node identifier for cluster mode
   # Required for multi-node deployments
@@ -290,6 +300,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |
 | `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |
+| `eviction_policy`       | string   | `lru`            | Eviction order when the disk cap is hit: `lru` or `fifo` (only applies when `max_disk_usage_bytes` > 0) |
 | `node_id`               | string   | `""`             | Unique node identifier for cluster mode                                             |
 | `cluster_addr`          | string   | `:7000`          | Address for memberlist gossip                                                       |
 | `grpc_addr`             | string   | `:9000`          | Address for gRPC server                                                             |
