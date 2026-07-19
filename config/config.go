@@ -424,9 +424,11 @@ func applyEnvOverrides(cfg *Config) {
 				cfg.Cache.RecoveryWorkers = workers
 			}
 		}
-		// Override eviction policy from environment ("lru" or "fifo")
-		if val := os.Getenv("TAG_CACHE_EVICTION_POLICY"); val != "" {
-			cfg.Cache.EvictionPolicy = strings.ToLower(strings.TrimSpace(val))
+		// Override eviction policy from environment ("lru" or "fifo").
+		// Ignore a blank/whitespace-only value so it can't wipe a valid YAML or
+		// default setting; an unrecognized non-empty value is caught by validate().
+		if val := strings.ToLower(strings.TrimSpace(os.Getenv("TAG_CACHE_EVICTION_POLICY"))); val != "" {
+			cfg.Cache.EvictionPolicy = val
 		}
 		// Override concurrent cache-write limit from environment
 		if val := os.Getenv("TAG_CACHE_MAX_CONCURRENT_WRITES"); val != "" {
@@ -501,7 +503,23 @@ func validate(cfg *Config) error {
 	if err := validateTLS(&cfg.Server); err != nil {
 		return err
 	}
+	if err := validateEvictionPolicy(cfg.Cache.EvictionPolicy); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateEvictionPolicy rejects an unrecognized eviction policy so a typo (e.g.
+// "fif0") fails fast at startup with a clear error, instead of being forwarded to
+// ocache where it silently degrades to the LRU fallback — quietly not applying the
+// policy the operator asked for.
+func validateEvictionPolicy(policy string) error {
+	switch policy {
+	case EvictionPolicyLRU, EvictionPolicyFIFO:
+		return nil
+	default:
+		return fmt.Errorf("invalid cache.eviction_policy %q: must be %q or %q", policy, EvictionPolicyLRU, EvictionPolicyFIFO)
+	}
 }
 
 // validateTLS checks that TLS configuration is consistent.
