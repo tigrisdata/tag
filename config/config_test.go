@@ -242,6 +242,49 @@ cache:
 	}
 }
 
+func TestLoad_EvictionPolicyDefaultsToLRU(t *testing.T) {
+	content := "cache:\n  enabled: true\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.EvictionPolicy != EvictionPolicyLRU {
+		t.Errorf("Cache.EvictionPolicy = %q, want %q (default)", cfg.Cache.EvictionPolicy, EvictionPolicyLRU)
+	}
+}
+
+func TestLoad_EvictionPolicyFromYAMLAndEnv(t *testing.T) {
+	content := "cache:\n  enabled: true\n  eviction_policy: fifo\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	// YAML value is honored (and normalized).
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.EvictionPolicy != EvictionPolicyFIFO {
+		t.Errorf("Cache.EvictionPolicy = %q, want %q from YAML", cfg.Cache.EvictionPolicy, EvictionPolicyFIFO)
+	}
+
+	// Env overrides YAML, case-insensitively.
+	t.Setenv("TAG_CACHE_EVICTION_POLICY", "LRU")
+	cfg, err = Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.EvictionPolicy != EvictionPolicyLRU {
+		t.Errorf("Cache.EvictionPolicy = %q, want %q from env override", cfg.Cache.EvictionPolicy, EvictionPolicyLRU)
+	}
+}
+
 func TestLoad_StorageTuningDefaults(t *testing.T) {
 	content := `
 cache:

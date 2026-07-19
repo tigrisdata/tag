@@ -2,6 +2,9 @@
 package metrics
 
 import (
+	"context"
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -84,6 +87,16 @@ var (
 		prometheus.GaugeOpts{
 			Name: "tag_active_connections",
 			Help: "Number of active connections",
+		},
+	)
+
+	// CacheSizeBytes is the current logical size of this node's local cache: the sum
+	// of stored object lengths, maintained live by ocache. Per-node — sum across
+	// nodes in Prometheus for a cluster-wide total.
+	CacheSizeBytes = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "tag_cache_size_bytes",
+			Help: "Current logical size of this node's local cache in bytes (sum of stored object lengths)",
 		},
 	)
 
@@ -374,4 +387,22 @@ func RecordRevalidationFailed() {
 // RecordRevalidationStaleServed records serving stale data due to revalidation failure.
 func RecordRevalidationStaleServed() {
 	RevalidationsStaleServed.Inc()
+}
+
+// SampleCacheSize publishes the local cache size to CacheSizeBytes on interval until
+// ctx is cancelled. size is read once immediately and then on each tick; it must be
+// cheap — ocache maintains this value live, so it is an atomic read, not a rescan.
+func SampleCacheSize(ctx context.Context, interval time.Duration, size func() int64) {
+	CacheSizeBytes.Set(float64(size()))
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			CacheSizeBytes.Set(float64(size()))
+		}
+	}
 }

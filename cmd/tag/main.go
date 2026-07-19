@@ -20,6 +20,7 @@ import (
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/handlers"
+	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy"
 )
 
@@ -36,6 +37,9 @@ const (
 
 	// Shutdown timeout for graceful shutdown
 	shutdownTimeout = 30 * time.Second
+
+	// How often the local cache size is sampled into tag_cache_size_bytes.
+	cacheSizeSampleInterval = 30 * time.Second
 )
 
 func main() {
@@ -233,6 +237,7 @@ func main() {
 		embeddedCfg.Storage = &ocachestorage.StorageConfig{
 			DeleteBatchSize: cfg.Cache.DeleteBatchSize,
 			RecoveryWorkers: cfg.Cache.RecoveryWorkers,
+			EvictionPolicy:  cfg.Cache.EvictionPolicy,
 		}
 
 		// Configure gRPC auth for cache cluster communication
@@ -269,6 +274,10 @@ func main() {
 
 		// Wrap embedded cache with the cache.Cache interface
 		objectCache = cache.NewCacheWithClient(embeddedCache, &cfg.Cache)
+
+		// Publish this node's local cache size as tag_cache_size_bytes. ocache keeps
+		// the total live (an atomic), so sampling it is cheap. Stops on ctx cancel.
+		go metrics.SampleCacheSize(ctx, cacheSizeSampleInterval, embeddedCache.Storage().TotalSize)
 
 		log.Info().
 			Str("node_id", cfg.Cache.NodeID).
