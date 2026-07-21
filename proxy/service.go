@@ -248,7 +248,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// second Delete is the same logical invalidation, so it is not counted again.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
 		s.cache.Delete(context.Background(), bucket, key)
-		s.warmOnWrite(r, bucket, key)
+		s.warmOnWrite(bucket, key)
 	}
 
 	status := "success"
@@ -394,7 +394,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// unchanged, so re-invalidating would only discard a valid racing refill.
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
 		s.cache.Delete(context.Background(), bucket, key)
-		s.warmOnWrite(r, bucket, key)
+		s.warmOnWrite(bucket, key)
 	}
 
 	return err
@@ -445,16 +445,23 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
 // invalidation racing the warm is provably newer and blocks it. Safe to call on
 // every successful write.
 //
-// The warm uses the same credentials the read path uses for background fetches:
-// ValidateAndGetCredentials returns TAG's own credentials in transparent mode and
-// the (authorized) client's in signing mode. An anonymous/unvalidated write yields
-// no usable credentials and is simply not warmed.
-func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
+// The warm reads with TAG's own background-fetch credentials, obtained directly
+// (never by re-validating the write request — that would re-run SigV4 and could trip
+// the max-request-age bound on a slow upload). Those credentials only exist in
+// transparent mode; in signing mode BackgroundFetchCredentials reports ok=false and
+// the warm is skipped, since TAG has no read identity other than the client's (which
+// a write-only client would lack). It therefore warms any write upstream accepted,
+// including anonymous writes to a public bucket.
+//
+// Best-effort caveat: warms are keyed by bucket/key for dedup, so if a read-path
+// fetch of the pre-write object is already in flight, this warm coalesces into it
+// and is dropped — the object is then simply populated on the next read.
+func (s *Service) warmOnWrite(bucket, key string) {
 	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
 		return
 	}
-	_, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
-	if err != nil || accessKey == "" || secretKey == "" {
+	accessKey, secretKey, ok := s.forwarder.BackgroundFetchCredentials()
+	if !ok {
 		return
 	}
 	metrics.WarmOnWriteTriggered.Inc()
@@ -516,7 +523,7 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		s.cache.Delete(context.Background(), bucket, key)
 		// Warm-on-write is the only way to make a multipart-completed object hot:
 		// TAG never sees its assembled body, so a write-through tee is impossible.
-		s.warmOnWrite(r, bucket, key)
+		s.warmOnWrite(bucket, key)
 	}
 
 	// Cache successful completions in ocache for idempotent replays. Only cache a

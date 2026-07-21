@@ -50,6 +50,13 @@ type RequestForwarder interface {
 	// Caller is responsible for closing the response body.
 	DoFullObjectRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error)
 
+	// BackgroundFetchCredentials returns credentials for a TAG-initiated background
+	// read (e.g. warm-on-write) that is NOT tied to a client request. ok is false
+	// when TAG has no independent read identity — signing mode, where the only
+	// credentials available are the requesting client's, so a background read must
+	// not be issued on TAG's behalf.
+	BackgroundFetchCredentials() (accessKey, secretKey string, ok bool)
+
 	// DoConditionalGetRequest executes a conditional GET for cache revalidation.
 	// Sends If-None-Match and/or If-Modified-Since headers.
 	// If rangeHeader is non-empty, includes a Range header (for range+revalidation).

@@ -109,6 +109,15 @@ func (f *signingForwarder) ValidateAndGetCredentials(r *http.Request) (AuthResul
 	return AuthValidated, accessKey, secretKey, nil
 }
 
+// BackgroundFetchCredentials reports that signing mode has no independent read
+// identity: TAG signs upstream requests as the requesting client, so there are no
+// TAG-owned credentials to issue a background read with. Returning ok=false makes
+// warm-on-write a no-op in signing mode, rather than reusing a client's credentials
+// for a read the client may not be authorized to make.
+func (f *signingForwarder) BackgroundFetchCredentials() (string, string, bool) {
+	return "", "", false
+}
+
 // DoRequestWithCreds executes a request with pre-validated credentials.
 // Returns the raw response for streaming. Caller is responsible for closing the response body.
 // If the request uses AWS chunked transfer encoding, the body is decoded on-the-fly.

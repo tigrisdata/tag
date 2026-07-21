@@ -135,6 +135,9 @@ cache:
   # NOT strict write-through: the write still invalidates, and the warm is a
   # separate, best-effort background GET — deduplicated and shed under the cache
   # populate budget. It costs one extra upstream GET per write, so it defaults off.
+  # Only takes effect in transparent proxy mode, where TAG has its own read
+  # credentials for the background fetch; in signing mode it is a no-op (TAG has no
+  # read identity other than the requesting client's).
   # Override with TAG_CACHE_WARM_ON_WRITE env var
   warm_on_write: false
 
@@ -311,7 +314,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |
 | `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |
 | `eviction_policy`       | string   | `lru`            | Eviction order when the disk cap is hit: `lru` or `fifo` (only applies when `max_disk_usage_bytes` > 0) |
-| `warm_on_write`         | bool     | `false`          | Warm the cache after a successful write via a background fetch (one extra upstream GET per write) |
+| `warm_on_write`         | bool     | `false`          | Warm the cache after a successful write via a background fetch (transparent mode only; one extra upstream GET per write) |
 | `node_id`               | string   | `""`             | Unique node identifier for cluster mode                                             |
 | `cluster_addr`          | string   | `:7000`          | Address for memberlist gossip                                                       |
 | `grpc_addr`             | string   | `:9000`          | Address for gRPC server                                                             |

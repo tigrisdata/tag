@@ -177,6 +177,14 @@ func (f *transparentForwarder) ValidateAndGetCredentials(r *http.Request) (AuthR
 	return result, f.proxySigner.AccessKey(), f.proxySigner.SecretKey(), nil
 }
 
+// BackgroundFetchCredentials returns TAG's own proxy (read-only) credentials, which
+// exist independently of any client request — so a TAG-initiated background read
+// (warm-on-write) can run regardless of the writing client's identity or read
+// permissions.
+func (f *transparentForwarder) BackgroundFetchCredentials() (string, string, bool) {
+	return f.proxySigner.AccessKey(), f.proxySigner.SecretKey(), true
+}
+
 // validateLocally performs local SigV4 validation of the client's request.
 func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, error) {
 	// If local auth is not configured, always treat as validated (legacy behavior)
