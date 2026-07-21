@@ -30,9 +30,9 @@ type mockForwarder struct {
 	doRequestFunc func(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error)
 	// Optional DoFullObjectRequest implementation for background-warm tests
 	doFullObjectFunc func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error)
-	// Optional BackgroundFetchCredentials implementation for warm-on-write tests.
-	// Nil defaults to transparent-mode behavior (credentials available, ok=true).
-	backgroundCredsFunc func() (string, string, bool)
+	// Optional ValidateAndGetCredentials implementation (e.g. to simulate an
+	// anonymous/unvalidated request that yields no credentials).
+	validateFunc func(r *http.Request) (AuthResult, string, string, error)
 }
 
 func (m *mockForwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
@@ -50,14 +50,10 @@ func (m *mockForwarder) ForwardWithCapture(ctx context.Context, w http.ResponseW
 }
 
 func (m *mockForwarder) ValidateAndGetCredentials(r *http.Request) (AuthResult, string, string, error) {
-	return AuthValidated, "access", "secret", nil
-}
-
-func (m *mockForwarder) BackgroundFetchCredentials() (string, string, bool) {
-	if m.backgroundCredsFunc != nil {
-		return m.backgroundCredsFunc()
+	if m.validateFunc != nil {
+		return m.validateFunc(r)
 	}
-	return "access", "secret", true
+	return AuthValidated, "access", "secret", nil
 }
 
 func (m *mockForwarder) DoRequestWithCreds(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error) {

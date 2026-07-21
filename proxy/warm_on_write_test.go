@@ -114,18 +114,19 @@ func TestHandlePutObject_WarmOnWrite_SkippedOnFailure(t *testing.T) {
 	}
 }
 
-// Signing mode has no independent read identity (BackgroundFetchCredentials ok=false),
-// so a successful write must not warm — TAG must not issue a background read with the
-// client's credentials.
-func TestHandlePutObject_WarmOnWrite_SkippedInSigningMode(t *testing.T) {
+// A write with no usable credentials (e.g. an anonymous/unvalidated write in signing
+// mode) must not warm — there is nothing to sign the background read with.
+func TestHandlePutObject_WarmOnWrite_SkippedWithoutCredentials(t *testing.T) {
 	var warms atomic.Int32
 	mock := &mockForwarder{
 		forwardFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
 			w.WriteHeader(http.StatusOK)
 			return nil
 		},
-		doFullObjectFunc:    warmObjectResponder(&warms, "warm-body"),
-		backgroundCredsFunc: func() (string, string, bool) { return "", "", false }, // signing mode
+		doFullObjectFunc: warmObjectResponder(&warms, "warm-body"),
+		validateFunc: func(*http.Request) (AuthResult, string, string, error) {
+			return AuthNotValidated, "", "", nil // no credentials available
+		},
 	}
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
@@ -137,10 +138,10 @@ func TestHandlePutObject_WarmOnWrite_SkippedInSigningMode(t *testing.T) {
 	}
 
 	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
-		t.Error("object was warmed in signing mode (no independent read identity)")
+		t.Error("object was warmed without usable credentials")
 	}
 	if got := warms.Load(); got != 0 {
-		t.Errorf("upstream warm fetches = %d, want 0 (signing mode)", got)
+		t.Errorf("upstream warm fetches = %d, want 0 (no credentials)", got)
 	}
 }
 
