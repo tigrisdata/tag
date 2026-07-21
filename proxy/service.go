@@ -454,9 +454,12 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
 // its warm GET fail (recorded as a background-fetch failure), just as it would if it
 // tried to read the object itself.
 //
-// Best-effort caveat: warms are keyed by bucket/key for dedup, so if a read-path
-// fetch of the pre-write object is already in flight, this warm coalesces into it
-// and is dropped — the object is then simply populated on the next read.
+// Best-effort caveat: warms are keyed by bucket/key for dedup, so if any fetch for
+// this key is already in flight — a concurrent read-path warm, or the warm from a
+// rapid prior write to the same key — this warm coalesces into it and is dropped.
+// A dropped warm just leaves the object to be populated on the next read (the
+// cache-on-read baseline); it is never stale, because a populate whose writeStartTime
+// predates the latest write's invalidation tombstone is blocked.
 func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
 		return
@@ -466,6 +469,14 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 		return
 	}
 	metrics.WarmOnWriteTriggered.Inc()
+	// publicACL is deliberately false here, unlike the read-path warm (which passes
+	// hasNoAuthCredentials). A successful anonymous read proves the object is
+	// publicly READABLE, but a successful anonymous WRITE only proves the bucket is
+	// publicly WRITABLE — inferring public-read from it could let an anonymous reader
+	// be served a private object from a public-write/private-read bucket. Leaving it
+	// false costs at most one anonymous cache miss after an anonymous write: that
+	// read's streaming populate re-caches with public-read, correctly derived from
+	// the anonymous GET succeeding.
 	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false)
 }
 
