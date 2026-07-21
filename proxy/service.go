@@ -248,6 +248,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// second Delete is the same logical invalidation, so it is not counted again.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
 		s.cache.Delete(context.Background(), bucket, key)
+		s.warmOnWrite(r, bucket, key)
 	}
 
 	status := "success"
@@ -393,6 +394,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// unchanged, so re-invalidating would only discard a valid racing refill.
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
 		s.cache.Delete(context.Background(), bucket, key)
+		s.warmOnWrite(r, bucket, key)
 	}
 
 	return err
@@ -433,6 +435,30 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
 		return
 	}
 	metrics.RecordCacheOperation("delete", "success")
+}
+
+// warmOnWrite repopulates the cache after a successful write by triggering a
+// background full-object fetch, so a read soon after the write hits cache
+// (cache-warm-on-write; see cache.warm_on_write). It is best-effort and fully
+// detached: triggerBackgroundCacheFetch deduplicates concurrent warms, sheds under
+// the populate byte budget, and stamps its own writeStartTime before the GET so an
+// invalidation racing the warm is provably newer and blocks it. Safe to call on
+// every successful write.
+//
+// The warm uses the same credentials the read path uses for background fetches:
+// ValidateAndGetCredentials returns TAG's own credentials in transparent mode and
+// the (authorized) client's in signing mode. An anonymous/unvalidated write yields
+// no usable credentials and is simply not warmed.
+func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
+	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
+		return
+	}
+	_, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
+	if err != nil || accessKey == "" || secretKey == "" {
+		return
+	}
+	metrics.WarmOnWriteTriggered.Inc()
+	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false)
 }
 
 // HandlePassthrough handles requests that are passed through without caching.
@@ -488,6 +514,9 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	completed := s3WriteSucceeded(capture)
 	if completed && s.cache.IsEnabled() {
 		s.cache.Delete(context.Background(), bucket, key)
+		// Warm-on-write is the only way to make a multipart-completed object hot:
+		// TAG never sees its assembled body, so a write-through tee is impossible.
+		s.warmOnWrite(r, bucket, key)
 	}
 
 	// Cache successful completions in ocache for idempotent replays. Only cache a

@@ -198,6 +198,14 @@ type CacheConfig struct {
 	// uses DefaultCacheMaxPopulateMemoryBytes; a negative value disables the memory
 	// cap (count-only, prior behavior).
 	MaxPopulateMemoryBytes int64 `yaml:"max_populate_memory_bytes"`
+	// WarmOnWrite, when true, repopulates the cache after a successful write
+	// (PutObject / CompleteMultipartUpload / CopyObject) by triggering a background
+	// full-object fetch — so a read soon after a write hits cache. This is
+	// cache-warm-on-write (write-around plus async warming), not strict
+	// write-through: the write still invalidates, and the warm is a separate,
+	// best-effort background GET (deduplicated and shed under the populate budget).
+	// It costs one extra upstream GET per write, so it defaults to false.
+	WarmOnWrite bool `yaml:"warm_on_write"`
 }
 
 // IsEnabled returns whether caching is enabled.
@@ -440,6 +448,12 @@ func applyEnvOverrides(cfg *Config) {
 		if val := os.Getenv("TAG_CACHE_MAX_POPULATE_MEMORY"); val != "" {
 			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n != 0 {
 				cfg.Cache.MaxPopulateMemoryBytes = n
+			}
+		}
+		// Override cache-warm-on-write from environment (accepts true/false/1/0)
+		if val := os.Getenv("TAG_CACHE_WARM_ON_WRITE"); val != "" {
+			if b, err := strconv.ParseBool(val); err == nil {
+				cfg.Cache.WarmOnWrite = b
 			}
 		}
 	}

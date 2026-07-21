@@ -28,6 +28,10 @@ type mockForwarder struct {
 	captureFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error)
 	// Optional DoRequestWithCreds implementation for upstream-fetch tests
 	doRequestFunc func(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error)
+	// Optional DoFullObjectRequest implementation for background-warm tests
+	doFullObjectFunc func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error)
+	// Optional ValidateAndGetCredentials implementation for auth/creds tests
+	validateFunc func(r *http.Request) (AuthResult, string, string, error)
 }
 
 func (m *mockForwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
@@ -45,6 +49,9 @@ func (m *mockForwarder) ForwardWithCapture(ctx context.Context, w http.ResponseW
 }
 
 func (m *mockForwarder) ValidateAndGetCredentials(r *http.Request) (AuthResult, string, string, error) {
+	if m.validateFunc != nil {
+		return m.validateFunc(r)
+	}
 	return AuthValidated, "access", "secret", nil
 }
 
@@ -56,6 +63,9 @@ func (m *mockForwarder) DoRequestWithCreds(ctx context.Context, r *http.Request,
 }
 
 func (m *mockForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+	if m.doFullObjectFunc != nil {
+		return m.doFullObjectFunc(ctx, bucket, key, accessKey, secretKey)
+	}
 	return nil, errors.New("mock: DoFullObjectRequest not implemented")
 }
 
