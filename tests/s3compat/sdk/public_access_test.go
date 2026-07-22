@@ -266,4 +266,22 @@ func TestSDK_PublicBucket_PrivateObjectDeniedAnonymously(t *testing.T) {
 		t.Errorf("Anonymous HEAD private-obj: must NOT get X-Cache HIT")
 	}
 	t.Logf("Anonymous HEAD private-obj: status=%d, X-Cache=%s", privHeadResp.StatusCode, privHeadResp.Header.Get("X-Cache"))
+
+	// The prior anonymous requests for private-obj must not have triggered a background
+	// fetch that read the object with TAG's credentials and cached it public-read. Wait
+	// for any such fetch to settle, then repeat: it must still be 403 and never a cache
+	// HIT. A regression here is a private object served to an anonymous reader.
+	time.Sleep(500 * time.Millisecond)
+	privResp2, err := globalEnv.DoRawGetUnauthenticated(bucket, "private-obj")
+	if err != nil {
+		t.Fatalf("Repeat anonymous GET private-obj failed: %v", err)
+	}
+	io.ReadAll(privResp2.Body)
+	privResp2.Body.Close()
+	if privResp2.StatusCode != http.StatusForbidden {
+		t.Errorf("Repeat anonymous GET private-obj: expected 403, got %d (private object leaked via a background fetch caching public-read)", privResp2.StatusCode)
+	}
+	if privResp2.Header.Get("X-Cache") == "HIT" {
+		t.Errorf("Repeat anonymous GET private-obj: X-Cache HIT — private object was cached as public-read")
+	}
 }

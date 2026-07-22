@@ -448,17 +448,18 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
 // Credentials and public-read handling depend on how the write was authenticated,
 // because a write proves nothing about who may READ the object:
 //
-//   - Authenticated write: warm with the write's credentials (TAG's own in
-//     transparent mode, the client's in signing mode) and publicACL=false. The cached
-//     entry serves authenticated reads; a signing-mode write-only client's warm will
-//     fail, exactly as its own read would.
-//   - Anonymous write: warm with an UNSIGNED (anonymous) fetch and publicACL=true. A
-//     successful anonymous write only proves public-WRITE, so we must not infer
-//     public-read from it. Instead the anonymous fetch itself is the probe: upstream
-//     returns 200 only if the object is genuinely publicly READABLE (then public-read
-//     is cached, so anonymous reads hit) and 403 otherwise (nothing is cached, so a
-//     private object in a public-write bucket is never exposed). This mirrors the read
-//     path, which likewise caches public-read only after a successful anonymous GET.
+//   - Authenticated write (anonymous=false): warm with the write's credentials
+//     (TAG's own in transparent mode, the client's in signing mode) via a signed
+//     fetch, which is never marked public-read. The cached entry serves authenticated
+//     reads; a signing-mode write-only client's warm will fail, exactly as its own
+//     read would.
+//   - Anonymous write (anonymous=true): warm with an UNSIGNED fetch. A successful
+//     anonymous write only proves public-WRITE, so we must not infer public-read from
+//     it. Instead the anonymous fetch itself is the probe: upstream returns 200 only if
+//     the object is genuinely publicly READABLE (then it is cached public-read, so
+//     anonymous reads hit) and 403 otherwise (nothing is cached, so a private object in
+//     a public-write bucket is never exposed). This mirrors the read path, which
+//     likewise caches public-read only after a successful anonymous read.
 //
 // Best-effort caveat: warms are keyed by bucket/key for dedup, so if any fetch for
 // this key is already in flight — a concurrent read-path warm, or the warm from a
@@ -478,7 +479,7 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	// probe). See the doc comment: never infer public-read from a public write.
 	if hasNoAuthCredentials(r) {
 		metrics.WarmOnWriteTriggered.Inc()
-		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*publicACL*/, true /*anonymous*/)
+		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*anonymous*/)
 		return
 	}
 
@@ -487,7 +488,7 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 		return
 	}
 	metrics.WarmOnWriteTriggered.Inc()
-	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*publicACL*/, false /*anonymous*/)
+	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/)
 }
 
 // HandlePassthrough handles requests that are passed through without caching.
