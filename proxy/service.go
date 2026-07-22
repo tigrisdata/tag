@@ -244,10 +244,10 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// restoring read-after-write semantics.
 	// Gated on a 2xx: a rejected PUT leaves the object unchanged, so re-invalidating
 	// would only discard a valid racing refill and cause an unnecessary later miss.
-	// The metric is recorded once on the pre-forward invalidation above; this
-	// second Delete is the same logical invalidation, so it is not counted again.
+	// Routed through invalidateObject (like the pre-forward call) so a failure of this
+	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
+		s.invalidateObject(context.Background(), bucket, key)
 		s.warmOnWrite(r, bucket, key)
 	}
 
@@ -282,10 +282,10 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// tombstone blocks that stale repopulation.
 	// Gated on a 2xx: a rejected DELETE leaves the object present, so re-invalidating
 	// would only discard a valid racing refill and cause an unnecessary later miss.
-	// The metric is recorded once on the pre-forward invalidation above; this
-	// second Delete is the same logical invalidation, so it is not counted again.
+	// Routed through invalidateObject (like the pre-forward call) so a failure of this
+	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
+		s.invalidateObject(context.Background(), bucket, key)
 	}
 
 	status := "success"
@@ -377,7 +377,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// Invalidate cache for destination object BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
 	if s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
+		s.invalidateObject(context.Background(), bucket, key)
 	}
 
 	// Forward to upstream, capturing the response so we can confirm the copy
@@ -393,7 +393,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
 	// unchanged, so re-invalidating would only discard a valid racing refill.
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
+		s.invalidateObject(context.Background(), bucket, key)
 		s.warmOnWrite(r, bucket, key)
 	}
 
@@ -542,7 +542,7 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// object unchanged, doesn't discard a valid racing refill.
 	completed := s3WriteSucceeded(capture)
 	if completed && s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
+		s.invalidateObject(context.Background(), bucket, key)
 		// Warm-on-write is the only way to make a multipart-completed object hot:
 		// TAG never sees its assembled body, so a write-through tee is impossible.
 		s.warmOnWrite(r, bucket, key)
