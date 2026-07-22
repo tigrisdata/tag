@@ -124,8 +124,8 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	// key than upstream reported as errored. Counting by key (never matching version
 	// IDs) is robust to VersionId representation differences and to Quiet mode, and
 	// can never leave a truly-deleted object cached (a success is never an <Error>).
-	// A key whose entries ALL errored keeps its refill (it's still upstream). The
-	// metric is recorded once on the pre-forward invalidation above, not again here.
+	// A key whose entries ALL errored keeps its refill (it's still upstream).
+	// Routed through invalidateObject so a failed re-invalidation is recorded/logged.
 	if err == nil && capture != nil && capture.StatusCode >= 200 && capture.StatusCode < 300 && s.cache.IsEnabled() {
 		erroredCounts, parsed := erroredDeleteKeyCounts(capture.Body)
 		for key, reqN := range requestedCounts {
@@ -133,7 +133,7 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 			if parsed && reqN <= erroredCounts[key] {
 				continue // every requested entry for this key errored — object still present
 			}
-			s.cache.Delete(context.Background(), bucket, key)
+			s.invalidateObject(context.Background(), bucket, key)
 		}
 	}
 
