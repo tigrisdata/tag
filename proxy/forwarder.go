@@ -325,12 +325,20 @@ func (b *baseForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, ac
 
 // DoAnonymousFullObjectRequest executes an UNSIGNED full-object GET (no credentials),
 // so upstream applies anonymous authorization: 200 for a publicly-readable object,
-// 403 otherwise. Caller is responsible for closing the response body.
+// 403 otherwise. Uses vhost-style addressing where the endpoint supports it, matching
+// the anonymous client-forward path — Tigris requires it for anonymous public-bucket
+// access. Caller is responsible for closing the response body.
 func (b *baseForwarder) DoAnonymousFullObjectRequest(ctx context.Context, bucket, key string) (*http.Response, error) {
-	fwdReq, err := b.signer.UnsignedRequest(ctx, "GET", "/"+bucket+"/"+key)
+	fullURL := anonymousObjectURL(b.signer.Endpoint(), bucket, key)
+	if fullURL == "" {
+		return nil, errors.New("failed to build anonymous request URL")
+	}
+
+	fwdReq, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
 	if err != nil {
 		return nil, err
 	}
+	fwdReq.Header.Set("Host", fwdReq.URL.Host)
 
 	upstreamStart := time.Now()
 	resp, err := b.httpClient.Do(fwdReq)

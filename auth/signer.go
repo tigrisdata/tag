@@ -65,31 +65,9 @@ func NewRequestSigner(endpoint, region string) *RequestSigner {
 	}
 }
 
-// UnsignedRequest builds an HTTP request to the upstream carrying NO credentials —
-// no Authorization, X-Amz-Date, or content hash — i.e. an anonymous request, exactly
-// like an unauthenticated client. Used to probe anonymous (public-read) access:
-// upstream serves it only if the object is publicly readable.
-func (s *RequestSigner) UnsignedRequest(ctx context.Context, method, path string) (*http.Request, error) {
-	baseURL, err := url.Parse(s.endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse endpoint: %w", err)
-	}
-
-	pathPart := path
-	queryPart := ""
-	if idx := strings.Index(path, "?"); idx != -1 {
-		pathPart = path[:idx]
-		queryPart = path[idx+1:]
-	}
-	baseURL.Path = pathPart
-	baseURL.RawQuery = queryPart
-
-	req, err := http.NewRequestWithContext(ctx, method, baseURL.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Host", req.URL.Host)
-	return req, nil
+// Endpoint returns the upstream endpoint this signer targets.
+func (s *RequestSigner) Endpoint() string {
+	return s.endpoint
 }
 
 // SignRequest creates a new HTTP request signed for Tigris using streaming.

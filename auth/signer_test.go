@@ -10,31 +10,6 @@ import (
 	"testing"
 )
 
-func TestRequestSigner_UnsignedRequest(t *testing.T) {
-	signer := NewRequestSigner("https://s3.amazonaws.com", "us-east-1")
-
-	req, err := signer.UnsignedRequest(t.Context(), http.MethodGet, "/test-bucket/test-key")
-	if err != nil {
-		t.Fatalf("UnsignedRequest: %v", err)
-	}
-
-	if req.Method != http.MethodGet {
-		t.Errorf("method = %q, want GET", req.Method)
-	}
-	if got, want := req.URL.String(), "https://s3.amazonaws.com/test-bucket/test-key"; got != want {
-		t.Errorf("URL = %q, want %q", got, want)
-	}
-	// The whole point: no credentials of any kind are attached.
-	for _, h := range []string{"Authorization", "X-Amz-Date", "X-Amz-Content-Sha256"} {
-		if v := req.Header.Get(h); v != "" {
-			t.Errorf("unsigned request carries %s=%q, want empty", h, v)
-		}
-	}
-	if req.Host != "s3.amazonaws.com" && req.Header.Get("Host") != "s3.amazonaws.com" {
-		t.Errorf("Host not set; req.Host=%q Host header=%q", req.Host, req.Header.Get("Host"))
-	}
-}
-
 func TestRequestSigner_SignRequest(t *testing.T) {
 	signer := NewRequestSigner("https://s3.amazonaws.com", "us-east-1")
 

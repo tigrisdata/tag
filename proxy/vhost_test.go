@@ -57,6 +57,53 @@ func TestVHostEndpoint(t *testing.T) {
 	}
 }
 
+func TestAnonymousObjectURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		bucket   string
+		key      string
+		want     string
+	}{
+		{
+			name:     "vhost-capable endpoint uses vhost style",
+			endpoint: "https://t3.storage.dev",
+			bucket:   "mybucket",
+			key:      "path/to/obj.parquet",
+			want:     "https://mybucket.t3.storage.dev/path/to/obj.parquet",
+		},
+		{
+			name:     "tigris subdomain endpoint uses vhost style",
+			endpoint: "https://fly.storage.tigris.dev",
+			bucket:   "assets",
+			key:      "logo.png",
+			want:     "https://assets.fly.storage.tigris.dev/logo.png",
+		},
+		{
+			name:     "localhost falls back to path style",
+			endpoint: "http://localhost:8080",
+			bucket:   "mybucket",
+			key:      "obj.txt",
+			want:     "http://localhost:8080/mybucket/obj.txt",
+		},
+		{
+			name:     "ip endpoint falls back to path style",
+			endpoint: "http://127.0.0.1:9000",
+			bucket:   "mybucket",
+			key:      "obj.txt",
+			want:     "http://127.0.0.1:9000/mybucket/obj.txt",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := anonymousObjectURL(tt.endpoint, tt.bucket, tt.key); got != tt.want {
+				t.Errorf("anonymousObjectURL(%q, %q, %q) = %q, want %q", tt.endpoint, tt.bucket, tt.key, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSupportsVHost(t *testing.T) {
 	tests := []struct {
 		name     string
