@@ -952,3 +952,87 @@ func TestCache_InvalidateOnDeleteObjects(t *testing.T) {
 
 	t.Logf("DeleteObjects cache invalidation verified: %d objects deleted and cache invalidated", len(keys))
 }
+
+// TestCache_WarmOnWrite verifies the end-to-end cache-warm-on-write path: with
+// cache.warm_on_write enabled, a successful PUT triggers a background full-object
+// fetch that populates the cache, so the object is a cache HIT on the next GET even
+// though no prior GET populated it. This exercises the real warm chain (warmOnWrite
+// -> triggerBackgroundCacheFetch -> fetchFullObjectToCache -> DoFullObjectRequest ->
+// setupCacheListener -> embedded cache write), which the proxy unit tests stub out.
+func TestCache_WarmOnWrite(t *testing.T) {
+	env := NewTestEnvironmentWithCache()
+	defer env.Close()
+	env.Config.Cache.WarmOnWrite = true // read live by warmOnWrite at request time
+
+	client := env.GetS3Client()
+	ctx := context.Background()
+	bucket := "warm-on-write-bucket"
+	key := "warm-on-write.txt"
+	content := []byte("warm me on write")
+	require.NoError(t, env.CreateTestBucket(bucket))
+
+	// PUT with no prior GET.
+	_, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(content),
+	})
+	require.NoError(t, err)
+
+	// The background warm must populate the cache without any GET having occurred.
+	require.True(t, env.WaitForCached(bucket, key, 3*time.Second),
+		"object should be warmed into cache after PUT (no GET) with warm_on_write=true")
+
+	// The first GET is therefore a cache hit, and returns the written content.
+	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	assert.Equal(t, content, body, "warmed GET should return the written content")
+	env.AssertXCacheHit(t) // hit because the write pre-populated the cache
+}
+
+// TestCache_WarmOnWriteDisabled is the control: with warm_on_write off (the default),
+// a PUT must NOT populate the cache — the object is only cached on first read.
+func TestCache_WarmOnWriteDisabled(t *testing.T) {
+	env := NewTestEnvironmentWithCache()
+	defer env.Close()
+	// WarmOnWrite defaults to false; assert it and leave it off.
+	require.False(t, env.Config.Cache.WarmOnWrite, "warm_on_write must default to false")
+
+	client := env.GetS3Client()
+	ctx := context.Background()
+	bucket := "warm-on-write-off-bucket"
+	key := "no-warm.txt"
+	content := []byte("do not warm on write")
+	require.NoError(t, env.CreateTestBucket(bucket))
+
+	_, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(content),
+	})
+	require.NoError(t, err)
+
+	// The object must never appear in cache from the PUT alone. Poll a bounded window
+	// so a warm that incorrectly fired would be caught, not raced past.
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		require.False(t, env.IsCached(bucket, key),
+			"object must not be cached after PUT when warm_on_write is disabled")
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The first GET is the cache-on-read baseline: a miss.
+	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	require.NoError(t, err)
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	env.AssertXCacheMiss(t)
+}
