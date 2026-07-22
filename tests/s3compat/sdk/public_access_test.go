@@ -268,20 +268,24 @@ func TestSDK_PublicBucket_PrivateObjectDeniedAnonymously(t *testing.T) {
 	t.Logf("Anonymous HEAD private-obj: status=%d, X-Cache=%s", privHeadResp.StatusCode, privHeadResp.Header.Get("X-Cache"))
 
 	// The prior anonymous requests for private-obj must not have triggered a background
-	// fetch that read the object with TAG's credentials and cached it public-read. Wait
-	// for any such fetch to settle, then repeat: it must still be 403 and never a cache
-	// HIT. A regression here is a private object served to an anonymous reader.
-	time.Sleep(500 * time.Millisecond)
-	privResp2, err := globalEnv.DoRawGetUnauthenticated(bucket, "private-obj")
-	if err != nil {
-		t.Fatalf("Repeat anonymous GET private-obj failed: %v", err)
-	}
-	io.ReadAll(privResp2.Body)
-	privResp2.Body.Close()
-	if privResp2.StatusCode != http.StatusForbidden {
-		t.Errorf("Repeat anonymous GET private-obj: expected 403, got %d (private object leaked via a background fetch caching public-read)", privResp2.StatusCode)
-	}
-	if privResp2.Header.Get("X-Cache") == "HIT" {
-		t.Errorf("Repeat anonymous GET private-obj: X-Cache HIT — private object was cached as public-read")
+	// fetch that read the object with TAG's credentials and cached it public-read. Such
+	// a fetch is asynchronous, so a single delayed check could race it and pass while
+	// the poisoned entry is still in flight. Instead poll: with the bug, once the entry
+	// is cached public-read EVERY subsequent anonymous GET leaks it, so any iteration in
+	// the window catches a 200/HIT. Without the bug, every iteration stays 403.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		r, err := globalEnv.DoRawGetUnauthenticated(bucket, "private-obj")
+		if err != nil {
+			t.Fatalf("Repeat anonymous GET private-obj failed: %v", err)
+		}
+		status := r.StatusCode
+		xcache := r.Header.Get("X-Cache")
+		io.ReadAll(r.Body)
+		r.Body.Close()
+		if status != http.StatusForbidden || xcache == "HIT" {
+			t.Fatalf("Anonymous GET private-obj returned status=%d X-Cache=%q — private object exposed to an anonymous reader (cached public-read)", status, xcache)
+		}
+		time.Sleep(100 * time.Millisecond) // pace the poll; the loop asserts every iteration
 	}
 }
