@@ -554,6 +554,20 @@ func (e *TestEnvironment) GetS3Client() *s3.Client {
 	})
 }
 
+// GetUpstreamS3Client returns an S3 client that talks directly to the mock upstream,
+// bypassing TAG and its cache. Use it to read the authoritative object state (e.g. to
+// check that a TAG read never serves content that differs from what upstream holds).
+func (e *TestEnvironment) GetUpstreamS3Client() *s3.Client {
+	return s3.NewFromConfig(aws.Config{}, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(e.UpstreamServer.URL)
+		o.Region = TestRegion
+		o.EndpointOptions.DisableHTTPS = true
+		o.UsePathStyle = true
+		o.Credentials = credentials.NewStaticCredentialsProvider(
+			TestAccessKey, TestSecretKey, "")
+	})
+}
+
 // GetS3ClientTLS returns an AWS SDK S3 client configured for a TLS TAG server.
 // The client uses the test server's HTTP client which trusts the test certificate.
 // Unlike GetS3Client, this does NOT disable HTTPS, allowing the SDK to use

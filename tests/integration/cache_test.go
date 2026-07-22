@@ -3,9 +3,11 @@ package integration
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1035,4 +1037,74 @@ func TestCache_WarmOnWriteDisabled(t *testing.T) {
 	_, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	env.AssertXCacheMiss(t)
+}
+
+// TestCache_ConcurrentPutsSameKey validates read-after-write correctness under
+// concurrent writes to a single key: after racing PUTs settle, a read through TAG
+// must return exactly what upstream holds — never a stale cached version left behind
+// by an earlier write's populate or warm. It runs with warm_on_write both off (pure
+// invalidation/tombstone correctness) and on (the warm dedup + tombstone-block path
+// we reason about but otherwise don't exercise end-to-end).
+func TestCache_ConcurrentPutsSameKey(t *testing.T) {
+	for _, warm := range []bool{false, true} {
+		name := "warm_off"
+		if warm {
+			name = "warm_on"
+		}
+		t.Run(name, func(t *testing.T) {
+			env := NewTestEnvironmentWithCache()
+			defer env.Close()
+			env.Config.Cache.WarmOnWrite = warm
+
+			client := env.GetS3Client()
+			ctx := context.Background()
+			bucket := "concurrent-put-" + strings.ReplaceAll(name, "_", "-") + "-bucket"
+			key := "racy.txt"
+			require.NoError(t, env.CreateTestBucket(bucket))
+
+			// Fire N concurrent PUTs of distinct content to the same key.
+			const writers = 8
+			var wg sync.WaitGroup
+			for i := 0; i < writers; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					content := []byte(fmt.Sprintf("version-%02d-of-%d-concurrent-writers", i, writers))
+					_, err := client.PutObject(ctx, &s3.PutObjectInput{
+						Bucket: aws.String(bucket),
+						Key:    aws.String(key),
+						Body:   bytes.NewReader(content),
+					})
+					assert.NoError(t, err)
+				}(i)
+			}
+			wg.Wait()
+
+			// Authoritative state: what upstream actually holds now (bypassing TAG).
+			upstream := env.GetUpstreamS3Client()
+			truthResp, err := upstream.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+			})
+			require.NoError(t, err)
+			want, _ := io.ReadAll(truthResp.Body)
+			truthResp.Body.Close()
+
+			// Two reads through TAG: the first populates the cache (or is served by a
+			// warm), the second is a cache hit. Both must equal the authoritative
+			// content — a stale cached version (a warm/populate of an earlier write
+			// that escaped its invalidation tombstone) would diverge on either read.
+			for i := 0; i < 2; i++ {
+				resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+					Bucket: aws.String(bucket),
+					Key:    aws.String(key),
+				})
+				require.NoError(t, err)
+				got, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				require.Equal(t, string(want), string(got),
+					"read %d through TAG returned content that differs from upstream (stale cache)", i)
+			}
+		})
+	}
 }
