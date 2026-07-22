@@ -445,14 +445,20 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
 // invalidation racing the warm is provably newer and blocks it. Safe to call on
 // every successful write.
 //
-// The warm uses the same credentials the read path uses for background fetches
-// (ValidateAndGetCredentials): TAG's own credentials in transparent mode — so any
-// write upstream accepted is warmed, including anonymous writes to a public bucket —
-// and the requesting client's credentials in signing mode. In signing mode an
-// anonymous/unvalidated write returns no usable credentials and is not warmed; and
-// because the warm reads as that client, a client authorized only to write will see
-// its warm GET fail (recorded as a background-fetch failure), just as it would if it
-// tried to read the object itself.
+// Credentials and public-read handling depend on how the write was authenticated,
+// because a write proves nothing about who may READ the object:
+//
+//   - Authenticated write: warm with the write's credentials (TAG's own in
+//     transparent mode, the client's in signing mode) and publicACL=false. The cached
+//     entry serves authenticated reads; a signing-mode write-only client's warm will
+//     fail, exactly as its own read would.
+//   - Anonymous write: warm with an UNSIGNED (anonymous) fetch and publicACL=true. A
+//     successful anonymous write only proves public-WRITE, so we must not infer
+//     public-read from it. Instead the anonymous fetch itself is the probe: upstream
+//     returns 200 only if the object is genuinely publicly READABLE (then public-read
+//     is cached, so anonymous reads hit) and 403 otherwise (nothing is cached, so a
+//     private object in a public-write bucket is never exposed). This mirrors the read
+//     path, which likewise caches public-read only after a successful anonymous GET.
 //
 // Best-effort caveat: warms are keyed by bucket/key for dedup, so if any fetch for
 // this key is already in flight — a concurrent read-path warm, or the warm from a
@@ -467,20 +473,21 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
 		return
 	}
+
+	// Anonymous write → anonymous warm (unsigned fetch, public-read learned from the
+	// probe). See the doc comment: never infer public-read from a public write.
+	if hasNoAuthCredentials(r) {
+		metrics.WarmOnWriteTriggered.Inc()
+		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*publicACL*/, true /*anonymous*/)
+		return
+	}
+
 	_, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil || accessKey == "" || secretKey == "" {
 		return
 	}
 	metrics.WarmOnWriteTriggered.Inc()
-	// publicACL is deliberately false here, unlike the read-path warm (which passes
-	// hasNoAuthCredentials). A successful anonymous read proves the object is
-	// publicly READABLE, but a successful anonymous WRITE only proves the bucket is
-	// publicly WRITABLE — inferring public-read from it could let an anonymous reader
-	// be served a private object from a public-write/private-read bucket. Leaving it
-	// false costs at most one anonymous cache miss after an anonymous write: that
-	// read's streaming populate re-caches with public-read, correctly derived from
-	// the anonymous GET succeeding.
-	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false)
+	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*publicACL*/, false /*anonymous*/)
 }
 
 // HandlePassthrough handles requests that are passed through without caching.

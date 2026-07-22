@@ -135,10 +135,12 @@ cache:
   # NOT strict write-through: the write still invalidates, and the warm is a
   # separate, best-effort background GET — deduplicated and shed under the cache
   # populate budget. It costs one extra upstream GET per write, so it defaults off.
-  # The warm reads with TAG's own credentials in transparent mode and the client's
-  # in signing mode; in signing mode a client authorized only to write will have its
-  # warm fetch fail (recorded as a background-fetch failure), same as if it read the
-  # object itself.
+  # An authenticated write warms with the write's credentials (TAG's own in
+  # transparent mode, the client's in signing mode); a signing-mode client authorized
+  # only to write will have its warm fetch fail, same as if it read the object itself.
+  # An anonymous write warms with an unsigned fetch, so the object is cached as
+  # public-read only if it is genuinely publicly readable (the anonymous read
+  # returns 200); a private object is never exposed via the cache.
   # Override with TAG_CACHE_WARM_ON_WRITE env var
   warm_on_write: false
 
