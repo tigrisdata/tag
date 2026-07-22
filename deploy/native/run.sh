@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # Configuration (can be overridden via environment variables)
-TAG_VERSION="${TAG_VERSION:-v1.9.4}"
+TAG_VERSION="${TAG_VERSION:-v1.11.1}"
 
 # Directories
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

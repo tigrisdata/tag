@@ -242,6 +242,132 @@ cache:
 	}
 }
 
+func TestLoad_EvictionPolicyDefaultsToLRU(t *testing.T) {
+	content := "cache:\n  enabled: true\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.EvictionPolicy != EvictionPolicyLRU {
+		t.Errorf("Cache.EvictionPolicy = %q, want %q (default)", cfg.Cache.EvictionPolicy, EvictionPolicyLRU)
+	}
+}
+
+func TestLoad_EvictionPolicyFromYAMLAndEnv(t *testing.T) {
+	content := "cache:\n  enabled: true\n  eviction_policy: fifo\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	// YAML value is honored (and normalized).
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.EvictionPolicy != EvictionPolicyFIFO {
+		t.Errorf("Cache.EvictionPolicy = %q, want %q from YAML", cfg.Cache.EvictionPolicy, EvictionPolicyFIFO)
+	}
+
+	// Env overrides YAML, case-insensitively.
+	t.Setenv("TAG_CACHE_EVICTION_POLICY", "LRU")
+	cfg, err = Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.EvictionPolicy != EvictionPolicyLRU {
+		t.Errorf("Cache.EvictionPolicy = %q, want %q from env override", cfg.Cache.EvictionPolicy, EvictionPolicyLRU)
+	}
+}
+
+func TestLoad_EvictionPolicyInvalidRejected(t *testing.T) {
+	// A typo must fail fast rather than being forwarded to ocache's LRU fallback.
+	t.Run("from yaml", func(t *testing.T) {
+		content := "cache:\n  enabled: true\n  eviction_policy: fif0\n"
+		tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+			t.Fatalf("Failed to create temp file: %v", err)
+		}
+		if _, err := Load(tmpFile); err == nil {
+			t.Error("Load() accepted invalid eviction_policy from YAML, want error")
+		}
+	})
+
+	t.Run("from env", func(t *testing.T) {
+		content := "cache:\n  enabled: true\n"
+		tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+			t.Fatalf("Failed to create temp file: %v", err)
+		}
+		t.Setenv("TAG_CACHE_EVICTION_POLICY", "bogus")
+		if _, err := Load(tmpFile); err == nil {
+			t.Error("Load() accepted invalid eviction_policy from env, want error")
+		}
+	})
+}
+
+func TestLoad_EvictionPolicyBlankEnvKeepsYAML(t *testing.T) {
+	// A whitespace-only env var must not wipe a valid YAML/default value.
+	content := "cache:\n  enabled: true\n  eviction_policy: fifo\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	t.Setenv("TAG_CACHE_EVICTION_POLICY", "   ")
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.EvictionPolicy != EvictionPolicyFIFO {
+		t.Errorf("Cache.EvictionPolicy = %q, want %q (blank env must not override YAML)", cfg.Cache.EvictionPolicy, EvictionPolicyFIFO)
+	}
+}
+
+func TestLoad_WarmOnWrite(t *testing.T) {
+	// Defaults to false.
+	base := "cache:\n  enabled: true\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(base), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.WarmOnWrite {
+		t.Error("Cache.WarmOnWrite defaulted to true, want false")
+	}
+
+	// YAML enables it.
+	yamlOn := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(yamlOn, []byte("cache:\n  enabled: true\n  warm_on_write: true\n"), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	cfg, err = Load(yamlOn)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Cache.WarmOnWrite {
+		t.Error("Cache.WarmOnWrite = false from YAML warm_on_write: true, want true")
+	}
+
+	// Env overrides YAML in both directions.
+	t.Setenv("TAG_CACHE_WARM_ON_WRITE", "false")
+	cfg, err = Load(yamlOn)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.WarmOnWrite {
+		t.Error("Cache.WarmOnWrite = true, want false from env override")
+	}
+}
+
 func TestLoad_StorageTuningDefaults(t *testing.T) {
 	content := `
 cache:

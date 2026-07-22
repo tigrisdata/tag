@@ -124,6 +124,27 @@ rate(tag_range_from_cache_hits_total[5m]) /
 rate(tag_requests_total{operation="GetObject"}[5m])
 ```
 
+#### tag_cache_size_bytes
+
+**Type:** Gauge
+
+Current logical size of **this node's** local cache in bytes (the sum of stored
+object lengths), sampled periodically from the embedded cache. Per-node — sum across
+nodes for a cluster-wide total.
+
+```promql
+# Cluster-wide cache size
+sum(tag_cache_size_bytes)
+
+# Fill against a configured disk cap (bytes)
+tag_cache_size_bytes / <max_disk_usage_bytes>
+```
+
+> The embedded cache also exports `ocache_disk_usage_bytes{type="total"}` (same
+> logical size) and `ocache_segment_size_bytes` (physical on-disk segment bytes,
+> including fragmentation and not-yet-compacted tombstones) directly at `/metrics`.
+> `tag_cache_size_bytes` is the stable, TAG-owned name for the logical size.
+
 ### Broadcast Metrics
 
 #### tag_broadcast_shared_total
@@ -201,6 +222,15 @@ rate(tag_background_fetches_triggered_total[5m])
 **Type:** Gauge
 
 Number of currently active background fetches.
+
+#### tag_warm_on_write_triggered_total
+
+**Type:** Counter
+
+Number of cache warms triggered by a successful write, when `cache.warm_on_write` is
+enabled. The warm's own outcome (success / failure / shed) is recorded by the
+`tag_background_fetches_*` and `tag_cache_populate_skipped_total` metrics; this counts
+how often a write initiated one.
 
 ### Revalidation Metrics
 

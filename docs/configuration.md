@@ -14,6 +14,8 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_DISABLED`              | Disable caching (`true` or `1`)                                                 | `false`                  |
 | `TAG_CACHE_DISK_PATH`             | Path to cache data directory                                                    | `/var/cache/tag`         |
 | `TAG_CACHE_MAX_DISK_USAGE`        | Max disk usage in bytes (0 = unlimited)                                         | `0`                      |
+| `TAG_CACHE_EVICTION_POLICY`       | Eviction order when the disk cap is hit: `lru` or `fifo` (oldest-written first)  | `lru`                    |
+| `TAG_CACHE_WARM_ON_WRITE`         | Warm the cache after a successful write via a background fetch (`true`/`false`)  | `false`                  |
 | `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
 | `TAG_CACHE_CLUSTER_ADDR`          | Address for memberlist gossip                                                   | `:7000`                  |
 | `TAG_CACHE_GRPC_ADDR`             | Address for gRPC server                                                         | `:9000`                  |
@@ -117,6 +119,30 @@ cache:
   # Max disk usage in bytes (0 = unlimited)
   # Default: 0
   max_disk_usage_bytes: 0
+
+  # Eviction order when the disk cap is reached: "lru" (default) or "fifo".
+  # "fifo" evicts oldest-written objects first — better for write-once workloads
+  # (e.g. dated parquet) where a rare read of an old object should not keep it
+  # resident at the expense of newer, hotter data.
+  # NOTE: eviction only runs when max_disk_usage_bytes > 0. With no disk cap the
+  # cache is never evicted and this setting has no effect.
+  # Override with TAG_CACHE_EVICTION_POLICY env var
+  eviction_policy: lru
+
+  # Warm the cache after a successful write (PutObject / CompleteMultipartUpload /
+  # CopyObject) by triggering a background full-object fetch, so a read soon after a
+  # write hits cache. This is cache-warm-on-write (write-around plus async warming),
+  # NOT strict write-through: the write still invalidates, and the warm is a
+  # separate, best-effort background GET — deduplicated and shed under the cache
+  # populate budget. It costs one extra upstream GET per write, so it defaults off.
+  # An authenticated write warms with the write's credentials (TAG's own in
+  # transparent mode, the client's in signing mode); a signing-mode client authorized
+  # only to write will have its warm fetch fail, same as if it read the object itself.
+  # An anonymous write warms with an unsigned fetch, so the object is cached as
+  # public-read only if it is genuinely publicly readable (the anonymous read
+  # returns 200); a private object is never exposed via the cache.
+  # Override with TAG_CACHE_WARM_ON_WRITE env var
+  warm_on_write: false
 
   # Unique node identifier for cluster mode
   # Required for multi-node deployments
@@ -290,6 +316,8 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |
 | `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |
+| `eviction_policy`       | string   | `lru`            | Eviction order when the disk cap is hit: `lru` or `fifo` (only applies when `max_disk_usage_bytes` > 0) |
+| `warm_on_write`         | bool     | `false`          | Warm the cache after a successful write via a background fetch (one extra upstream GET per write) |
 | `node_id`               | string   | `""`             | Unique node identifier for cluster mode                                             |
 | `cluster_addr`          | string   | `:7000`          | Address for memberlist gossip                                                       |
 | `grpc_addr`             | string   | `:9000`          | Address for gRPC server                                                             |

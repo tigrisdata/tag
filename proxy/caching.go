@@ -133,6 +133,7 @@ func (s *Service) setupCacheListener(
 	broadcaster *broadcast.Broadcaster,
 	slotHeld bool,
 	weight int64,
+	writeStartTime int64,
 ) (*io.PipeWriter, chan error) {
 	// Bound concurrent cache-populate operations. When the limit is saturated,
 	// skip caching entirely: the object is still served/forwarded from upstream,
@@ -150,9 +151,6 @@ func (s *Service) setupCacheListener(
 			return nil, nil
 		}
 	}
-
-	// Record when this write started - used to check against tombstones
-	writeStartTime := time.Now().UnixNano()
 
 	listener := broadcaster.Subscribe()
 	if listener == nil {
@@ -319,10 +317,16 @@ func (s *Service) setupCacheListener(
 
 // fetchFullObjectToCache fetches the full object and caches it.
 // This makes a full-object request (no Range header) and streams directly to cache.
+// When anonymous is true the fetch is unsigned and, if it succeeds, the object is
+// cached as public-read. These are inseparable: public-read may be inferred ONLY
+// from a successful UNSIGNED read (which proves anonymous readability). A signed
+// fetch — which uses TAG's credentials and can read private objects — must never
+// mark an entry public-read, or a later anonymous request could be served a private
+// object from cache.
 func (s *Service) fetchFullObjectToCache(
 	ctx context.Context,
 	bucket, key, accessKey, secretKey string,
-	publicACL bool,
+	anonymous bool,
 	broadcaster *broadcast.Broadcaster,
 ) error {
 	// This is a background fetch whose only purpose is to populate the cache, so
@@ -349,14 +353,36 @@ func (s *Service) fetchFullObjectToCache(
 		}
 	}()
 
-	// Execute full object request (no Range header)
-	resp, err := s.forwarder.DoFullObjectRequest(ctx, bucket, key, accessKey, secretKey)
+	// Stamp the cache-write start BEFORE the upstream request, for the same reason
+	// as the inline path: a timestamp taken after the response leaves the whole
+	// round-trip unguarded, letting an invalidation that landed mid-fetch look older
+	// than our write and pass the tombstone check.
+	writeStartTime := time.Now().UnixNano()
+
+	// Execute full object request (no Range header). An anonymous warm uses an
+	// unsigned request so upstream applies anonymous authorization — 200 only if the
+	// object is publicly readable — which is what lets us cache public-read safely.
+	var (
+		resp *http.Response
+		err  error
+	)
+	if anonymous {
+		resp, err = s.forwarder.DoAnonymousFullObjectRequest(ctx, bucket, key)
+	} else {
+		resp, err = s.forwarder.DoFullObjectRequest(ctx, bucket, key, accessKey, secretKey)
+	}
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// For an anonymous probe, a 403 is a definitive answer — the object is not
+		// publicly readable, so there is nothing to warm as public — not a failure.
+		if anonymous && resp.StatusCode == http.StatusForbidden {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Anonymous warm skipped - object not publicly readable")
+			return errCachePopulateDeclined
+		}
 		return fmt.Errorf("unexpected status %d for background fetch", resp.StatusCode)
 	}
 
@@ -380,7 +406,7 @@ func (s *Service) fetchFullObjectToCache(
 	// Hand the reserved slot to the cache listener (streams to cache via pipe).
 	// Ownership of releasing the slot transfers to setupCacheListener, so drop
 	// our own release regardless of the result.
-	cachePipeWriter, cacheErrCh := s.setupCacheListener(ctx, bucket, key, broadcaster, true, weight)
+	cachePipeWriter, cacheErrCh := s.setupCacheListener(ctx, bucket, key, broadcaster, true, weight, writeStartTime)
 	slotOwned = false
 	if cachePipeWriter == nil {
 		// No listener could be created; nothing to populate.
@@ -388,10 +414,11 @@ func (s *Service) fetchFullObjectToCache(
 		return errCachePopulateDeclined
 	}
 
-	// If the original request was anonymous and succeeded, the object is publicly
-	// accessible. Tigris omits X-Amz-Acl for objects inheriting bucket-level access,
-	// so inject public-read to ensure the cached metadata allows anonymous reads.
-	if publicACL && resp.Header.Get("X-Amz-Acl") == "" {
+	// The unsigned fetch succeeded, so the object is anonymously readable. Tigris
+	// omits X-Amz-Acl for objects inheriting bucket-level access, so inject public-read
+	// to ensure the cached metadata allows anonymous reads. Gated on `anonymous`: a
+	// signed fetch can read private objects, so it must never mark an entry public.
+	if anonymous && resp.Header.Get("X-Amz-Acl") == "" {
 		resp.Header.Set("X-Amz-Acl", "public-read")
 	}
 
@@ -464,7 +491,11 @@ streamLoop:
 // starts a fetch; subsequent triggers while the fetch is in progress are no-ops.
 // This avoids broadcast.Manager's "no late joiners" policy which incorrectly
 // allows multiple fetches when the first has already started streaming.
-func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, publicACL bool) {
+// When anonymous is true the fetch is issued without credentials and, on success,
+// cached as public-read (see fetchFullObjectToCache); accessKey/secretKey are then
+// ignored. Pass anonymous=true exactly when the triggering request was anonymous, so
+// public-read is only ever inferred from a confirmed anonymous read.
+func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool) {
 	bcastKey := "bg:" + bucket + "/" + key
 
 	// Atomic check-and-set: if key exists, a fetch is already in progress
@@ -490,7 +521,7 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 		}
 		broadcaster := broadcast.NewBroadcaster(channelBuf)
 
-		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, publicACL, broadcaster)
+		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, broadcaster)
 
 		switch {
 		case errors.Is(err, errCachePopulateDeclined):

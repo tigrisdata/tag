@@ -73,6 +73,18 @@ const (
 	// as a literal so the config package stays free of the cgo/RocksDB dependency.
 	DefaultCacheRecoveryWorkers = 16
 
+	// EvictionPolicyLRU evicts least-recently-used entries first (default).
+	// EvictionPolicyFIFO evicts oldest-written entries first — better for
+	// write-once workloads (e.g. dated parquet) where a rare read of an old object
+	// should not keep it resident at the expense of newer, hotter data. Both mirror
+	// ocache storage.EvictionPolicy{LRU,FIFO} and only take effect when
+	// max_disk_usage_bytes > 0 (eviction runs only under a disk cap).
+	EvictionPolicyLRU  = "lru"
+	EvictionPolicyFIFO = "fifo"
+
+	// DefaultCacheEvictionPolicy preserves the historical behavior (LRU).
+	DefaultCacheEvictionPolicy = EvictionPolicyLRU
+
 	// DefaultCacheMaxConcurrentWrites is the default ceiling on concurrent
 	// cache-populate operations.
 	DefaultCacheMaxConcurrentWrites = 256
@@ -165,6 +177,10 @@ type CacheConfig struct {
 	// Advanced storage tuning (maps to ocache stor.StorageConfig).
 	DeleteBatchSize int `yaml:"delete_batch_size"` // File deletions processed per deletion-queue batch (default: DefaultCacheDeleteBatchSize)
 	RecoveryWorkers int `yaml:"recovery_workers"`  // Parallel workers for startup file recovery (default: DefaultCacheRecoveryWorkers)
+	// EvictionPolicy selects the order entries are evicted when the disk cap is hit:
+	// "lru" (default) or "fifo" (oldest-written first). Only takes effect when
+	// MaxDiskUsageBytes > 0 — with no disk cap nothing is evicted regardless.
+	EvictionPolicy string `yaml:"eviction_policy"`
 	// MaxConcurrentWrites bounds concurrent cache-populate operations (upstream
 	// fetch + streaming write). When saturated, the object is still served from
 	// upstream but not cached, so the memory/I/O-heavy write path can't grow
@@ -182,6 +198,14 @@ type CacheConfig struct {
 	// uses DefaultCacheMaxPopulateMemoryBytes; a negative value disables the memory
 	// cap (count-only, prior behavior).
 	MaxPopulateMemoryBytes int64 `yaml:"max_populate_memory_bytes"`
+	// WarmOnWrite, when true, repopulates the cache after a successful write
+	// (PutObject / CompleteMultipartUpload / CopyObject) by triggering a background
+	// full-object fetch — so a read soon after a write hits cache. This is
+	// cache-warm-on-write (write-around plus async warming), not strict
+	// write-through: the write still invalidates, and the warm is a separate,
+	// best-effort background GET (deduplicated and shed under the populate budget).
+	// It costs one extra upstream GET per write, so it defaults to false.
+	WarmOnWrite bool `yaml:"warm_on_write"`
 }
 
 // IsEnabled returns whether caching is enabled.
@@ -313,6 +337,10 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cache.RecoveryWorkers == 0 {
 		cfg.Cache.RecoveryWorkers = DefaultCacheRecoveryWorkers
 	}
+	cfg.Cache.EvictionPolicy = strings.ToLower(strings.TrimSpace(cfg.Cache.EvictionPolicy))
+	if cfg.Cache.EvictionPolicy == "" {
+		cfg.Cache.EvictionPolicy = DefaultCacheEvictionPolicy
+	}
 	if cfg.Cache.MaxConcurrentWrites == 0 {
 		cfg.Cache.MaxConcurrentWrites = DefaultCacheMaxConcurrentWrites
 	}
@@ -404,6 +432,12 @@ func applyEnvOverrides(cfg *Config) {
 				cfg.Cache.RecoveryWorkers = workers
 			}
 		}
+		// Override eviction policy from environment ("lru" or "fifo").
+		// Ignore a blank/whitespace-only value so it can't wipe a valid YAML or
+		// default setting; an unrecognized non-empty value is caught by validate().
+		if val := strings.ToLower(strings.TrimSpace(os.Getenv("TAG_CACHE_EVICTION_POLICY"))); val != "" {
+			cfg.Cache.EvictionPolicy = val
+		}
 		// Override concurrent cache-write limit from environment
 		if val := os.Getenv("TAG_CACHE_MAX_CONCURRENT_WRITES"); val != "" {
 			if n, err := strconv.Atoi(val); err == nil && n > 0 {
@@ -414,6 +448,12 @@ func applyEnvOverrides(cfg *Config) {
 		if val := os.Getenv("TAG_CACHE_MAX_POPULATE_MEMORY"); val != "" {
 			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n != 0 {
 				cfg.Cache.MaxPopulateMemoryBytes = n
+			}
+		}
+		// Override cache-warm-on-write from environment (accepts true/false/1/0)
+		if val := os.Getenv("TAG_CACHE_WARM_ON_WRITE"); val != "" {
+			if b, err := strconv.ParseBool(val); err == nil {
+				cfg.Cache.WarmOnWrite = b
 			}
 		}
 	}
@@ -477,7 +517,23 @@ func validate(cfg *Config) error {
 	if err := validateTLS(&cfg.Server); err != nil {
 		return err
 	}
+	if err := validateEvictionPolicy(cfg.Cache.EvictionPolicy); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateEvictionPolicy rejects an unrecognized eviction policy so a typo (e.g.
+// "fif0") fails fast at startup with a clear error, instead of being forwarded to
+// ocache where it silently degrades to the LRU fallback — quietly not applying the
+// policy the operator asked for.
+func validateEvictionPolicy(policy string) error {
+	switch policy {
+	case EvictionPolicyLRU, EvictionPolicyFIFO:
+		return nil
+	default:
+		return fmt.Errorf("invalid cache.eviction_policy %q: must be %q or %q", policy, EvictionPolicyLRU, EvictionPolicyFIFO)
+	}
 }
 
 // validateTLS checks that TLS configuration is consistent.

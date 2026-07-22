@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/handlers"
+	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy"
 )
 
@@ -36,6 +38,9 @@ const (
 
 	// Shutdown timeout for graceful shutdown
 	shutdownTimeout = 30 * time.Second
+
+	// How often the local cache size is sampled into tag_cache_size_bytes.
+	cacheSizeSampleInterval = 30 * time.Second
 )
 
 func main() {
@@ -233,6 +238,7 @@ func main() {
 		embeddedCfg.Storage = &ocachestorage.StorageConfig{
 			DeleteBatchSize: cfg.Cache.DeleteBatchSize,
 			RecoveryWorkers: cfg.Cache.RecoveryWorkers,
+			EvictionPolicy:  cfg.Cache.EvictionPolicy,
 		}
 
 		// Configure gRPC auth for cache cluster communication
@@ -269,6 +275,26 @@ func main() {
 
 		// Wrap embedded cache with the cache.Cache interface
 		objectCache = cache.NewCacheWithClient(embeddedCache, &cfg.Cache)
+
+		// Publish this node's local cache size as tag_cache_size_bytes. ocache keeps
+		// the total live (an atomic), so sampling it is cheap.
+		//
+		// The sampler must stop before embeddedCache.Close(), or a tick could read
+		// TotalSize() on closing storage. The root ctx's cancel is deferred earlier,
+		// so it runs AFTER Close() (defers are LIFO); give the sampler its own cancel
+		// and join it in a defer registered here — after the Close() defer above — so
+		// it is stopped and drained first.
+		sizeCtx, sizeCancel := context.WithCancel(ctx)
+		var sizeSamplerWG sync.WaitGroup
+		sizeSamplerWG.Add(1)
+		go func() {
+			defer sizeSamplerWG.Done()
+			metrics.SampleCacheSize(sizeCtx, cacheSizeSampleInterval, embeddedCache.Storage().TotalSize)
+		}()
+		defer func() {
+			sizeCancel()
+			sizeSamplerWG.Wait()
+		}()
 
 		log.Info().
 			Str("node_id", cfg.Cache.NodeID).

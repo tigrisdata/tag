@@ -65,6 +65,11 @@ func NewRequestSigner(endpoint, region string) *RequestSigner {
 	}
 }
 
+// Endpoint returns the upstream endpoint this signer targets.
+func (s *RequestSigner) Endpoint() string {
+	return s.endpoint
+}
+
 // SignRequest creates a new HTTP request signed for Tigris using streaming.
 // It accepts a pre-computed body hash (from X-Amz-Content-Sha256 header) to avoid
 // buffering the entire body in memory. The body is passed through as-is.

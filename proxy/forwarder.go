@@ -50,6 +50,14 @@ type RequestForwarder interface {
 	// Caller is responsible for closing the response body.
 	DoFullObjectRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error)
 
+	// DoAnonymousFullObjectRequest executes an UNSIGNED full-object GET — a request
+	// carrying no credentials, exactly like an anonymous client read. Upstream serves
+	// it (200) only if the object is publicly readable and returns 403 otherwise.
+	// Used by warm-on-write after an anonymous write, to learn public-read status from
+	// a genuine anonymous read rather than inferring it from a (public-write) write.
+	// Caller is responsible for closing the response body.
+	DoAnonymousFullObjectRequest(ctx context.Context, bucket, key string) (*http.Response, error)
+
 	// DoConditionalGetRequest executes a conditional GET for cache revalidation.
 	// Sends If-None-Match and/or If-Modified-Since headers.
 	// If rangeHeader is non-empty, includes a Range header (for range+revalidation).
@@ -309,6 +317,34 @@ func (b *baseForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, ac
 	metrics.RecordUpstreamRequest("GET", time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background fetch failed")
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// DoAnonymousFullObjectRequest executes an UNSIGNED full-object GET (no credentials),
+// so upstream applies anonymous authorization: 200 for a publicly-readable object,
+// 403 otherwise. Uses vhost-style addressing where the endpoint supports it, matching
+// the anonymous client-forward path — Tigris requires it for anonymous public-bucket
+// access. Caller is responsible for closing the response body.
+func (b *baseForwarder) DoAnonymousFullObjectRequest(ctx context.Context, bucket, key string) (*http.Response, error) {
+	fullURL := anonymousObjectURL(b.signer.Endpoint(), bucket, key)
+	if fullURL == "" {
+		return nil, errors.New("failed to build anonymous request URL")
+	}
+
+	fwdReq, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	fwdReq.Header.Set("Host", fwdReq.URL.Host)
+
+	upstreamStart := time.Now()
+	resp, err := b.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest("GET", time.Since(upstreamStart).Seconds(), err)
+	if err != nil {
+		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Anonymous background fetch failed")
 		return nil, err
 	}
 

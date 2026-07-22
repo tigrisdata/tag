@@ -50,6 +50,29 @@ func SupportsVHost(endpoint string) bool {
 	return true
 }
 
+// anonymousObjectURL returns the URL for an anonymous (unsigned) GET of bucket/key.
+// It uses vhost-style addressing (bucket in the hostname) when the endpoint supports
+// it — which Tigris requires for anonymous access to public buckets; a path-style
+// anonymous GET 403s even for a publicly-readable object — and path-style otherwise.
+// This mirrors the anonymous client-forward path (buildTransparentRequest). Returns ""
+// if the endpoint cannot be parsed.
+func anonymousObjectURL(endpoint, bucket, key string) string {
+	target := endpoint
+	path := "/" + bucket + "/" + key
+	if bucket != "" && SupportsVHost(endpoint) {
+		target = VHostEndpoint(endpoint, bucket)
+		path = "/" + key
+	}
+
+	u, err := url.Parse(target)
+	if err != nil {
+		return ""
+	}
+	u.Path = path
+	u.RawQuery = ""
+	return u.String()
+}
+
 // RemoveBucketPrefix strips the leading /bucket from a path.
 // e.g., ("/mybucket/key/path", "mybucket") -> "/key/path"
 // Returns "/" if only the bucket was in the path.

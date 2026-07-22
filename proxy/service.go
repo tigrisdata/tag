@@ -231,10 +231,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 
 	// Invalidate cache BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
-	if s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
-		metrics.RecordCacheOperation("delete", "success")
-	}
+	s.invalidateObject(context.Background(), bucket, key)
 
 	// Forward to Tigris, recording the upstream status.
 	rec := &statusRecorder{ResponseWriter: w}
@@ -247,10 +244,11 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// restoring read-after-write semantics.
 	// Gated on a 2xx: a rejected PUT leaves the object unchanged, so re-invalidating
 	// would only discard a valid racing refill and cause an unnecessary later miss.
-	// The metric is recorded once on the pre-forward invalidation above; this
-	// second Delete is the same logical invalidation, so it is not counted again.
+	// Routed through invalidateObject (like the pre-forward call) so a failure of this
+	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
+		s.invalidateObject(context.Background(), bucket, key)
+		s.warmOnWrite(r, bucket, key)
 	}
 
 	status := "success"
@@ -272,10 +270,7 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 
 	// Invalidate cache BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
-	if s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
-		metrics.RecordCacheOperation("delete", "success")
-	}
+	s.invalidateObject(context.Background(), bucket, key)
 
 	// Forward to upstream, recording the upstream status.
 	rec := &statusRecorder{ResponseWriter: w}
@@ -287,10 +282,10 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// tombstone blocks that stale repopulation.
 	// Gated on a 2xx: a rejected DELETE leaves the object present, so re-invalidating
 	// would only discard a valid racing refill and cause an unnecessary later miss.
-	// The metric is recorded once on the pre-forward invalidation above; this
-	// second Delete is the same logical invalidation, so it is not counted again.
+	// Routed through invalidateObject (like the pre-forward call) so a failure of this
+	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
+		s.invalidateObject(context.Background(), bucket, key)
 	}
 
 	status := "success"
@@ -382,7 +377,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// Invalidate cache for destination object BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
 	if s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
+		s.invalidateObject(context.Background(), bucket, key)
 	}
 
 	// Forward to upstream, capturing the response so we can confirm the copy
@@ -397,30 +392,103 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// blocks that stale repopulation.
 	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
 	// unchanged, so re-invalidating would only discard a valid racing refill.
-	if err == nil && copyObjectSucceeded(capture) && s.cache.IsEnabled() {
-		s.cache.Delete(context.Background(), bucket, key)
+	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
+		s.invalidateObject(context.Background(), bucket, key)
+		s.warmOnWrite(r, bucket, key)
 	}
 
 	return err
 }
 
-// copyObjectSucceeded reports whether a captured CopyObject response indicates the
-// copy actually happened: a 2xx status whose body is not an S3 <Error> document
-// (S3 can return 200 OK with an error body for copies that fail mid-operation).
+// s3WriteSucceeded reports whether a captured mutation response indicates the write
+// actually happened: a 2xx status whose body is not an S3 <Error> document. Both
+// CopyObject and CompleteMultipartUpload can return 200 OK with an error body for an
+// operation that failed mid-flight, so status alone is not enough.
 //
 // It deliberately does NOT gate on capture.Complete. The two ways to be wrong are
-// not symmetric: treating a failed copy as successful only re-invalidates a
-// destination that didn't change (an extra cache miss), while treating a successful
-// copy as failed skips the invalidation and can leave a racing refill of the OLD
-// destination cached — serving stale data. So an unconfirmable outcome must be
-// assumed successful. An incomplete capture still detects a failure whenever the
-// <Error> root element was captured (isS3ErrorBody only reads the first element);
-// only a body truncated before that root reads as success, which is the safe side.
-func copyObjectSucceeded(capture *ResponseCapture) bool {
+// not symmetric: treating a failed write as successful only re-invalidates an object
+// that didn't change (an extra cache miss), while treating a successful write as
+// failed skips the invalidation and can leave a racing refill of the OLD object
+// cached — serving stale data. So an unconfirmable outcome must be assumed
+// successful. An incomplete capture still detects a failure whenever the <Error>
+// root element was captured (isS3ErrorBody only reads the first element); only a body
+// truncated before that root reads as success, which is the safe side.
+func s3WriteSucceeded(capture *ResponseCapture) bool {
 	if capture == nil || capture.StatusCode < 200 || capture.StatusCode >= 300 {
 		return false
 	}
 	return !isS3ErrorBody(capture.Body)
+}
+
+// invalidateObject removes an object's cached metadata (writing a tombstone) and
+// records the true outcome of the attempt. A failed backend invalidation is recorded
+// as an error rather than success: a false-green delete metric would hide the very
+// read-after-write hazard the invalidation exists to prevent, since the stale entry
+// is still in place. It is a no-op when the cache is disabled.
+func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
+	if !s.cache.IsEnabled() {
+		return
+	}
+	if err := s.cache.Delete(ctx, bucket, key); err != nil {
+		metrics.RecordCacheOperation("delete", "error")
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache invalidation failed")
+		return
+	}
+	metrics.RecordCacheOperation("delete", "success")
+}
+
+// warmOnWrite repopulates the cache after a successful write by triggering a
+// background full-object fetch, so a read soon after the write hits cache
+// (cache-warm-on-write; see cache.warm_on_write). It is best-effort and fully
+// detached: triggerBackgroundCacheFetch deduplicates concurrent warms, sheds under
+// the populate byte budget, and stamps its own writeStartTime before the GET so an
+// invalidation racing the warm is provably newer and blocks it. Safe to call on
+// every successful write.
+//
+// Credentials and public-read handling depend on how the write was authenticated,
+// because a write proves nothing about who may READ the object:
+//
+//   - Authenticated write (anonymous=false): warm with the write's credentials
+//     (TAG's own in transparent mode, the client's in signing mode) via a signed
+//     fetch, which is never marked public-read. The cached entry serves authenticated
+//     reads; a signing-mode write-only client's warm will fail, exactly as its own
+//     read would.
+//   - Anonymous write (anonymous=true): warm with an UNSIGNED fetch. A successful
+//     anonymous write only proves public-WRITE, so we must not infer public-read from
+//     it. Instead the anonymous fetch itself is the probe: upstream returns 200 only if
+//     the object is genuinely publicly READABLE (then it is cached public-read, so
+//     anonymous reads hit) and 403 otherwise (nothing is cached, so a private object in
+//     a public-write bucket is never exposed). This mirrors the read path, which
+//     likewise caches public-read only after a successful anonymous read.
+//
+// Best-effort caveat: warms are keyed by bucket/key for dedup, so if any fetch for
+// this key is already in flight — a concurrent read-path warm, or the warm from a
+// rapid prior write to the same key — this warm coalesces into that one and is
+// dropped. When it coalesces into a fetch that predates this write, that fetch's own
+// populate is tombstone-blocked (its writeStartTime is older than this write's
+// invalidation), so it writes nothing either: the key is simply left absent, not
+// left stale. The next read then misses and inline-populates the current object.
+// This can never serve a stale object — the same tombstone that blocks the racing
+// populate is the read-after-write guard.
+func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
+	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
+		return
+	}
+
+	// Anonymous write → anonymous warm (unsigned fetch, public-read learned from the
+	// probe). See the doc comment: never infer public-read from a public write.
+	if hasNoAuthCredentials(r) {
+		metrics.WarmOnWriteTriggered.Inc()
+		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*anonymous*/)
+		return
+	}
+
+	_, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
+	if err != nil || accessKey == "" || secretKey == "" {
+		return
+	}
+	metrics.WarmOnWriteTriggered.Inc()
+	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/)
 }
 
 // HandlePassthrough handles requests that are passed through without caching.
@@ -438,7 +506,10 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Str("uploadId", uploadId).Msg("HandleCompleteMultipartUpload")
 
-	// Check ocache first for idempotent completion (works across TAG pods)
+	// Check ocache first for idempotent completion (works across TAG pods).
+	// A replay returns the already-completed response without touching upstream and
+	// without changing the object, so it needs no read-cache invalidation — the first
+	// completion (below) already invalidated it.
 	if s.cache.IsEnabled() {
 		entry, found, err := s.cache.GetCompletion(ctx, bucket, key, uploadId)
 		if err == nil && found {
@@ -452,15 +523,36 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		}
 	}
 
+	// Invalidate the object's read cache BEFORE forwarding. Completing a multipart
+	// upload overwrites the object, so any previously cached version is now stale;
+	// like PutObject/DeleteObject/CopyObject, invalidate up front so a forward that
+	// succeeds but whose post-invalidation fails can't leave stale data served.
+	s.invalidateObject(context.Background(), bucket, key)
+
 	// Forward to upstream with response capture
 	capture, err := s.forwarder.ForwardWithCapture(ctx, w, r)
 	if err != nil {
 		return err
 	}
 
-	// Cache successful completions (2xx status codes) in ocache
-	// Only cache if the body was fully captured to avoid storing corrupted responses
-	if capture.StatusCode >= 200 && capture.StatusCode < 300 && capture.Complete {
+	// Re-invalidate AFTER upstream confirms the completion, for the same
+	// read-after-write reason as HandlePutObject: a GET racing the in-flight
+	// completion may have re-cached the pre-overwrite object; this second tombstone
+	// blocks that stale repopulation. Gated on a confirmed-successful completion
+	// (2xx and not a 200-with-<Error> body) so a failed completion, which leaves the
+	// object unchanged, doesn't discard a valid racing refill.
+	completed := s3WriteSucceeded(capture)
+	if completed && s.cache.IsEnabled() {
+		s.invalidateObject(context.Background(), bucket, key)
+		// Warm-on-write is the only way to make a multipart-completed object hot:
+		// TAG never sees its assembled body, so a write-through tee is impossible.
+		s.warmOnWrite(r, bucket, key)
+	}
+
+	// Cache successful completions in ocache for idempotent replays. Only cache a
+	// genuine success (not a 200-with-<Error> body) that was fully captured, so we
+	// never replay a corrupted or error response as a successful completion.
+	if completed && capture.Complete {
 		if cacheErr := s.cache.PutCompletion(ctx, bucket, key, uploadId, capture.StatusCode, capture.Headers, capture.Body); cacheErr != nil {
 			log.Debug().Err(cacheErr).Msg("Failed to cache completion response")
 			// Don't fail the request if caching fails
