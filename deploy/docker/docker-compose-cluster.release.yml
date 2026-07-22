@@ -12,7 +12,7 @@
 #   docker compose -f docker-compose-cluster.release.yml up -d
 #
 # Defaults to the latest published image. For reproducible deployments, pin a
-# specific release by setting TAG_VERSION (e.g. TAG_VERSION=v1.11.1) in your .env.
+# specific release by setting TAG_VERSION (e.g. TAG_VERSION=v1.12.0) in your .env.
 # All nodes share this variable, so the cluster stays on a single version.
 
 x-tag-common: &tag-common
