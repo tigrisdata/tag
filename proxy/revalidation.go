@@ -371,7 +371,7 @@ func (s *Service) handleRevalidation206Range(
 		totalSize <= s.config.Cache.SizeThreshold &&
 		s.cache.IsEnabled() &&
 		accessKey != "" && secretKey != "" {
-		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r))
+		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), false)
 	}
 
 	return copyErr

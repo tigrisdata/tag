@@ -248,6 +248,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// second Delete is the same logical invalidation, so it is not counted again.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
 		s.cache.Delete(context.Background(), bucket, key)
+		s.warmOnWrite(r, bucket, key)
 	}
 
 	status := "success"
@@ -393,6 +394,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// unchanged, so re-invalidating would only discard a valid racing refill.
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
 		s.cache.Delete(context.Background(), bucket, key)
+		s.warmOnWrite(r, bucket, key)
 	}
 
 	return err
@@ -433,6 +435,59 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
 		return
 	}
 	metrics.RecordCacheOperation("delete", "success")
+}
+
+// warmOnWrite repopulates the cache after a successful write by triggering a
+// background full-object fetch, so a read soon after the write hits cache
+// (cache-warm-on-write; see cache.warm_on_write). It is best-effort and fully
+// detached: triggerBackgroundCacheFetch deduplicates concurrent warms, sheds under
+// the populate byte budget, and stamps its own writeStartTime before the GET so an
+// invalidation racing the warm is provably newer and blocks it. Safe to call on
+// every successful write.
+//
+// Credentials and public-read handling depend on how the write was authenticated,
+// because a write proves nothing about who may READ the object:
+//
+//   - Authenticated write: warm with the write's credentials (TAG's own in
+//     transparent mode, the client's in signing mode) and publicACL=false. The cached
+//     entry serves authenticated reads; a signing-mode write-only client's warm will
+//     fail, exactly as its own read would.
+//   - Anonymous write: warm with an UNSIGNED (anonymous) fetch and publicACL=true. A
+//     successful anonymous write only proves public-WRITE, so we must not infer
+//     public-read from it. Instead the anonymous fetch itself is the probe: upstream
+//     returns 200 only if the object is genuinely publicly READABLE (then public-read
+//     is cached, so anonymous reads hit) and 403 otherwise (nothing is cached, so a
+//     private object in a public-write bucket is never exposed). This mirrors the read
+//     path, which likewise caches public-read only after a successful anonymous GET.
+//
+// Best-effort caveat: warms are keyed by bucket/key for dedup, so if any fetch for
+// this key is already in flight — a concurrent read-path warm, or the warm from a
+// rapid prior write to the same key — this warm coalesces into that one and is
+// dropped. When it coalesces into a fetch that predates this write, that fetch's own
+// populate is tombstone-blocked (its writeStartTime is older than this write's
+// invalidation), so it writes nothing either: the key is simply left absent, not
+// left stale. The next read then misses and inline-populates the current object.
+// This can never serve a stale object — the same tombstone that blocks the racing
+// populate is the read-after-write guard.
+func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
+	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
+		return
+	}
+
+	// Anonymous write → anonymous warm (unsigned fetch, public-read learned from the
+	// probe). See the doc comment: never infer public-read from a public write.
+	if hasNoAuthCredentials(r) {
+		metrics.WarmOnWriteTriggered.Inc()
+		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*publicACL*/, true /*anonymous*/)
+		return
+	}
+
+	_, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
+	if err != nil || accessKey == "" || secretKey == "" {
+		return
+	}
+	metrics.WarmOnWriteTriggered.Inc()
+	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*publicACL*/, false /*anonymous*/)
 }
 
 // HandlePassthrough handles requests that are passed through without caching.
@@ -488,6 +543,9 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	completed := s3WriteSucceeded(capture)
 	if completed && s.cache.IsEnabled() {
 		s.cache.Delete(context.Background(), bucket, key)
+		// Warm-on-write is the only way to make a multipart-completed object hot:
+		// TAG never sees its assembled body, so a write-through tee is impossible.
+		s.warmOnWrite(r, bucket, key)
 	}
 
 	// Cache successful completions in ocache for idempotent replays. Only cache a

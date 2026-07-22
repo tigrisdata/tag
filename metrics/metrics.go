@@ -209,6 +209,16 @@ var (
 		},
 	)
 
+	// WarmOnWriteTriggered counts background warms triggered by a successful write
+	// (cache.warm_on_write). The warm's own outcome is recorded by the
+	// background-fetch metrics; this counts how often a write initiated one.
+	WarmOnWriteTriggered = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_warm_on_write_triggered_total",
+			Help: "Number of cache warms triggered by a successful write",
+		},
+	)
+
 	// LocalAuthValidations counts local auth validation attempts and results.
 	LocalAuthValidations = promauto.NewCounterVec(
 		prometheus.CounterOpts{

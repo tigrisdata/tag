@@ -329,6 +329,45 @@ func TestLoad_EvictionPolicyBlankEnvKeepsYAML(t *testing.T) {
 	}
 }
 
+func TestLoad_WarmOnWrite(t *testing.T) {
+	// Defaults to false.
+	base := "cache:\n  enabled: true\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(base), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.WarmOnWrite {
+		t.Error("Cache.WarmOnWrite defaulted to true, want false")
+	}
+
+	// YAML enables it.
+	yamlOn := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(yamlOn, []byte("cache:\n  enabled: true\n  warm_on_write: true\n"), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	cfg, err = Load(yamlOn)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Cache.WarmOnWrite {
+		t.Error("Cache.WarmOnWrite = false from YAML warm_on_write: true, want true")
+	}
+
+	// Env overrides YAML in both directions.
+	t.Setenv("TAG_CACHE_WARM_ON_WRITE", "false")
+	cfg, err = Load(yamlOn)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.WarmOnWrite {
+		t.Error("Cache.WarmOnWrite = true, want false from env override")
+	}
+}
+
 func TestLoad_StorageTuningDefaults(t *testing.T) {
 	content := `
 cache:

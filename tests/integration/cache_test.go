@@ -3,9 +3,11 @@ package integration
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -951,4 +953,158 @@ func TestCache_InvalidateOnDeleteObjects(t *testing.T) {
 	}
 
 	t.Logf("DeleteObjects cache invalidation verified: %d objects deleted and cache invalidated", len(keys))
+}
+
+// TestCache_WarmOnWrite verifies the end-to-end cache-warm-on-write path: with
+// cache.warm_on_write enabled, a successful PUT triggers a background full-object
+// fetch that populates the cache, so the object is a cache HIT on the next GET even
+// though no prior GET populated it. This exercises the real warm chain (warmOnWrite
+// -> triggerBackgroundCacheFetch -> fetchFullObjectToCache -> DoFullObjectRequest ->
+// setupCacheListener -> embedded cache write), which the proxy unit tests stub out.
+func TestCache_WarmOnWrite(t *testing.T) {
+	env := NewTestEnvironmentWithCache()
+	defer env.Close()
+	env.Config.Cache.WarmOnWrite = true // read live by warmOnWrite at request time
+
+	client := env.GetS3Client()
+	ctx := context.Background()
+	bucket := "warm-on-write-bucket"
+	key := "warm-on-write.txt"
+	content := []byte("warm me on write")
+	require.NoError(t, env.CreateTestBucket(bucket))
+
+	// PUT with no prior GET.
+	_, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(content),
+	})
+	require.NoError(t, err)
+
+	// The background warm must populate the cache without any GET having occurred.
+	require.True(t, env.WaitForCached(bucket, key, 3*time.Second),
+		"object should be warmed into cache after PUT (no GET) with warm_on_write=true")
+
+	// The first GET is therefore a cache hit, and returns the written content.
+	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	assert.Equal(t, content, body, "warmed GET should return the written content")
+	env.AssertXCacheHit(t) // hit because the write pre-populated the cache
+}
+
+// TestCache_WarmOnWriteDisabled is the control: with warm_on_write off (the default),
+// a PUT must NOT populate the cache — the object is only cached on first read.
+func TestCache_WarmOnWriteDisabled(t *testing.T) {
+	env := NewTestEnvironmentWithCache()
+	defer env.Close()
+	// WarmOnWrite defaults to false; assert it and leave it off.
+	require.False(t, env.Config.Cache.WarmOnWrite, "warm_on_write must default to false")
+
+	client := env.GetS3Client()
+	ctx := context.Background()
+	bucket := "warm-on-write-off-bucket"
+	key := "no-warm.txt"
+	content := []byte("do not warm on write")
+	require.NoError(t, env.CreateTestBucket(bucket))
+
+	_, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(content),
+	})
+	require.NoError(t, err)
+
+	// The object must never appear in cache from the PUT alone. Poll a bounded window
+	// so a warm that incorrectly fired would be caught, not raced past.
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		require.False(t, env.IsCached(bucket, key),
+			"object must not be cached after PUT when warm_on_write is disabled")
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The first GET is the cache-on-read baseline: a miss.
+	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	require.NoError(t, err)
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	env.AssertXCacheMiss(t)
+}
+
+// TestCache_ConcurrentPutsSameKey validates read-after-write correctness under
+// concurrent writes to a single key: after racing PUTs settle, a read through TAG
+// must return exactly what upstream holds — never a stale cached version left behind
+// by an earlier write's populate or warm. It runs with warm_on_write both off (pure
+// invalidation/tombstone correctness) and on (the warm dedup + tombstone-block path
+// we reason about but otherwise don't exercise end-to-end).
+func TestCache_ConcurrentPutsSameKey(t *testing.T) {
+	for _, warm := range []bool{false, true} {
+		name := "warm_off"
+		if warm {
+			name = "warm_on"
+		}
+		t.Run(name, func(t *testing.T) {
+			env := NewTestEnvironmentWithCache()
+			defer env.Close()
+			env.Config.Cache.WarmOnWrite = warm
+
+			client := env.GetS3Client()
+			ctx := context.Background()
+			bucket := "concurrent-put-" + strings.ReplaceAll(name, "_", "-") + "-bucket"
+			key := "racy.txt"
+			require.NoError(t, env.CreateTestBucket(bucket))
+
+			// Fire N concurrent PUTs of distinct content to the same key.
+			const writers = 8
+			var wg sync.WaitGroup
+			for i := 0; i < writers; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					content := []byte(fmt.Sprintf("version-%02d-of-%d-concurrent-writers", i, writers))
+					_, err := client.PutObject(ctx, &s3.PutObjectInput{
+						Bucket: aws.String(bucket),
+						Key:    aws.String(key),
+						Body:   bytes.NewReader(content),
+					})
+					assert.NoError(t, err)
+				}(i)
+			}
+			wg.Wait()
+
+			// Authoritative state: what upstream actually holds now (bypassing TAG).
+			upstream := env.GetUpstreamS3Client()
+			truthResp, err := upstream.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+			})
+			require.NoError(t, err)
+			want, _ := io.ReadAll(truthResp.Body)
+			truthResp.Body.Close()
+
+			// Two reads through TAG: the first populates the cache (or is served by a
+			// warm), the second is a cache hit. Both must equal the authoritative
+			// content — a stale cached version (a warm/populate of an earlier write
+			// that escaped its invalidation tombstone) would diverge on either read.
+			for i := 0; i < 2; i++ {
+				resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+					Bucket: aws.String(bucket),
+					Key:    aws.String(key),
+				})
+				require.NoError(t, err)
+				got, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				require.Equal(t, string(want), string(got),
+					"read %d through TAG returned content that differs from upstream (stale cache)", i)
+			}
+		})
+	}
 }

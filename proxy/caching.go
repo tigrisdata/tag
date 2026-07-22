@@ -321,6 +321,7 @@ func (s *Service) fetchFullObjectToCache(
 	ctx context.Context,
 	bucket, key, accessKey, secretKey string,
 	publicACL bool,
+	anonymous bool,
 	broadcaster *broadcast.Broadcaster,
 ) error {
 	// This is a background fetch whose only purpose is to populate the cache, so
@@ -353,14 +354,30 @@ func (s *Service) fetchFullObjectToCache(
 	// than our write and pass the tombstone check.
 	writeStartTime := time.Now().UnixNano()
 
-	// Execute full object request (no Range header)
-	resp, err := s.forwarder.DoFullObjectRequest(ctx, bucket, key, accessKey, secretKey)
+	// Execute full object request (no Range header). An anonymous warm uses an
+	// unsigned request so upstream applies anonymous authorization — 200 only if the
+	// object is publicly readable — which is what lets us cache public-read safely.
+	var (
+		resp *http.Response
+		err  error
+	)
+	if anonymous {
+		resp, err = s.forwarder.DoAnonymousFullObjectRequest(ctx, bucket, key)
+	} else {
+		resp, err = s.forwarder.DoFullObjectRequest(ctx, bucket, key, accessKey, secretKey)
+	}
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// For an anonymous probe, a 403 is a definitive answer — the object is not
+		// publicly readable, so there is nothing to warm as public — not a failure.
+		if anonymous && resp.StatusCode == http.StatusForbidden {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Anonymous warm skipped - object not publicly readable")
+			return errCachePopulateDeclined
+		}
 		return fmt.Errorf("unexpected status %d for background fetch", resp.StatusCode)
 	}
 
@@ -468,7 +485,9 @@ streamLoop:
 // starts a fetch; subsequent triggers while the fetch is in progress are no-ops.
 // This avoids broadcast.Manager's "no late joiners" policy which incorrectly
 // allows multiple fetches when the first has already started streaming.
-func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, publicACL bool) {
+// When anonymous is true the fetch is issued without credentials (see
+// fetchFullObjectToCache); accessKey/secretKey are then ignored.
+func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, publicACL, anonymous bool) {
 	bcastKey := "bg:" + bucket + "/" + key
 
 	// Atomic check-and-set: if key exists, a fetch is already in progress
@@ -494,7 +513,7 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 		}
 		broadcaster := broadcast.NewBroadcaster(channelBuf)
 
-		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, publicACL, broadcaster)
+		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, publicACL, anonymous, broadcaster)
 
 		switch {
 		case errors.Is(err, errCachePopulateDeclined):

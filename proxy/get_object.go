@@ -298,7 +298,7 @@ func (s *Service) fetchAndBroadcast(
 		if upErr := broadcaster.Error(); upErr == nil ||
 			errors.Is(upErr, context.Canceled) || errors.Is(upErr, context.DeadlineExceeded) {
 			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
-				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r))
+				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), false)
 			}
 		}
 	}
@@ -739,7 +739,7 @@ func (s *Service) handleRangeWithBackgroundCache(
 	if cacheable {
 		defer func() {
 			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
-				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r))
+				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), false)
 			}
 		}()
 	}

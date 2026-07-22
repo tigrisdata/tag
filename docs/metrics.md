@@ -223,6 +223,15 @@ rate(tag_background_fetches_triggered_total[5m])
 
 Number of currently active background fetches.
 
+#### tag_warm_on_write_triggered_total
+
+**Type:** Counter
+
+Number of cache warms triggered by a successful write, when `cache.warm_on_write` is
+enabled. The warm's own outcome (success / failure / shed) is recorded by the
+`tag_background_fetches_*` and `tag_cache_populate_skipped_total` metrics; this counts
+how often a write initiated one.
+
 ### Revalidation Metrics
 
 #### tag_revalidations_triggered_total
