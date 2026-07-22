@@ -45,6 +45,9 @@ func runFetchAndBroadcast(t *testing.T, doRequestErr error) *warmForwarder {
 
 	bcaster := broadcast.NewBroadcaster(broadcast.DefaultChannelBuffer)
 	req := httptest.NewRequest(http.MethodGet, "/cold-bucket/cold-key", nil)
+	// Authenticated request → the cold-owner warm uses a signed fetch
+	// (DoFullObjectRequest). An anonymous request would warm via an unsigned fetch.
+	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=access/20260101/us-east-1/s3/aws4_request, Signature=deadbeef")
 	w := httptest.NewRecorder()
 
 	_ = svc.fetchAndBroadcast(ctx, w, req, "cold-bucket", "cold-key", "access", "secret", bcaster, time.Now(), "MISS")

@@ -266,4 +266,26 @@ func TestSDK_PublicBucket_PrivateObjectDeniedAnonymously(t *testing.T) {
 		t.Errorf("Anonymous HEAD private-obj: must NOT get X-Cache HIT")
 	}
 	t.Logf("Anonymous HEAD private-obj: status=%d, X-Cache=%s", privHeadResp.StatusCode, privHeadResp.Header.Get("X-Cache"))
+
+	// The prior anonymous requests for private-obj must not have triggered a background
+	// fetch that read the object with TAG's credentials and cached it public-read. Such
+	// a fetch is asynchronous, so a single delayed check could race it and pass while
+	// the poisoned entry is still in flight. Instead poll: with the bug, once the entry
+	// is cached public-read EVERY subsequent anonymous GET leaks it, so any iteration in
+	// the window catches a 200/HIT. Without the bug, every iteration stays 403.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		r, err := globalEnv.DoRawGetUnauthenticated(bucket, "private-obj")
+		if err != nil {
+			t.Fatalf("Repeat anonymous GET private-obj failed: %v", err)
+		}
+		status := r.StatusCode
+		xcache := r.Header.Get("X-Cache")
+		io.ReadAll(r.Body)
+		r.Body.Close()
+		if status != http.StatusForbidden || xcache == "HIT" {
+			t.Fatalf("Anonymous GET private-obj returned status=%d X-Cache=%q — private object exposed to an anonymous reader (cached public-read)", status, xcache)
+		}
+		time.Sleep(100 * time.Millisecond) // pace the poll; the loop asserts every iteration
+	}
 }
