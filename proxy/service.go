@@ -456,10 +456,13 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
 //
 // Best-effort caveat: warms are keyed by bucket/key for dedup, so if any fetch for
 // this key is already in flight — a concurrent read-path warm, or the warm from a
-// rapid prior write to the same key — this warm coalesces into it and is dropped.
-// A dropped warm just leaves the object to be populated on the next read (the
-// cache-on-read baseline); it is never stale, because a populate whose writeStartTime
-// predates the latest write's invalidation tombstone is blocked.
+// rapid prior write to the same key — this warm coalesces into that one and is
+// dropped. When it coalesces into a fetch that predates this write, that fetch's own
+// populate is tombstone-blocked (its writeStartTime is older than this write's
+// invalidation), so it writes nothing either: the key is simply left absent, not
+// left stale. The next read then misses and inline-populates the current object.
+// This can never serve a stale object — the same tombstone that blocks the racing
+// populate is the read-after-write guard.
 func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
 		return
