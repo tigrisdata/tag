@@ -372,6 +372,11 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Upstream.Endpoint = endpoint
 	}
 
+	// Override upstream region (SigV4 signing scope) from environment
+	if region := os.Getenv("TAG_UPSTREAM_REGION"); region != "" {
+		cfg.Upstream.Region = region
+	}
+
 	// Override upstream HTTP connection pool size from environment
 	if poolSize := os.Getenv("TAG_MAX_IDLE_CONNS_PER_HOST"); poolSize != "" {
 		if size, err := strconv.Atoi(poolSize); err == nil && size > 0 {
