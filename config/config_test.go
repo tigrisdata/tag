@@ -135,6 +135,7 @@ log:
 
 	// Set environment variables
 	t.Setenv("TAG_UPSTREAM_ENDPOINT", "https://t3.storage.dev")
+	t.Setenv("TAG_UPSTREAM_REGION", "us-west-2")
 	t.Setenv("TAG_CACHE_NODE_ID", "env-node-1")
 	t.Setenv("TAG_CACHE_DISK_PATH", "/env/cache/path")
 	t.Setenv("TAG_CACHE_SEED_NODES", "env-node-0:7000,env-node-1:7000")
@@ -148,6 +149,9 @@ log:
 	// Verify env overrides
 	if cfg.Upstream.Endpoint != "https://t3.storage.dev" {
 		t.Errorf("Upstream.Endpoint = %q, want https://t3.storage.dev", cfg.Upstream.Endpoint)
+	}
+	if cfg.Upstream.Region != "us-west-2" {
+		t.Errorf("Upstream.Region = %q, want us-west-2 (TAG_UPSTREAM_REGION override)", cfg.Upstream.Region)
 	}
 	if cfg.Cache.NodeID != "env-node-1" {
 		t.Errorf("Cache.NodeID = %q, want env-node-1", cfg.Cache.NodeID)

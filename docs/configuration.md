@@ -9,6 +9,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `AWS_ACCESS_KEY_ID`               | S3 access key (must have read-only access for all buckets accessed through TAG) | (required)               |
 | `AWS_SECRET_ACCESS_KEY`           | S3 secret key for authentication                                                | (required)               |
 | `TAG_UPSTREAM_ENDPOINT`           | Tigris S3 endpoint URL                                                          | `https://t3.storage.dev` |
+| `TAG_UPSTREAM_REGION`             | Upstream region for SigV4 signing scope                                         | `auto`                   |
 | `TAG_MAX_IDLE_CONNS_PER_HOST`     | HTTP connection pool size per upstream host                                     | `100`                    |
 | `TAG_CACHE_TTL`                   | Default TTL for cached objects (Go duration, e.g. `12h`, `30m`)                 | `24h`                    |
 | `TAG_CACHE_DISABLED`              | Disable caching (`true` or `1`)                                                 | `false`                  |
