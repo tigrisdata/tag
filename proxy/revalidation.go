@@ -116,7 +116,7 @@ func (s *Service) forwardAfterCacheMiss(ctx context.Context, w http.ResponseWrit
 	if s.cache.IsEnabled() && bodyGone(bodyErr) {
 		s.cache.Delete(context.Background(), bucket, key)
 	}
-	w.Header().Set(XCacheHeader, XCacheMiss)
+	writeCacheStatus(w, XCacheMiss)
 	forwardErr := s.forwarder.Forward(ctx, w, r)
 	status := "success"
 	if forwardErr != nil {
@@ -189,7 +189,7 @@ func (s *Service) handleRevalidation200(
 
 	// Write response headers to client
 	copyHeaders(w.Header(), resp.Header)
-	w.Header().Set(XCacheHeader, XCacheRevalidated)
+	writeCacheStatus(w, XCacheRevalidated)
 	w.WriteHeader(resp.StatusCode)
 
 	if !shouldCache {
@@ -264,9 +264,8 @@ func (s *Service) serveFromCache(
 ) error {
 	// Zero-byte objects: no body to serve
 	if meta.ContentLength == 0 {
-		metrics.RecordCacheHit()
 		meta.WriteHeaders(w)
-		w.Header().Set(XCacheHeader, XCacheHit)
+		writeCacheStatus(w, XCacheHit)
 		w.WriteHeader(meta.StatusCode)
 		metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
 		return nil
@@ -279,9 +278,8 @@ func (s *Service) serveFromCache(
 
 		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.ETag, bodyBuf)
 		if bodyErr == nil && bodyBuf.Len() > 0 {
-			metrics.RecordCacheHit()
 			meta.WriteHeaders(w)
-			w.Header().Set(XCacheHeader, XCacheHit)
+			writeCacheStatus(w, XCacheHit)
 			w.WriteHeader(meta.StatusCode)
 			n, _ := w.Write(bodyBuf.Bytes())
 			metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
@@ -316,9 +314,8 @@ func (s *Service) serveFromCache(
 		return fmt.Errorf("cache body unavailable: %w", readErr)
 	}
 
-	metrics.RecordCacheHit()
 	meta.WriteHeaders(w)
-	w.Header().Set(XCacheHeader, XCacheHit)
+	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(meta.StatusCode)
 
 	cw := &countingWriter{w: w}
@@ -354,7 +351,7 @@ func (s *Service) handleRevalidation206Range(
 
 	// Stream range response to client
 	copyHeaders(w.Header(), resp.Header)
-	w.Header().Set(XCacheHeader, XCacheRevalidated)
+	writeCacheStatus(w, XCacheRevalidated)
 	w.WriteHeader(resp.StatusCode)
 
 	n, copyErr := io.Copy(w, resp.Body)
@@ -426,7 +423,7 @@ func (s *Service) revalidateAndServeHead(
 		io.Copy(io.Discard, resp.Body)
 
 		copyHeaders(w.Header(), resp.Header)
-		w.Header().Set(XCacheHeader, XCacheRevalidated)
+		writeCacheStatus(w, XCacheRevalidated)
 		w.WriteHeader(resp.StatusCode)
 		metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
 		return nil
@@ -450,9 +447,8 @@ func (s *Service) revalidateAndServeHead(
 		}
 	}
 
-	metrics.RecordCacheHit()
 	meta.WriteHeaders(w)
-	w.Header().Set(XCacheHeader, XCacheHit)
+	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(meta.StatusCode)
 	metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
 	return nil

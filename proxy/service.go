@@ -25,6 +25,40 @@ const (
 	XCacheRevalidated = "REVALIDATED" // Object revalidated with upstream
 )
 
+// writeCacheStatus sets the X-Cache response header and records the matching
+// hit/miss counter, keeping the header and tag_cache_{hits,misses}_total in
+// lockstep. Call it once per response, where the status is committed — never pair
+// it with a separate RecordCacheHit/RecordCacheMiss for the same response.
+//
+// HIT increments hits; MISS increments misses. REVALIDATED, BYPASS, and DISABLED
+// set the header but are neither hits nor misses: REVALIDATED (object changed on
+// upstream) is tracked by the tag_revalidations_* metrics, and a bypassed/disabled
+// request made no cache decision. Range-from-cache hits additionally call
+// RecordRangeFromCacheHit for the specialized counter.
+func writeCacheStatus(w http.ResponseWriter, status string) {
+	w.Header().Set(XCacheHeader, status)
+	switch status {
+	case XCacheHit:
+		metrics.RecordCacheHit()
+	case XCacheMiss:
+		metrics.RecordCacheMiss()
+	}
+}
+
+// cacheMissStatus returns the X-Cache status for a request not served from cache:
+// DISABLED when caching is off, BYPASS when the client opted out (Cache-Control:
+// no-store), otherwise MISS. Only MISS counts as a cache miss.
+func (s *Service) cacheMissStatus(bypassCache bool) string {
+	switch {
+	case !s.cache.IsEnabled():
+		return XCacheDisabled
+	case bypassCache:
+		return XCacheBypass
+	default:
+		return XCacheMiss
+	}
+}
+
 // Service provides the core caching proxy logic.
 type Service struct {
 	forwarder               RequestForwarder
@@ -335,27 +369,25 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 			}
 
 			if !forceRevalidate {
-				metrics.RecordCacheHit()
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD served from cache")
 				meta.WriteHeaders(w)
-				w.Header().Set(XCacheHeader, XCacheHit)
+				writeCacheStatus(w, XCacheHit)
 				w.WriteHeader(meta.StatusCode)
 				metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
 				return nil
 			}
 			// forceRevalidate but no ETag — fall through to upstream
 		}
-		metrics.RecordCacheMiss()
 	}
 
-	// Cache miss - forward to upstream
-	// Set X-Cache header before forwarding (will be included in response)
+	// Cache miss - forward to upstream. Set the X-Cache header (and the matching
+	// hit/miss counter) before forwarding; a disabled/bypassed request is neither.
 	if !s.cache.IsEnabled() {
-		w.Header().Set(XCacheHeader, XCacheDisabled)
+		writeCacheStatus(w, XCacheDisabled)
 	} else if bypassCache {
-		w.Header().Set(XCacheHeader, XCacheBypass)
+		writeCacheStatus(w, XCacheBypass)
 	} else {
-		w.Header().Set(XCacheHeader, XCacheMiss)
+		writeCacheStatus(w, XCacheMiss)
 	}
 	err = s.forwarder.Forward(ctx, w, r)
 
