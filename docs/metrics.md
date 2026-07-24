@@ -73,7 +73,14 @@ rate(tag_request_duration_seconds_sum[5m]) / rate(tag_request_duration_seconds_c
 
 **Type:** Counter
 
-Total number of cache hits.
+Total number of cache hits — every request served from cache, including
+range-from-cache hits and conditional 304 (Not Modified) responses. It is
+recorded in lockstep with the `X-Cache: HIT` response header.
+
+`tag_cache_hits_total` and `tag_cache_misses_total` count only `HIT` and `MISS`.
+`REVALIDATED` responses (object changed on upstream) are neither — they are tracked
+by the `tag_revalidations_*` metrics — and `BYPASS`/`DISABLED` requests are not
+counted at all.
 
 **Example queries:**
 
@@ -81,7 +88,7 @@ Total number of cache hits.
 # Cache hit rate
 rate(tag_cache_hits_total[5m])
 
-# Cache hit ratio
+# Cache hit ratio (of hit/miss decisions; excludes REVALIDATED)
 rate(tag_cache_hits_total[5m]) /
 (rate(tag_cache_hits_total[5m]) + rate(tag_cache_misses_total[5m]))
 ```
