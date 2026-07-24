@@ -138,14 +138,14 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 						log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range cache body missing - invalidating orphaned meta and forwarding with background cache")
 						s.cache.Delete(context.Background(), bucket, key)
 					}
-					return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start)
+					// Body genuinely gone for an otherwise-cacheable request → a miss.
+					return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start, XCacheMiss)
 				}
 
 				// Check conditional request: If-None-Match
 				if ifNoneMatch != "" && meta.MatchesETag(ifNoneMatch) {
-					metrics.RecordCacheHit()
 					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified")
-					w.Header().Set(XCacheHeader, XCacheHit)
+					writeCacheStatus(w, XCacheHit)
 					w.Header().Set("ETag", meta.ETag)
 					w.WriteHeader(http.StatusNotModified)
 					metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
@@ -156,9 +156,8 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				if ifModifiedSince != "" {
 					if t, parseErr := http.ParseTime(ifModifiedSince); parseErr == nil {
 						if !meta.IsModifiedSince(t) {
-							metrics.RecordCacheHit()
 							log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified (time)")
-							w.Header().Set(XCacheHeader, XCacheHit)
+							writeCacheStatus(w, XCacheHit)
 							w.Header().Set("ETag", meta.ETag)
 							w.WriteHeader(http.StatusNotModified)
 							metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
@@ -185,29 +184,22 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				}
 			}
 		}
-		metrics.RecordCacheMiss()
 	}
 
-	// 3. Cache miss - handle differently for range requests vs full object requests
+	// 3. Cache miss — determine the X-Cache status once (DISABLED / BYPASS / MISS);
+	// the hit/miss counter is recorded where this status is written to the response,
+	// so bypassed/disabled requests are not counted as misses.
+	xCache := s.cacheMissStatus(bypassCache)
+
 	// Range requests: forward immediately + trigger background cache fetch
 	if rangeHeader != "" {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range request cache miss - forwarding with background cache")
-		return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start)
+		return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start, xCache)
 	}
 
 	// Full object request: use broadcast manager for streaming coalescing
 	bcastKey := makeBroadcastKey(bucket, key, rangeHeader)
 	broadcaster, isFirstCaller := s.broadcastManager.GetOrCreate(bcastKey)
-
-	// Determine X-Cache header value for this request
-	var xCache string
-	if !s.cache.IsEnabled() {
-		xCache = XCacheDisabled
-	} else if bypassCache {
-		xCache = XCacheBypass
-	} else {
-		xCache = XCacheMiss
-	}
 
 	// Update active broadcasts metric
 	metrics.SetActiveBroadcasts(s.broadcastManager.ActiveCount())
@@ -482,7 +474,7 @@ func (s *Service) writeChunksToResponse(
 		if len(chunk.Data) > 0 {
 			if !headersWritten {
 				copyHeaders(w.Header(), headers)
-				w.Header().Set(XCacheHeader, xCache)
+				writeCacheStatus(w, xCache)
 				w.WriteHeader(status)
 				headersWritten = true
 			}
@@ -505,7 +497,7 @@ func (s *Service) writeChunksToResponse(
 	// Zero-byte response or all-empty chunks: commit headers now
 	if !headersWritten {
 		copyHeaders(w.Header(), headers)
-		w.Header().Set(XCacheHeader, xCache)
+		writeCacheStatus(w, xCache)
 		w.WriteHeader(status)
 	}
 
@@ -617,7 +609,7 @@ func (s *Service) serveRangeFromCache(
 	ranges, parseErr := parseRangeHeader(rangeHeader, meta.ContentLength)
 	if parseErr != nil || len(ranges) == 0 {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
-		w.Header().Set(XCacheHeader, XCacheHit)
+		writeCacheStatus(w, XCacheHit)
 		s3err.WriteError(w, r, s3err.ErrInvalidRange)
 		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
 		return true, nil
@@ -627,7 +619,7 @@ func (s *Service) serveRangeFromCache(
 	if len(ranges) > 1 {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Multi-range not supported from cache")
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
-		w.Header().Set(XCacheHeader, XCacheHit)
+		writeCacheStatus(w, XCacheHit)
 		s3err.WriteError(w, r, s3err.ErrInvalidRange)
 		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
 		return true, nil
@@ -664,7 +656,7 @@ func (s *Service) serveRangeFromCache(
 	}
 
 	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
-	w.Header().Set(XCacheHeader, XCacheHit)
+	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(http.StatusPartialContent)
 
 	// Stream range from cache using counting writer to track actual bytes
@@ -700,6 +692,7 @@ func (s *Service) handleRangeWithBackgroundCache(
 	r *http.Request,
 	bucket, key, accessKey, secretKey string,
 	startTime time.Time,
+	xCache string,
 ) error {
 	// Forward the Range request directly to client (low latency)
 	resp, err := s.forwarder.DoRequestWithCreds(ctx, r, accessKey, secretKey)
@@ -746,7 +739,7 @@ func (s *Service) handleRangeWithBackgroundCache(
 
 	// Write response headers
 	copyHeaders(w.Header(), resp.Header)
-	w.Header().Set(XCacheHeader, XCacheMiss)
+	writeCacheStatus(w, xCache)
 	w.WriteHeader(resp.StatusCode)
 
 	// Stream Range response body to client.
