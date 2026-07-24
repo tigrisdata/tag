@@ -153,9 +153,12 @@ everything is `local`.
 **Example queries:**
 
 ```promql
-# Remote serve ratio (fraction of cache reads pulled cross-node; lower is better)
-rate(tag_cache_serve_locality_total{locality="remote"}[5m]) /
-rate(tag_cache_serve_locality_total[5m])
+# Remote serve ratio (fraction of cache reads pulled cross-node; lower is better).
+# Aggregate with sum() so the denominator is local+remote; dividing the raw
+# vectors would match locality="remote" against itself and always report 1.
+sum(rate(tag_cache_serve_locality_total{locality="remote"}[5m]))
+/
+sum(rate(tag_cache_serve_locality_total[5m]))
 
 # Cross-node read rate per node
 sum by (pod) (rate(tag_cache_serve_locality_total{locality="remote"}[5m]))
