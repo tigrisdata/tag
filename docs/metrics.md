@@ -131,6 +131,36 @@ rate(tag_range_from_cache_hits_total[5m]) /
 rate(tag_requests_total{operation="GetObject"}[5m])
 ```
 
+#### tag_cache_serve_locality_total
+
+**Type:** Counter
+
+Cache body reads labeled by whether this node owns the key (`locality="local"`,
+served from local storage) or had to pull it from a peer over gRPC
+(`locality="remote"`). In a cluster, a high `remote` share is the cross-node
+data-plane cost — the single-owner consistent-hash ring routes most reads to the
+owning node, so serving a range pulls the body from a peer. In single-node mode
+everything is `local`.
+
+| Label      | Description                                                        |
+| ---------- | ------------------------------------------------------------------ |
+| `locality` | `local` (this node owns the key) or `remote` (pulled from a peer)  |
+
+> Only populated when the embedded cache client can report key ownership
+> (cluster mode on a build whose ocache exposes it). When it cannot, the counter
+> stays at 0 rather than guessing a locality.
+
+**Example queries:**
+
+```promql
+# Remote serve ratio (fraction of cache reads pulled cross-node; lower is better)
+rate(tag_cache_serve_locality_total{locality="remote"}[5m]) /
+rate(tag_cache_serve_locality_total[5m])
+
+# Cross-node read rate per node
+sum by (pod) (rate(tag_cache_serve_locality_total{locality="remote"}[5m]))
+```
+
 #### tag_cache_size_bytes
 
 **Type:** Gauge

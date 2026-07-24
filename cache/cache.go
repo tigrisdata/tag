@@ -13,7 +13,17 @@ import (
 	"github.com/rs/zerolog/log"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/config"
+	"github.com/tigrisdata/tag/metrics"
 )
+
+// localityChecker is an optional CacheClient capability: it reports whether a
+// key is owned by the local node (a read is served from local storage) or must
+// be pulled from a peer over gRPC. The embedded ocache cluster client
+// implements it; clients that cannot tell simply do not, in which case serve
+// locality is left unrecorded.
+type localityChecker interface {
+	IsLocal(key string) bool
+}
 
 // ErrNotFound indicates the key was not found in the cache.
 var ErrNotFound = errors.New("not found in cache")
@@ -281,6 +291,7 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w i
 		return err
 	}
 
+	c.recordServeLocality(bodyKey)
 	log.Debug().
 		Str("bucket", bucket).
 		Str("key", key).
@@ -341,6 +352,23 @@ func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
 	return c.DeleteWithMeta(ctx, bucket, key)
 }
 
+// recordServeLocality records whether a successful body read for bodyKey was
+// satisfied from local storage or pulled from a peer over gRPC. It is a no-op
+// when the underlying client cannot report key ownership (e.g. non-cluster
+// clients or an ocache version without IsLocal), so the metric stays honest
+// rather than reporting a guessed locality.
+func (c *Cache) recordServeLocality(bodyKey string) {
+	lc, ok := c.client.(localityChecker)
+	if !ok {
+		return
+	}
+	if lc.IsLocal(bodyKey) {
+		metrics.RecordCacheServeLocality(metrics.LocalityLocal)
+	} else {
+		metrics.RecordCacheServeLocality(metrics.LocalityRemote)
+	}
+}
+
 // ============================================================================
 // Range request support
 // ============================================================================
@@ -370,6 +398,7 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 			}
 			return err
 		}
+		c.recordServeLocality(bodyKey)
 		// Write only the first byte
 		if buf.Len() > 0 {
 			_, err = w.Write(buf.Bytes()[:1])
@@ -393,6 +422,7 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 		return err
 	}
 
+	c.recordServeLocality(bodyKey)
 	log.Debug().
 		Str("bucket", bucket).
 		Str("key", key).

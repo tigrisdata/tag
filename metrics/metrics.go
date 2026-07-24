@@ -201,6 +201,19 @@ var (
 		},
 	)
 
+	// CacheServeLocality counts cache body reads by whether this node owns the
+	// key (served from local storage) or must pull it from a peer over gRPC. In
+	// a cluster a high "remote" share is the cross-node data-plane cost; in
+	// single-node mode everything is "local". Only populated when the cache
+	// client can report key ownership.
+	CacheServeLocality = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_cache_serve_locality_total",
+			Help: "Cache body reads by locality: local (this node owns the key) vs remote (pulled from a peer over gRPC)",
+		},
+		[]string{"locality"},
+	)
+
 	// ActiveBackgroundFetches tracks the number of active background fetches.
 	ActiveBackgroundFetches = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -367,6 +380,18 @@ func RecordBackgroundFetchFailed() {
 // RecordRangeFromCacheHit records a range request served from cache.
 func RecordRangeFromCacheHit() {
 	RangeFromCacheHits.Inc()
+}
+
+// Cache serve locality label values.
+const (
+	LocalityLocal  = "local"
+	LocalityRemote = "remote"
+)
+
+// RecordCacheServeLocality records a cache body read as served locally or
+// pulled from a peer over gRPC.
+func RecordCacheServeLocality(locality string) {
+	CacheServeLocality.WithLabelValues(locality).Inc()
 }
 
 // RecordLocalAuthValidation records a local auth validation result.
