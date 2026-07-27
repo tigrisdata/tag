@@ -76,6 +76,8 @@ ifeq ($(UNAME_S),Darwin)
         -lstdc++ -lm -pthread
     # macOS can't fully static link, just strip symbols
     LDFLAGS := -ldflags "-s -w -X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME) -X main.GitCommit=$(GIT_COMMIT)"
+    # macOS uses the plain rocksdb-static (no jemalloc), so tests link with defaults.
+    TEST_LDFLAGS :=
     # Prevent grocksdb from injecting its own -lzstd -llz4 -lz -lsnappy flags,
     # which conflict with the explicit .a paths above.
     BUILD_TAGS := -tags grocksdb_clean_link
@@ -87,6 +89,12 @@ else
     # flag lets jemalloc's first-seen definition win instead of a hard link error.
     CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -lrocksdb -ljemalloc -ldl -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread
     LDFLAGS := -ldflags "-linkmode external -extldflags '-static -Wl,--allow-multiple-definition' -X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME) -X main.GitCommit=$(GIT_COMMIT)"
+    # Because jemalloc (linked via CGO_LDFLAGS) now provides malloc, cgo test binaries
+    # must use external linking too — Go's internal linker can't resolve the malloc
+    # relocations from net/runtime/cgo otherwise ("relocation target malloc not defined").
+    # Not fully static (test binaries don't need it); --allow-multiple-definition is
+    # defensive against the glibc/jemalloc malloc overlap.
+    TEST_LDFLAGS := -ldflags "-linkmode external -extldflags '-Wl,--allow-multiple-definition'"
 endif
 
 # CGO environment for RocksDB (used across multiple targets)
@@ -162,7 +170,7 @@ endif
 test: build
 	@echo "Running unit tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -v -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./cmd/... ./config/... ./handlers/... ./metrics/... ./proxy/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./cmd/... ./config/... ./handlers/... ./metrics/... ./proxy/...
 
 .PHONY: test-all
 test-all: test test-integration
@@ -178,7 +186,7 @@ test-auth:
 test-cache: rocksdb-static
 	@echo "Running cache tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -v -timeout 30s $(TESTFLAGS) ./cache/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -timeout 30s $(TESTFLAGS) ./cache/...
 
 .PHONY: test-proxy
 test-proxy:
@@ -190,13 +198,13 @@ test-proxy:
 test-race: rocksdb-static
 	@echo "Running unit tests with race detector..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -race -v -timeout 120s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -race -v -timeout 120s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
 
 .PHONY: test-coverage
 test-coverage: rocksdb-static
 	@echo "Running unit tests with coverage..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -coverprofile=coverage.out -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -coverprofile=coverage.out -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated at coverage.html"
 
@@ -205,25 +213,25 @@ test-coverage: rocksdb-static
 test-integration: rocksdb-static
 	@echo "Running integration tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
 
 .PHONY: test-integration-short
 test-integration-short: rocksdb-static
 	@echo "Running integration tests (short mode)..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -v -short -timeout 30s $(TESTFLAGS) ./tests/integration/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -short -timeout 30s $(TESTFLAGS) ./tests/integration/...
 
 .PHONY: test-integration-race
 test-integration-race: rocksdb-static
 	@echo "Running integration tests with race detector..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -race -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -race -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
 
 .PHONY: test-integration-coverage
 test-integration-coverage: rocksdb-static
 	@echo "Running integration tests with coverage..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -coverprofile=coverage-integration.out -timeout 300s $(TESTFLAGS) ./tests/integration/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -coverprofile=coverage-integration.out -timeout 300s $(TESTFLAGS) ./tests/integration/...
 	go tool cover -html=coverage-integration.out -o coverage-integration.html
 	@echo "Integration coverage report generated at coverage-integration.html"
 
@@ -576,7 +584,7 @@ test-sdk: rocksdb-static
 		echo "  Start TAG with: make s3-test-local"; \
 		exit 1; \
 	fi
-	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) $(CGO_ENV) go test $(BUILD_TAGS) -v -timeout 300s $(TESTFLAGS) ./tests/s3compat/sdk/...
+	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) $(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -timeout 300s $(TESTFLAGS) ./tests/s3compat/sdk/...
 
 # Benchmark TAG's core S3 operations with warp (requires a running TAG + AWS creds).
 # Start TAG first with: make s3-test-local
