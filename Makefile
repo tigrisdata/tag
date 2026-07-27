@@ -138,13 +138,15 @@ rocksdb-static:
 	    [ "$$(cat $(ROCKSDB_STATIC_DIR)/.artifact 2>/dev/null)" = "$(ROCKSDB_STATIC_ARTIFACT)" ]; then \
 		echo "RocksDB static artifacts already present ($(ROCKSDB_STATIC_ARTIFACT))"; \
 	else \
-		echo "Downloading RocksDB static artifacts: $(ROCKSDB_STATIC_ARTIFACT)..."; \
-		rm -rf $(ROCKSDB_STATIC_DIR); \
-		mkdir -p $(ROCKSDB_STATIC_DIR); \
-		curl -fsSL "$(ROCKSDB_STATIC_URL)/$(ROCKSDB_STATIC_ARTIFACT)" -o $(ROCKSDB_STATIC_DIR)/rocksdb.tar.gz && \
-		tar -xzf $(ROCKSDB_STATIC_DIR)/rocksdb.tar.gz -C $(ROCKSDB_STATIC_DIR) && \
-		rm $(ROCKSDB_STATIC_DIR)/rocksdb.tar.gz && \
-		echo "$(ROCKSDB_STATIC_ARTIFACT)" > $(ROCKSDB_STATIC_DIR)/.artifact; \
+		echo "Downloading RocksDB static artifacts: $(ROCKSDB_STATIC_ARTIFACT)..." && \
+		rm -rf $(ROCKSDB_STATIC_DIR).tmp && \
+		mkdir -p $(ROCKSDB_STATIC_DIR).tmp && \
+		curl -fsSL "$(ROCKSDB_STATIC_URL)/$(ROCKSDB_STATIC_ARTIFACT)" -o $(ROCKSDB_STATIC_DIR).tmp/rocksdb.tar.gz && \
+		tar -xzf $(ROCKSDB_STATIC_DIR).tmp/rocksdb.tar.gz -C $(ROCKSDB_STATIC_DIR).tmp && \
+		rm $(ROCKSDB_STATIC_DIR).tmp/rocksdb.tar.gz && \
+		echo "$(ROCKSDB_STATIC_ARTIFACT)" > $(ROCKSDB_STATIC_DIR).tmp/.artifact && \
+		rm -rf $(ROCKSDB_STATIC_DIR) && \
+		mv $(ROCKSDB_STATIC_DIR).tmp $(ROCKSDB_STATIC_DIR) && \
 		echo "RocksDB static artifacts extracted ($(ROCKSDB_STATIC_ARTIFACT))"; \
 	fi
 
@@ -306,6 +308,8 @@ help:
 	@echo "Build targets:"
 	@echo "  all             - Build the binary (default)"
 	@echo "  build           - Build TAG with embedded cache (requires RocksDB)"
+	@echo "  verify-jemalloc - Verify jemalloc is the linked, active allocator (Linux; run by build)"
+	@echo "                    Example: make build (auto-runs it) or make verify-jemalloc after a build"
 	@echo "  rocksdb-static  - Download RocksDB static artifacts (auto-downloaded by build)"
 	@echo ""
 	@echo "  Build requires RocksDB static artifacts which are auto-downloaded."
