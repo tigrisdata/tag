@@ -36,8 +36,16 @@ UNAME_M := $(shell uname -m)
 # RocksDB artifacts use: Linux-x86_64, Linux-aarch64, macOS-arm64
 ifeq ($(UNAME_S),Darwin)
     ROCKSDB_PLATFORM := macOS-arm64
+    # macOS dev builds use the plain rocksdb-static artifact. jemalloc is only linked
+    # for the Linux deploy target (no macOS jemalloc artifact is published).
+    ROCKSDB_ARTIFACT_VARIANT :=
     BREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo "/opt/homebrew")
 else
+    # Linux deploy target uses the jemalloc variant of the rocksdb-static artifact
+    # (RocksDB built -DWITH_JEMALLOC=ON + bundled static libjemalloc.a) so jemalloc is
+    # the process allocator, fixing glibc-malloc RSS fragmentation.
+    # See tigrisdata/tag#129 and tigrisdata/ocache#176/#198/#201.
+    ROCKSDB_ARTIFACT_VARIANT := jemalloc-
     ifeq ($(UNAME_M),aarch64)
         ROCKSDB_PLATFORM := Linux-aarch64
     else ifeq ($(UNAME_M),arm64)
@@ -50,7 +58,7 @@ endif
 # RocksDB static build configuration
 ROCKSDB_VERSION ?= 10.4.2
 ROCKSDB_STATIC_URL := https://ocache-releases.t3.storage.dev/rocksdb/$(ROCKSDB_VERSION)
-ROCKSDB_STATIC_ARTIFACT := rocksdb-static-$(ROCKSDB_VERSION)-$(ROCKSDB_PLATFORM).tar.gz
+ROCKSDB_STATIC_ARTIFACT := rocksdb-static-$(ROCKSDB_VERSION)-$(ROCKSDB_ARTIFACT_VARIANT)$(ROCKSDB_PLATFORM).tar.gz
 ROCKSDB_STATIC_DIR := $(shell pwd)/rocksdb-static
 
 # CGO configuration for RocksDB (always enabled for embedded cache)
@@ -72,9 +80,13 @@ ifeq ($(UNAME_S),Darwin)
     # which conflict with the explicit .a paths above.
     BUILD_TAGS := -tags grocksdb_clean_link
 else
-    # Linux: fully static binary
-    CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread
-    LDFLAGS := -ldflags "-linkmode external -extldflags '-static' -X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME) -X main.GitCommit=$(GIT_COMMIT)"
+    # Linux: fully static binary.
+    # -ljemalloc -ldl go AFTER -lrocksdb so jemalloc's malloc resolves RocksDB's allocations.
+    # --allow-multiple-definition: a fully-static glibc binary also pulls glibc's malloc.o
+    # (for internal aliases like __libc_malloc), which collides with jemalloc's malloc; the
+    # flag lets jemalloc's first-seen definition win instead of a hard link error.
+    CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -lrocksdb -ljemalloc -ldl -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread
+    LDFLAGS := -ldflags "-linkmode external -extldflags '-static -Wl,--allow-multiple-definition' -X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME) -X main.GitCommit=$(GIT_COMMIT)"
 endif
 
 # CGO environment for RocksDB (used across multiple targets)
@@ -94,6 +106,22 @@ all: build
 build: rocksdb-static
 	@echo "Building $(BINARY_NAME) with embedded cache..."
 	$(CGO_ENV) go build $(BUILD_TAGS) $(LDFLAGS) -o $(BINARY_NAME) $(CMD_PATH)
+	@$(MAKE) verify-jemalloc
+
+# Verify jemalloc is the linked, active allocator on the Linux deploy build.
+# A silent no-op (jemalloc not actually the allocator) looks identical until prod RSS
+# creeps, so this gates the build. Skipped on macOS (plain rocksdb-static, no jemalloc).
+.PHONY: verify-jemalloc
+verify-jemalloc:
+ifeq ($(UNAME_S),Darwin)
+	@echo "Skipping jemalloc verification (macOS dev build uses plain rocksdb-static)"
+else
+	@echo "Verifying jemalloc is the linked, active allocator..."
+	@nm $(BINARY_NAME) | grep -qE ' T mallctl$$' || { echo "FAIL: jemalloc not linked (mallctl symbol absent)"; exit 1; }
+	@nm $(BINARY_NAME) | grep -qE ' T malloc$$'  || { echo "FAIL: malloc symbol not defined in binary"; exit 1; }
+	@MALLOC_CONF=verify:1 ./$(BINARY_NAME) --version 2>&1 | grep -q '<jemalloc>' || { echo "FAIL: jemalloc not active at runtime (glibc ignores MALLOC_CONF)"; exit 1; }
+	@echo "OK: jemalloc linked (mallctl + malloc) and active at runtime"
+endif
 
 # Download and extract RocksDB static artifacts
 .PHONY: rocksdb-static
