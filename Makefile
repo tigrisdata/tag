@@ -154,7 +154,7 @@ rocksdb-static:
 .PHONY: rocksdb-static-clean
 rocksdb-static-clean:
 	@echo "Removing RocksDB static artifacts..."
-	rm -rf $(ROCKSDB_STATIC_DIR)
+	rm -rf $(ROCKSDB_STATIC_DIR) $(ROCKSDB_STATIC_DIR).tmp
 
 # Install system dependencies for RocksDB compression libraries
 .PHONY: install-deps
