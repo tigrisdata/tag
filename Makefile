@@ -134,15 +134,18 @@ endif
 # Download and extract RocksDB static artifacts
 .PHONY: rocksdb-static
 rocksdb-static:
-	@if [ ! -d "$(ROCKSDB_STATIC_DIR)/include" ]; then \
-		echo "Downloading RocksDB static artifacts for $(ROCKSDB_PLATFORM)..."; \
+	@if [ -d "$(ROCKSDB_STATIC_DIR)/include" ] && \
+	    [ "$$(cat $(ROCKSDB_STATIC_DIR)/.artifact 2>/dev/null)" = "$(ROCKSDB_STATIC_ARTIFACT)" ]; then \
+		echo "RocksDB static artifacts already present ($(ROCKSDB_STATIC_ARTIFACT))"; \
+	else \
+		echo "Downloading RocksDB static artifacts: $(ROCKSDB_STATIC_ARTIFACT)..."; \
+		rm -rf $(ROCKSDB_STATIC_DIR); \
 		mkdir -p $(ROCKSDB_STATIC_DIR); \
 		curl -fsSL "$(ROCKSDB_STATIC_URL)/$(ROCKSDB_STATIC_ARTIFACT)" -o $(ROCKSDB_STATIC_DIR)/rocksdb.tar.gz && \
-		cd $(ROCKSDB_STATIC_DIR) && tar -xzf rocksdb.tar.gz && \
-		rm rocksdb.tar.gz; \
-		echo "RocksDB static artifacts extracted to $(ROCKSDB_STATIC_DIR)"; \
-	else \
-		echo "RocksDB static artifacts already present at $(ROCKSDB_STATIC_DIR)"; \
+		tar -xzf $(ROCKSDB_STATIC_DIR)/rocksdb.tar.gz -C $(ROCKSDB_STATIC_DIR) && \
+		rm $(ROCKSDB_STATIC_DIR)/rocksdb.tar.gz && \
+		echo "$(ROCKSDB_STATIC_ARTIFACT)" > $(ROCKSDB_STATIC_DIR)/.artifact; \
+		echo "RocksDB static artifacts extracted ($(ROCKSDB_STATIC_ARTIFACT))"; \
 	fi
 
 # Clean RocksDB static artifacts
