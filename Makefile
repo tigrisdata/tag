@@ -127,7 +127,11 @@ else
 	@echo "Verifying jemalloc is the linked, active allocator..."
 	@nm $(BINARY_NAME) | grep -qE ' T mallctl$$' || { echo "FAIL: jemalloc not linked (mallctl symbol absent)"; exit 1; }
 	@nm $(BINARY_NAME) | grep -qE ' T malloc$$'  || { echo "FAIL: malloc symbol not defined in binary"; exit 1; }
-	@MALLOC_CONF=verify:1 ./$(BINARY_NAME) --version 2>&1 | grep -q '<jemalloc>' || { echo "FAIL: jemalloc not active at runtime (glibc ignores MALLOC_CONF)"; exit 1; }
+	@# confirm_conf:true is jemalloc's documented option for confirming MALLOC_CONF is
+	@# read: it echoes each parsed conf pair prefixed with "<jemalloc>". glibc ignores
+	@# MALLOC_CONF entirely, so the marker is absent when jemalloc is not the allocator.
+	@# (Positive signal — does not rely on any key being unrecognized.)
+	@MALLOC_CONF=confirm_conf:true ./$(BINARY_NAME) --version 2>&1 | grep -q '<jemalloc>' || { echo "FAIL: jemalloc not active at runtime (glibc ignores MALLOC_CONF)"; exit 1; }
 	@echo "OK: jemalloc linked (mallctl + malloc) and active at runtime"
 endif
 
