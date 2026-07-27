@@ -36,8 +36,16 @@ UNAME_M := $(shell uname -m)
 # RocksDB artifacts use: Linux-x86_64, Linux-aarch64, macOS-arm64
 ifeq ($(UNAME_S),Darwin)
     ROCKSDB_PLATFORM := macOS-arm64
+    # macOS dev builds use the plain rocksdb-static artifact. jemalloc is only linked
+    # for the Linux deploy target (no macOS jemalloc artifact is published).
+    ROCKSDB_ARTIFACT_VARIANT :=
     BREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo "/opt/homebrew")
 else
+    # Linux deploy target uses the jemalloc variant of the rocksdb-static artifact
+    # (RocksDB built -DWITH_JEMALLOC=ON + bundled static libjemalloc.a) so jemalloc is
+    # the process allocator, fixing glibc-malloc RSS fragmentation.
+    # See tigrisdata/tag#129 and tigrisdata/ocache#176/#198/#201.
+    ROCKSDB_ARTIFACT_VARIANT := jemalloc-
     ifeq ($(UNAME_M),aarch64)
         ROCKSDB_PLATFORM := Linux-aarch64
     else ifeq ($(UNAME_M),arm64)
@@ -50,7 +58,7 @@ endif
 # RocksDB static build configuration
 ROCKSDB_VERSION ?= 10.4.2
 ROCKSDB_STATIC_URL := https://ocache-releases.t3.storage.dev/rocksdb/$(ROCKSDB_VERSION)
-ROCKSDB_STATIC_ARTIFACT := rocksdb-static-$(ROCKSDB_VERSION)-$(ROCKSDB_PLATFORM).tar.gz
+ROCKSDB_STATIC_ARTIFACT := rocksdb-static-$(ROCKSDB_VERSION)-$(ROCKSDB_ARTIFACT_VARIANT)$(ROCKSDB_PLATFORM).tar.gz
 ROCKSDB_STATIC_DIR := $(shell pwd)/rocksdb-static
 
 # CGO configuration for RocksDB (always enabled for embedded cache)
@@ -68,13 +76,25 @@ ifeq ($(UNAME_S),Darwin)
         -lstdc++ -lm -pthread
     # macOS can't fully static link, just strip symbols
     LDFLAGS := -ldflags "-s -w -X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME) -X main.GitCommit=$(GIT_COMMIT)"
+    # macOS uses the plain rocksdb-static (no jemalloc), so tests link with defaults.
+    TEST_LDFLAGS :=
     # Prevent grocksdb from injecting its own -lzstd -llz4 -lz -lsnappy flags,
     # which conflict with the explicit .a paths above.
     BUILD_TAGS := -tags grocksdb_clean_link
 else
-    # Linux: fully static binary
-    CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread
-    LDFLAGS := -ldflags "-linkmode external -extldflags '-static' -X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME) -X main.GitCommit=$(GIT_COMMIT)"
+    # Linux: fully static binary.
+    # -ljemalloc -ldl go AFTER -lrocksdb so jemalloc's malloc resolves RocksDB's allocations.
+    # --allow-multiple-definition: a fully-static glibc binary also pulls glibc's malloc.o
+    # (for internal aliases like __libc_malloc), which collides with jemalloc's malloc; the
+    # flag lets jemalloc's first-seen definition win instead of a hard link error.
+    CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -lrocksdb -ljemalloc -ldl -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread
+    LDFLAGS := -ldflags "-linkmode external -extldflags '-static -Wl,--allow-multiple-definition' -X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME) -X main.GitCommit=$(GIT_COMMIT)"
+    # Because jemalloc (linked via CGO_LDFLAGS) now provides malloc, cgo test binaries
+    # must use external linking too — Go's internal linker can't resolve the malloc
+    # relocations from net/runtime/cgo otherwise ("relocation target malloc not defined").
+    # Not fully static (test binaries don't need it); --allow-multiple-definition is
+    # defensive against the glibc/jemalloc malloc overlap.
+    TEST_LDFLAGS := -ldflags "-linkmode external -extldflags '-Wl,--allow-multiple-definition'"
 endif
 
 # CGO environment for RocksDB (used across multiple targets)
@@ -94,26 +114,51 @@ all: build
 build: rocksdb-static
 	@echo "Building $(BINARY_NAME) with embedded cache..."
 	$(CGO_ENV) go build $(BUILD_TAGS) $(LDFLAGS) -o $(BINARY_NAME) $(CMD_PATH)
+	@$(MAKE) verify-jemalloc
+
+# Verify jemalloc is the linked, active allocator on the Linux deploy build.
+# A silent no-op (jemalloc not actually the allocator) looks identical until prod RSS
+# creeps, so this gates the build. Skipped on macOS (plain rocksdb-static, no jemalloc).
+.PHONY: verify-jemalloc
+verify-jemalloc:
+ifeq ($(UNAME_S),Darwin)
+	@echo "Skipping jemalloc verification (macOS dev build uses plain rocksdb-static)"
+else
+	@echo "Verifying jemalloc is the linked, active allocator..."
+	@nm $(BINARY_NAME) | grep -qE ' T mallctl$$' || { echo "FAIL: jemalloc not linked (mallctl symbol absent)"; exit 1; }
+	@nm $(BINARY_NAME) | grep -qE ' T malloc$$'  || { echo "FAIL: malloc symbol not defined in binary"; exit 1; }
+	@# confirm_conf:true is jemalloc's documented option for confirming MALLOC_CONF is
+	@# read: it echoes each parsed conf pair prefixed with "<jemalloc>". glibc ignores
+	@# MALLOC_CONF entirely, so the marker is absent when jemalloc is not the allocator.
+	@# (Positive signal — does not rely on any key being unrecognized.)
+	@MALLOC_CONF=confirm_conf:true ./$(BINARY_NAME) --version 2>&1 | grep -q '<jemalloc>' || { echo "FAIL: jemalloc not active at runtime (glibc ignores MALLOC_CONF)"; exit 1; }
+	@echo "OK: jemalloc linked (mallctl + malloc) and active at runtime"
+endif
 
 # Download and extract RocksDB static artifacts
 .PHONY: rocksdb-static
 rocksdb-static:
-	@if [ ! -d "$(ROCKSDB_STATIC_DIR)/include" ]; then \
-		echo "Downloading RocksDB static artifacts for $(ROCKSDB_PLATFORM)..."; \
-		mkdir -p $(ROCKSDB_STATIC_DIR); \
-		curl -fsSL "$(ROCKSDB_STATIC_URL)/$(ROCKSDB_STATIC_ARTIFACT)" -o $(ROCKSDB_STATIC_DIR)/rocksdb.tar.gz && \
-		cd $(ROCKSDB_STATIC_DIR) && tar -xzf rocksdb.tar.gz && \
-		rm rocksdb.tar.gz; \
-		echo "RocksDB static artifacts extracted to $(ROCKSDB_STATIC_DIR)"; \
+	@if [ -d "$(ROCKSDB_STATIC_DIR)/include" ] && \
+	    [ "$$(cat $(ROCKSDB_STATIC_DIR)/.artifact 2>/dev/null)" = "$(ROCKSDB_STATIC_ARTIFACT)" ]; then \
+		echo "RocksDB static artifacts already present ($(ROCKSDB_STATIC_ARTIFACT))"; \
 	else \
-		echo "RocksDB static artifacts already present at $(ROCKSDB_STATIC_DIR)"; \
+		echo "Downloading RocksDB static artifacts: $(ROCKSDB_STATIC_ARTIFACT)..." && \
+		rm -rf $(ROCKSDB_STATIC_DIR).tmp && \
+		mkdir -p $(ROCKSDB_STATIC_DIR).tmp && \
+		curl -fsSL "$(ROCKSDB_STATIC_URL)/$(ROCKSDB_STATIC_ARTIFACT)" -o $(ROCKSDB_STATIC_DIR).tmp/rocksdb.tar.gz && \
+		tar -xzf $(ROCKSDB_STATIC_DIR).tmp/rocksdb.tar.gz -C $(ROCKSDB_STATIC_DIR).tmp && \
+		rm $(ROCKSDB_STATIC_DIR).tmp/rocksdb.tar.gz && \
+		echo "$(ROCKSDB_STATIC_ARTIFACT)" > $(ROCKSDB_STATIC_DIR).tmp/.artifact && \
+		rm -rf $(ROCKSDB_STATIC_DIR) && \
+		mv $(ROCKSDB_STATIC_DIR).tmp $(ROCKSDB_STATIC_DIR) && \
+		echo "RocksDB static artifacts extracted ($(ROCKSDB_STATIC_ARTIFACT))"; \
 	fi
 
 # Clean RocksDB static artifacts
 .PHONY: rocksdb-static-clean
 rocksdb-static-clean:
 	@echo "Removing RocksDB static artifacts..."
-	rm -rf $(ROCKSDB_STATIC_DIR)
+	rm -rf $(ROCKSDB_STATIC_DIR) $(ROCKSDB_STATIC_DIR).tmp
 
 # Install system dependencies for RocksDB compression libraries
 .PHONY: install-deps
@@ -134,7 +179,7 @@ endif
 test: build
 	@echo "Running unit tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -v -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./cmd/... ./config/... ./handlers/... ./metrics/... ./proxy/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./cmd/... ./config/... ./handlers/... ./metrics/... ./proxy/...
 
 .PHONY: test-all
 test-all: test test-integration
@@ -150,7 +195,7 @@ test-auth:
 test-cache: rocksdb-static
 	@echo "Running cache tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -v -timeout 30s $(TESTFLAGS) ./cache/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -timeout 30s $(TESTFLAGS) ./cache/...
 
 .PHONY: test-proxy
 test-proxy:
@@ -162,13 +207,13 @@ test-proxy:
 test-race: rocksdb-static
 	@echo "Running unit tests with race detector..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -race -v -timeout 120s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -race -v -timeout 120s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
 
 .PHONY: test-coverage
 test-coverage: rocksdb-static
 	@echo "Running unit tests with coverage..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -coverprofile=coverage.out -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -coverprofile=coverage.out -timeout 60s $(TESTFLAGS) ./auth/... ./cache/... ./config/... ./handlers/... ./metrics/... ./proxy/...
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated at coverage.html"
 
@@ -177,25 +222,25 @@ test-coverage: rocksdb-static
 test-integration: rocksdb-static
 	@echo "Running integration tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
 
 .PHONY: test-integration-short
 test-integration-short: rocksdb-static
 	@echo "Running integration tests (short mode)..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -v -short -timeout 30s $(TESTFLAGS) ./tests/integration/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -short -timeout 30s $(TESTFLAGS) ./tests/integration/...
 
 .PHONY: test-integration-race
 test-integration-race: rocksdb-static
 	@echo "Running integration tests with race detector..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -race -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -race -v -timeout 300s $(TESTFLAGS) ./tests/integration/...
 
 .PHONY: test-integration-coverage
 test-integration-coverage: rocksdb-static
 	@echo "Running integration tests with coverage..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	$(CGO_ENV) go test $(BUILD_TAGS) -coverprofile=coverage-integration.out -timeout 300s $(TESTFLAGS) ./tests/integration/...
+	$(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -coverprofile=coverage-integration.out -timeout 300s $(TESTFLAGS) ./tests/integration/...
 	go tool cover -html=coverage-integration.out -o coverage-integration.html
 	@echo "Integration coverage report generated at coverage-integration.html"
 
@@ -267,6 +312,8 @@ help:
 	@echo "Build targets:"
 	@echo "  all             - Build the binary (default)"
 	@echo "  build           - Build TAG with embedded cache (requires RocksDB)"
+	@echo "  verify-jemalloc - Verify jemalloc is the linked, active allocator (Linux; run by build)"
+	@echo "                    Example: make build (auto-runs it) or make verify-jemalloc after a build"
 	@echo "  rocksdb-static  - Download RocksDB static artifacts (auto-downloaded by build)"
 	@echo ""
 	@echo "  Build requires RocksDB static artifacts which are auto-downloaded."
@@ -548,7 +595,7 @@ test-sdk: rocksdb-static
 		echo "  Start TAG with: make s3-test-local"; \
 		exit 1; \
 	fi
-	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) $(CGO_ENV) go test $(BUILD_TAGS) -v -timeout 300s $(TESTFLAGS) ./tests/s3compat/sdk/...
+	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) $(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -timeout 300s $(TESTFLAGS) ./tests/s3compat/sdk/...
 
 # Benchmark TAG's core S3 operations with warp (requires a running TAG + AWS creds).
 # Start TAG first with: make s3-test-local

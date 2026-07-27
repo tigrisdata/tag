@@ -47,6 +47,9 @@ jobs:
       - name: Run linting
         run: make lint-ci
 
+      - name: Build static binary (validates jemalloc link + verify gate)
+        run: make build
+
       - name: Run unit tests
         run: make test
 
