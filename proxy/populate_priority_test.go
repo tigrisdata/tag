@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 )
@@ -76,6 +77,78 @@ func TestByteBudget_ReserveCapFlooredAtPerPopulateCap(t *testing.T) {
 	}
 	if b.tryAcquireReadMiss(1) {
 		t.Fatal("read-miss must not consume the floored reserve held for the pending warm")
+	}
+}
+
+// A non-finite fraction (NaN) is unordered and slips past the </> clamps; it must
+// disable the reserve rather than produce a garbage int64 cap from total*NaN.
+func TestByteBudget_NaNFractionDisablesReserve(t *testing.T) {
+	b := newByteBudget(100, math.NaN(), 40)
+	if b.reserveCap != 0 {
+		t.Fatalf("NaN fraction must disable the reserve (cap 0), got %d", b.reserveCap)
+	}
+	// Reserve disabled: read-miss uses the whole budget even under warm demand.
+	b.pendingWarm = 40
+	if !b.tryAcquireReadMiss(100) {
+		t.Fatal("NaN fraction should leave the full budget available to read-miss")
+	}
+}
+
+// The count slot is shared with read-miss, so a warm holding its reserved bytes must
+// still wait (bounded) for a count slot rather than being shed the instant a
+// read-miss flood has filled every slot.
+func TestService_AcquireCacheSlot_WarmWaitsForCountSlot(t *testing.T) {
+	s := &Service{
+		cacheSemaphore: make(chan struct{}, 1), // a single slot, held by the read-miss below
+		populateBudget: newByteBudget(1000, 0.5, 1),
+	}
+	if !s.acquireCacheSlot(context.Background(), 10, priorityReadMiss) {
+		t.Fatal("setup: read-miss should take the only count slot")
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		done <- s.acquireCacheSlot(ctx, 10, priorityWarmWrite)
+	}()
+
+	// Warm has budget headroom but no free count slot; it must wait, not shed.
+	select {
+	case <-done:
+		t.Fatal("warm should wait for a count slot, not be shed immediately")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	s.releaseCacheSlot(10) // free the slot; warm should now win it
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("warm should acquire once a count slot frees")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("warm timed out waiting for the count slot")
+	}
+}
+
+// When no count slot frees before the deadline, warm is shed — and it must hand back
+// the reserved budget it was holding while it waited, or that budget leaks.
+func TestService_AcquireCacheSlot_WarmCountTimeoutReleasesBudget(t *testing.T) {
+	s := &Service{
+		cacheSemaphore: make(chan struct{}, 1),
+		populateBudget: newByteBudget(1000, 0.5, 1),
+	}
+	if !s.acquireCacheSlot(context.Background(), 10, priorityReadMiss) {
+		t.Fatal("setup: read-miss should take the only count slot")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if s.acquireCacheSlot(ctx, 10, priorityWarmWrite) {
+		t.Fatal("warm should be shed when no count slot frees before the deadline")
+	}
+	// Read-miss holds 10 of 1000; if warm released the 10 it briefly took, 990 remain.
+	if !s.populateBudget.tryAcquireReadMiss(990) {
+		t.Fatal("warm must release its held budget when it times out on the count slot")
 	}
 }
 

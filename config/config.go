@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"strconv"
@@ -495,8 +496,12 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	// Clamp the reservation fraction to [0, 1] (negative disables the reservation).
 	// Applied after defaults + env so both a stray config value and an env override
-	// land in range.
-	if cfg.Cache.WarmOnWriteReservedFraction < 0 {
+	// land in range. NaN is unordered — it slips past both comparisons — so a
+	// malformed non-finite value (e.g. env/YAML "NaN") falls back to the default
+	// rather than propagating into the integer budget cap as garbage.
+	if math.IsNaN(cfg.Cache.WarmOnWriteReservedFraction) {
+		cfg.Cache.WarmOnWriteReservedFraction = DefaultWarmOnWriteReservedFraction
+	} else if cfg.Cache.WarmOnWriteReservedFraction < 0 {
 		cfg.Cache.WarmOnWriteReservedFraction = 0
 	} else if cfg.Cache.WarmOnWriteReservedFraction > 1 {
 		cfg.Cache.WarmOnWriteReservedFraction = 1

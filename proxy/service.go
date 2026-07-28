@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -213,7 +214,9 @@ type byteBudget struct {
 // a fraction*total smaller than a single populate would let read-miss oscillate just
 // below the warm's required weight and starve it under a small budget.
 func newByteBudget(total int64, reserveFraction float64, perPopulateCap int64) *byteBudget {
-	if reserveFraction < 0 {
+	// NaN is unordered, so it slips past the < / > clamps below; converting
+	// total*NaN to int64 yields a garbage cap. Disable the reservation in that case.
+	if math.IsNaN(reserveFraction) || reserveFraction < 0 {
 		reserveFraction = 0
 	} else if reserveFraction > 1 {
 		reserveFraction = 1
@@ -302,10 +305,14 @@ func (s *Service) acquireCacheSlot(ctx context.Context, weight int64, prio popul
 		if s.populateBudget != nil && !s.populateBudget.acquireWarm(ctx, weight) {
 			return false
 		}
+		// The count slot is shared with read-miss populates, so protecting only the
+		// byte budget still lets a read-miss flood that fills every slot shed a warm
+		// that already holds its reserved bytes. Wait for a slot too, bounded by ctx
+		// (the caller's warm-acquire deadline); free the held budget if it never comes.
 		if s.cacheSemaphore != nil {
 			select {
 			case s.cacheSemaphore <- struct{}{}:
-			default:
+			case <-ctx.Done():
 				if s.populateBudget != nil {
 					s.populateBudget.release(weight) // hand back budget we can't use
 				}
