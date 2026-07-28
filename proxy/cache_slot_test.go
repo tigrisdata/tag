@@ -47,7 +47,7 @@ func TestService_CacheSlotByteBudget(t *testing.T) {
 	// Count effectively unlimited (large), budget = 100 bytes.
 	s := &Service{
 		cacheSemaphore: make(chan struct{}, 1000),
-		populateBudget: newByteBudget(100, 0),
+		populateBudget: newByteBudget(100, 0, 1),
 	}
 
 	if !s.acquireCacheSlot(context.Background(), 60, priorityReadMiss) {
@@ -71,7 +71,7 @@ func TestService_CacheSlotByteBudget(t *testing.T) {
 func TestService_CacheSlotByteBudgetReleasesCountOnByteReject(t *testing.T) {
 	s := &Service{
 		cacheSemaphore: make(chan struct{}, 1),
-		populateBudget: newByteBudget(10, 0),
+		populateBudget: newByteBudget(10, 0, 1),
 	}
 	// Byte budget too small — acquire must fail and free the single count slot.
 	if s.acquireCacheSlot(context.Background(), 1000, priorityReadMiss) {
@@ -127,7 +127,7 @@ func TestService_BackgroundReservationClampedToBudget(t *testing.T) {
 	const budget = 8 << 20 // 8MB budget, below the 80MB ceiling
 	s := &Service{
 		cacheSemaphore: make(chan struct{}, 256),
-		populateBudget: newByteBudget(budget, 0),
+		populateBudget: newByteBudget(budget, 0, 1),
 		perPopulateCap: 80 << 20,
 		config:         &config.Config{},
 	}

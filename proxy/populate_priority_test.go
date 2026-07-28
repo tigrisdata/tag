@@ -9,7 +9,7 @@ import (
 // readMiss uses the whole budget when no warm-on-write is pending (elastic — the
 // reservation costs nothing when unused).
 func TestByteBudget_ReadMissUsesFullBudgetWhenNoWarmPending(t *testing.T) {
-	b := newByteBudget(100, 0.5) // reserveCap = 50, but nothing pending
+	b := newByteBudget(100, 0.5, 1) // reserveCap = 50, but nothing pending
 	if !b.tryAcquireReadMiss(100) {
 		t.Fatal("read-miss should use the full budget when no warm-on-write is pending")
 	}
@@ -21,8 +21,8 @@ func TestByteBudget_ReadMissUsesFullBudgetWhenNoWarmPending(t *testing.T) {
 // readMiss backs off by exactly the pending warm demand (capped at reserveCap),
 // leaving that headroom protected for warm-on-write.
 func TestByteBudget_ReadMissYieldsPendingWarm(t *testing.T) {
-	b := newByteBudget(100, 0.5) // cap 50
-	b.pendingWarm = 30           // a warm-on-write of 30 is waiting
+	b := newByteBudget(100, 0.5, 1) // cap 50
+	b.pendingWarm = 30              // a warm-on-write of 30 is waiting
 
 	// read-miss may take up to 100 - min(30,50) = 70.
 	if !b.tryAcquireReadMiss(70) {
@@ -36,8 +36,8 @@ func TestByteBudget_ReadMissYieldsPendingWarm(t *testing.T) {
 // The reserve is capped at reserveCap: even huge pending warm demand can't make
 // read-miss yield more than the configured fraction.
 func TestByteBudget_ReserveCapBoundsYield(t *testing.T) {
-	b := newByteBudget(100, 0.5) // cap 50
-	b.pendingWarm = 90           // more than the cap
+	b := newByteBudget(100, 0.5, 1) // cap 50
+	b.pendingWarm = 90              // more than the cap
 
 	if !b.tryAcquireReadMiss(50) {
 		t.Fatal("read-miss should still get (total - cap) even under large warm demand")
@@ -50,17 +50,39 @@ func TestByteBudget_ReserveCapBoundsYield(t *testing.T) {
 // reserveFraction 0 disables the reservation: read-miss uses the whole budget even
 // with warm-on-write pending (equal competition).
 func TestByteBudget_ReservationDisabled(t *testing.T) {
-	b := newByteBudget(100, 0) // cap 0
+	b := newByteBudget(100, 0, 1) // cap 0
 	b.pendingWarm = 40
 	if !b.tryAcquireReadMiss(100) {
 		t.Fatal("with the reservation disabled, read-miss uses the full budget")
 	}
 }
 
+// Fix for the small-budget starvation: when the configured fraction of the budget is
+// smaller than a single populate's byte weight, reserveCap is floored at
+// perPopulateCap so one warm-on-write can still fit. Otherwise a read-miss flood
+// would starve every warm on a small budget (fraction*total < one populate).
+func TestByteBudget_ReserveCapFlooredAtPerPopulateCap(t *testing.T) {
+	const perPopulateCap = 40
+	// 0.1 * 100 = 10, well below a single populate (40); the floor lifts it to 40.
+	b := newByteBudget(100, 0.1, perPopulateCap)
+	if b.reserveCap != perPopulateCap {
+		t.Fatalf("reserveCap should be floored at perPopulateCap %d, got %d", perPopulateCap, b.reserveCap)
+	}
+
+	// A warm-on-write of one populate is pending; read-miss must yield the full 40.
+	b.pendingWarm = perPopulateCap
+	if !b.tryAcquireReadMiss(60) {
+		t.Fatal("read-miss should take total minus the floored reserve (100-40=60)")
+	}
+	if b.tryAcquireReadMiss(1) {
+		t.Fatal("read-miss must not consume the floored reserve held for the pending warm")
+	}
+}
+
 // The regression this feature exists for: a read-miss flood fills the budget, yet a
 // warm-on-write still acquires — read-miss yields freed budget to the pending warm.
 func TestByteBudget_WarmWinsAgainstReadMissFlood(t *testing.T) {
-	b := newByteBudget(100, 0.5) // cap 50
+	b := newByteBudget(100, 0.5, 1) // cap 50
 
 	// Read-miss fills the entire budget.
 	if !b.tryAcquireReadMiss(100) {
@@ -98,7 +120,7 @@ func TestByteBudget_WarmWinsAgainstReadMissFlood(t *testing.T) {
 // warm-on-write gives up (does not block forever) when budget never frees, so it's
 // shed like any other populate rather than pinning a goroutine.
 func TestByteBudget_WarmTimesOutWhenBudgetNeverFrees(t *testing.T) {
-	b := newByteBudget(100, 0.5)
+	b := newByteBudget(100, 0.5, 1)
 	if !b.tryAcquireReadMiss(100) {
 		t.Fatal("setup: fill the budget")
 	}
@@ -114,7 +136,7 @@ func TestByteBudget_WarmTimesOutWhenBudgetNeverFrees(t *testing.T) {
 func TestService_AcquireCacheSlot_WarmPriority(t *testing.T) {
 	s := &Service{
 		cacheSemaphore: make(chan struct{}, 1000),
-		populateBudget: newByteBudget(100, 0.5),
+		populateBudget: newByteBudget(100, 0.5, 1),
 	}
 	if !s.acquireCacheSlot(context.Background(), 100, priorityReadMiss) {
 		t.Fatal("setup: fill the budget with a read-miss")

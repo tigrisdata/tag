@@ -484,8 +484,11 @@ func applyEnvOverrides(cfg *Config) {
 			}
 		}
 		// Override the warm-on-write populate reservation fraction from environment.
+		// f != 0 mirrors the sibling budget overrides: an env "0" means "use the
+		// default" (per the documented 0-or-unset contract), not "disable" — a
+		// negative value disables.
 		if val := os.Getenv("TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION"); val != "" {
-			if f, err := strconv.ParseFloat(val, 64); err == nil {
+			if f, err := strconv.ParseFloat(val, 64); err == nil && f != 0 {
 				cfg.Cache.WarmOnWriteReservedFraction = f
 			}
 		}

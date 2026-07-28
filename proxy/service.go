@@ -102,7 +102,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		if cfg.Cache.WarmOnWrite {
 			reserveFraction = cfg.Cache.WarmOnWriteReservedFraction
 		}
-		populateBudget = newByteBudget(cfg.Cache.MaxPopulateMemoryBytes, reserveFraction)
+		populateBudget = newByteBudget(cfg.Cache.MaxPopulateMemoryBytes, reserveFraction, perPopulateCap)
 	}
 
 	log.Info().
@@ -199,6 +199,7 @@ const warmPopulateAcquireTimeout = 30 * time.Second
 // flood while no budget is wasted.
 type byteBudget struct {
 	mu          sync.Mutex
+	cond        *sync.Cond // signaled on release so waiting warm-on-write acquirers wake
 	remaining   int64
 	pendingWarm int64 // sum of weights of warm-on-write acquirers currently waiting
 	reserveCap  int64 // max bytes read-miss will hold back for pending warm-on-write
@@ -206,18 +207,27 @@ type byteBudget struct {
 
 // newByteBudget creates a budget of `total` bytes. reserveFraction (clamped to
 // [0,1]) caps the share read-miss populates will yield to pending warm-on-write; 0
-// disables the reservation (equal competition).
-func newByteBudget(total int64, reserveFraction float64) *byteBudget {
+// disables the reservation (equal competition). When the reservation is enabled,
+// reserveCap is floored at perPopulateCap (the largest weight a single populate
+// reserves) so one warm-on-write populate can always fit in the reserve — otherwise
+// a fraction*total smaller than a single populate would let read-miss oscillate just
+// below the warm's required weight and starve it under a small budget.
+func newByteBudget(total int64, reserveFraction float64, perPopulateCap int64) *byteBudget {
 	if reserveFraction < 0 {
 		reserveFraction = 0
 	} else if reserveFraction > 1 {
 		reserveFraction = 1
 	}
 	cap := int64(float64(total) * reserveFraction)
+	if reserveFraction > 0 && cap < perPopulateCap {
+		cap = perPopulateCap
+	}
 	if cap > total {
 		cap = total
 	}
-	return &byteBudget{remaining: total, reserveCap: cap}
+	b := &byteBudget{remaining: total, reserveCap: cap}
+	b.cond = sync.NewCond(&b.mu)
+	return b
 }
 
 // tryAcquireReadMiss reserves n bytes for a read-miss populate without blocking. It
@@ -240,46 +250,40 @@ func (b *byteBudget) tryAcquireReadMiss(n int64) bool {
 
 // acquireWarm reserves n bytes for a warm-on-write populate, waiting (bounded by
 // ctx) for budget and taking priority over read-miss populates: while it waits it
-// registers pendingWarm so read-miss acquirers yield, then polls until budget frees
-// or ctx is cancelled. Returns false only on cancellation. Warm volume is low, so
-// the bounded poll is cheap relative to the correctness of not missing a wakeup.
+// registers pendingWarm so read-miss acquirers yield, then parks on the condition
+// variable until a release wakes it (or ctx is cancelled). Returns false only on
+// cancellation.
 func (b *byteBudget) acquireWarm(ctx context.Context, n int64) bool {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.pendingWarm += n
-	b.mu.Unlock()
-	defer func() {
-		b.mu.Lock()
-		b.pendingWarm -= n
-		b.mu.Unlock()
-	}()
+	defer func() { b.pendingWarm -= n }()
 
-	backoff := time.Millisecond
-	for {
+	// Wake this waiter if ctx is cancelled while it's parked in cond.Wait() — the
+	// condition variable itself has no timeout. stop() cancels the hook once we're
+	// done (whether we acquired or gave up).
+	stop := context.AfterFunc(ctx, func() {
 		b.mu.Lock()
-		if b.remaining >= n {
-			b.remaining -= n
-			b.mu.Unlock()
-			return true
-		}
+		b.cond.Broadcast()
 		b.mu.Unlock()
+	})
+	defer stop()
 
-		t := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			t.Stop()
+	for b.remaining < n {
+		if ctx.Err() != nil {
 			return false
-		case <-t.C:
 		}
-		if backoff < 25*time.Millisecond {
-			backoff *= 2
-		}
+		b.cond.Wait()
 	}
+	b.remaining -= n
+	return true
 }
 
 func (b *byteBudget) release(n int64) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.remaining += n
+	b.cond.Broadcast() // wake warm-on-write waiters to re-check the freed budget
+	b.mu.Unlock()
 }
 
 // acquireCacheSlot tries to reserve a cache-populate slot without blocking,
@@ -289,6 +293,29 @@ func (b *byteBudget) release(n int64) {
 // false when either the count limit or the memory budget is saturated, in which
 // case the caller should skip caching rather than block or spawn unbounded work.
 func (s *Service) acquireCacheSlot(ctx context.Context, weight int64, prio populatePriority) bool {
+	// Warm-on-write may block waiting for its reserved budget, so it reserves the
+	// byte budget FIRST and takes the count slot only once budget is secured.
+	// Reversing this (count-then-blocking-budget) would let a waiting warm hold a
+	// count slot for the whole wait, shedding read-miss populates that have budget
+	// headroom and exhausting MaxConcurrentWrites under a burst of warms.
+	if prio == priorityWarmWrite {
+		if s.populateBudget != nil && !s.populateBudget.acquireWarm(ctx, weight) {
+			return false
+		}
+		if s.cacheSemaphore != nil {
+			select {
+			case s.cacheSemaphore <- struct{}{}:
+			default:
+				if s.populateBudget != nil {
+					s.populateBudget.release(weight) // hand back budget we can't use
+				}
+				return false
+			}
+		}
+		return true
+	}
+
+	// Read-miss acquires non-blocking: count slot then byte budget.
 	if s.cacheSemaphore != nil {
 		select {
 		case s.cacheSemaphore <- struct{}{}:
@@ -296,19 +323,11 @@ func (s *Service) acquireCacheSlot(ctx context.Context, weight int64, prio popul
 			return false
 		}
 	}
-	if s.populateBudget != nil {
-		var ok bool
-		if prio == priorityWarmWrite {
-			ok = s.populateBudget.acquireWarm(ctx, weight)
-		} else {
-			ok = s.populateBudget.tryAcquireReadMiss(weight)
+	if s.populateBudget != nil && !s.populateBudget.tryAcquireReadMiss(weight) {
+		if s.cacheSemaphore != nil {
+			<-s.cacheSemaphore // hand back the count slot we just took
 		}
-		if !ok {
-			if s.cacheSemaphore != nil {
-				<-s.cacheSemaphore // hand back the count slot we just took
-			}
-			return false
-		}
+		return false
 	}
 	return true
 }

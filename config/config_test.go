@@ -468,8 +468,9 @@ func TestLoad_WarmOnWriteReservedFractionOverrideAndClamp(t *testing.T) {
 		want float64
 	}{
 		{"0.25", 0.25}, // in-range value honored
-		{"-1", 0},      // negative disables the reservation
-		{"2.5", 1},     // above 1 clamps to 1
+		{"0", DefaultWarmOnWriteReservedFraction}, // 0 means "use default", not disable
+		{"-1", 0},  // negative disables the reservation
+		{"2.5", 1}, // above 1 clamps to 1
 	}
 	for _, tc := range cases {
 		t.Run(tc.env, func(t *testing.T) {
