@@ -120,12 +120,16 @@ var (
 
 	// CachePopulateSkipped counts cache-populate operations skipped because the
 	// concurrent-cache-write limit was saturated (the object is still served from
-	// upstream, just not cached).
-	CachePopulateSkipped = promauto.NewCounter(
+	// upstream, just not cached). Labeled by source so warm-on-write starvation is
+	// visible separately from the read-miss warm flood (issue #100): a healthy
+	// deployment shows source="warm_on_write" near zero while source="read_miss"
+	// absorbs the shedding. Sum across sources for the total.
+	CachePopulateSkipped = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "tag_cache_populate_skipped_total",
-			Help: "Total cache populates skipped due to the concurrent-cache-write limit",
+			Help: "Total cache populates skipped due to the concurrent-cache-write limit, by source",
 		},
+		[]string{"source"},
 	)
 
 	// BytesTransferred tracks bytes transferred.
@@ -387,6 +391,17 @@ const (
 	LocalityLocal  = "local"
 	LocalityRemote = "remote"
 )
+
+// Cache-populate source label values (for CachePopulateSkipped).
+const (
+	PopulateSourceWarmOnWrite = "warm_on_write"
+	PopulateSourceReadMiss    = "read_miss"
+)
+
+// RecordCachePopulateSkipped records a shed cache-populate, attributed to its source.
+func RecordCachePopulateSkipped(source string) {
+	CachePopulateSkipped.WithLabelValues(source).Inc()
+}
 
 // RecordCacheServeLocality records a cache body read as served locally or
 // pulled from a peer over gRPC.

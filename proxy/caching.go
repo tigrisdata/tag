@@ -145,8 +145,11 @@ func (s *Service) setupCacheListener(
 	// released on the no-listener path below or by the populate goroutine. weight is
 	// the byte reservation (matching what was/should be acquired) to release.
 	if !slotHeld {
-		if !s.acquireCacheSlot(weight) {
-			metrics.CachePopulateSkipped.Inc()
+		// The inline populate serves a cache miss while streaming from upstream, so
+		// it is a read-triggered populate (priorityReadMiss): non-blocking, yields
+		// budget headroom to pending warm-on-write.
+		if !s.acquireCacheSlot(ctx, weight, priorityReadMiss) {
+			metrics.RecordCachePopulateSkipped(metrics.PopulateSourceReadMiss)
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping cache populate - concurrent write limit reached")
 			return nil, nil
 		}
@@ -328,6 +331,7 @@ func (s *Service) fetchFullObjectToCache(
 	bucket, key, accessKey, secretKey string,
 	anonymous bool,
 	broadcaster *broadcast.Broadcaster,
+	prio populatePriority,
 ) error {
 	// This is a background fetch whose only purpose is to populate the cache, so
 	// reserve a cache-populate slot up front. If the concurrent-write limit is
@@ -342,8 +346,17 @@ func (s *Service) fetchFullObjectToCache(
 	// large-object warms to keep buffered memory bounded (small objects, cached
 	// inline, reserve their actual size instead).
 	weight := s.populateWeight(-1)
-	if !s.acquireCacheSlot(weight) {
-		metrics.CachePopulateSkipped.Inc()
+	// Warm-on-write populates wait (bounded) for their reserved budget and take
+	// priority; read-miss populates acquire non-blocking. Bound the warm wait so a
+	// starved warm doesn't hold a count slot for the whole fetch timeout.
+	acqCtx := ctx
+	if prio == priorityWarmWrite {
+		var cancel context.CancelFunc
+		acqCtx, cancel = context.WithTimeout(ctx, warmPopulateAcquireTimeout)
+		defer cancel()
+	}
+	if !s.acquireCacheSlot(acqCtx, weight, prio) {
+		metrics.RecordCachePopulateSkipped(prio.metricSource())
 		return errCachePopulateDeclined
 	}
 	slotOwned := true
@@ -495,7 +508,7 @@ streamLoop:
 // cached as public-read (see fetchFullObjectToCache); accessKey/secretKey are then
 // ignored. Pass anonymous=true exactly when the triggering request was anonymous, so
 // public-read is only ever inferred from a confirmed anonymous read.
-func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool) {
+func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority) {
 	bcastKey := "bg:" + bucket + "/" + key
 
 	// Atomic check-and-set: if key exists, a fetch is already in progress
@@ -521,7 +534,7 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 		}
 		broadcaster := broadcast.NewBroadcaster(channelBuf)
 
-		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, broadcaster)
+		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, broadcaster, prio)
 
 		switch {
 		case errors.Is(err, errCachePopulateDeclined):

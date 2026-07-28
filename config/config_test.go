@@ -447,6 +447,51 @@ func TestLoad_CachePopulateMemoryFromYAML(t *testing.T) {
 	}
 }
 
+func TestLoad_WarmOnWriteReservedFractionDefault(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.WarmOnWriteReservedFraction != DefaultWarmOnWriteReservedFraction {
+		t.Errorf("WarmOnWriteReservedFraction = %v, want %v (default)",
+			cfg.Cache.WarmOnWriteReservedFraction, DefaultWarmOnWriteReservedFraction)
+	}
+}
+
+func TestLoad_WarmOnWriteReservedFractionOverrideAndClamp(t *testing.T) {
+	cases := []struct {
+		env  string
+		want float64
+	}{
+		{"0.25", 0.25}, // in-range value honored
+		{"0", DefaultWarmOnWriteReservedFraction},   // 0 means "use default", not disable
+		{"NaN", DefaultWarmOnWriteReservedFraction}, // non-finite is malformed → default
+		{"-1", 0},  // negative disables the reservation
+		{"2.5", 1}, // above 1 clamps to 1
+	}
+	for _, tc := range cases {
+		t.Run(tc.env, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			t.Setenv("TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION", tc.env)
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.WarmOnWriteReservedFraction != tc.want {
+				t.Errorf("env=%s: WarmOnWriteReservedFraction = %v, want %v",
+					tc.env, cfg.Cache.WarmOnWriteReservedFraction, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoad_StorageTuningInvalidEnvIgnored(t *testing.T) {
 	content := `
 cache:
