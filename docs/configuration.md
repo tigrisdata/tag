@@ -17,6 +17,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_MAX_DISK_USAGE`        | Max disk usage in bytes (0 = unlimited)                                         | `0`                      |
 | `TAG_CACHE_EVICTION_POLICY`       | Eviction order when the disk cap is hit: `lru` or `fifo` (oldest-written first)  | `lru`                    |
 | `TAG_CACHE_WARM_ON_WRITE`         | Warm the cache after a successful write via a background fetch (`true`/`false`)  | `false`                  |
+| `TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION` | Fraction of the populate memory budget reserved (elastically) for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; negative disables) | `0.5` |
 | `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
 | `TAG_CACHE_CLUSTER_ADDR`          | Address for memberlist gossip                                                   | `:7000`                  |
 | `TAG_CACHE_GRPC_ADDR`             | Address for gRPC server                                                         | `:9000`                  |
@@ -144,6 +145,13 @@ cache:
   # returns 200); a private object is never exposed via the cache.
   # Override with TAG_CACHE_WARM_ON_WRITE env var
   warm_on_write: false
+  # Fraction of the populate memory budget reserved for warm-on-write populates so
+  # they aren't starved by the read-miss full-object warm flood. The reservation is
+  # elastic and demand-driven: read-miss warms use the whole budget when no
+  # warm-on-write is pending, and back off only by what pending warm-on-writes need
+  # (up to this fraction). Only applied when warm_on_write is true. 0/unset = default,
+  # negative disables. Override with TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION env var.
+  warm_on_write_reserved_fraction: 0.5
 
   # Unique node identifier for cluster mode
   # Required for multi-node deployments
@@ -319,6 +327,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |
 | `eviction_policy`       | string   | `lru`            | Eviction order when the disk cap is hit: `lru` or `fifo` (only applies when `max_disk_usage_bytes` > 0) |
 | `warm_on_write`         | bool     | `false`          | Warm the cache after a successful write via a background fetch (one extra upstream GET per write) |
+| `warm_on_write_reserved_fraction` | float | `0.5`     | Elastic share of the populate budget reserved for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; `0`/unset = default, negative = disabled) |
 | `node_id`               | string   | `""`             | Unique node identifier for cluster mode                                             |
 | `cluster_addr`          | string   | `:7000`          | Address for memberlist gossip                                                       |
 | `grpc_addr`             | string   | `:9000`          | Address for gRPC server                                                             |

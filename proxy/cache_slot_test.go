@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"testing"
 
 	"github.com/tigrisdata/tag/config"
@@ -12,18 +13,18 @@ import (
 func TestService_CacheSlotCountLimit(t *testing.T) {
 	s := &Service{cacheSemaphore: make(chan struct{}, 2)}
 
-	if !s.acquireCacheSlot(1) {
+	if !s.acquireCacheSlot(context.Background(), 1, priorityReadMiss) {
 		t.Fatal("1st acquire should succeed")
 	}
-	if !s.acquireCacheSlot(1) {
+	if !s.acquireCacheSlot(context.Background(), 1, priorityReadMiss) {
 		t.Fatal("2nd acquire should succeed")
 	}
-	if s.acquireCacheSlot(1) {
+	if s.acquireCacheSlot(context.Background(), 1, priorityReadMiss) {
 		t.Fatal("3rd acquire should fail when the count limit (2) is reached")
 	}
 
 	s.releaseCacheSlot(1)
-	if !s.acquireCacheSlot(1) {
+	if !s.acquireCacheSlot(context.Background(), 1, priorityReadMiss) {
 		t.Fatal("acquire after release should succeed")
 	}
 }
@@ -32,7 +33,7 @@ func TestService_CacheSlotCountLimit(t *testing.T) {
 func TestService_CacheSlotUnlimited(t *testing.T) {
 	s := &Service{} // nil cacheSemaphore and nil populateBudget
 	for range 100 {
-		if !s.acquireCacheSlot(1 << 30) {
+		if !s.acquireCacheSlot(context.Background(), 1<<30, priorityReadMiss) {
 			t.Fatal("nil limiters must always admit")
 		}
 	}
@@ -46,21 +47,21 @@ func TestService_CacheSlotByteBudget(t *testing.T) {
 	// Count effectively unlimited (large), budget = 100 bytes.
 	s := &Service{
 		cacheSemaphore: make(chan struct{}, 1000),
-		populateBudget: newByteBudget(100),
+		populateBudget: newByteBudget(100, 0),
 	}
 
-	if !s.acquireCacheSlot(60) {
+	if !s.acquireCacheSlot(context.Background(), 60, priorityReadMiss) {
 		t.Fatal("reserve 60/100 should succeed")
 	}
-	if !s.acquireCacheSlot(40) {
+	if !s.acquireCacheSlot(context.Background(), 40, priorityReadMiss) {
 		t.Fatal("reserve 40 more (100/100) should succeed")
 	}
-	if s.acquireCacheSlot(1) {
+	if s.acquireCacheSlot(context.Background(), 1, priorityReadMiss) {
 		t.Fatal("reserve beyond the byte budget should fail")
 	}
 	// A rejected acquire must not leak the count slot it briefly took.
 	s.releaseCacheSlot(40) // free 40 bytes
-	if !s.acquireCacheSlot(40) {
+	if !s.acquireCacheSlot(context.Background(), 40, priorityReadMiss) {
 		t.Fatal("acquire after releasing bytes should succeed")
 	}
 }
@@ -70,14 +71,14 @@ func TestService_CacheSlotByteBudget(t *testing.T) {
 func TestService_CacheSlotByteBudgetReleasesCountOnByteReject(t *testing.T) {
 	s := &Service{
 		cacheSemaphore: make(chan struct{}, 1),
-		populateBudget: newByteBudget(10),
+		populateBudget: newByteBudget(10, 0),
 	}
 	// Byte budget too small — acquire must fail and free the single count slot.
-	if s.acquireCacheSlot(1000) {
+	if s.acquireCacheSlot(context.Background(), 1000, priorityReadMiss) {
 		t.Fatal("acquire should fail when weight exceeds the byte budget")
 	}
 	// The count slot must be available again.
-	if !s.acquireCacheSlot(5) {
+	if !s.acquireCacheSlot(context.Background(), 5, priorityReadMiss) {
 		t.Fatal("count slot leaked after byte-budget rejection")
 	}
 }
@@ -126,7 +127,7 @@ func TestService_BackgroundReservationClampedToBudget(t *testing.T) {
 	const budget = 8 << 20 // 8MB budget, below the 80MB ceiling
 	s := &Service{
 		cacheSemaphore: make(chan struct{}, 256),
-		populateBudget: newByteBudget(budget),
+		populateBudget: newByteBudget(budget, 0),
 		perPopulateCap: 80 << 20,
 		config:         &config.Config{},
 	}
@@ -136,14 +137,14 @@ func TestService_BackgroundReservationClampedToBudget(t *testing.T) {
 	if w != budget {
 		t.Fatalf("populateWeight(-1) = %d, want %d (clamped to budget)", w, budget)
 	}
-	if !s.acquireCacheSlot(w) {
+	if !s.acquireCacheSlot(context.Background(), w, priorityReadMiss) {
 		t.Fatal("background populate should admit one-at-a-time when budget < ceiling")
 	}
-	if s.acquireCacheSlot(s.populateWeight(-1)) {
+	if s.acquireCacheSlot(context.Background(), s.populateWeight(-1), priorityReadMiss) {
 		t.Fatal("second concurrent background populate should be throttled by the full budget")
 	}
 	s.releaseCacheSlot(w)
-	if !s.acquireCacheSlot(s.populateWeight(-1)) {
+	if !s.acquireCacheSlot(context.Background(), s.populateWeight(-1), priorityReadMiss) {
 		t.Fatal("after release the next background populate should admit")
 	}
 }

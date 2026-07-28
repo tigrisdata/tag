@@ -97,6 +97,15 @@ const (
 	// fan-out — e.g. 256 large populates × ~80 MB ≈ 20 GB — so this budget, not the
 	// count, is what actually bounds populate memory.
 	DefaultCacheMaxPopulateMemoryBytes = 1 << 30
+
+	// DefaultWarmOnWriteReservedFraction is the default cap on the fraction of the
+	// cache-populate memory budget reserved for warm-on-write populates (when
+	// warm_on_write is enabled). The reservation is demand-driven and elastic:
+	// read-miss warms use the whole budget when no warm-on-write is pending, and
+	// back off only by what pending warm-on-writes actually need, up to this cap.
+	// This protects warm-on-write from being starved by the read-miss full-object
+	// warm flood for read-recently-written workloads (issue #100).
+	DefaultWarmOnWriteReservedFraction = 0.5
 )
 
 // Config holds all configuration for TAG.
@@ -206,6 +215,16 @@ type CacheConfig struct {
 	// best-effort background GET (deduplicated and shed under the populate budget).
 	// It costs one extra upstream GET per write, so it defaults to false.
 	WarmOnWrite bool `yaml:"warm_on_write"`
+	// WarmOnWriteReservedFraction caps the fraction of the populate memory budget
+	// that warm-on-write populates may reserve ahead of read-miss warms, so
+	// warm-on-write is never starved by the read-miss full-object warm flood. The
+	// reservation is demand-driven and elastic: read-miss warms use the whole
+	// budget when no warm-on-write is pending, and back off only by what pending
+	// warm-on-writes need (up to this cap). Only applied when WarmOnWrite is true.
+	// 0 or unset uses DefaultWarmOnWriteReservedFraction; a negative value disables
+	// the reservation (read-miss and warm-on-write compete equally). Clamped to
+	// [0, 1].
+	WarmOnWriteReservedFraction float64 `yaml:"warm_on_write_reserved_fraction"`
 }
 
 // IsEnabled returns whether caching is enabled.
@@ -347,6 +366,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cache.MaxPopulateMemoryBytes == 0 {
 		cfg.Cache.MaxPopulateMemoryBytes = DefaultCacheMaxPopulateMemoryBytes
 	}
+	if cfg.Cache.WarmOnWriteReservedFraction == 0 {
+		cfg.Cache.WarmOnWriteReservedFraction = DefaultWarmOnWriteReservedFraction
+	}
 
 	// Broadcast defaults
 	if cfg.Broadcast.ChunkSize == 0 {
@@ -461,6 +483,20 @@ func applyEnvOverrides(cfg *Config) {
 				cfg.Cache.WarmOnWrite = b
 			}
 		}
+		// Override the warm-on-write populate reservation fraction from environment.
+		if val := os.Getenv("TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION"); val != "" {
+			if f, err := strconv.ParseFloat(val, 64); err == nil {
+				cfg.Cache.WarmOnWriteReservedFraction = f
+			}
+		}
+	}
+	// Clamp the reservation fraction to [0, 1] (negative disables the reservation).
+	// Applied after defaults + env so both a stray config value and an env override
+	// land in range.
+	if cfg.Cache.WarmOnWriteReservedFraction < 0 {
+		cfg.Cache.WarmOnWriteReservedFraction = 0
+	} else if cfg.Cache.WarmOnWriteReservedFraction > 1 {
+		cfg.Cache.WarmOnWriteReservedFraction = 1
 	}
 
 	// Override log level from environment

@@ -272,6 +272,32 @@ enabled. The warm's own outcome (success / failure / shed) is recorded by the
 `tag_background_fetches_*` and `tag_cache_populate_skipped_total` metrics; this counts
 how often a write initiated one.
 
+#### tag_cache_populate_skipped_total
+
+**Type:** Counter
+
+Cache-populate operations skipped because the concurrent-cache-write limit
+(count or memory budget) was saturated — the object is still served from upstream,
+just not cached.
+
+| Label    | Description                                                                 |
+| -------- | --------------------------------------------------------------------------- |
+| `source` | `warm_on_write` (a write-triggered warm) or `read_miss` (a read-triggered warm) |
+
+For a read-recently-written workload with `warm_on_write` on, a healthy deployment
+shows `source="warm_on_write"` near zero while `source="read_miss"` absorbs the
+shedding — warm-on-write is protected from the read-miss warm flood by the reserved
+populate budget (`cache.warm_on_write_reserved_fraction`). Sum across sources for the
+total.
+
+```promql
+# Warm-on-write shed rate (should be ~0 when protected)
+rate(tag_cache_populate_skipped_total{source="warm_on_write"}[5m])
+
+# Total populate shed rate
+sum(rate(tag_cache_populate_skipped_total[5m]))
+```
+
 ### Revalidation Metrics
 
 #### tag_revalidations_triggered_total
