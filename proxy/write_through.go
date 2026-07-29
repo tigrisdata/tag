@@ -13,11 +13,6 @@ import (
 	"github.com/tigrisdata/tag/metrics"
 )
 
-// defaultObjectContentType approximates the Content-Type an origin GET returns for an
-// object uploaded without one, so a write-through cache hit doesn't diverge from a miss by
-// omitting the header entirely.
-const defaultObjectContentType = "application/octet-stream"
-
 // bodyTeeingForwarder is implemented by forwarders that can tee the decoded request body
 // while forwarding a single PutObject. Only the signing forwarder implements it: it decodes
 // AWS chunked encoding and thus sees the assembled object bytes. The transparent forwarder
@@ -117,89 +112,95 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 	return ts, err
 }
 
-// writeThroughCache populates the cache from a teed PutObject body, avoiding a read-back
-// GET. It returns true when the object was handed off to an async cache write, false when
-// it declined (over-cap body, missing ETag, or not cacheable) — in which case the caller
-// should fall back to warm-on-write. It always releases the reserved populate budget:
-// immediately on decline, or when the async write completes on success.
+// writeThroughCache populates the cache from a teed PutObject body without a full-object
+// read-back. It fetches AUTHORITATIVE object metadata with a HEAD (which returns exactly the
+// headers a GET would, minus the body), so the cached entry can never diverge from an origin
+// GET, then writes that meta with the bytes already teed.
 //
-// writeStartTime is stamped here (after the caller's post-forward invalidation) so this
-// write's own tombstone ordering matches warm-on-write: the object's own invalidations are
-// older and don't block it, while a later competing DELETE/overwrite does.
+// Returns true when the write was handed off to the async path (which caches the object or,
+// if the HEAD can't confirm it, falls back to a read-back warm), false when it declined
+// synchronously (over-cap body, missing ETag, or no usable credentials) so the caller warms.
+// The reserved populate budget is always released: synchronously on decline, or when the
+// async work completes.
 func (s *Service) writeThroughCache(bucket, key string, r *http.Request, ts *teeState) bool {
-	if ts.buf.overflowed {
-		// Client sent more than its declared length; caching a truncated body would be wrong.
-		s.releaseCacheSlot(ts.weight)
-		return false
-	}
-	etag := ts.respHeaders.Get("ETag")
-	if etag == "" {
-		// No version identity from upstream — bodies are ETag-addressed, so this isn't
-		// cacheable. Fall back to warm-on-write (which learns the ETag from a GET).
+	putETag := ts.respHeaders.Get("ETag")
+	if ts.buf.overflowed || putETag == "" {
+		// Over-declared body, or no version identity from upstream (bodies are ETag-addressed).
 		s.releaseCacheSlot(ts.weight)
 		return false
 	}
 
-	// Build the headers a GET of this object would return: object metadata (Content-Type,
-	// Content-Encoding, Cache-Control, x-amz-meta-*, ...) from the PUT request; ETag/version
-	// from the PUT response; Content-Length from the bytes actually teed. Several fields must
-	// be corrected so a cache-hit GET matches an origin GET rather than the raw write request.
-	h := r.Header.Clone()
-	h.Set("ETag", etag)
-	h.Set("Content-Length", strconv.FormatInt(int64(len(ts.buf.buf)), 10))
-
-	// version-id comes from the PUT response, not the request.
-	if v := ts.respHeaders.Get("x-amz-version-id"); v != "" {
-		h.Set("x-amz-version-id", v)
-	} else {
-		h.Del("x-amz-version-id")
+	// Credentials for the authoritative HEAD, read synchronously (r must not be used from the
+	// async goroutine — the server may recycle it after the handler returns).
+	_, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
+	if err != nil || accessKey == "" || secretKey == "" {
+		s.releaseCacheSlot(ts.weight)
+		return false
 	}
 
-	// The tee stores the DECODED body, so strip the aws-chunked transfer token (as the
-	// forwarded upstream request does); otherwise a cache hit would advertise a bogus
-	// Content-Encoding over un-chunked bytes.
-	stripAWSChunkedEncodingHeader(h)
+	body := ts.buf.buf
+	go func() {
+		defer s.releaseCacheSlot(ts.weight)
+		if s.cacheTeedBodyFromHead(bucket, key, putETag, body, accessKey, secretKey) {
+			return
+		}
+		// The HEAD couldn't confirm the version we teed (HEAD failed, object changed/removed,
+		// or size disagreement). Fall back to a read-back warm so the object is still cached
+		// correctly. Uses the credentials captured above — not r.
+		metrics.WarmOnWriteTriggered.Inc()
+		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite)
+	}()
+	return true
+}
 
-	// X-Amz-Acl is a write-only directive; an origin GET never echoes it. Drop it so cache
-	// hits don't emit a header the origin omits (and so the entry isn't marked public-read
-	// from a write directive — the tee is authenticated-only regardless).
-	h.Del("X-Amz-Acl")
+// cacheTeedBodyFromHead HEADs the object for authoritative metadata and, only if the object
+// is still the exact version we teed (ETag matches) and is cacheable, writes that meta with
+// the teed body. Returns false (so the caller can fall back to warm-on-write) when it can't
+// confirm/cache the object.
+//
+// writeStartTime is stamped just before the write (after the caller's post-forward
+// invalidation) so tombstone ordering matches warm-on-write: the object's own invalidations
+// are older and don't block it, while a later competing DELETE/overwrite does.
+func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte, accessKey, secretKey string) bool {
+	headCtx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+	defer cancel()
 
-	// A PUT request carries no Last-Modified. Approximate the object's modification time from
-	// the PUT response (Last-Modified if present, else Date, else now) so conditional GETs
-	// (If-Modified-Since) work and the header isn't absent where an origin GET returns it.
-	if lm := ts.respHeaders.Get("Last-Modified"); lm != "" {
-		h.Set("Last-Modified", lm)
-	} else if d := ts.respHeaders.Get("Date"); d != "" {
-		h.Set("Last-Modified", d)
-	} else {
-		h.Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+	// Empty etag/lastModified => a plain (non-conditional) HEAD.
+	resp, err := s.forwarder.DoConditionalHeadRequest(headCtx, bucket, key, accessKey, secretKey, "", 0)
+	if err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Write-through tee HEAD failed")
+		return false
+	}
+	if resp.Body != nil {
+		defer resp.Body.Close()
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false // object removed or unreadable
+	}
+	// Only cache if the object is still the exact version we teed. A concurrent overwrite
+	// returns a different ETag whose body is NOT what we hold; caching it would pair
+	// mismatched meta and body (the torn-pair hazard ETag-versioned bodies prevent).
+	if resp.Header.Get("ETag") != putETag {
+		return false
 	}
 
-	// When the client omits Content-Type, the origin applies a default on GET; mirror it so a
-	// cache hit doesn't return an empty Content-Type where a miss returns the default.
-	if h.Get("Content-Type") == "" {
-		h.Set("Content-Type", defaultObjectContentType)
-	}
-
-	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, h)
+	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
 	if !meta.IsCacheable(s.config.Cache.SizeThreshold) {
-		s.releaseCacheSlot(ts.weight)
+		return false
+	}
+	if meta.ContentLength != int64(len(body)) {
+		// HEAD's advertised length disagrees with the bytes we teed; don't cache a mismatch.
 		return false
 	}
 
 	writeStartTime := time.Now().UnixNano()
 	ttl := int(s.config.Cache.TTL.Seconds())
-	body := ts.buf.buf
-
-	go func() {
-		defer s.releaseCacheSlot(ts.weight)
-		cacheCtx, cancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
-		defer cancel()
-		if err := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, writeStartTime); err != nil {
-			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Write-through cache tee failed")
-		}
-	}()
+	cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
+	defer cacheCancel()
+	if err := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, writeStartTime); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Write-through cache tee write failed")
+		return false
+	}
 	metrics.CacheWriteThrough.Inc()
 	return true
 }

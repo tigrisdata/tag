@@ -3,9 +3,11 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,7 +16,8 @@ import (
 // teeMockForwarder is a mockForwarder that also implements bodyTeeingForwarder, so
 // HandlePutObject takes the write-through tee path. teeFunc simulates the signing
 // forwarder: it reads the request body into the tee (as decodeChunkedIfNeeded + TeeReader
-// would) and returns the upstream PUT status + response headers (with the ETag).
+// would) and returns the upstream PUT status + response headers (with the ETag). The
+// authoritative HEAD the tee then issues is served from the embedded mock's conditionalResp.
 type teeMockForwarder struct {
 	*mockForwarder
 	teeFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, error)
@@ -37,16 +40,30 @@ func teeUpstream(puts *atomic.Int32, etag string) func(context.Context, http.Res
 	}
 }
 
-// A single authenticated PutObject within the size threshold is cached by teeing the body
-// on the write path — no read-back warm GET — and the cached body/ETag match the write.
-func TestHandlePutObject_WriteThroughTee_CachesWithoutReadBack(t *testing.T) {
+// headResp builds the HEAD response the tee uses to source authoritative cache metadata.
+func headResp(etag, contentType string, contentLength int64) *http.Response {
+	h := http.Header{}
+	h.Set("ETag", etag)
+	if contentType != "" {
+		h.Set("Content-Type", contentType)
+	}
+	h.Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	h.Set("Last-Modified", "Wed, 21 Oct 2026 07:28:00 GMT")
+	return &http.Response{StatusCode: http.StatusOK, Header: h, Body: http.NoBody, ContentLength: contentLength}
+}
+
+// A single authenticated PutObject within the size threshold is cached by teeing the body,
+// with metadata sourced from an authoritative HEAD (not the read-back full-object GET). The
+// cached ETag/Content-Type/Content-Length/Last-Modified come from the HEAD, and the body
+// matches the write.
+func TestHandlePutObject_WriteThroughTee_CachesFromHead(t *testing.T) {
 	var puts, warmGets atomic.Int32
 	body := "write-through-tee-body-contents"
 
 	mock := &teeMockForwarder{
 		mockForwarder: &mockForwarder{
-			// If this fires, the tee fell back to a read-back warm — which we assert against.
-			doFullObjectFunc: warmObjectResponder(&warmGets, "warm-body"),
+			conditionalResp:  headResp(`"tee-etag"`, "text/plain", int64(len(body))),
+			doFullObjectFunc: warmObjectResponder(&warmGets, "warm-body"), // fires only on fallback
 		},
 		teeFunc: teeUpstream(&puts, `"tee-etag"`),
 	}
@@ -66,7 +83,7 @@ func TestHandlePutObject_WriteThroughTee_CachesWithoutReadBack(t *testing.T) {
 		t.Fatal("object was not cached via write-through tee")
 	}
 	if got := warmGets.Load(); got != 0 {
-		t.Errorf("read-back warm GETs = %d, want 0 (tee must avoid the read-back)", got)
+		t.Errorf("read-back warm GETs = %d, want 0 (tee sources meta from HEAD, no full read-back)", got)
 	}
 	if got := puts.Load(); got != 1 {
 		t.Errorf("upstream PUTs = %d, want 1", got)
@@ -79,8 +96,14 @@ func TestHandlePutObject_WriteThroughTee_CachesWithoutReadBack(t *testing.T) {
 	if meta.ETag != `"tee-etag"` {
 		t.Errorf("cached ETag = %q, want %q", meta.ETag, `"tee-etag"`)
 	}
+	if meta.ContentType != "text/plain" {
+		t.Errorf("cached Content-Type = %q, want text/plain (from HEAD)", meta.ContentType)
+	}
 	if meta.ContentLength != int64(len(body)) {
 		t.Errorf("cached ContentLength = %d, want %d", meta.ContentLength, len(body))
+	}
+	if meta.LastModified == 0 {
+		t.Error("cached LastModified = 0, want the HEAD's value")
 	}
 	var buf bytes.Buffer
 	if err := c.GetBodyStream(context.Background(), wowBucket, wowKey, meta.ETag, &buf); err != nil {
@@ -88,6 +111,70 @@ func TestHandlePutObject_WriteThroughTee_CachesWithoutReadBack(t *testing.T) {
 	}
 	if buf.String() != body {
 		t.Errorf("cached body = %q, want %q", buf.String(), body)
+	}
+}
+
+// If the HEAD reports a different ETag than the PUT (a concurrent overwrite landed between
+// our PUT and HEAD), the teed body is stale and must NOT be cached against that version; the
+// tee falls back to a read-back warm.
+func TestHandlePutObject_WriteThroughTee_ETagMismatchFallsBackToWarm(t *testing.T) {
+	var puts, warmGets atomic.Int32
+	body := "teed-body"
+
+	mock := &teeMockForwarder{
+		mockForwarder: &mockForwarder{
+			conditionalResp:  headResp(`"newer-etag"`, "text/plain", int64(len(body))), // != tee ETag
+			doFullObjectFunc: warmObjectResponder(&warmGets, "warm-body"),
+		},
+		teeFunc: teeUpstream(&puts, `"tee-etag"`),
+	}
+	svc, c := newTestService(mock, true)
+	svc.config.Cache.WarmOnWrite = true
+	svc.config.Cache.SizeThreshold = 1 << 20
+
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
+		t.Fatalf("HandlePutObject: %v", err)
+	}
+
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("object was not cached (expected the warm fallback to cache it)")
+	}
+	if got := warmGets.Load(); got != 1 {
+		t.Errorf("warm read-back GETs = %d, want 1 (ETag mismatch must fall back to warm)", got)
+	}
+	// Cached via the warm fallback (its ETag), not the stale teed version.
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if meta.ETag != `"warm-etag"` {
+		t.Errorf("cached ETag = %q, want %q (warm fallback, not the teed body)", meta.ETag, `"warm-etag"`)
+	}
+}
+
+// If the HEAD itself fails, the tee can't source authoritative metadata, so it falls back to
+// a read-back warm rather than caching with guessed headers.
+func TestHandlePutObject_WriteThroughTee_HeadFailureFallsBackToWarm(t *testing.T) {
+	var puts, warmGets atomic.Int32
+	mock := &teeMockForwarder{
+		mockForwarder: &mockForwarder{
+			conditionalErr:   errors.New("head failed"),
+			doFullObjectFunc: warmObjectResponder(&warmGets, "warm-body"),
+		},
+		teeFunc: teeUpstream(&puts, `"tee-etag"`),
+	}
+	svc, c := newTestService(mock, true)
+	svc.config.Cache.WarmOnWrite = true
+	svc.config.Cache.SizeThreshold = 1 << 20
+
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, "body")); err != nil {
+		t.Fatalf("HandlePutObject: %v", err)
+	}
+
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("object was not cached (expected the warm fallback after HEAD failure)")
+	}
+	if got := warmGets.Load(); got != 1 {
+		t.Errorf("warm read-back GETs = %d, want 1 (HEAD failure must fall back to warm)", got)
 	}
 }
 
@@ -116,49 +203,6 @@ func TestHandlePutObject_WriteThroughTee_DisabledWhenWarmOnWriteOff(t *testing.T
 	}
 	if got := puts.Load(); got != 0 {
 		t.Errorf("tee upstream PUTs = %d, want 0 (tee must not run when warm_on_write is off)", got)
-	}
-}
-
-// The tee synthesizes cache metadata that matches an origin GET rather than the raw PUT
-// request: aws-chunked is stripped from Content-Encoding (the decoded body is cached),
-// X-Amz-Acl is not cached/echoed, a missing Content-Type defaults, and Last-Modified is set.
-func TestHandlePutObject_WriteThroughTee_MetaMatchesOriginGet(t *testing.T) {
-	var puts atomic.Int32
-	mock := &teeMockForwarder{
-		mockForwarder: &mockForwarder{},
-		teeFunc:       teeUpstream(&puts, `"tee-etag"`),
-	}
-	svc, c := newTestService(mock, true)
-	svc.config.Cache.WarmOnWrite = true
-	svc.config.Cache.SizeThreshold = 1 << 20
-
-	r := authedPut(wowBucket, wowKey, "chunked-decoded-body")
-	r.Header.Set("Content-Encoding", "aws-chunked,gzip") // combined transfer token + real encoding
-	r.Header.Set("X-Amz-Acl", "public-read")             // write-only directive, not a GET header
-	// No Content-Type set → should default.
-
-	w := httptest.NewRecorder()
-	if err := svc.HandlePutObject(w, r); err != nil {
-		t.Fatalf("HandlePutObject: %v", err)
-	}
-	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
-		t.Fatal("object not cached via tee")
-	}
-	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
-	if meta.ContentEncoding != "gzip" {
-		t.Errorf("Content-Encoding = %q, want %q (aws-chunked stripped)", meta.ContentEncoding, "gzip")
-	}
-	if meta.ACL != "" {
-		t.Errorf("ACL = %q, want empty (X-Amz-Acl must not be cached)", meta.ACL)
-	}
-	if meta.ContentType != "application/octet-stream" {
-		t.Errorf("Content-Type = %q, want application/octet-stream (default)", meta.ContentType)
-	}
-	if meta.LastModified == 0 {
-		t.Error("LastModified = 0, want a populated timestamp")
-	}
-	if meta.IsPublicRead() {
-		t.Error("object marked public-read from a write directive")
 	}
 }
 

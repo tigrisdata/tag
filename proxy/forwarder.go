@@ -476,15 +476,7 @@ func prepareForwardedRequest(fwdReq *http.Request, contentLength int64, chunked 
 // AWS S3 allows combined values like "aws-chunked,gzip". After decoding the chunked
 // layer, we strip only the aws-chunked token and preserve any remaining encodings.
 func stripAWSChunkedEncoding(req *http.Request) {
-	stripAWSChunkedEncodingHeader(req.Header)
-}
-
-// stripAWSChunkedEncodingHeader removes the "aws-chunked" token from a header set's
-// Content-Encoding, preserving any other encodings (e.g. "aws-chunked,gzip" -> "gzip").
-// Used both on the forwarded upstream request and when synthesizing cache metadata for a
-// write-through tee (which stores the DECODED body, so aws-chunked must not be advertised).
-func stripAWSChunkedEncodingHeader(h http.Header) {
-	ce := h.Get("Content-Encoding")
+	ce := req.Header.Get("Content-Encoding")
 	if ce == "" {
 		return
 	}
@@ -497,9 +489,9 @@ func stripAWSChunkedEncodingHeader(h http.Header) {
 	}
 
 	if len(remaining) == 0 {
-		h.Del("Content-Encoding")
+		req.Header.Del("Content-Encoding")
 	} else {
-		h.Set("Content-Encoding", strings.Join(remaining, ","))
+		req.Header.Set("Content-Encoding", strings.Join(remaining, ","))
 	}
 }
 
