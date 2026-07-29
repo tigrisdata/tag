@@ -210,8 +210,16 @@ func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte
 	ttl := int(s.config.Cache.TTL.Seconds())
 	cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
 	defer cacheCancel()
-	if err := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, writeStartTime); err != nil {
+	wrote, err := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, writeStartTime)
+	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Write-through cache tee write failed")
+		return false
+	}
+	if !wrote {
+		// A newer tombstone (competing DELETE/overwrite) superseded our teed version, so
+		// nothing was cached. Report not-cached so the caller warms: warm's own writeStartTime
+		// is newer than that tombstone, so it will cache the CURRENT version (or no-op on a
+		// delete) rather than our stale body.
 		return false
 	}
 	metrics.CacheWriteThrough.Inc()

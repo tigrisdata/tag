@@ -190,17 +190,18 @@ func TestHandlePutObject_WriteThroughTee_HeadFailureFallsBackToWarm(t *testing.T
 
 // A competing overwrite/DELETE that lands during the HEAD window must not be resurrected:
 // writeStartTime is stamped BEFORE the HEAD, so a tombstone written during the HEAD is newer
-// and the tombstone-aware write skips. (With writeStartTime stamped after the HEAD, the stale
-// teed body would be cached.)
-func TestHandlePutObject_WriteThroughTee_TombstoneDuringHeadBlocksWrite(t *testing.T) {
-	var puts atomic.Int32
+// and the tombstone-aware write skips the stale teed body. Because it was skipped (not an
+// error and not a real write), the tee falls back to a warm that caches the CURRENT version.
+func TestHandlePutObject_WriteThroughTee_TombstoneDuringHeadFallsBackToWarm(t *testing.T) {
+	var puts, warmGets atomic.Int32
 	var svc *Service
 	body := "stale-teed-body"
 
 	mock := &teeMockForwarder{
 		mockForwarder: &mockForwarder{
 			conditionalResp: headResp(`"tee-etag"`, "text/plain", int64(len(body))),
-			// No doFullObjectFunc: the write is a tombstone-skip (not an error), so no warm fallback.
+			// The fallback warm fetches the current version (ETag "warm-etag").
+			doFullObjectFunc: warmObjectResponder(&warmGets, "current-body"),
 		},
 		teeFunc: teeUpstream(&puts, `"tee-etag"`),
 		// Simulate the competing write's invalidation landing in the HEAD window.
@@ -215,8 +216,16 @@ func TestHandlePutObject_WriteThroughTee_TombstoneDuringHeadBlocksWrite(t *testi
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
 		t.Fatalf("HandlePutObject: %v", err)
 	}
-	if metaCached(c, wowBucket, wowKey, 500*time.Millisecond) {
-		t.Error("stale teed body was cached despite a tombstone during the HEAD window")
+	// The stale teed body is tombstone-skipped; the fallback warm caches the current version.
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("expected the warm fallback to cache the current version after the tombstone skip")
+	}
+	if got := warmGets.Load(); got != 1 {
+		t.Errorf("warm fallback GETs = %d, want 1 (a tombstone-skip must fall back to warm, not count as a write-through)", got)
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if meta.ETag != `"warm-etag"` {
+		t.Errorf("cached ETag = %q, want the warm/current version, not the stale teed body %q", meta.ETag, `"tee-etag"`)
 	}
 }
 

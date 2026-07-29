@@ -211,7 +211,7 @@ func (s *Service) handleRevalidation200(
 	// Background goroutine: write to cache from pipe reader
 	cacheErrCh := make(chan error, 1)
 	go func() {
-		cacheErr := s.cache.PutWithMetaStreamTombstoneAware(
+		_, cacheErr := s.cache.PutWithMetaStreamTombstoneAware(
 			context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime,
 		)
 		if cacheErr != nil {

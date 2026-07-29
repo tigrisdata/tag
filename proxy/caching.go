@@ -212,7 +212,7 @@ func (s *Service) setupCacheListener(
 		// Start cache writer goroutine - will call Read() when ready
 		cacheErrCh := make(chan error, 1)
 		go func() {
-			cacheErr := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+			_, cacheErr := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
 			if cacheErr != nil {
 				log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")
 			}

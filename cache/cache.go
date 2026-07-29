@@ -150,6 +150,11 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 // the orphaned body is cleaned up. Checking after body stream (rather than
 // before) closes the TOCTOU window where an invalidation during streaming
 // could be missed, causing resurrected metadata without a body.
+//
+// Returns wrote=true only when the metadata was actually written (the entry is now
+// visible). It is false when the write was skipped without error — the object was not
+// cacheable (no ETag) or a newer tombstone superseded it — so callers can distinguish a
+// no-op from a real write (e.g. for metrics or a fallback).
 func (c *Cache) PutWithMetaStreamTombstoneAware(
 	ctx context.Context,
 	bucket, key string,
@@ -157,9 +162,9 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 	body io.Reader,
 	ttl int,
 	writeStartTime int64, // Unix nano timestamp when write started
-) error {
+) (wrote bool, err error) {
 	if !c.IsEnabled() {
-		return nil
+		return false, nil
 	}
 
 	// Objects without an ETag are not cached: they would share a single
@@ -170,7 +175,7 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 	// Drain the body first so the producer side of the pipe never blocks.
 	if meta.ETag == "" {
 		_, _ = io.Copy(io.Discard, body)
-		return nil
+		return false, nil
 	}
 
 	if ttl == 0 {
@@ -184,13 +189,13 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 	metaBytes, err := meta.Encode()
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta encode error")
-		return err
+		return false, err
 	}
 
 	// Stream body to cache
 	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
-		return err
+		return false, err
 	}
 
 	// Check tombstone AFTER body stream, right before meta write.
@@ -209,7 +214,7 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		// a reader streaming this exact body key, and deleting it would truncate
 		// that reader. Without a visible meta entry the orphaned body is unreachable
 		// and harmless until it expires.
-		return nil
+		return false, nil
 	}
 
 	// Write metadata AFTER body (makes entry visible)
@@ -217,7 +222,7 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
 		// Same rationale as the tombstone branch: leave the versioned body to TTL
 		// rather than risk truncating a concurrent same-version reader.
-		return err
+		return false, err
 	}
 
 	log.Debug().
@@ -226,7 +231,7 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		Int("ttl", ttl).
 		Int("meta_size", len(metaBytes)).
 		Msg("Cached object with metadata (streamed, tombstone-aware)")
-	return nil
+	return true, nil
 }
 
 // GetMeta retrieves only object metadata from cache (no body).
