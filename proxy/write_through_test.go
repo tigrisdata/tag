@@ -20,23 +20,33 @@ import (
 // authoritative HEAD the tee then issues is served from the embedded mock's conditionalResp.
 type teeMockForwarder struct {
 	*mockForwarder
-	teeFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, error)
+	teeFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, string, string, error)
+	// headHook, if set, runs when the tee issues its authoritative HEAD — used to simulate a
+	// competing write landing during the HEAD window.
+	headHook func()
 }
 
-func (m *teeMockForwarder) ForwardTeeingBody(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, error) {
+func (m *teeMockForwarder) ForwardTeeingBody(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, string, string, error) {
 	return m.teeFunc(ctx, w, r, tee)
 }
 
+func (m *teeMockForwarder) DoConditionalHeadRequest(ctx context.Context, bucket, key, accessKey, secretKey, etag string, lastModified int64) (*http.Response, error) {
+	if m.headHook != nil {
+		m.headHook()
+	}
+	return m.mockForwarder.DoConditionalHeadRequest(ctx, bucket, key, accessKey, secretKey, etag, lastModified)
+}
+
 // teeUpstream returns a teeFunc that tees the whole body, responds 200 with the given
-// ETag, and counts how many PUTs reached "upstream".
-func teeUpstream(puts *atomic.Int32, etag string) func(context.Context, http.ResponseWriter, *http.Request, io.Writer) (int, http.Header, error) {
-	return func(_ context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, error) {
+// ETag and validated credentials, and counts how many PUTs reached "upstream".
+func teeUpstream(puts *atomic.Int32, etag string) func(context.Context, http.ResponseWriter, *http.Request, io.Writer) (int, http.Header, string, string, error) {
+	return func(_ context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, string, string, error) {
 		_, _ = io.Copy(tee, r.Body) // tee the object bytes into the caller's buffer
 		puts.Add(1)
 		h := http.Header{}
 		h.Set("ETag", etag)
 		w.WriteHeader(http.StatusOK)
-		return http.StatusOK, h, nil
+		return http.StatusOK, h, "access", "secret", nil
 	}
 }
 
@@ -175,6 +185,38 @@ func TestHandlePutObject_WriteThroughTee_HeadFailureFallsBackToWarm(t *testing.T
 	}
 	if got := warmGets.Load(); got != 1 {
 		t.Errorf("warm read-back GETs = %d, want 1 (HEAD failure must fall back to warm)", got)
+	}
+}
+
+// A competing overwrite/DELETE that lands during the HEAD window must not be resurrected:
+// writeStartTime is stamped BEFORE the HEAD, so a tombstone written during the HEAD is newer
+// and the tombstone-aware write skips. (With writeStartTime stamped after the HEAD, the stale
+// teed body would be cached.)
+func TestHandlePutObject_WriteThroughTee_TombstoneDuringHeadBlocksWrite(t *testing.T) {
+	var puts atomic.Int32
+	var svc *Service
+	body := "stale-teed-body"
+
+	mock := &teeMockForwarder{
+		mockForwarder: &mockForwarder{
+			conditionalResp: headResp(`"tee-etag"`, "text/plain", int64(len(body))),
+			// No doFullObjectFunc: the write is a tombstone-skip (not an error), so no warm fallback.
+		},
+		teeFunc: teeUpstream(&puts, `"tee-etag"`),
+		// Simulate the competing write's invalidation landing in the HEAD window.
+		headHook: func() { svc.invalidateObject(context.Background(), wowBucket, wowKey) },
+	}
+	s, c := newTestService(mock, true)
+	svc = s
+	svc.config.Cache.WarmOnWrite = true
+	svc.config.Cache.SizeThreshold = 1 << 20
+
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
+		t.Fatalf("HandlePutObject: %v", err)
+	}
+	if metaCached(c, wowBucket, wowKey, 500*time.Millisecond) {
+		t.Error("stale teed body was cached despite a tombstone during the HEAD window")
 	}
 }
 

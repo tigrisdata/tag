@@ -69,17 +69,17 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 // warm-on-write. The `tee` writer must never return an error — that would truncate the
 // upstream stream via io.TeeReader — so callers pass a capped, non-erroring buffer and
 // check overflow out of band.
-func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, error) {
+func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, string, string, error) {
 	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
 	accessKey, err := f.validator.ValidateRequest(r)
 	if err != nil {
 		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
-		return 0, nil, mapAuthError(err)
+		return 0, nil, "", "", mapAuthError(err)
 	}
 	secretKey, err := f.credStore.GetSecretKey(accessKey)
 	if err != nil {
-		return 0, nil, mapAuthError(err)
+		return 0, nil, "", "", mapAuthError(err)
 	}
 
 	path := r.URL.Path
@@ -91,11 +91,13 @@ func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.Respons
 	teedBody := io.TeeReader(body, tee)
 	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, teedBody, bodyHash, accessKey, secretKey, r.Header)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, "", "", err
 	}
 	prepareForwardedRequest(fwdReq, contentLength, chunked)
 
-	return f.executeAndStreamReturningMeta(w, fwdReq, contentLength, nil)
+	// Return the validated credentials so the caller can HEAD/warm without re-validating.
+	status, headers, err := f.executeAndStreamReturningMeta(w, fwdReq, contentLength, nil)
+	return status, headers, accessKey, secretKey, err
 }
 
 // ForwardWithCapture forwards request and captures response for caching.

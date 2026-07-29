@@ -18,7 +18,10 @@ import (
 // AWS chunked encoding and thus sees the assembled object bytes. The transparent forwarder
 // preserves the client's opaque body + signature, so it can't tee cleanly.
 type bodyTeeingForwarder interface {
-	ForwardTeeingBody(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, error)
+	// ForwardTeeingBody forwards the PUT while teeing the decoded body into tee, and returns
+	// the upstream status + response headers plus the client credentials it already validated
+	// and derived (so the caller can HEAD/warm without re-validating the signature).
+	ForwardTeeingBody(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (statusCode int, respHeaders http.Header, accessKey, secretKey string, err error)
 }
 
 // cappedBuffer is an io.Writer that accumulates up to cap bytes, then silently discards the
@@ -55,6 +58,8 @@ type teeState struct {
 	respHeaders http.Header
 	statusCode  int
 	weight      int64
+	accessKey   string // client credentials validated by ForwardTeeingBody, reused for the HEAD/warm
+	secretKey   string
 }
 
 // teeObjectSize returns the decoded object size for a PutObject, preferring the AWS
@@ -106,9 +111,11 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 	// Preallocate to the exact known size to avoid repeated append reallocations on the
 	// write hot path.
 	ts := &teeState{buf: &cappedBuffer{buf: make([]byte, 0, int(size)), cap: int(size)}, weight: size}
-	status, headers, err := tf.ForwardTeeingBody(ctx, w, r, ts.buf)
+	status, headers, accessKey, secretKey, err := tf.ForwardTeeingBody(ctx, w, r, ts.buf)
 	ts.statusCode = status
 	ts.respHeaders = headers
+	ts.accessKey = accessKey
+	ts.secretKey = secretKey
 	return ts, err
 }
 
@@ -122,23 +129,20 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 // synchronously (over-cap body, missing ETag, or no usable credentials) so the caller warms.
 // The reserved populate budget is always released: synchronously on decline, or when the
 // async work completes.
-func (s *Service) writeThroughCache(bucket, key string, r *http.Request, ts *teeState) bool {
+func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 	putETag := ts.respHeaders.Get("ETag")
-	if ts.buf.overflowed || putETag == "" {
-		// Over-declared body, or no version identity from upstream (bodies are ETag-addressed).
-		s.releaseCacheSlot(ts.weight)
-		return false
-	}
-
-	// Credentials for the authoritative HEAD, read synchronously (r must not be used from the
-	// async goroutine — the server may recycle it after the handler returns).
-	_, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
-	if err != nil || accessKey == "" || secretKey == "" {
+	// Credentials were validated and derived by ForwardTeeingBody (no re-validation here). The
+	// async goroutine uses only these captured values — never r, which the server may recycle
+	// after the handler returns.
+	if ts.buf.overflowed || putETag == "" || ts.accessKey == "" || ts.secretKey == "" {
+		// Over-declared body, no version identity from upstream (bodies are ETag-addressed),
+		// or no usable credentials.
 		s.releaseCacheSlot(ts.weight)
 		return false
 	}
 
 	body := ts.buf.buf
+	accessKey, secretKey := ts.accessKey, ts.secretKey
 	go func() {
 		defer s.releaseCacheSlot(ts.weight)
 		if s.cacheTeedBodyFromHead(bucket, key, putETag, body, accessKey, secretKey) {
@@ -146,7 +150,7 @@ func (s *Service) writeThroughCache(bucket, key string, r *http.Request, ts *tee
 		}
 		// The HEAD couldn't confirm the version we teed (HEAD failed, object changed/removed,
 		// or size disagreement). Fall back to a read-back warm so the object is still cached
-		// correctly. Uses the credentials captured above — not r.
+		// correctly.
 		metrics.WarmOnWriteTriggered.Inc()
 		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite)
 	}()
@@ -157,11 +161,15 @@ func (s *Service) writeThroughCache(bucket, key string, r *http.Request, ts *tee
 // is still the exact version we teed (ETag matches) and is cacheable, writes that meta with
 // the teed body. Returns false (so the caller can fall back to warm-on-write) when it can't
 // confirm/cache the object.
-//
-// writeStartTime is stamped just before the write (after the caller's post-forward
-// invalidation) so tombstone ordering matches warm-on-write: the object's own invalidations
-// are older and don't block it, while a later competing DELETE/overwrite does.
 func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte, accessKey, secretKey string) bool {
+	// Stamp the tombstone reference BEFORE the HEAD (mirroring warm-on-write, which stamps
+	// before its fetch), so the whole HEAD-to-write window is guarded: a competing overwrite
+	// whose invalidation lands after this point is newer than writeStartTime and skips our
+	// write, while one that landed earlier is caught by the ETag-consistency check below. It
+	// is still newer than this PUT's own post-forward invalidation (stamped before this
+	// goroutine ran), so our own invalidation doesn't block us.
+	writeStartTime := time.Now().UnixNano()
+
 	headCtx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 	defer cancel()
 
@@ -193,7 +201,6 @@ func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte
 		return false
 	}
 
-	writeStartTime := time.Now().UnixNano()
 	ttl := int(s.config.Cache.TTL.Seconds())
 	cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
 	defer cacheCancel()

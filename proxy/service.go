@@ -418,7 +418,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 		cached := false
 		if teed != nil {
 			// writeThroughCache takes ownership of the reserved populate budget.
-			cached = s.writeThroughCache(bucket, key, r, teed)
+			cached = s.writeThroughCache(bucket, key, teed)
 			teed = nil
 		}
 		if !cached {
