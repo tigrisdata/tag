@@ -160,11 +160,13 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 		}
 		// The HEAD couldn't confirm the version we teed (HEAD failed, object changed/removed, size
 		// disagreement, or a competing write superseded it). Fall back to a read-back warm to cache
-		// the current object. Admit it NON-BLOCKING (priorityReadMiss): we still hold the tee's
-		// reservation, so a blocking warm could stall on our own slot, and its streaming buffers
-		// must fit the budget alongside ours — if not, shed and let a read-miss cache it later.
+		// the current object, with the same protected (blocking) admission as the normal
+		// warm-on-write path — so budget pressure doesn't shed it and leave a cold-read window.
+		// Holding the tee reservation across this doesn't stall the warm: triggerBackgroundCacheFetch
+		// only SPAWNS the fetch and returns, so this goroutine returns and its deferred release frees
+		// the slot, which the warm's (separate) blocking acquire then observes.
 		metrics.WarmOnWriteTriggered.Inc()
-		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityReadMiss)
+		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite)
 	}()
 	return true
 }
