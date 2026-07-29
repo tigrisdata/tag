@@ -188,6 +188,42 @@ func TestHandlePutObject_WriteThroughTee_HeadFailureFallsBackToWarm(t *testing.T
 	}
 }
 
+// When the authoritative HEAD shows the object is not cacheable (Cache-Control: no-store),
+// the tee must NOT fall back to a read-back warm — a warm would only re-download the full
+// body to reject it again, defeating the bandwidth win.
+func TestHandlePutObject_WriteThroughTee_NotCacheableSkipsWarm(t *testing.T) {
+	var puts, warmGets atomic.Int32
+	body := "no-store-body"
+
+	head := headResp(`"tee-etag"`, "text/plain", int64(len(body)))
+	head.Header.Set("Cache-Control", "no-store")
+
+	mock := &teeMockForwarder{
+		mockForwarder: &mockForwarder{
+			conditionalResp:  head,
+			doFullObjectFunc: warmObjectResponder(&warmGets, "warm-body"), // must NOT fire
+		},
+		teeFunc: teeUpstream(&puts, `"tee-etag"`),
+	}
+	svc, c := newTestService(mock, true)
+	svc.config.Cache.WarmOnWrite = true
+	svc.config.Cache.SizeThreshold = 1 << 20
+
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
+		t.Fatalf("HandlePutObject: %v", err)
+	}
+	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
+		t.Error("no-store object was cached")
+	}
+	if got := warmGets.Load(); got != 0 {
+		t.Errorf("read-back warm GETs = %d, want 0 (HEAD said not cacheable — warm would only re-download and re-reject)", got)
+	}
+	if got := puts.Load(); got != 1 {
+		t.Errorf("tee upstream PUTs = %d, want 1", got)
+	}
+}
+
 // A competing overwrite/DELETE that lands during the HEAD window must not be resurrected:
 // writeStartTime is stamped BEFORE the HEAD, so a tombstone written during the HEAD is newer
 // and the tombstone-aware write skips the stale teed body. Because it was skipped (not an

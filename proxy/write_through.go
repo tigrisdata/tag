@@ -145,29 +145,42 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 	accessKey, secretKey := ts.accessKey, ts.secretKey
 	weight := ts.weight
 	go func() {
-		cached := s.cacheTeedBodyFromHead(bucket, key, putETag, body, accessKey, secretKey)
+		outcome := s.cacheTeedBodyFromHead(bucket, key, putETag, body, accessKey, secretKey)
 		// Release the tee's populate reservation (and the buffer it accounts for, now consumed
 		// by the write) BEFORE any fallback warm acquires its own slot — never hold both, or a
 		// saturated / single-slot budget couldn't admit the warm and the object would be left
 		// uncached.
 		s.releaseCacheSlot(weight)
-		if cached {
+		if outcome != teeFallbackWarm {
+			// teeCached: already cached. teeNotCacheable: the authoritative HEAD says the object
+			// isn't cacheable (Cache-Control no-store/private, or over threshold), so a warm would
+			// only re-download the full body to reject it again — skip it.
 			return
 		}
-		// The HEAD couldn't confirm the version we teed (HEAD failed, object changed/removed,
-		// or size disagreement). Fall back to a read-back warm so the object is still cached
-		// correctly.
+		// The HEAD couldn't confirm the version we teed (HEAD failed, object changed/removed, size
+		// disagreement, or a competing write superseded it). Fall back to a read-back warm to
+		// cache the current object correctly.
 		metrics.WarmOnWriteTriggered.Inc()
 		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite)
 	}()
 	return true
 }
 
+// teeOutcome is the result of a HEAD-verified write-through cache attempt.
+type teeOutcome int
+
+const (
+	teeCached       teeOutcome = iota // meta+body written; no fallback needed
+	teeNotCacheable                   // HEAD authoritatively says not cacheable; a warm would only re-download and re-reject
+	teeFallbackWarm                   // couldn't confirm/write the version; a read-back warm may still cache the current object
+)
+
 // cacheTeedBodyFromHead HEADs the object for authoritative metadata and, only if the object
 // is still the exact version we teed (ETag matches) and is cacheable, writes that meta with
-// the teed body. Returns false (so the caller can fall back to warm-on-write) when it can't
-// confirm/cache the object.
-func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte, accessKey, secretKey string) bool {
+// the teed body. It returns teeCached on a successful write, teeNotCacheable when the HEAD
+// authoritatively shows the object should not be cached (so warming is pointless), and
+// teeFallbackWarm when it couldn't confirm/write the version (so a read-back warm may help).
+func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte, accessKey, secretKey string) teeOutcome {
 	// Stamp the tombstone reference BEFORE the HEAD (mirroring warm-on-write, which stamps
 	// before its fetch), so the whole HEAD-to-write window is guarded: a competing overwrite
 	// whose invalidation lands after this point is newer than writeStartTime and skips our
@@ -183,28 +196,32 @@ func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte
 	resp, err := s.forwarder.DoConditionalHeadRequest(headCtx, bucket, key, accessKey, secretKey, "", 0)
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Write-through tee HEAD failed")
-		return false
+		return teeFallbackWarm
 	}
 	if resp.Body != nil {
 		defer resp.Body.Close()
 	}
 	if resp.StatusCode != http.StatusOK {
-		return false // object removed or unreadable
+		return teeFallbackWarm // object removed/unreadable now; a warm may still fetch it
 	}
 	// Only cache if the object is still the exact version we teed. A concurrent overwrite
 	// returns a different ETag whose body is NOT what we hold; caching it would pair
 	// mismatched meta and body (the torn-pair hazard ETag-versioned bodies prevent).
 	if resp.Header.Get("ETag") != putETag {
-		return false
+		return teeFallbackWarm // superseded by a concurrent overwrite; warm caches the current version
 	}
 
 	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
 	if !meta.IsCacheable(s.config.Cache.SizeThreshold) {
-		return false
+		// The authoritative HEAD says this object must not be cached (Cache-Control no-store/
+		// private, or over threshold). A warm would only re-download the full body to reject it
+		// again, so don't fall back.
+		return teeNotCacheable
 	}
 	if meta.ContentLength != int64(len(body)) {
-		// HEAD's advertised length disagrees with the bytes we teed; don't cache a mismatch.
-		return false
+		// HEAD's advertised length disagrees with the bytes we teed; let a warm fetch the
+		// authoritative body instead of caching a mismatch.
+		return teeFallbackWarm
 	}
 
 	ttl := int(s.config.Cache.TTL.Seconds())
@@ -213,15 +230,14 @@ func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte
 	wrote, err := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, writeStartTime)
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Write-through cache tee write failed")
-		return false
+		return teeFallbackWarm
 	}
 	if !wrote {
 		// A newer tombstone (competing DELETE/overwrite) superseded our teed version, so
-		// nothing was cached. Report not-cached so the caller warms: warm's own writeStartTime
-		// is newer than that tombstone, so it will cache the CURRENT version (or no-op on a
-		// delete) rather than our stale body.
-		return false
+		// nothing was cached. Warm instead: its own writeStartTime is newer than that tombstone,
+		// so it caches the CURRENT version (or no-ops on a delete) rather than our stale body.
+		return teeFallbackWarm
 	}
 	metrics.CacheWriteThrough.Inc()
-	return true
+	return teeCached
 }
