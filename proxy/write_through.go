@@ -143,9 +143,15 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 
 	body := ts.buf.buf
 	accessKey, secretKey := ts.accessKey, ts.secretKey
+	weight := ts.weight
 	go func() {
-		defer s.releaseCacheSlot(ts.weight)
-		if s.cacheTeedBodyFromHead(bucket, key, putETag, body, accessKey, secretKey) {
+		cached := s.cacheTeedBodyFromHead(bucket, key, putETag, body, accessKey, secretKey)
+		// Release the tee's populate reservation (and the buffer it accounts for, now consumed
+		// by the write) BEFORE any fallback warm acquires its own slot — never hold both, or a
+		// saturated / single-slot budget couldn't admit the warm and the object would be left
+		// uncached.
+		s.releaseCacheSlot(weight)
+		if cached {
 			return
 		}
 		// The HEAD couldn't confirm the version we teed (HEAD failed, object changed/removed,
