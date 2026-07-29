@@ -145,12 +145,13 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 	accessKey, secretKey := ts.accessKey, ts.secretKey
 	weight := ts.weight
 	go func() {
+		// Hold the tee's populate reservation for the whole goroutine: it accounts for the
+		// object-sized teed body, which stays live until this returns. Releasing it early
+		// (before a fallback allocates) would let the body coexist unaccounted with the
+		// fallback's buffers and push live populate memory past the budget.
+		defer s.releaseCacheSlot(weight)
+
 		outcome := s.cacheTeedBodyFromHead(bucket, key, putETag, body, accessKey, secretKey)
-		// Release the tee's populate reservation (and the buffer it accounts for, now consumed
-		// by the write) BEFORE any fallback warm acquires its own slot — never hold both, or a
-		// saturated / single-slot budget couldn't admit the warm and the object would be left
-		// uncached.
-		s.releaseCacheSlot(weight)
 		if outcome != teeFallbackWarm {
 			// teeCached: already cached. teeNotCacheable: the authoritative HEAD says the object
 			// isn't cacheable (Cache-Control no-store/private, or over threshold), so a warm would
@@ -158,10 +159,12 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 			return
 		}
 		// The HEAD couldn't confirm the version we teed (HEAD failed, object changed/removed, size
-		// disagreement, or a competing write superseded it). Fall back to a read-back warm to
-		// cache the current object correctly.
+		// disagreement, or a competing write superseded it). Fall back to a read-back warm to cache
+		// the current object. Admit it NON-BLOCKING (priorityReadMiss): we still hold the tee's
+		// reservation, so a blocking warm could stall on our own slot, and its streaming buffers
+		// must fit the budget alongside ours — if not, shed and let a read-miss cache it later.
 		metrics.WarmOnWriteTriggered.Inc()
-		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite)
+		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityReadMiss)
 	}()
 	return true
 }
