@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"io"
 	"net/http"
 
 	"github.com/rs/zerolog/log"
@@ -54,6 +55,47 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 	prepareForwardedRequest(fwdReq, contentLength, chunked)
 
 	return f.executeAndStream(w, fwdReq, contentLength, nil)
+}
+
+// ForwardTeeingBody forwards a single PutObject while teeing the decoded request body
+// into `tee`, so the caller can populate the cache from the bytes TAG already has in hand
+// (a write-through tee) instead of a read-back warm-on-write GET. Returns the upstream
+// status code and a clone of the response headers (for the ETag) so the caller can build
+// cache metadata for the just-written object.
+//
+// Only the signing forwarder implements this: it decodes any AWS chunked encoding, so it
+// sees the assembled object bytes. The transparent forwarder preserves the client's opaque
+// (possibly chunked) body and signature, so it can't tee cleanly and falls back to
+// warm-on-write. The `tee` writer must never return an error — that would truncate the
+// upstream stream via io.TeeReader — so callers pass a capped, non-erroring buffer and
+// check overflow out of band.
+func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, error) {
+	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
+
+	accessKey, err := f.validator.ValidateRequest(r)
+	if err != nil {
+		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
+		return 0, nil, mapAuthError(err)
+	}
+	secretKey, err := f.credStore.GetSecretKey(accessKey)
+	if err != nil {
+		return 0, nil, mapAuthError(err)
+	}
+
+	path := r.URL.Path
+	if r.URL.RawQuery != "" {
+		path = path + "?" + r.URL.RawQuery
+	}
+
+	// Tee the decoded body into the caller's buffer as it is streamed upstream.
+	teedBody := io.TeeReader(body, tee)
+	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, teedBody, bodyHash, accessKey, secretKey, r.Header)
+	if err != nil {
+		return 0, nil, err
+	}
+	prepareForwardedRequest(fwdReq, contentLength, chunked)
+
+	return f.executeAndStreamReturningMeta(w, fwdReq, contentLength, nil)
 }
 
 // ForwardWithCapture forwards request and captures response for caching.

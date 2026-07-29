@@ -272,6 +272,22 @@ enabled. The warm's own outcome (success / failure / shed) is recorded by the
 `tag_background_fetches_*` and `tag_cache_populate_skipped_total` metrics; this counts
 how often a write initiated one.
 
+#### tag_cache_write_through_total
+
+**Type:** Counter
+
+Number of objects cached by teeing the `PutObject` body on the write path
+(write-through), avoiding a read-back warm-on-write GET. Applies to authenticated single
+PUTs within `cache.size_threshold` in signing mode. Compare with
+`tag_warm_on_write_triggered_total` (the read-back fallback used for multipart completions,
+`CopyObject`, over-threshold or anonymous writes, and when the populate budget is saturated).
+
+```promql
+# Share of write-triggered cache populates served by the write-through tee (no read-back)
+rate(tag_cache_write_through_total[5m]) /
+(rate(tag_cache_write_through_total[5m]) + rate(tag_warm_on_write_triggered_total[5m]))
+```
+
 #### tag_cache_populate_skipped_total
 
 **Type:** Counter

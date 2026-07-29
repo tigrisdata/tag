@@ -236,6 +236,16 @@ var (
 		},
 	)
 
+	// CacheWriteThrough counts objects populated into the cache by teeing the PUT body
+	// on the write path (write-through), avoiding a read-back warm-on-write GET. Compare
+	// with tag_warm_on_write_triggered_total, which counts the read-back fallback.
+	CacheWriteThrough = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_cache_write_through_total",
+			Help: "Number of objects cached by teeing the PUT body (write-through, no read-back)",
+		},
+	)
+
 	// LocalAuthValidations counts local auth validation attempts and results.
 	LocalAuthValidations = promauto.NewCounterVec(
 		prometheus.CounterOpts{
