@@ -91,6 +91,77 @@ func TestHandlePutObject_WriteThroughTee_CachesWithoutReadBack(t *testing.T) {
 	}
 }
 
+// With warm-on-write disabled (the default), an eligible PUT must NOT be cached by the
+// tee — the tee is an optimization of warm-on-write and must respect the flag.
+func TestHandlePutObject_WriteThroughTee_DisabledWhenWarmOnWriteOff(t *testing.T) {
+	var puts atomic.Int32
+	mock := &teeMockForwarder{
+		mockForwarder: &mockForwarder{
+			forwardFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
+				w.WriteHeader(http.StatusOK)
+				return nil
+			},
+		},
+		teeFunc: teeUpstream(&puts, `"tee-etag"`),
+	}
+	svc, c := newTestService(mock, true) // WarmOnWrite defaults to false
+	svc.config.Cache.SizeThreshold = 1 << 20
+
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, "body")); err != nil {
+		t.Fatalf("HandlePutObject: %v", err)
+	}
+	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
+		t.Error("object was cached by the tee despite warm_on_write=false")
+	}
+	if got := puts.Load(); got != 0 {
+		t.Errorf("tee upstream PUTs = %d, want 0 (tee must not run when warm_on_write is off)", got)
+	}
+}
+
+// The tee synthesizes cache metadata that matches an origin GET rather than the raw PUT
+// request: aws-chunked is stripped from Content-Encoding (the decoded body is cached),
+// X-Amz-Acl is not cached/echoed, a missing Content-Type defaults, and Last-Modified is set.
+func TestHandlePutObject_WriteThroughTee_MetaMatchesOriginGet(t *testing.T) {
+	var puts atomic.Int32
+	mock := &teeMockForwarder{
+		mockForwarder: &mockForwarder{},
+		teeFunc:       teeUpstream(&puts, `"tee-etag"`),
+	}
+	svc, c := newTestService(mock, true)
+	svc.config.Cache.WarmOnWrite = true
+	svc.config.Cache.SizeThreshold = 1 << 20
+
+	r := authedPut(wowBucket, wowKey, "chunked-decoded-body")
+	r.Header.Set("Content-Encoding", "aws-chunked,gzip") // combined transfer token + real encoding
+	r.Header.Set("X-Amz-Acl", "public-read")             // write-only directive, not a GET header
+	// No Content-Type set → should default.
+
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, r); err != nil {
+		t.Fatalf("HandlePutObject: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("object not cached via tee")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if meta.ContentEncoding != "gzip" {
+		t.Errorf("Content-Encoding = %q, want %q (aws-chunked stripped)", meta.ContentEncoding, "gzip")
+	}
+	if meta.ACL != "" {
+		t.Errorf("ACL = %q, want empty (X-Amz-Acl must not be cached)", meta.ACL)
+	}
+	if meta.ContentType != "application/octet-stream" {
+		t.Errorf("Content-Type = %q, want application/octet-stream (default)", meta.ContentType)
+	}
+	if meta.LastModified == 0 {
+		t.Error("LastModified = 0, want a populated timestamp")
+	}
+	if meta.IsPublicRead() {
+		t.Error("object marked public-read from a write directive")
+	}
+}
+
 // An object larger than the cache size threshold is not eligible for the tee; it falls
 // back to warm-on-write (the read-back path).
 func TestHandlePutObject_WriteThroughTee_FallsBackAboveSizeThreshold(t *testing.T) {

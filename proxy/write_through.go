@@ -13,6 +13,11 @@ import (
 	"github.com/tigrisdata/tag/metrics"
 )
 
+// defaultObjectContentType approximates the Content-Type an origin GET returns for an
+// object uploaded without one, so a write-through cache hit doesn't diverge from a miss by
+// omitting the header entirely.
+const defaultObjectContentType = "application/octet-stream"
+
 // bodyTeeingForwarder is implemented by forwarders that can tee the decoded request body
 // while forwarding a single PutObject. Only the signing forwarder implements it: it decodes
 // AWS chunked encoding and thus sees the assembled object bytes. The transparent forwarder
@@ -79,6 +84,10 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 	tf, ok := s.forwarder.(bodyTeeingForwarder)
 	size := teeObjectSize(r)
 	eligible := ok &&
+		// The tee is an optimization of warm-on-write (cache-on-write), so it must respect
+		// the same flag: when warm-on-write is disabled (the default), a successful PUT must
+		// not populate the cache at all.
+		s.config.Cache.WarmOnWrite &&
 		s.cache.IsEnabled() &&
 		s.populateBudget != nil &&
 		// Anonymous writes fall back to warm-on-write, whose unsigned probe learns whether
@@ -99,7 +108,9 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 		return nil, s.forwarder.Forward(ctx, w, r)
 	}
 
-	ts := &teeState{buf: &cappedBuffer{cap: int(size)}, weight: size}
+	// Preallocate to the exact known size to avoid repeated append reallocations on the
+	// write hot path.
+	ts := &teeState{buf: &cappedBuffer{buf: make([]byte, 0, int(size)), cap: int(size)}, weight: size}
 	status, headers, err := tf.ForwardTeeingBody(ctx, w, r, ts.buf)
 	ts.statusCode = status
 	ts.respHeaders = headers
@@ -130,16 +141,46 @@ func (s *Service) writeThroughCache(bucket, key string, r *http.Request, ts *tee
 	}
 
 	// Build the headers a GET of this object would return: object metadata (Content-Type,
-	// Content-Encoding, x-amz-meta-*, ...) from the PUT request; ETag/version from the PUT
-	// response; Content-Length from the bytes actually teed.
+	// Content-Encoding, Cache-Control, x-amz-meta-*, ...) from the PUT request; ETag/version
+	// from the PUT response; Content-Length from the bytes actually teed. Several fields must
+	// be corrected so a cache-hit GET matches an origin GET rather than the raw write request.
 	h := r.Header.Clone()
 	h.Set("ETag", etag)
+	h.Set("Content-Length", strconv.FormatInt(int64(len(ts.buf.buf)), 10))
+
+	// version-id comes from the PUT response, not the request.
 	if v := ts.respHeaders.Get("x-amz-version-id"); v != "" {
 		h.Set("x-amz-version-id", v)
 	} else {
 		h.Del("x-amz-version-id")
 	}
-	h.Set("Content-Length", strconv.FormatInt(int64(len(ts.buf.buf)), 10))
+
+	// The tee stores the DECODED body, so strip the aws-chunked transfer token (as the
+	// forwarded upstream request does); otherwise a cache hit would advertise a bogus
+	// Content-Encoding over un-chunked bytes.
+	stripAWSChunkedEncodingHeader(h)
+
+	// X-Amz-Acl is a write-only directive; an origin GET never echoes it. Drop it so cache
+	// hits don't emit a header the origin omits (and so the entry isn't marked public-read
+	// from a write directive — the tee is authenticated-only regardless).
+	h.Del("X-Amz-Acl")
+
+	// A PUT request carries no Last-Modified. Approximate the object's modification time from
+	// the PUT response (Last-Modified if present, else Date, else now) so conditional GETs
+	// (If-Modified-Since) work and the header isn't absent where an origin GET returns it.
+	if lm := ts.respHeaders.Get("Last-Modified"); lm != "" {
+		h.Set("Last-Modified", lm)
+	} else if d := ts.respHeaders.Get("Date"); d != "" {
+		h.Set("Last-Modified", d)
+	} else {
+		h.Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+	}
+
+	// When the client omits Content-Type, the origin applies a default on GET; mirror it so a
+	// cache hit doesn't return an empty Content-Type where a miss returns the default.
+	if h.Get("Content-Type") == "" {
+		h.Set("Content-Type", defaultObjectContentType)
+	}
 
 	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, h)
 	if !meta.IsCacheable(s.config.Cache.SizeThreshold) {
