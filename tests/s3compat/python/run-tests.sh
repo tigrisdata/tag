@@ -95,21 +95,46 @@ EOF
 # BucketNotEmpty on any transient object-delete/list hiccup or list lag. Tigris supports
 # deleting a non-empty bucket via the Tigris-Force-Delete header, collapsing teardown to a
 # single op. TAG signs and forwards tigris-* headers upstream, so the header reaches Tigris.
-# This mirrors the Go SDK suite (tests/s3compat/sdk/testutil.go). Written unconditionally so
+# This mirrors the Go SDK suite (tests/s3compat/sdk/testutil.go).
+#
+# The header is applied ONLY during fixture setup/teardown (bucket cleanup), never during a
+# test body: tests like test_bucket_delete_nonempty assert that deleting a non-empty bucket
+# is rejected, which must keep its natural (non-force) semantics. Written unconditionally so
 # it is present even when the cloned s3-tests/ dir is cached from a previous run.
 cat <<'EOF' >conftest.py
 import boto3
+import pytest
+
+# Toggled True only while a test's setup/teardown fixtures run (where nuke_prefixed_buckets
+# lives), False during the test body — so in-test DeleteBucket calls keep normal semantics.
+_force = {"on": False}
 
 
-def _tigris_force_delete(request, **kwargs):
+def _maybe_force_delete(request, **kwargs):
     # before-sign fires before SigV4, so the header is part of the client-signed request.
-    request.headers["Tigris-Force-Delete"] = "true"
+    if _force["on"]:
+        request.headers["Tigris-Force-Delete"] = "true"
 
 
 # ceph's get_client() builds clients from the default session; register there so every
-# client the tests create inherits the hook.
+# client the tests create inherits the hook. The hook reads _force at request time, so
+# toggling the flag works regardless of when each client was constructed.
 boto3.setup_default_session()
-boto3.DEFAULT_SESSION.events.register("before-sign.s3.DeleteBucket", _tigris_force_delete)
+boto3.DEFAULT_SESSION.events.register("before-sign.s3.DeleteBucket", _maybe_force_delete)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_setup(item):
+    _force["on"] = True  # ceph clears pre-existing buckets during setup
+    yield
+    _force["on"] = False
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    _force["on"] = True  # nuke_prefixed_buckets runs here
+    yield
+    _force["on"] = False
 EOF
 
 # If specific test path is provided as argument, run that
