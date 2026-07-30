@@ -97,44 +97,36 @@ EOF
 # single op. TAG signs and forwards tigris-* headers upstream, so the header reaches Tigris.
 # This mirrors the Go SDK suite (tests/s3compat/sdk/testutil.go).
 #
-# The header is applied ONLY during fixture setup/teardown (bucket cleanup), never during a
+# The header is scoped to ceph's nuke_bucket cleanup function (see conftest below), never a
 # test body: tests like test_bucket_delete_nonempty assert that deleting a non-empty bucket
 # is rejected, which must keep its natural (non-force) semantics. Written unconditionally so
 # it is present even when the cloned s3-tests/ dir is cached from a previous run.
 cat <<'EOF' >conftest.py
-import boto3
-import pytest
-
-# Toggled True only while a test's setup/teardown fixtures run (where nuke_prefixed_buckets
-# lives), False during the test body — so in-test DeleteBucket calls keep normal semantics.
-_force = {"on": False}
-
-
-def _maybe_force_delete(request, **kwargs):
+def _add_force_delete_header(request, **kwargs):
     # before-sign fires before SigV4, so the header is part of the client-signed request.
-    if _force["on"]:
-        request.headers["Tigris-Force-Delete"] = "true"
+    request.headers["Tigris-Force-Delete"] = "true"
 
 
-# ceph's get_client() builds clients from the default session; register there so every
-# client the tests create inherits the hook. The hook reads _force at request time, so
-# toggling the flag works regardless of when each client was constructed.
-boto3.setup_default_session()
-boto3.DEFAULT_SESSION.events.register("before-sign.s3.DeleteBucket", _maybe_force_delete)
+def pytest_configure(config):
+    # Scope Tigris-Force-Delete to ceph's bucket-cleanup path only. nuke_bucket is the sole
+    # function that deletes a bucket during setup/teardown, and nuke_prefixed_buckets calls it
+    # as a same-module global, so patching the attribute is picked up. Test bodies call
+    # client.delete_bucket directly (never nuke_bucket), so a test like test_bucket_delete_
+    # nonempty — which asserts a non-empty-bucket delete is rejected — keeps natural semantics.
+    # The header is registered on the cleanup client only for the duration of each nuke_bucket
+    # call, then unregistered, so it can never leak into a test body.
+    import s3tests.functional as sf
 
+    orig_nuke_bucket = sf.nuke_bucket
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_setup(item):
-    _force["on"] = True  # ceph clears pre-existing buckets during setup
-    yield
-    _force["on"] = False
+    def _nuke_bucket_force(client, bucket):
+        client.meta.events.register("before-sign.s3.DeleteBucket", _add_force_delete_header)
+        try:
+            return orig_nuke_bucket(client, bucket)
+        finally:
+            client.meta.events.unregister("before-sign.s3.DeleteBucket", _add_force_delete_header)
 
-
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_teardown(item, nextitem):
-    _force["on"] = True  # nuke_prefixed_buckets runs here
-    yield
-    _force["on"] = False
+    sf.nuke_bucket = _nuke_bucket_force
 EOF
 
 # If specific test path is provided as argument, run that
