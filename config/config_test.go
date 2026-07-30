@@ -502,7 +502,7 @@ func TestLoad_WriteThroughMaxSizeDefaultOverrideAndClamp(t *testing.T) {
 		{"default", "cache:\n  enabled: true\n", "", DefaultCacheWriteThroughMaxSize},
 		{"env override honored", "cache:\n  enabled: true\n", "8388608", 8388608}, // 8 MiB
 		{"negative disables the tee", "cache:\n  enabled: true\n", "-1", -1},
-		// WT default (16 MiB) exceeds a 1 MiB size_threshold, so it clamps down: a tee'd
+		// WT default (25 MiB) exceeds a 1 MiB size_threshold, so it clamps down: a tee'd
 		// object must be cacheable.
 		{"clamped to size_threshold", "cache:\n  enabled: true\n  size_threshold: 1048576\n", "", 1048576},
 	}

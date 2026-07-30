@@ -39,9 +39,12 @@ const (
 	DefaultCacheSizeThreshold = 1024 * 1024 * 1024
 
 	// DefaultCacheWriteThroughMaxSize caps the object size eligible for the write-through
-	// tee (16 MiB). It is far smaller than DefaultCacheSizeThreshold because the tee buffers
+	// tee (25 MiB). It is far smaller than DefaultCacheSizeThreshold because the tee buffers
 	// the whole object in memory while forwarding the PUT, whereas the read/warm paths stream.
-	DefaultCacheWriteThroughMaxSize = 16 * 1024 * 1024
+	// 25 MiB matches the common S3 client single-PUT/multipart cutover (e.g. Parseable's
+	// P_MULTIPART_MIN_SIZE), so every single PutObject is tee-eligible and only multipart
+	// uploads (which the tee doesn't handle) fall back to warm-on-write.
+	DefaultCacheWriteThroughMaxSize = 25 * 1024 * 1024
 
 	// DefaultCacheDiskPath is the default disk path for embedded cache storage.
 	DefaultCacheDiskPath = "/var/cache/tag"
