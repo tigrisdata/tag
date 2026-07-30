@@ -90,6 +90,28 @@ commands = pytest {posargs}
 addopts = -W ignore::DeprecationWarning
 EOF
 
+# Drop a conftest.py so the ceph teardown (nuke_prefixed_buckets) force-deletes buckets.
+# The stock teardown does list-objects -> delete-each -> delete-bucket, which trips
+# BucketNotEmpty on any transient object-delete/list hiccup or list lag. Tigris supports
+# deleting a non-empty bucket via the Tigris-Force-Delete header, collapsing teardown to a
+# single op. TAG signs and forwards tigris-* headers upstream, so the header reaches Tigris.
+# This mirrors the Go SDK suite (tests/s3compat/sdk/testutil.go). Written unconditionally so
+# it is present even when the cloned s3-tests/ dir is cached from a previous run.
+cat <<'EOF' >conftest.py
+import boto3
+
+
+def _tigris_force_delete(request, **kwargs):
+    # before-sign fires before SigV4, so the header is part of the client-signed request.
+    request.headers["Tigris-Force-Delete"] = "true"
+
+
+# ceph's get_client() builds clients from the default session; register there so every
+# client the tests create inherits the hook.
+boto3.setup_default_session()
+boto3.DEFAULT_SESSION.events.register("before-sign.s3.DeleteBucket", _tigris_force_delete)
+EOF
+
 # If specific test path is provided as argument, run that
 if [ $# -ge 1 ]; then
     tox -- "s3tests/functional/$1"
