@@ -80,6 +80,7 @@ func TestHandlePutObject_WriteThroughTee_CachesFromHead(t *testing.T) {
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
 	svc.config.Cache.SizeThreshold = 1 << 20
+	svc.config.Cache.WriteThroughMaxSize = 1 << 20
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
@@ -141,6 +142,7 @@ func TestHandlePutObject_WriteThroughTee_ETagMismatchFallsBackToWarm(t *testing.
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
 	svc.config.Cache.SizeThreshold = 1 << 20
+	svc.config.Cache.WriteThroughMaxSize = 1 << 20
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
@@ -174,6 +176,7 @@ func TestHandlePutObject_WriteThroughTee_HeadFailureFallsBackToWarm(t *testing.T
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
 	svc.config.Cache.SizeThreshold = 1 << 20
+	svc.config.Cache.WriteThroughMaxSize = 1 << 20
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, "body")); err != nil {
@@ -208,6 +211,7 @@ func TestHandlePutObject_WriteThroughTee_NotCacheableSkipsWarm(t *testing.T) {
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
 	svc.config.Cache.SizeThreshold = 1 << 20
+	svc.config.Cache.WriteThroughMaxSize = 1 << 20
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
@@ -247,6 +251,7 @@ func TestHandlePutObject_WriteThroughTee_TombstoneDuringHeadFallsBackToWarm(t *t
 	svc = s
 	svc.config.Cache.WarmOnWrite = true
 	svc.config.Cache.SizeThreshold = 1 << 20
+	svc.config.Cache.WriteThroughMaxSize = 1 << 20
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
@@ -280,6 +285,7 @@ func TestHandlePutObject_WriteThroughTee_DisabledWhenWarmOnWriteOff(t *testing.T
 	}
 	svc, c := newTestService(mock, true) // WarmOnWrite defaults to false
 	svc.config.Cache.SizeThreshold = 1 << 20
+	svc.config.Cache.WriteThroughMaxSize = 1 << 20
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, "body")); err != nil {
@@ -293,11 +299,11 @@ func TestHandlePutObject_WriteThroughTee_DisabledWhenWarmOnWriteOff(t *testing.T
 	}
 }
 
-// An object larger than the cache size threshold is not eligible for the tee; it falls
-// back to warm-on-write (the read-back path).
-func TestHandlePutObject_WriteThroughTee_FallsBackAboveSizeThreshold(t *testing.T) {
+// An object larger than WriteThroughMaxSize is not eligible for the tee (it would have to
+// be buffered); it falls back to the streaming warm-on-write read-back instead.
+func TestHandlePutObject_WriteThroughTee_FallsBackAboveWriteThroughMaxSize(t *testing.T) {
 	var puts, warmGets atomic.Int32
-	body := "this-body-exceeds-the-tiny-threshold"
+	body := "this-body-exceeds-the-tiny-write-through-cap"
 
 	mock := &teeMockForwarder{
 		mockForwarder: &mockForwarder{
@@ -311,9 +317,10 @@ func TestHandlePutObject_WriteThroughTee_FallsBackAboveSizeThreshold(t *testing.
 	}
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
-	// Threshold sits between the PUT body (36 bytes) and the warm object (9 bytes): the tee
-	// is skipped (body too big) but the read-back warm still caches the smaller fetched object.
-	svc.config.Cache.SizeThreshold = 20
+	// WriteThroughMaxSize sits below the PUT body: the tee is skipped (too big to buffer),
+	// but the object is still cacheable (SizeThreshold large) so the warm read-back caches it.
+	svc.config.Cache.SizeThreshold = 1 << 20
+	svc.config.Cache.WriteThroughMaxSize = 8
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
@@ -321,12 +328,12 @@ func TestHandlePutObject_WriteThroughTee_FallsBackAboveSizeThreshold(t *testing.
 	}
 
 	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
-		t.Fatal("object was not warmed after an above-threshold PUT")
+		t.Fatal("object was not warmed after an above-cap PUT")
 	}
 	if got := warmGets.Load(); got != 1 {
-		t.Errorf("read-back warm GETs = %d, want 1 (above threshold must fall back to warm)", got)
+		t.Errorf("read-back warm GETs = %d, want 1 (above write-through cap must fall back to warm)", got)
 	}
 	if got := puts.Load(); got != 0 {
-		t.Errorf("tee upstream PUTs = %d, want 0 (tee must not run above threshold)", got)
+		t.Errorf("tee upstream PUTs = %d, want 0 (tee must not run above the write-through cap)", got)
 	}
 }

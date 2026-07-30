@@ -94,7 +94,10 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 		// the object is public-read before caching it; the tee can't make that inference.
 		!hasNoAuthCredentials(r) &&
 		size > 0 &&
-		size <= s.config.Cache.SizeThreshold
+		// The tee buffers the whole object in memory, so it uses WriteThroughMaxSize (a small
+		// cap), not SizeThreshold. Larger-but-cacheable objects fall back to streaming
+		// warm-on-write. IsCacheable(SizeThreshold) still applies to the meta after the HEAD.
+		size <= s.config.Cache.WriteThroughMaxSize
 
 	if !eligible {
 		return nil, s.forwarder.Forward(ctx, w, r)
@@ -199,7 +202,7 @@ func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte
 
 	// Empty etag/lastModified => a plain (non-conditional) HEAD.
 	resp, err := s.forwarder.DoConditionalHeadRequest(headCtx, bucket, key, accessKey, secretKey, "", 0)
-	if err != nil {
+	if err != nil || resp == nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Write-through tee HEAD failed")
 		return teeFallbackWarm
 	}

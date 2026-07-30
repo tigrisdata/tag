@@ -38,6 +38,11 @@ const (
 	// DefaultCacheSizeThreshold is the max object size to cache (1GB).
 	DefaultCacheSizeThreshold = 1024 * 1024 * 1024
 
+	// DefaultCacheWriteThroughMaxSize caps the object size eligible for the write-through
+	// tee (16 MiB). It is far smaller than DefaultCacheSizeThreshold because the tee buffers
+	// the whole object in memory while forwarding the PUT, whereas the read/warm paths stream.
+	DefaultCacheWriteThroughMaxSize = 16 * 1024 * 1024
+
 	// DefaultCacheDiskPath is the default disk path for embedded cache storage.
 	DefaultCacheDiskPath = "/var/cache/tag"
 
@@ -216,6 +221,16 @@ type CacheConfig struct {
 	// best-effort background GET (deduplicated and shed under the populate budget).
 	// It costs one extra upstream GET per write, so it defaults to false.
 	WarmOnWrite bool `yaml:"warm_on_write"`
+	// WriteThroughMaxSize caps the object size eligible for the write-through tee — the
+	// optimization that caches an authenticated single PutObject by teeing its body while
+	// forwarding (metadata sourced from a HEAD), avoiding the warm-on-write read-back GET.
+	// The tee BUFFERS the whole object in memory, so this is deliberately much smaller than
+	// SizeThreshold (which only decides whether an object is cacheable at all, on the
+	// streaming read/warm paths). Larger-but-cacheable objects fall back to the streaming
+	// warm-on-write read-back instead of being buffered. Only applied when WarmOnWrite is
+	// true. 0 or unset uses DefaultCacheWriteThroughMaxSize; a negative value disables the
+	// tee (all writes warm). Clamped to SizeThreshold, since a tee'd object must be cacheable.
+	WriteThroughMaxSize int64 `yaml:"write_through_max_size"`
 	// WarmOnWriteReservedFraction caps the fraction of the populate memory budget
 	// that warm-on-write populates may reserve ahead of read-miss warms, so
 	// warm-on-write is never starved by the read-miss full-object warm flood. The
@@ -340,6 +355,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Cache.SizeThreshold == 0 {
 		cfg.Cache.SizeThreshold = DefaultCacheSizeThreshold
+	}
+	if cfg.Cache.WriteThroughMaxSize == 0 {
+		cfg.Cache.WriteThroughMaxSize = DefaultCacheWriteThroughMaxSize
 	}
 	if cfg.Cache.DiskPath == "" {
 		cfg.Cache.DiskPath = DefaultCacheDiskPath
@@ -483,6 +501,18 @@ func applyEnvOverrides(cfg *Config) {
 			if b, err := strconv.ParseBool(val); err == nil {
 				cfg.Cache.WarmOnWrite = b
 			}
+		}
+		// Override the write-through tee size cap from environment (negative disables the tee;
+		// 0/unset keeps the default set in applyDefaults).
+		if val := os.Getenv("TAG_CACHE_WRITE_THROUGH_MAX_SIZE"); val != "" {
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n != 0 {
+				cfg.Cache.WriteThroughMaxSize = n
+			}
+		}
+		// A tee'd object must be cacheable, so the tee cap can never exceed SizeThreshold.
+		// (A negative cap — the tee disabled — is left as-is.)
+		if cfg.Cache.WriteThroughMaxSize > cfg.Cache.SizeThreshold {
+			cfg.Cache.WriteThroughMaxSize = cfg.Cache.SizeThreshold
 		}
 		// Override the warm-on-write populate reservation fraction from environment.
 		// f != 0 mirrors the sibling budget overrides: an env "0" means "use the
