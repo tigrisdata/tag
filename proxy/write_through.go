@@ -89,7 +89,10 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 		// not populate the cache at all.
 		s.config.Cache.WarmOnWrite &&
 		s.cache.IsEnabled() &&
-		s.populateBudget != nil &&
+		// Not gated on a configured populate budget: acquireCacheSlot/releaseCacheSlot treat a
+		// nil budget as unlimited (count-semaphore only), exactly as warm-on-write does, so the
+		// tee must stay available when the byte budget is explicitly disabled — otherwise every
+		// eligible PUT silently regresses to the read-back warm.
 		// Anonymous writes fall back to warm-on-write, whose unsigned probe learns whether
 		// the object is public-read before caching it; the tee can't make that inference.
 		!hasNoAuthCredentials(r) &&

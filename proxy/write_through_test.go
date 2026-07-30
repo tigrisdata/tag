@@ -125,6 +125,45 @@ func TestHandlePutObject_WriteThroughTee_CachesFromHead(t *testing.T) {
 	}
 }
 
+// A negative max_populate_memory_bytes disables the byte budget (svc.populateBudget == nil).
+// The tee must still run in that supported config — acquireCacheSlot treats a nil budget as
+// unlimited (count-semaphore only), just like warm-on-write — instead of silently regressing
+// every eligible PUT to a read-back warm.
+func TestHandlePutObject_WriteThroughTee_CachesWithNilPopulateBudget(t *testing.T) {
+	var puts, warmGets atomic.Int32
+	body := "tee-body-without-populate-budget"
+
+	mock := &teeMockForwarder{
+		mockForwarder: &mockForwarder{
+			conditionalResp:  headResp(`"tee-etag"`, "text/plain", int64(len(body))),
+			doFullObjectFunc: warmObjectResponder(&warmGets, "warm-body"), // fires only on fallback
+		},
+		teeFunc: teeUpstream(&puts, `"tee-etag"`),
+	}
+	svc, c := newTestService(mock, true)
+	svc.config.Cache.WarmOnWrite = true
+	svc.config.Cache.SizeThreshold = 1 << 20
+	svc.config.Cache.WriteThroughMaxSize = 1 << 20
+	svc.populateBudget = nil // byte budget explicitly disabled (max_populate_memory_bytes < 0)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
+		t.Fatalf("HandlePutObject: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("client status = %d, want 200", w.Code)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("object was not cached via write-through tee with a nil populate budget")
+	}
+	if got := warmGets.Load(); got != 0 {
+		t.Errorf("read-back warm GETs = %d, want 0 (tee must run without a byte budget)", got)
+	}
+	if got := puts.Load(); got != 1 {
+		t.Errorf("upstream PUTs = %d, want 1", got)
+	}
+}
+
 // If the HEAD reports a different ETag than the PUT (a concurrent overwrite landed between
 // our PUT and HEAD), the teed body is stale and must NOT be cached against that version; the
 // tee falls back to a read-back warm.
