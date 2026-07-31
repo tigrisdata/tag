@@ -97,10 +97,12 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 		// the object is public-read before caching it; the tee can't make that inference.
 		!hasNoAuthCredentials(r) &&
 		size > 0 &&
-		// The tee buffers the whole object in memory, so it uses WriteThroughMaxSize (a small
-		// cap), not SizeThreshold. Larger-but-cacheable objects fall back to streaming
-		// warm-on-write. IsCacheable(SizeThreshold) still applies to the meta after the HEAD.
-		size <= s.config.Cache.WriteThroughMaxSize
+		// The tee is the whole-object write path, which applies only below the block-mode
+		// boundary: objects at or above BlockCacheMinSize are cached at block granularity on
+		// read instead (RFC 0001), so the tee (and warm-on-write) is a no-op for them. This
+		// also bounds the tee's in-memory buffer to < BlockCacheMinSize. IsCacheable(
+		// SizeThreshold) still applies to the meta after the HEAD.
+		size < s.config.Cache.BlockCacheMinSize
 
 	if !eligible {
 		return nil, s.forwarder.Forward(ctx, w, r)

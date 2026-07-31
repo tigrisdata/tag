@@ -492,18 +492,17 @@ func TestLoad_WarmOnWriteReservedFractionOverrideAndClamp(t *testing.T) {
 	}
 }
 
-func TestLoad_WriteThroughMaxSizeDefaultOverrideAndClamp(t *testing.T) {
+func TestLoad_BlockCacheMinSizeDefaultOverrideAndClamp(t *testing.T) {
 	cases := []struct {
 		name string
 		yaml string
 		env  string
 		want int64
 	}{
-		{"default", "cache:\n  enabled: true\n", "", DefaultCacheWriteThroughMaxSize},
+		{"default", "cache:\n  enabled: true\n", "", DefaultCacheBlockCacheMinSize},
 		{"env override honored", "cache:\n  enabled: true\n", "8388608", 8388608}, // 8 MiB
-		{"negative disables the tee", "cache:\n  enabled: true\n", "-1", -1},
-		// WT default (25 MiB) exceeds a 1 MiB size_threshold, so it clamps down: a tee'd
-		// object must be cacheable.
+		// The default (25 MiB) exceeds a 1 MiB size_threshold, so it clamps down: a
+		// whole-object-cached object must be cacheable.
 		{"clamped to size_threshold", "cache:\n  enabled: true\n  size_threshold: 1048576\n", "", 1048576},
 	}
 	for _, tc := range cases {
@@ -513,14 +512,44 @@ func TestLoad_WriteThroughMaxSizeDefaultOverrideAndClamp(t *testing.T) {
 				t.Fatalf("Failed to create temp file: %v", err)
 			}
 			if tc.env != "" {
-				t.Setenv("TAG_CACHE_WRITE_THROUGH_MAX_SIZE", tc.env)
+				t.Setenv("TAG_CACHE_BLOCK_CACHE_MIN_SIZE", tc.env)
 			}
 			cfg, err := Load(tmpFile)
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
 			}
-			if cfg.Cache.WriteThroughMaxSize != tc.want {
-				t.Errorf("WriteThroughMaxSize = %d, want %d", cfg.Cache.WriteThroughMaxSize, tc.want)
+			if cfg.Cache.BlockCacheMinSize != tc.want {
+				t.Errorf("BlockCacheMinSize = %d, want %d", cfg.Cache.BlockCacheMinSize, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_BlockSizeDefaultAndOverride(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		want int64
+	}{
+		{"default", "", DefaultCacheBlockSize},
+		{"env override honored", "1048576", 1048576}, // 1 MiB
+		{"non-positive ignored", "-1", DefaultCacheBlockSize},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			if tc.env != "" {
+				t.Setenv("TAG_CACHE_BLOCK_SIZE", tc.env)
+			}
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.BlockSize != tc.want {
+				t.Errorf("BlockSize = %d, want %d", cfg.Cache.BlockSize, tc.want)
 			}
 		})
 	}

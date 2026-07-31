@@ -18,7 +18,9 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_EVICTION_POLICY`       | Eviction order when the disk cap is hit: `lru` or `fifo` (oldest-written first)  | `lru`                    |
 | `TAG_CACHE_WARM_ON_WRITE`         | Warm the cache after a successful write via a background fetch (`true`/`false`)  | `false`                  |
 | `TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION` | Fraction of the populate memory budget reserved (elastically) for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; negative disables) | `0.5` |
-| `TAG_CACHE_WRITE_THROUGH_MAX_SIZE` | Max object size (bytes) cached via the write-through tee, which buffers the body in memory (only when `warm_on_write` is on; larger objects fall back to the streaming warm read-back; negative disables the tee; clamped to `size_threshold`) | `26214400` (25 MiB) |
+| `TAG_CACHE_BLOCK_CACHING_ENABLED`  | Enable block-aligned caching for large objects (RFC 0001): objects at/above `block_cache_min_size` are cached at `block_size` granularity on read (`true`/`false`) | `false`                  |
+| `TAG_CACHE_BLOCK_CACHE_MIN_SIZE`   | Whole-object vs block-mode boundary (bytes). Objects smaller use whole-object write-path caching (tee + warm-on-write); objects this size or larger are block-cached on read (write path is a no-op). Clamped to `size_threshold` | `26214400` (25 MiB) |
+| `TAG_CACHE_BLOCK_SIZE`             | Block granularity (bytes) for block-mode objects; must stay below ocache's 64 MB compaction threshold | `4194304` (4 MiB)        |
 | `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
 | `TAG_CACHE_CLUSTER_ADDR`          | Address for memberlist gossip                                                   | `:7000`                  |
 | `TAG_CACHE_GRPC_ADDR`             | Address for gRPC server                                                         | `:9000`                  |
@@ -154,13 +156,23 @@ cache:
   # negative disables. Override with TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION env var.
   warm_on_write_reserved_fraction: 0.5
 
-  # Max object size cached via the write-through tee. The tee buffers the whole object
-  # in memory while forwarding the PUT, so this is far smaller than size_threshold (which
-  # only decides overall cacheability on the streaming paths). Larger-but-cacheable objects
-  # fall back to the streaming warm-on-write read-back. Only applied when warm_on_write is
-  # true. 0/unset = default, negative disables the tee, clamped to size_threshold. Override
-  # with TAG_CACHE_WRITE_THROUGH_MAX_SIZE env var.
-  write_through_max_size: 26214400
+  # Block-aligned caching for large objects (RFC 0001). When enabled, objects at or above
+  # block_cache_min_size are cached at block_size granularity on read, so a range read
+  # populates and serves only the blocks it touches. Off by default (opt-in rollout).
+  block_caching_enabled: false
+
+  # Whole-object vs block-mode boundary. Objects SMALLER than this use whole-object
+  # write-path caching (the write-through tee and warm-on-write, which buffer/stream the
+  # whole body); objects this size or LARGER are block-cached on read and their write path
+  # is a no-op. Replaces the former write_through_max_size (same 25 MiB default, so the
+  # tee's whole-object cap is unchanged). 0/unset = default, clamped to size_threshold.
+  # Override with TAG_CACHE_BLOCK_CACHE_MIN_SIZE env var.
+  block_cache_min_size: 26214400
+
+  # Block granularity for block-mode objects. Must stay below ocache's 64 MB compaction
+  # threshold so blocks pack into shared segments. 0/unset = default. Override with
+  # TAG_CACHE_BLOCK_SIZE env var.
+  block_size: 4194304
 
   # Unique node identifier for cluster mode
   # Required for multi-node deployments
@@ -332,7 +344,9 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `enabled`               | bool     | `true`           | Enable caching                                                                      |
 | `ttl`                   | duration | `24h`            | Default TTL for cached objects                                                      |
 | `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
-| `write_through_max_size` | int64   | `26214400`       | Max object size cached via the write-through tee (buffers in memory; negative disables; clamped to `size_threshold`) |
+| `block_caching_enabled` | bool     | `false`          | Enable block-aligned caching for large objects (RFC 0001)                           |
+| `block_cache_min_size`  | int64    | `26214400`       | Whole-object vs block-mode boundary; objects smaller use whole-object write-path caching (tee + warm-on-write), objects this size or larger are block-cached on read (clamped to `size_threshold`) |
+| `block_size`            | int64    | `4194304`        | Block granularity for block-mode objects (must stay below ocache's 64 MB compaction threshold) |
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |
 | `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |
 | `eviction_policy`       | string   | `lru`            | Eviction order when the disk cap is hit: `lru` or `fifo` (only applies when `max_disk_usage_bytes` > 0) |

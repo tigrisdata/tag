@@ -38,13 +38,19 @@ const (
 	// DefaultCacheSizeThreshold is the max object size to cache (1GB).
 	DefaultCacheSizeThreshold = 1024 * 1024 * 1024
 
-	// DefaultCacheWriteThroughMaxSize caps the object size eligible for the write-through
-	// tee (25 MiB). It is far smaller than DefaultCacheSizeThreshold because the tee buffers
-	// the whole object in memory while forwarding the PUT, whereas the read/warm paths stream.
-	// 25 MiB matches the common S3 client single-PUT/multipart cutover (e.g. Parseable's
-	// P_MULTIPART_MIN_SIZE), so every single PutObject is tee-eligible and only multipart
-	// uploads (which the tee doesn't handle) fall back to warm-on-write.
-	DefaultCacheWriteThroughMaxSize = 25 * 1024 * 1024
+	// DefaultCacheBlockCacheMinSize (25 MiB) is the single whole-object vs block-mode
+	// boundary. Objects SMALLER than this use whole-object write-path caching (the
+	// write-through tee and warm-on-write, which buffer/stream the whole body); objects
+	// this size or LARGER are cached at block granularity on read (see RFC 0001), and the
+	// write path is a no-op for them. 25 MiB matches the common S3 client single-PUT/
+	// multipart cutover (e.g. Parseable's P_MULTIPART_MIN_SIZE): single PutObjects stay
+	// whole-object, multipart uploads become block-cached.
+	DefaultCacheBlockCacheMinSize = 25 * 1024 * 1024
+
+	// DefaultCacheBlockSize (4 MiB) is the granularity at which block-mode objects are
+	// cached. It must stay below ocache's 64 MB CompactThreshold so blocks pack into
+	// shared segments rather than each becoming a standalone file (see RFC 0001).
+	DefaultCacheBlockSize = 4 * 1024 * 1024
 
 	// DefaultCacheDiskPath is the default disk path for embedded cache storage.
 	DefaultCacheDiskPath = "/var/cache/tag"
@@ -224,16 +230,23 @@ type CacheConfig struct {
 	// best-effort background GET (deduplicated and shed under the populate budget).
 	// It costs one extra upstream GET per write, so it defaults to false.
 	WarmOnWrite bool `yaml:"warm_on_write"`
-	// WriteThroughMaxSize caps the object size eligible for the write-through tee — the
-	// optimization that caches an authenticated single PutObject by teeing its body while
-	// forwarding (metadata sourced from a HEAD), avoiding the warm-on-write read-back GET.
-	// The tee BUFFERS the whole object in memory, so this is deliberately much smaller than
-	// SizeThreshold (which only decides whether an object is cacheable at all, on the
-	// streaming read/warm paths). Larger-but-cacheable objects fall back to the streaming
-	// warm-on-write read-back instead of being buffered. Only applied when WarmOnWrite is
-	// true. 0 or unset uses DefaultCacheWriteThroughMaxSize; a negative value disables the
-	// tee (all writes warm). Clamped to SizeThreshold, since a tee'd object must be cacheable.
-	WriteThroughMaxSize int64 `yaml:"write_through_max_size"`
+	// BlockCachingEnabled turns on block-aligned caching for large objects (RFC 0001):
+	// objects at or above BlockCacheMinSize are cached at BlockSize granularity on read,
+	// so a range read (e.g. a Parquet footer) populates and serves only the blocks it
+	// touches instead of the whole object. Defaults to false (opt-in rollout).
+	BlockCachingEnabled bool `yaml:"block_caching_enabled"`
+	// BlockCacheMinSize is the single whole-object vs block-mode boundary. Objects SMALLER
+	// than this use whole-object write-path caching (the write-through tee and warm-on-write,
+	// which buffer/stream the whole body); objects this size or LARGER are cached at block
+	// granularity on read, and their write path is a no-op. It replaces the former
+	// write_through_max_size (same 25 MiB default, so the tee's whole-object cap and its
+	// in-memory buffer bound are unchanged). 0 or unset uses DefaultCacheBlockCacheMinSize.
+	// Clamped to SizeThreshold, since a whole-object-cached object must be cacheable.
+	BlockCacheMinSize int64 `yaml:"block_cache_min_size"`
+	// BlockSize is the granularity at which block-mode objects are cached. It must stay
+	// below ocache's 64 MB CompactThreshold so blocks pack into shared segments. 0 or unset
+	// uses DefaultCacheBlockSize (4 MiB). Only meaningful when BlockCachingEnabled is true.
+	BlockSize int64 `yaml:"block_size"`
 	// WarmOnWriteReservedFraction caps the fraction of the populate memory budget
 	// that warm-on-write populates may reserve ahead of read-miss warms, so
 	// warm-on-write is never starved by the read-miss full-object warm flood. The
@@ -359,8 +372,11 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cache.SizeThreshold == 0 {
 		cfg.Cache.SizeThreshold = DefaultCacheSizeThreshold
 	}
-	if cfg.Cache.WriteThroughMaxSize == 0 {
-		cfg.Cache.WriteThroughMaxSize = DefaultCacheWriteThroughMaxSize
+	if cfg.Cache.BlockCacheMinSize == 0 {
+		cfg.Cache.BlockCacheMinSize = DefaultCacheBlockCacheMinSize
+	}
+	if cfg.Cache.BlockSize == 0 {
+		cfg.Cache.BlockSize = DefaultCacheBlockSize
 	}
 	if cfg.Cache.DiskPath == "" {
 		cfg.Cache.DiskPath = DefaultCacheDiskPath
@@ -505,17 +521,29 @@ func applyEnvOverrides(cfg *Config) {
 				cfg.Cache.WarmOnWrite = b
 			}
 		}
-		// Override the write-through tee size cap from environment (negative disables the tee;
-		// 0/unset keeps the default set in applyDefaults).
-		if val := os.Getenv("TAG_CACHE_WRITE_THROUGH_MAX_SIZE"); val != "" {
-			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n != 0 {
-				cfg.Cache.WriteThroughMaxSize = n
+		// Override block-aligned caching from environment (accepts true/false/1/0).
+		if val := os.Getenv("TAG_CACHE_BLOCK_CACHING_ENABLED"); val != "" {
+			if b, err := strconv.ParseBool(val); err == nil {
+				cfg.Cache.BlockCachingEnabled = b
 			}
 		}
-		// A tee'd object must be cacheable, so the tee cap can never exceed SizeThreshold.
-		// (A negative cap — the tee disabled — is left as-is.)
-		if cfg.Cache.WriteThroughMaxSize > cfg.Cache.SizeThreshold {
-			cfg.Cache.WriteThroughMaxSize = cfg.Cache.SizeThreshold
+		// Override the whole-object vs block-mode boundary from environment
+		// (0/unset keeps the default set in applyDefaults).
+		if val := os.Getenv("TAG_CACHE_BLOCK_CACHE_MIN_SIZE"); val != "" {
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n != 0 {
+				cfg.Cache.BlockCacheMinSize = n
+			}
+		}
+		// A whole-object-cached object must be cacheable, so the boundary can never exceed
+		// SizeThreshold (an object at/above the boundary is block-cached instead).
+		if cfg.Cache.BlockCacheMinSize > cfg.Cache.SizeThreshold {
+			cfg.Cache.BlockCacheMinSize = cfg.Cache.SizeThreshold
+		}
+		// Override the block granularity from environment (0/unset keeps the default).
+		if val := os.Getenv("TAG_CACHE_BLOCK_SIZE"); val != "" {
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n > 0 {
+				cfg.Cache.BlockSize = n
+			}
 		}
 		// Override the warm-on-write populate reservation fraction from environment.
 		// f != 0 mirrors the sibling budget overrides: an env "0" means "use the

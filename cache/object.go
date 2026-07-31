@@ -13,9 +13,10 @@ import (
 
 const (
 	// Cache key prefixes for separate metadata and body storage
-	metaKeyPrefix = "meta|"
-	bodyKeyPrefix = "body|"
-	tombKeyPrefix = "tomb|"
+	metaKeyPrefix  = "meta|"
+	bodyKeyPrefix  = "body|"
+	blockKeyPrefix = "blk|"
+	tombKeyPrefix  = "tomb|"
 )
 
 // CachedObjectMeta represents cached S3 object metadata.
@@ -42,6 +43,11 @@ type CachedObjectMeta struct {
 	PartsCount           string            `json:"parts_count,omitempty"`            // x-amz-mp-parts-count
 	UserMetadata         map[string]string `json:"user_metadata,omitempty"`          // x-amz-meta-*
 	StatusCode           int               `json:"status_code"`                      // Original HTTP status (200, etc.)
+	// BlockSize records the block granularity for a block-mode entry (RFC 0001). 0 means
+	// the body is stored as a single whole blob (MakeBodyKey); >0 means the body is stored
+	// as fixed-size blocks (MakeBlockKey) of this size. Captured at populate time so an
+	// entry keeps its block layout even if the block_size config later changes.
+	BlockSize int64 `json:"block_size,omitempty"`
 }
 
 // MetaFromHTTPHeaders builds CachedObjectMeta from S3 response headers.
@@ -271,6 +277,17 @@ func MakeBodyKey(bucket, key, etag string) string {
 		return bodyKeyPrefix + bucket + "|" + key
 	}
 	return bodyKeyPrefix + bucket + "|" + key + "|" + etagKeyComponent(etag)
+}
+
+// MakeBlockKey creates the cache key for a single block of a block-mode object body
+// ("blk|bucket|key|<etag>|<blockIdx>"). Blocks are ETag-scoped exactly like whole
+// bodies (MakeBodyKey), so a concurrent overwrite writes new block keys under the new
+// ETag and never clobbers the version an in-flight reader resolved; stale blocks age
+// out by TTL. blockIdx is the zero-based index of a fixed-size block within the object.
+// An ETag-less object is not block-cached (no version discriminator), matching the
+// body-key invariant; callers must pass a non-empty etag.
+func MakeBlockKey(bucket, key, etag string, blockIdx int64) string {
+	return blockKeyPrefix + bucket + "|" + key + "|" + etagKeyComponent(etag) + "|" + strconv.FormatInt(blockIdx, 10)
 }
 
 // MakeTombstoneKey creates the cache key for invalidation tombstones.
