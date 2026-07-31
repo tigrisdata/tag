@@ -150,6 +150,33 @@ func TestBlockCache_PartialHitFetchesMissingBlock(t *testing.T) {
 	}
 }
 
+// Warm-on-write is a no-op for objects at or above the block-mode boundary: they are cached
+// per-block on read (RFC 0001), never warmed whole. The whole-object fetch aborts after
+// headers (no read-back), so no whole-body entry is created.
+func TestBlockCache_WarmOnWriteNoopAboveBoundary(t *testing.T) {
+	var warmFetches atomic.Int32
+	mock := &mockForwarder{
+		forwardFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
+			w.WriteHeader(http.StatusOK)
+			return nil
+		},
+		doFullObjectFunc: warmObjectResponder(&warmFetches, "ABCDEFGHIJ"), // 10 bytes >= boundary
+	}
+	svc, c := newTestService(mock, true)
+	svc.config.Cache.WarmOnWrite = true
+	svc.config.Cache.BlockCachingEnabled = true
+	svc.config.Cache.BlockCacheMinSize = 8
+	svc.config.Cache.SizeThreshold = 1 << 20
+
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, "ABCDEFGHIJ")); err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
+		t.Error("warm-on-write cached a block-mode-sized object whole (want no-op above the boundary)")
+	}
+}
+
 // If a block fetched during populate reports a different ETag than the object we forwarded
 // (a concurrent overwrite), it must not be cached, and the block-mode meta is not written.
 func TestBlockCache_ETagMismatchDoesNotCache(t *testing.T) {

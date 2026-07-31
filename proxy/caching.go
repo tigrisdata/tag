@@ -410,6 +410,15 @@ func (s *Service) fetchFullObjectToCache(
 		return nil
 	}
 
+	// Objects at or above the block-mode boundary are cached at block granularity on read
+	// (RFC 0001), never warmed/fetched whole. Aborting here, after headers but before the
+	// body download, makes warm-on-write a true no-op for them (no read-back amplification).
+	if s.isBlockEligibleSize(resp.ContentLength) {
+		log.Debug().Str("bucket", bucket).Str("key", key).Int64("size", resp.ContentLength).
+			Msg("Skipping whole-object populate - object is block-mode (cached per-block on read)")
+		return nil
+	}
+
 	// Check for no-cache headers
 	if s.hasNoCacheHeaders(resp.Header) {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Skipping background cache - no-cache headers")

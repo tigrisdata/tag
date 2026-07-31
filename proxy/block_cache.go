@@ -22,6 +22,15 @@ const maxConcurrentBlockFetches = 4
 // version than the meta we hold (a concurrent overwrite), so it must not be cached.
 var errBlockETagMismatch = errors.New("block etag mismatch")
 
+// isBlockEligibleSize reports whether an object of the given content length is handled by
+// block-mode caching (RFC 0001) rather than whole-object caching: it is at or above the
+// block-mode boundary and block caching is enabled. A negative/unknown length is not eligible.
+// Whole-object populate paths (warm-on-write, full-object background fetch, full-GET stream
+// caching) skip such objects — they are cached at block granularity on read instead.
+func (s *Service) isBlockEligibleSize(contentLength int64) bool {
+	return s.config.Cache.BlockCachingEnabled && contentLength >= s.config.Cache.BlockCacheMinSize
+}
+
 // blockBounds returns the inclusive object-byte bounds [start,end] of block i for an object
 // of contentLength bytes cached at blockSize granularity. The last block is clamped to the
 // object end.

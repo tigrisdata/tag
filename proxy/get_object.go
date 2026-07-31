@@ -349,7 +349,11 @@ func (s *Service) streamFromUpstream(
 	shouldCache := resp.StatusCode == http.StatusOK &&
 		s.cache.IsEnabled() &&
 		!s.hasNoCacheHeaders(resp.Header) &&
-		s.isWithinSizeThreshold(resp)
+		s.isWithinSizeThreshold(resp) &&
+		// A full GET of a block-mode-sized object must not create a whole-body entry that
+		// would shadow block mode; such objects are cached per-block on read (RFC 0001).
+		// Full-object assembly from blocks is phase 4; for now these are served but not cached.
+		!s.isBlockEligibleSize(resp.ContentLength)
 
 	// Set up cache listener if caching (streams directly to cache via pipe)
 	var cachePipeWriter *io.PipeWriter
