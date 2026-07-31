@@ -387,15 +387,31 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 	if !c.IsEnabled() {
 		return ErrCacheDisabled
 	}
+	return c.getRangeStreamByKey(ctx, MakeBodyKey(bucket, key, etag), bucket, key, start, end, w)
+}
 
-	bodyKey := MakeBodyKey(bucket, key, etag)
+// GetBlockRangeStream streams an inclusive block-LOCAL byte range [start,end] of a single
+// block of a block-mode object to w. blockIdx identifies the block; start and end are
+// offsets WITHIN the block (0 = first byte of the block), not within the object. Pass the
+// meta's ETag so the block resolves to the exact cached version. Returns ErrNotFound if the
+// block is not in cache. See RFC 0001.
+func (c *Cache) GetBlockRangeStream(ctx context.Context, bucket, key, etag string, blockIdx, start, end int64, w io.Writer) error {
+	if !c.IsEnabled() {
+		return ErrCacheDisabled
+	}
+	return c.getRangeStreamByKey(ctx, MakeBlockKey(bucket, key, etag, blockIdx), bucket, key, start, end, w)
+}
 
+// getRangeStreamByKey streams an inclusive byte range [start,end] of the blob at cacheKey to
+// w, mapping ocache's not-found to ErrNotFound and handling ocache's read-byte-0 quirk.
+// bucket/key are used for logging only.
+func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key string, start, end int64, w io.Writer) error {
 	// Handle ocache quirk: reading byte 0 alone requires reading 2 bytes
 	// and discarding the last byte
 	if start == 0 && end == 0 {
 		// Single byte at position 0 - need to read 2 bytes and discard last
 		var buf bytes.Buffer
-		err := c.client.GetRangeStream(ctx, bodyKey, 0, 1, &buf)
+		err := c.client.GetRangeStream(ctx, cacheKey, 0, 1, &buf)
 		if err != nil {
 			if isNotFoundError(err) {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
@@ -403,7 +419,7 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 			}
 			return err
 		}
-		c.recordServeLocality(bodyKey)
+		c.recordServeLocality(cacheKey)
 		// Write only the first byte
 		if buf.Len() > 0 {
 			_, err = w.Write(buf.Bytes()[:1])
@@ -412,7 +428,7 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 	}
 
 	// ocache now uses inclusive end (same as HTTP Range semantics)
-	err := c.client.GetRangeStream(ctx, bodyKey, start, end, w)
+	err := c.client.GetRangeStream(ctx, cacheKey, start, end, w)
 	if err != nil {
 		if isNotFoundError(err) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
@@ -427,7 +443,7 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 		return err
 	}
 
-	c.recordServeLocality(bodyKey)
+	c.recordServeLocality(cacheKey)
 	log.Debug().
 		Str("bucket", bucket).
 		Str("key", key).
@@ -436,6 +452,81 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 		Int64("length", end-start+1).
 		Msg("Cache hit (range)")
 	return nil
+}
+
+// BlockExists reports whether the given block of a block-mode object is present in cache.
+// It probes the block's first byte (quirk-safe, cheap), so a not-found or any read error
+// returns false — the caller then (re)fetches the block. See RFC 0001.
+func (c *Cache) BlockExists(ctx context.Context, bucket, key, etag string, blockIdx int64) bool {
+	if !c.IsEnabled() || etag == "" {
+		return false
+	}
+	err := c.getRangeStreamByKey(ctx, MakeBlockKey(bucket, key, etag, blockIdx), bucket, key, 0, 0, io.Discard)
+	return err == nil
+}
+
+// PutBlockStream writes a single block of a block-mode object to cache. Blocks are
+// ETag-scoped (MakeBlockKey) exactly like whole bodies, and — like bodies — are never
+// deleted on invalidation; they age out by TTL. The block-mode meta (written tombstone-
+// aware via PutMetaTombstoneAware) is the visibility gate, and reads only resolve blocks
+// after a meta hit, so a block written for a since-deleted object is unreachable and
+// harmless. An empty etag is not block-cached (no version discriminator). See RFC 0001.
+func (c *Cache) PutBlockStream(ctx context.Context, bucket, key, etag string, blockIdx int64, r io.Reader, ttl int) error {
+	if !c.IsEnabled() || etag == "" {
+		_, _ = io.Copy(io.Discard, r) // drain so a pipe producer never blocks
+		return nil
+	}
+	if ttl == 0 {
+		ttl = int(c.defaultTTL)
+	}
+	blockKey := MakeBlockKey(bucket, key, etag, blockIdx)
+	if err := c.client.PutStream(ctx, blockKey, r, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
+		return err
+	}
+	return nil
+}
+
+// PutMetaTombstoneAware writes only the object metadata (no body), gated on the tombstone
+// like PutWithMetaStreamTombstoneAware: if an invalidation landed at or after writeStartTime
+// the write is skipped and wrote=false is returned. It is the visibility gate for a block-
+// mode entry — callers write the touched blocks first, then this meta last. See RFC 0001.
+func (c *Cache) PutMetaTombstoneAware(
+	ctx context.Context,
+	bucket, key string,
+	meta *CachedObjectMeta,
+	ttl int,
+	writeStartTime int64,
+) (wrote bool, err error) {
+	if !c.IsEnabled() {
+		return false, nil
+	}
+	if meta.ETag == "" {
+		return false, nil
+	}
+	if ttl == 0 {
+		ttl = int(c.defaultTTL)
+	}
+	metaKey := MakeMetaKey(bucket, key)
+	metaBytes, err := meta.Encode()
+	if err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta encode error")
+		return false, err
+	}
+	// Tombstone gate right before the (visibility-granting) meta write: if the key was
+	// invalidated at or after our write start, skip so we don't resurrect stale metadata.
+	tombTs := c.GetTombstoneTimestamp(ctx, bucket, key)
+	if tombTs >= writeStartTime {
+		log.Debug().Str("bucket", bucket).Str("key", key).
+			Int64("tombstone_ts", tombTs).Int64("write_start", writeStartTime).
+			Msg("Skipping block-mode meta write - tombstone detected")
+		return false, nil
+	}
+	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
+		return false, err
+	}
+	return true, nil
 }
 
 // ============================================================================

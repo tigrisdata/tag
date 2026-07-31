@@ -123,6 +123,16 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				// If this is a Range request and we have the full object cached,
 				// serve the range from the cached object
 				if rangeHeader != "" {
+					// Block-mode entry (RFC 0001): serve the range from its blocks, fetching any
+					// missing covering blocks. On a non-serve (budget shed / fetch failure), forward
+					// the range with a background (block) populate.
+					if meta.BlockSize > 0 {
+						served, rangeErr := s.serveRangeFromBlockCache(ctx, w, r, bucket, key, accessKey, secretKey, meta, rangeHeader, start)
+						if served {
+							return rangeErr
+						}
+						return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start, XCacheMiss)
+					}
 					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving range from cached full object")
 					served, rangeErr := s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
 					if served {
@@ -166,21 +176,26 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					}
 				}
 
-				// Serve full response from cache
-				if cacheBodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); cacheBodyErr != nil {
-					log.Warn().Err(cacheBodyErr).Str("bucket", bucket).Str("key", key).Msg("Cache body unavailable, falling through to upstream")
-					// Invalidate only when the body is genuinely gone: the metadata is then
-					// orphaned, and clearing it stops a meta-hit/body-miss loop that repeats
-					// the failed cache read on every request before refetching. A transient
-					// failure (e.g. the client disconnected mid-read) must not evict a
-					// still-valid hot entry. serveFromCache errors before committing
-					// headers, so falling through to the miss path below is safe either way.
-					if bodyGone(cacheBodyErr) {
-						s.cache.Delete(context.Background(), bucket, key)
+				// Serve full response from cache. A block-mode entry (BlockSize>0) has no
+				// whole-body blob; assembling the full object from its blocks is RFC 0001
+				// phase 4, so for now fall through to the miss path (forward + re-warm) rather
+				// than serving. This never serves stale data.
+				if meta.BlockSize == 0 {
+					if cacheBodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); cacheBodyErr != nil {
+						log.Warn().Err(cacheBodyErr).Str("bucket", bucket).Str("key", key).Msg("Cache body unavailable, falling through to upstream")
+						// Invalidate only when the body is genuinely gone: the metadata is then
+						// orphaned, and clearing it stops a meta-hit/body-miss loop that repeats
+						// the failed cache read on every request before refetching. A transient
+						// failure (e.g. the client disconnected mid-read) must not evict a
+						// still-valid hot entry. serveFromCache errors before committing
+						// headers, so falling through to the miss path below is safe either way.
+						if bodyGone(cacheBodyErr) {
+							s.cache.Delete(context.Background(), bucket, key)
+						}
+						// Fall through to cache miss path
+					} else {
+						return nil
 					}
-					// Fall through to cache miss path
-				} else {
-					return nil
 				}
 			}
 		}
@@ -729,7 +744,23 @@ func (s *Service) handleRangeWithBackgroundCache(
 	// detached, deduplicated (activeBackgroundFetches), and guarded by
 	// GetMeta(!found), so the cost is bounded to at most one background fetch per
 	// key and it's a no-op once the object is cached.
-	if cacheable {
+	// Objects at or above the block-mode boundary are cached at block granularity (RFC 0001)
+	// rather than fetched whole: capture the block-mode meta + the blocks this request touched
+	// (from the response headers, before its body is streamed), and populate them in the
+	// background. buildBlockMeta/triggerBlockModePopulate never reuse resp.Body — blocks are
+	// fetched with fresh aligned range GETs.
+	blockEligible := s.config.Cache.BlockCachingEnabled &&
+		cacheable &&
+		totalSize >= s.config.Cache.BlockCacheMinSize &&
+		resp.Header.Get("ETag") != "" &&
+		!s.hasNoCacheHeaders(resp.Header)
+
+	if blockEligible {
+		meta := s.buildBlockMeta(bucket, key, resp.Header, totalSize)
+		if touched := touchedBlocks(r.Header.Get("Range"), totalSize, meta.BlockSize); len(touched) > 0 {
+			defer s.triggerBlockModePopulate(bucket, key, accessKey, secretKey, meta, touched)
+		}
+	} else if cacheable {
 		defer func() {
 			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
 				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss)

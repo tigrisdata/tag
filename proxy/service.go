@@ -14,6 +14,7 @@ import (
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy/broadcast"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -70,6 +71,7 @@ type Service struct {
 	perPopulateCap          int64              // Max bytes a single populate can buffer (reservation ceiling)
 	broadcastManager        *broadcast.Manager // For streaming request coalescing
 	activeBackgroundFetches sync.Map           // Dedup for background full-object fetches (range caching)
+	blockFetch              singleflight.Group // Coalesce concurrent fetches of the same block (RFC 0001)
 }
 
 // NewService creates a new proxy service.
