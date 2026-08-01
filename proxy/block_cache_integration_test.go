@@ -18,10 +18,11 @@ import (
 // client-range forward (DoRequestWithCreds) and per-block fetches (DoConditionalGetRequest).
 type blockMockForwarder struct {
 	*mockForwarder
-	object       []byte
-	etag         string
-	blockGetETag string       // ETag returned by per-block fetches (defaults to etag)
-	blockGets    atomic.Int32 // count of per-block DoConditionalGetRequest calls
+	object           []byte
+	etag             string
+	blockGetETag     string       // ETag returned by per-block fetches (defaults to etag)
+	blockGetWhole2xx bool         // if set, per-block fetches return 200 with the WHOLE object
+	blockGets        atomic.Int32 // count of per-block DoConditionalGetRequest calls
 }
 
 func newBlockMock(object []byte, etag string) *blockMockForwarder {
@@ -31,6 +32,20 @@ func newBlockMock(object []byte, etag string) *blockMockForwarder {
 		return m.serveRange(r.Header.Get("Range"), m.etag), nil
 	}
 	return m
+}
+
+// wholeObject200 returns the whole object as a 200 (as if upstream ignored the Range).
+func (m *blockMockForwarder) wholeObject200() *http.Response {
+	h := http.Header{}
+	h.Set("ETag", m.blockGetETag)
+	h.Set("Content-Type", "application/octet-stream")
+	h.Set("Content-Length", fmt.Sprintf("%d", len(m.object)))
+	return &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        h,
+		Body:          io.NopCloser(strings.NewReader(string(m.object))),
+		ContentLength: int64(len(m.object)),
+	}
 }
 
 func (m *blockMockForwarder) serveRange(rangeHeader, etag string) *http.Response {
@@ -46,14 +61,18 @@ func (m *blockMockForwarder) serveRange(rangeHeader, etag string) *http.Response
 	h.Set("Content-Type", "application/octet-stream")
 	h.Set("Content-Length", fmt.Sprintf("%d", e-s+1))
 	return &http.Response{
-		StatusCode: http.StatusPartialContent,
-		Header:     h,
-		Body:       io.NopCloser(strings.NewReader(string(m.object[s : e+1]))),
+		StatusCode:    http.StatusPartialContent,
+		Header:        h,
+		Body:          io.NopCloser(strings.NewReader(string(m.object[s : e+1]))),
+		ContentLength: e - s + 1, // real net/http populates this from the header
 	}
 }
 
 func (m *blockMockForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _, _ string, _ int64, rangeHeader string) (*http.Response, error) {
 	m.blockGets.Add(1)
+	if m.blockGetWhole2xx {
+		return m.wholeObject200(), nil
+	}
 	return m.serveRange(rangeHeader, m.blockGetETag), nil
 }
 
@@ -213,6 +232,29 @@ func TestBlockCache_WarmOnWriteNoopAboveBoundary(t *testing.T) {
 	}
 	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
 		t.Error("warm-on-write cached a block-mode-sized object whole (want no-op above the boundary)")
+	}
+}
+
+// If upstream ignores the Range and returns 200 with the whole object, that body must not be
+// stored as a block (its byte 0 is the object start, not the block offset). The block is
+// rejected and the block-mode meta is not written.
+func TestBlockCache_WholeObject200NotStoredAsBlock(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	mock.blockGetWhole2xx = true // per-block fetches return 200 with the whole object
+	svc, c := newBlockService(t, mock)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if w.Code != http.StatusPartialContent || w.Body.String() != "ABCD" {
+		t.Fatalf("cold miss: code=%d body=%q, want 206 ABCD", w.Code, w.Body.String())
+	}
+	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
+		t.Error("block-mode meta written despite a 200 (whole-object) block fetch")
+	}
+	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 0) {
+		t.Error("whole-object 200 body was stored as block 0")
 	}
 }
 

@@ -375,7 +375,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cache.BlockCacheMinSize == 0 {
 		cfg.Cache.BlockCacheMinSize = DefaultCacheBlockCacheMinSize
 	}
-	if cfg.Cache.BlockSize == 0 {
+	// Block size must be positive (it is a divisor in block arithmetic); a zero or negative
+	// value — from YAML or a programmatic config — falls back to the default.
+	if cfg.Cache.BlockSize <= 0 {
 		cfg.Cache.BlockSize = DefaultCacheBlockSize
 	}
 	if cfg.Cache.DiskPath == "" {

@@ -528,17 +528,21 @@ func TestLoad_BlockCacheMinSizeDefaultOverrideAndClamp(t *testing.T) {
 func TestLoad_BlockSizeDefaultAndOverride(t *testing.T) {
 	cases := []struct {
 		name string
+		yaml string
 		env  string
 		want int64
 	}{
-		{"default", "", DefaultCacheBlockSize},
-		{"env override honored", "1048576", 1048576}, // 1 MiB
-		{"non-positive ignored", "-1", DefaultCacheBlockSize},
+		{"default", "cache:\n  enabled: true\n", "", DefaultCacheBlockSize},
+		{"env override honored", "cache:\n  enabled: true\n", "1048576", 1048576}, // 1 MiB
+		{"non-positive env ignored", "cache:\n  enabled: true\n", "-1", DefaultCacheBlockSize},
+		// A negative block_size must never reach block arithmetic (it is a divisor): it
+		// falls back to the default rather than passing through.
+		{"negative yaml defaults", "cache:\n  enabled: true\n  block_size: -4096\n", "", DefaultCacheBlockSize},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-			if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
 				t.Fatalf("Failed to create temp file: %v", err)
 			}
 			if tc.env != "" {

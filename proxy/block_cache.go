@@ -201,11 +201,18 @@ func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey
 // The populate budget is reserved by the block's actual size (read-miss priority, non-blocking);
 // on decline the block is not cached and errCachePopulateDeclined is returned. The fetched
 // block's ETag must match meta.ETag or it is rejected (a concurrent overwrite).
-func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) error {
+// The caller's ctx is intentionally not threaded into the singleflight body: the leader's
+// fetch is shared by all waiters, so binding it to one caller's context would let that
+// caller's cancellation fail the block for everyone. The fetch runs under a detached,
+// timeout-bounded context instead.
+func (s *Service) fetchOneBlock(_ context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) error {
 	blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, blockIdx)
 	_, err, _ := s.blockFetch.Do(blockKey, func() (interface{}, error) {
+		fetchCtx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+		defer cancel()
+
 		// Re-check presence inside the singleflight leader: a prior fetch may have landed.
-		if s.cache.BlockExists(ctx, bucket, key, meta.ETag, blockIdx) {
+		if s.cache.BlockExists(fetchCtx, bucket, key, meta.ETag, blockIdx) {
 			return nil, nil
 		}
 		bStart, bEnd := blockBounds(blockIdx, meta.BlockSize, meta.ContentLength)
@@ -213,26 +220,34 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 
 		// Non-blocking read-miss reservation by the block's actual size. On decline the block
 		// isn't cached; the caller falls through to a direct upstream range.
-		if !s.acquireCacheSlot(ctx, weight, priorityReadMiss) {
+		if !s.acquireCacheSlot(fetchCtx, weight, priorityReadMiss) {
 			metrics.RecordCachePopulateSkipped(priorityReadMiss.metricSource())
 			return nil, errCachePopulateDeclined
 		}
 		defer s.releaseCacheSlot(weight)
 
-		resp, rerr := s.forwarder.DoConditionalGetRequest(ctx, bucket, key, accessKey, secretKey, "", 0, fmt.Sprintf("bytes=%d-%d", bStart, bEnd))
+		resp, rerr := s.forwarder.DoConditionalGetRequest(fetchCtx, bucket, key, accessKey, secretKey, "", 0, fmt.Sprintf("bytes=%d-%d", bStart, bEnd))
 		if rerr != nil {
 			return nil, rerr
 		}
 		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("unexpected status %d fetching block %d", resp.StatusCode, blockIdx)
+		// A block fetch must be a 206 whose body is exactly the requested block bytes. A 200
+		// means upstream ignored the Range and returned the whole object (whose byte 0 is the
+		// object start, not this block's offset), and a length that differs from the requested
+		// block means the 206 bounds don't match — storing either would corrupt block offsets.
+		// Reject both; the caller falls through to a direct upstream range.
+		if resp.StatusCode != http.StatusPartialContent {
+			return nil, fmt.Errorf("block %d fetch: unexpected status %d (want 206)", blockIdx, resp.StatusCode)
+		}
+		if resp.ContentLength >= 0 && resp.ContentLength != weight {
+			return nil, fmt.Errorf("block %d fetch: got %d bytes, want %d", blockIdx, resp.ContentLength, weight)
 		}
 		// ETag guard: the block must belong to the exact version meta describes.
 		if respETag := resp.Header.Get("ETag"); respETag != "" && respETag != meta.ETag {
 			return nil, errBlockETagMismatch
 		}
 		ttl := int(s.config.Cache.TTL.Seconds())
-		if perr := s.cache.PutBlockStream(ctx, bucket, key, meta.ETag, blockIdx, resp.Body, ttl); perr != nil {
+		if perr := s.cache.PutBlockStream(fetchCtx, bucket, key, meta.ETag, blockIdx, resp.Body, ttl); perr != nil {
 			return nil, perr
 		}
 		metrics.CacheBlockPopulated.Inc()

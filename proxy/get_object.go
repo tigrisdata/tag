@@ -105,7 +105,10 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			// Client-triggered revalidation: Cache-Control: no-cache/max-age=0
 			// For range requests, the Range header is included in the conditional GET
 			// so upstream returns 304 (serve range from cache) or 206 (stream range to client).
-			if forceRevalidate && meta.ETag != "" {
+			// revalidateAndServe uses the whole-body serve/populate helpers, which don't
+			// understand block-mode entries — so for a block-mode entry (BlockSize>0) fall
+			// through to the miss path instead, which re-forwards fresh and re-populates blocks.
+			if forceRevalidate && meta.ETag != "" && meta.BlockSize == 0 {
 				log.Debug().
 					Str("bucket", bucket).
 					Str("key", key).
@@ -113,7 +116,8 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				return s.revalidateAndServe(ctx, w, r, bucket, key, accessKey, secretKey, meta, start)
 			}
 
-			// If client forced revalidation but no ETag available, fall through to full miss
+			// If the client forced revalidation but there is no whole-body entry to revalidate
+			// (no ETag, or a block-mode entry), fall through to the miss path.
 			if forceRevalidate {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Force revalidate but no ETag, falling through to upstream")
 				// Fall through to cache miss path below
