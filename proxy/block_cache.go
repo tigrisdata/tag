@@ -96,20 +96,12 @@ func (s *Service) serveRangeFromBlockCache(
 	blockSize := meta.BlockSize
 	b0, bK := coveringBlocks(rng.start, rng.end, blockSize)
 
-	// Probe which covering blocks are missing, then fetch just those (coalesced, concurrent).
-	var missing []int64
-	for i := b0; i <= bK; i++ {
-		if !s.cache.BlockExists(ctx, bucket, key, meta.ETag, i) {
-			missing = append(missing, i)
-		}
-	}
-	if len(missing) > 0 {
-		if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, missing); ferr != nil {
-			// Couldn't populate the missing blocks (budget shed, upstream error, or a
-			// concurrent overwrite). Nothing written yet — let the caller forward upstream.
-			log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Block populate failed - falling through to upstream")
-			return false, ferr
-		}
+	// Make the covering blocks present (probe + fetch any missing, coalesced/concurrent).
+	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, b0, bK); ferr != nil {
+		// Couldn't populate the missing blocks (budget shed, upstream error, or a concurrent
+		// overwrite). Nothing written yet — let the caller forward upstream.
+		log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Block populate failed - falling through to upstream")
+		return false, ferr
 	}
 
 	// All covering blocks are present: commit the 206 and stream the assembled range.
@@ -136,6 +128,56 @@ func (s *Service) serveRangeFromBlockCache(
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
 	}
 	metrics.RecordRangeFromCacheHit()
+	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	return true, nil
+}
+
+// serveFullObjectFromBlockCache serves a full-object GET from a block-mode entry by assembling
+// all of its blocks (fetching any missing), streaming them in order. It returns served=false,
+// without writing anything, when the blocks cannot be populated — the caller then falls through
+// to the miss path.
+func (s *Service) serveFullObjectFromBlockCache(
+	ctx context.Context,
+	w http.ResponseWriter,
+	bucket, key, accessKey, secretKey string,
+	meta *cache.CachedObjectMeta,
+	startTime time.Time,
+) (served bool, err error) {
+	// Zero-byte object: headers only.
+	if meta.ContentLength == 0 {
+		meta.WriteHeaders(w)
+		writeCacheStatus(w, XCacheHit)
+		w.WriteHeader(meta.StatusCode)
+		metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+		return true, nil
+	}
+
+	blockSize := meta.BlockSize
+	lastBlock := (meta.ContentLength - 1) / blockSize
+
+	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, 0, lastBlock); ferr != nil {
+		log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Full-object block assembly failed - falling through to upstream")
+		return false, ferr
+	}
+
+	meta.WriteHeaders(w)
+	writeCacheStatus(w, XCacheHit)
+	w.WriteHeader(meta.StatusCode)
+
+	cw := &countingWriter{w: w}
+	for i := int64(0); i <= lastBlock; i++ {
+		bStart, bEnd := blockBounds(i, blockSize, meta.ContentLength)
+		if berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, i, 0, bEnd-bStart, cw); berr != nil {
+			if cw.written > 0 {
+				metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+			}
+			log.Warn().Err(berr).Str("bucket", bucket).Str("key", key).Int64("block", i).Msg("Block vanished mid-assembly")
+			return true, berr
+		}
+	}
+	if cw.written > 0 {
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+	}
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
 	return true, nil
 }
@@ -193,9 +235,36 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 		if perr := s.cache.PutBlockStream(ctx, bucket, key, meta.ETag, blockIdx, resp.Body, ttl); perr != nil {
 			return nil, perr
 		}
+		metrics.CacheBlockPopulated.Inc()
+		metrics.CacheBlockBytesPopulated.Add(float64(weight))
 		return nil, nil
 	})
 	return err
+}
+
+// ensureBlocksCached makes covering blocks [b0,bK] present in cache: it probes each (recording
+// per-block hits/misses), fetches any that are missing, and records whether the request was a
+// full hit or a partial hit. It returns an error only when a missing block could not be
+// populated (budget shed, upstream/ETag failure) — the caller then falls through to upstream.
+func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, b0, bK int64) error {
+	var missing []int64
+	for i := b0; i <= bK; i++ {
+		if s.cache.BlockExists(ctx, bucket, key, meta.ETag, i) {
+			metrics.CacheBlockHits.Inc()
+		} else {
+			metrics.CacheBlockMisses.Inc()
+			missing = append(missing, i)
+		}
+	}
+	if len(missing) == 0 {
+		metrics.CacheBlockRangeServed.WithLabelValues("full_hit").Inc()
+		return nil
+	}
+	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, missing); err != nil {
+		return err
+	}
+	metrics.CacheBlockRangeServed.WithLabelValues("partial_hit").Inc()
+	return nil
 }
 
 // buildBlockMeta builds a block-mode CachedObjectMeta from a range (206) response's headers.

@@ -133,9 +133,11 @@ The 25 MiB boundary matches Parseable's single-PUT (<25 MiB, whole-object) vs mu
 
 ## Distributed considerations (deferred)
 
-ocache routes **per key** via consistent hashing, so naively appending `blockIdx` scatters an object's blocks across nodes. For a K-block range read that means gathering from up to K nodes, multiplying the cross-node gRPC data-plane traffic that is already the cluster burst-CPU bottleneck (and the reason single-node wins for Parseable's fan-out).
+ocache routes **per key** via consistent hashing, so appending `blockIdx` distributes an object's blocks across nodes. This is the standard sharded-cache design (ceph and most sharded stores work this way) and is often beneficial — it spreads load and allows parallel block fetches from multiple nodes. It is **not** treated as a problem here.
 
-**Decision:** deferred, and may not be pursued. Phase 1 targets single-node deployments (Parseable's current recommended shape), which are unaffected. If cluster block caching is later needed, block-locality routing — hashing on object identity `bucket|key|etag` rather than the per-block key so all of an object's blocks share one owner node — would be an **ocache-side** change (per the OCache-vs-TAG plan split), and block caching for clusters should not ship before it or it will regress the very workload it targets.
+The only reason to revisit it would be TAG-specific: prod measured this deployment's cross-node gRPC *data plane* as expensive (a large share of burst CPU, and a warm-p95 tax in the 1-vs-2-node test). But that measurement was for **whole-object** fan-out (one key → one remote owner → whole object over gRPC); block-level transfers have a different profile and we don't yet know their cross-node impact — it may be neutral or better. That per-hop gRPC overhead is also an implementation cost being addressed separately, not a property of block distribution.
+
+**Decision:** ship with block distribution as-is; measure block-level cross-node behavior in a cluster before deciding anything. Block caching defaults **off** (`block_caching_enabled`), and single-node deployments (Parseable's current shape) are unaffected regardless. *If* the data later shows a cluster problem, an optional block-locality routing mode — hashing on object identity `bucket|key|etag` so an object's blocks co-locate on one owner — is an **ocache-side** change (per the OCache-vs-TAG plan split) that can be added then. It is explicitly not a prerequisite for this work.
 
 ## Rollout and phasing
 

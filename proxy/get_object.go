@@ -176,26 +176,30 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					}
 				}
 
-				// Serve full response from cache. A block-mode entry (BlockSize>0) has no
-				// whole-body blob; assembling the full object from its blocks is RFC 0001
-				// phase 4, so for now fall through to the miss path (forward + re-warm) rather
-				// than serving. This never serves stale data.
-				if meta.BlockSize == 0 {
-					if cacheBodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); cacheBodyErr != nil {
-						log.Warn().Err(cacheBodyErr).Str("bucket", bucket).Str("key", key).Msg("Cache body unavailable, falling through to upstream")
-						// Invalidate only when the body is genuinely gone: the metadata is then
-						// orphaned, and clearing it stops a meta-hit/body-miss loop that repeats
-						// the failed cache read on every request before refetching. A transient
-						// failure (e.g. the client disconnected mid-read) must not evict a
-						// still-valid hot entry. serveFromCache errors before committing
-						// headers, so falling through to the miss path below is safe either way.
-						if bodyGone(cacheBodyErr) {
-							s.cache.Delete(context.Background(), bucket, key)
-						}
-						// Fall through to cache miss path
-					} else {
-						return nil
+				// Serve full response from cache.
+				if meta.BlockSize > 0 {
+					// Block-mode entry: assemble the full object from its blocks (RFC 0001),
+					// fetching any that are missing. On a non-serve (budget shed / fetch
+					// failure) fall through to the miss path rather than serving stale data.
+					served, assembleErr := s.serveFullObjectFromBlockCache(ctx, w, bucket, key, accessKey, secretKey, meta, start)
+					if served {
+						return assembleErr
 					}
+					// Fall through to cache miss path
+				} else if cacheBodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); cacheBodyErr != nil {
+					log.Warn().Err(cacheBodyErr).Str("bucket", bucket).Str("key", key).Msg("Cache body unavailable, falling through to upstream")
+					// Invalidate only when the body is genuinely gone: the metadata is then
+					// orphaned, and clearing it stops a meta-hit/body-miss loop that repeats
+					// the failed cache read on every request before refetching. A transient
+					// failure (e.g. the client disconnected mid-read) must not evict a
+					// still-valid hot entry. serveFromCache errors before committing
+					// headers, so falling through to the miss path below is safe either way.
+					if bodyGone(cacheBodyErr) {
+						s.cache.Delete(context.Background(), bucket, key)
+					}
+					// Fall through to cache miss path
+				} else {
+					return nil
 				}
 			}
 		}

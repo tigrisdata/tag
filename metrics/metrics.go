@@ -246,6 +246,50 @@ var (
 		},
 	)
 
+	// CacheBlockPopulated counts blocks fetched from upstream and written to cache
+	// (block-aligned caching, RFC 0001).
+	CacheBlockPopulated = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_cache_block_populated_total",
+			Help: "Number of object blocks fetched from upstream and cached (block-aligned caching)",
+		},
+	)
+
+	// CacheBlockBytesPopulated counts bytes fetched into cached blocks. Compare with
+	// tag_bytes_transferred_total{direction="out"} to gauge populate-vs-served amplification.
+	CacheBlockBytesPopulated = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_cache_block_bytes_populated_total",
+			Help: "Bytes fetched from upstream into cached blocks (block-aligned caching)",
+		},
+	)
+
+	// CacheBlockHits counts covering blocks already present in cache when serving a request
+	// from block mode; CacheBlockMisses counts covering blocks that had to be fetched.
+	CacheBlockHits = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_cache_block_hits_total",
+			Help: "Covering blocks already cached at serve time (block-aligned caching)",
+		},
+	)
+	CacheBlockMisses = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_cache_block_misses_total",
+			Help: "Covering blocks that had to be fetched at serve time (block-aligned caching)",
+		},
+	)
+
+	// CacheBlockRangeServed counts requests served from block mode, labeled by whether every
+	// covering block was already cached ("full_hit") or at least one had to be fetched
+	// ("partial_hit"). The partial-hit rate is partial_hit / (full_hit + partial_hit).
+	CacheBlockRangeServed = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_cache_block_range_served_total",
+			Help: "Requests served from block mode, by outcome (full_hit, partial_hit)",
+		},
+		[]string{"result"},
+	)
+
 	// LocalAuthValidations counts local auth validation attempts and results.
 	LocalAuthValidations = promauto.NewCounterVec(
 		prometheus.CounterOpts{

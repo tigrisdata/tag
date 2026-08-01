@@ -58,9 +58,14 @@ func (m *blockMockForwarder) DoConditionalGetRequest(_ context.Context, _, _, _,
 }
 
 func blockGet(bucket, key, rangeHeader string) *http.Request {
+	r := fullGet(bucket, key)
+	r.Header.Set("Range", rangeHeader)
+	return r
+}
+
+func fullGet(bucket, key string) *http.Request {
 	r := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
 	r.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/s3/aws4_request, Signature=deadbeef")
-	r.Header.Set("Range", rangeHeader)
 	return r
 }
 
@@ -147,6 +152,40 @@ func TestBlockCache_PartialHitFetchesMissingBlock(t *testing.T) {
 	}
 	if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 1) {
 		t.Error("block 1 not cached after the partial hit")
+	}
+}
+
+// A full-object GET of a block-mode entry assembles the whole object from its blocks,
+// fetching any that are missing, and serves 200 with the complete body.
+func TestBlockCache_FullGetAssemblesAllBlocks(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Establish a block-mode entry (meta + block 0) via a cold range miss.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated")
+	}
+
+	// Full GET (no Range): assemble all three blocks (0 present, 1 and 2 fetched), serve whole.
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("full GET: code=%d body=%q, want 200 ABCDEFGHIJ", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
+	}
+	// Assembly populated the remaining blocks for next time.
+	for i := int64(1); i <= 2; i++ {
+		if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, i) {
+			t.Errorf("block %d not cached after full-object assembly", i)
+		}
 	}
 }
 

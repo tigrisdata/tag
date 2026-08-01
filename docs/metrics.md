@@ -291,6 +291,41 @@ rate(tag_cache_write_through_total[5m]) /
 (rate(tag_cache_write_through_total[5m]) + rate(tag_warm_on_write_triggered_total[5m]))
 ```
 
+#### tag_cache_block_populated_total / tag_cache_block_bytes_populated_total
+
+**Type:** Counter
+
+Block-aligned caching (RFC 0001, `cache.block_caching_enabled`). Objects at or above
+`cache.block_cache_min_size` are cached at `cache.block_size` granularity on read, so a range
+read (e.g. a Parquet footer) populates and serves only the blocks it touches.
+`tag_cache_block_populated_total` counts blocks fetched from upstream and written to cache;
+`tag_cache_block_bytes_populated_total` is the bytes those fetches pulled. Compare the bytes
+against `tag_bytes_transferred_total{direction="out"}` to gauge populate-vs-served amplification.
+
+#### tag_cache_block_hits_total / tag_cache_block_misses_total
+
+**Type:** Counter
+
+Per-covering-block presence when serving a request from block mode: `hits` were already cached,
+`misses` had to be fetched. The block cache-hit ratio is:
+
+```promql
+rate(tag_cache_block_hits_total[5m]) /
+(rate(tag_cache_block_hits_total[5m]) + rate(tag_cache_block_misses_total[5m]))
+```
+
+#### tag_cache_block_range_served_total
+
+**Type:** Counter (labeled by `result`)
+
+Requests served from block mode, labeled `full_hit` (every covering block was already cached)
+or `partial_hit` (at least one covering block had to be fetched). Partial-hit rate:
+
+```promql
+rate(tag_cache_block_range_served_total{result="partial_hit"}[5m]) /
+rate(tag_cache_block_range_served_total[5m])
+```
+
 #### tag_cache_populate_skipped_total
 
 **Type:** Counter
