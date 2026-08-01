@@ -761,9 +761,8 @@ func (s *Service) handleRangeWithBackgroundCache(
 	// (from the response headers, before its body is streamed), and populate them in the
 	// background. buildBlockMeta/triggerBlockModePopulate never reuse resp.Body — blocks are
 	// fetched with fresh aligned range GETs.
-	blockEligible := s.config.Cache.BlockCachingEnabled &&
+	blockEligible := s.isBlockEligibleSize(totalSize) &&
 		cacheable &&
-		totalSize >= s.config.Cache.BlockCacheMinSize &&
 		resp.Header.Get("ETag") != "" &&
 		!s.hasNoCacheHeaders(resp.Header)
 

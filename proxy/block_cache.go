@@ -23,12 +23,17 @@ const maxConcurrentBlockFetches = 4
 var errBlockETagMismatch = errors.New("block etag mismatch")
 
 // isBlockEligibleSize reports whether an object of the given content length is handled by
-// block-mode caching (RFC 0001) rather than whole-object caching: it is at or above the
-// block-mode boundary and block caching is enabled. A negative/unknown length is not eligible.
-// Whole-object populate paths (warm-on-write, full-object background fetch, full-GET stream
-// caching) skip such objects — they are cached at block granularity on read instead.
+// block-mode caching (RFC 0001) rather than whole-object caching: block caching is enabled,
+// the block size is valid, and the object is at or above the block-mode boundary. A
+// negative/unknown length is not eligible. Requiring BlockSize > 0 here means a config that
+// enables block caching but leaves BlockSize at 0 (e.g. a Config built directly, bypassing
+// Load's normalization) behaves as block-caching-off rather than dividing by zero in block
+// arithmetic. Whole-object populate paths (warm-on-write, full-object background fetch,
+// full-GET stream caching) skip block-eligible objects — they are cached per-block on read.
 func (s *Service) isBlockEligibleSize(contentLength int64) bool {
-	return s.config.Cache.BlockCachingEnabled && contentLength >= s.config.Cache.BlockCacheMinSize
+	return s.config.Cache.BlockCachingEnabled &&
+		s.config.Cache.BlockSize > 0 &&
+		contentLength >= s.config.Cache.BlockCacheMinSize
 }
 
 // blockBounds returns the inclusive object-byte bounds [start,end] of block i for an object
@@ -239,8 +244,13 @@ func (s *Service) fetchOneBlock(_ context.Context, bucket, key, accessKey, secre
 		if resp.StatusCode != http.StatusPartialContent {
 			return nil, fmt.Errorf("block %d fetch: unexpected status %d (want 206)", blockIdx, resp.StatusCode)
 		}
-		if resp.ContentLength >= 0 && resp.ContentLength != weight {
-			return nil, fmt.Errorf("block %d fetch: got %d bytes, want %d", blockIdx, resp.ContentLength, weight)
+		// The response length must be exactly the requested block. This rejects a 200 (whole
+		// object) as well as any 206 whose length differs — including an unknown/chunked length
+		// (ContentLength < 0), which we can't validate and so must not store (a short or long
+		// body would be served at fixed block-local offsets, corrupting reads). S3/Tigris always
+		// sets Content-Length on a 206, so a well-formed block fetch is never rejected here.
+		if resp.ContentLength != weight {
+			return nil, fmt.Errorf("block %d fetch: content-length %d, want %d", blockIdx, resp.ContentLength, weight)
 		}
 		// ETag guard: the block must belong to the exact version meta describes.
 		if respETag := resp.Header.Get("ETag"); respETag != "" && respETag != meta.ETag {

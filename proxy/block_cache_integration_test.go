@@ -18,11 +18,12 @@ import (
 // client-range forward (DoRequestWithCreds) and per-block fetches (DoConditionalGetRequest).
 type blockMockForwarder struct {
 	*mockForwarder
-	object           []byte
-	etag             string
-	blockGetETag     string       // ETag returned by per-block fetches (defaults to etag)
-	blockGetWhole2xx bool         // if set, per-block fetches return 200 with the WHOLE object
-	blockGets        atomic.Int32 // count of per-block DoConditionalGetRequest calls
+	object             []byte
+	etag               string
+	blockGetETag       string       // ETag returned by per-block fetches (defaults to etag)
+	blockGetWhole2xx   bool         // if set, per-block fetches return 200 with the WHOLE object
+	blockGetUnknownLen bool         // if set, per-block 206 fetches report ContentLength -1
+	blockGets          atomic.Int32 // count of per-block DoConditionalGetRequest calls
 }
 
 func newBlockMock(object []byte, etag string) *blockMockForwarder {
@@ -73,7 +74,11 @@ func (m *blockMockForwarder) DoConditionalGetRequest(_ context.Context, _, _, _,
 	if m.blockGetWhole2xx {
 		return m.wholeObject200(), nil
 	}
-	return m.serveRange(rangeHeader, m.blockGetETag), nil
+	resp := m.serveRange(rangeHeader, m.blockGetETag)
+	if m.blockGetUnknownLen {
+		resp.ContentLength = -1 // chunked/unknown length: can't be validated
+	}
+	return resp, nil
 }
 
 func blockGet(bucket, key, rangeHeader string) *http.Request {
@@ -232,6 +237,43 @@ func TestBlockCache_WarmOnWriteNoopAboveBoundary(t *testing.T) {
 	}
 	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
 		t.Error("warm-on-write cached a block-mode-sized object whole (want no-op above the boundary)")
+	}
+}
+
+// A 206 with an unknown/chunked ContentLength can't be validated against the requested block
+// length, so it must not be stored (a short/long body would be served at fixed block offsets).
+func TestBlockCache_UnknownLengthBlockNotStored(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	mock.blockGetUnknownLen = true // per-block 206 fetches report ContentLength -1
+	svc, c := newBlockService(t, mock)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
+		t.Error("block-mode meta written from an unknown-length block fetch")
+	}
+	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 0) {
+		t.Error("unknown-length body stored as block 0")
+	}
+}
+
+// A config that enables block caching but leaves block_size at 0 (e.g. a Config built directly,
+// bypassing Load's normalization) must not divide by zero: it behaves as block-caching-off and
+// the large object falls back to whole-object caching.
+func TestBlockCache_ZeroBlockSizeNoPanic(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, _ := newBlockService(t, mock)
+	svc.config.Cache.BlockSize = 0 // programmatic misconfiguration
+
+	// A range read on a block-eligible-sized object must complete without panicking.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("range GET: %v", err)
+	}
+	if w.Code != http.StatusPartialContent || w.Body.String() != "ABCD" {
+		t.Fatalf("range GET: code=%d body=%q, want 206 ABCD", w.Code, w.Body.String())
 	}
 }
 
