@@ -769,7 +769,17 @@ func (s *Service) handleRangeWithBackgroundCache(
 	if blockEligible {
 		meta := s.buildBlockMeta(bucket, key, resp.Header, totalSize)
 		if touched := touchedBlocks(r.Header.Get("Range"), totalSize, meta.BlockSize); len(touched) > 0 {
-			defer s.triggerBlockModePopulate(bucket, key, accessKey, secretKey, meta, touched)
+			// Only establish a block-mode entry when none exists (mirrors the whole-object
+			// path's GetMeta(!found) dedup). A fall-through after a failed block serve must not
+			// rewrite an existing entry's meta: if block_size changed since the entry was
+			// written, its cached blocks would be reinterpreted at the new boundaries (index
+			// collisions → wrong bytes). Existing entries are filled incrementally by the serve
+			// path under their own captured BlockSize instead.
+			defer func() {
+				if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
+					s.triggerBlockModePopulate(bucket, key, accessKey, secretKey, meta, touched)
+				}
+			}()
 		}
 	} else if cacheable {
 		defer func() {

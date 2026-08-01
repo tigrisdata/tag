@@ -72,6 +72,29 @@ func TestBlockRoundTrip(t *testing.T) {
 	}
 }
 
+// A block of exactly 1 byte (the last block when contentLength % blockSize == 1) must probe
+// and read correctly through the byte-0 quirk path, which requests [0,1]: ocache returns the
+// single available byte (memory clamps the end; embedded reads it then EOFs) rather than
+// erroring, so presence probes and single-byte reads don't spuriously miss.
+func TestBlockRoundTrip_OneByteBlock(t *testing.T) {
+	c := newBlockTestCache(t)
+	ctx := context.Background()
+	bucket, key, etag := "b", "k", `"v1"`
+	if err := c.PutBlockStream(ctx, bucket, key, etag, 5, strings.NewReader("Z"), 60); err != nil {
+		t.Fatalf("PutBlockStream: %v", err)
+	}
+	if !c.BlockExists(ctx, bucket, key, etag, 5) {
+		t.Error("BlockExists(1-byte block) = false, want true")
+	}
+	var buf bytes.Buffer
+	if err := c.GetBlockRangeStream(ctx, bucket, key, etag, 5, 0, 0, &buf); err != nil {
+		t.Fatalf("GetBlockRangeStream(1-byte block, 0-0): %v", err)
+	}
+	if buf.String() != "Z" {
+		t.Errorf("GetBlockRangeStream(1-byte block) = %q, want Z", buf.String())
+	}
+}
+
 // An empty ETag is not block-cached (no version discriminator).
 func TestPutBlockStream_EmptyETagNotCached(t *testing.T) {
 	c := newBlockTestCache(t)
