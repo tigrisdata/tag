@@ -258,6 +258,35 @@ func TestBlockCache_WholeObject200NotStoredAsBlock(t *testing.T) {
 	}
 }
 
+// When a block-mode entry is stale (the object was overwritten out of band, so a block fetch
+// reports a newer ETag), the stale meta must be invalidated so later requests don't repeat the
+// mismatch until TTL. Exercised via a full GET, whose miss path never re-populates block mode.
+func TestBlockCache_ETagMismatchInvalidatesStaleMeta(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Establish a block-mode entry at ETag v1 (meta + block 0).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated")
+	}
+
+	// The object is overwritten out of band: upstream now serves v2.
+	mock.etag = `"v2"`
+	mock.blockGetETag = `"v2"`
+
+	// A full GET assembles all blocks; fetching a missing block reports v2 != cached v1, so the
+	// stale meta is invalidated (rather than left to repeat the mismatch on every request).
+	w2 := httptest.NewRecorder()
+	_ = svc.HandleGetObject(w2, fullGet(wowBucket, wowKey))
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
+		t.Error("stale block-mode meta not invalidated after ETag mismatch")
+	}
+}
+
 // If a block fetched during populate reports a different ETag than the object we forwarded
 // (a concurrent overwrite), it must not be cached, and the block-mode meta is not written.
 func TestBlockCache_ETagMismatchDoesNotCache(t *testing.T) {

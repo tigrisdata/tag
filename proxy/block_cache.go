@@ -276,6 +276,16 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 		return nil
 	}
 	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, missing); err != nil {
+		// A definitive version mismatch means the cached block-mode meta is stale — the object
+		// was overwritten (out of band, since a through-TAG write would have invalidated it).
+		// Invalidate the meta so the caller's fall-through re-establishes the current version,
+		// instead of repeating this mismatch on every request until the meta TTL expires. This
+		// matters most for full-object GETs, whose miss path never re-populates block mode.
+		// Transient failures (budget shed, upstream blip) leave the still-valid meta in place.
+		if errors.Is(err, errBlockETagMismatch) {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta after ETag mismatch")
+			s.cache.Delete(context.Background(), bucket, key)
+		}
 		return err
 	}
 	metrics.CacheBlockRangeServed.WithLabelValues("partial_hit").Inc()
