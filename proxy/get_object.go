@@ -367,10 +367,14 @@ func (s *Service) streamFromUpstream(
 	// block-eligible sizes: the whole object was fetched to satisfy this GET, so there is no
 	// range-miss amplification to avoid, and a later range read serves its bytes efficiently
 	// from the whole body (RFC 0001 — block mode is established only on the range-read path).
+	// Exception: if a block-mode entry already exists, do not whole-cache over it. This full GET
+	// may be the fall-through after a *transient* block-assemble failure; overwriting would
+	// demote the still-valid block entry to whole and re-download the whole object.
 	shouldCache := resp.StatusCode == http.StatusOK &&
 		s.cache.IsEnabled() &&
 		!s.hasNoCacheHeaders(resp.Header) &&
-		s.isWithinSizeThreshold(resp)
+		s.isWithinSizeThreshold(resp) &&
+		!s.hasBlockModeEntry(ctx, bucket, key)
 
 	// Set up cache listener if caching (streams directly to cache via pipe)
 	var cachePipeWriter *io.PipeWriter

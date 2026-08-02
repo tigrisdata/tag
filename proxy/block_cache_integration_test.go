@@ -27,6 +27,7 @@ type blockMockForwarder struct {
 	blockGetUnknownLen  bool         // if set, per-block 206 fetches report ContentLength -1
 	blockGetWrongOffset bool         // if set, per-block 206 Content-Range has wrong (same-length) bounds
 	blockGet404         bool         // if set, per-block fetches return 404 (object gone)
+	blockGetTransient   bool         // if set, per-block fetches return a transient (non-stale) error
 	blockGets           atomic.Int32 // count of per-block DoConditionalGetRequest calls
 }
 
@@ -82,6 +83,9 @@ func (m *blockMockForwarder) serveRange(rangeHeader, etag string) *http.Response
 
 func (m *blockMockForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _, _ string, _ int64, rangeHeader string) (*http.Response, error) {
 	m.blockGets.Add(1)
+	if m.blockGetTransient {
+		return nil, fmt.Errorf("simulated upstream blip")
+	}
 	if m.blockGet404 {
 		return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
 	}
@@ -574,5 +578,87 @@ func TestBlockCache_ETagMismatchDoesNotCache(t *testing.T) {
 	// But the block-mode meta must never be written (the mismatched block was rejected).
 	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
 		t.Error("block-mode meta written despite an ETag mismatch on block fetch")
+	}
+}
+
+// A full GET that falls through to upstream after a *transient* block-assemble failure (an
+// upstream blip, not an ETag mismatch or 404) must not whole-cache over the still-valid
+// block-mode entry: doing so would demote block mode to whole and re-download the whole object.
+func TestBlockCache_TransientBlockFailureKeepsBlockMode(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // 10 bytes → blocks [0..3][4..7][8..9]
+	svc, c := newBlockService(t, mock)
+
+	// Establish a block-mode entry (block 0 + block-mode meta) via a cold range miss.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated after cold miss")
+	}
+	if meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey); meta.BlockSize != 4 {
+		t.Fatalf("meta.BlockSize=%d, want 4 (block mode)", meta.BlockSize)
+	}
+
+	// A full GET now needs the not-yet-cached blocks 1 and 2; make those fetches fail
+	// transiently so serveFullObjectFromBlockCache gives up and falls through to upstream.
+	mock.blockGetTransient = true
+	wf := httptest.NewRecorder()
+	if err := svc.HandleGetObject(wf, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET: %v", err)
+	}
+	// The client is still served the whole object from the upstream fall-through.
+	if wf.Code != http.StatusOK || wf.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("full GET: code=%d body=%q, want 200 ABCDEFGHIJ", wf.Code, wf.Body.String())
+	}
+	// The block-mode entry must survive: the transient fall-through must NOT whole-cache over it.
+	meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if !found || meta.BlockSize != 4 {
+		t.Fatalf("block-mode meta clobbered by transient fall-through: found=%v BlockSize=%d, want block mode (4)", found, meta.BlockSize)
+	}
+}
+
+// If an entry is established concurrently (e.g. a racing full-GET whole-caches the object)
+// while a block-mode populate is in flight, the populate must not overwrite it — otherwise a
+// complete whole-mode entry is demoted to a partial block-mode one.
+func TestBlockCache_ConcurrentEntryNotOverwrittenByBlockPopulate(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Seed a whole-mode entry via a full-GET cold miss (whole-caches, BlockSize 0).
+	wf := httptest.NewRecorder()
+	if err := svc.HandleGetObject(wf, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("whole-mode meta not populated after full-GET cold miss")
+	}
+	seeded, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if seeded.BlockSize != 0 {
+		t.Fatalf("seeded meta.BlockSize=%d, want 0 (whole mode)", seeded.BlockSize)
+	}
+
+	// Now drive a block-mode populate for the same object (as a racing range miss would).
+	// Its schedule-time !found gate is already stale — the whole entry above exists — so the
+	// re-check before the meta write must make it a no-op.
+	blockMeta := *seeded
+	blockMeta.BlockSize = 4
+	before := mock.blockGets.Load()
+	svc.triggerBlockModePopulate(wowBucket, wowKey, "ak", "sk", &blockMeta, []int64{0})
+
+	// Wait for the populate goroutine to actually run (it fetches block 0) ...
+	deadline := time.Now().Add(2 * time.Second)
+	for mock.blockGets.Load() == before {
+		if time.Now().After(deadline) {
+			t.Fatal("block-mode populate never ran")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// ... then confirm it left the whole-mode meta intact rather than stamping block-mode meta.
+	// A brief settle covers the window between the block fetch and the (skipped) meta write.
+	time.Sleep(100 * time.Millisecond)
+	meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if !found || meta.BlockSize != 0 {
+		t.Fatalf("whole-mode meta demoted by block populate: found=%v BlockSize=%d, want whole mode (0)", found, meta.BlockSize)
 	}
 }

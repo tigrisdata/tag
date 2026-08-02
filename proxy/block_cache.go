@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -38,6 +39,20 @@ func (s *Service) isBlockEligibleSize(contentLength int64) bool {
 	return s.config.Cache.BlockCachingEnabled &&
 		s.config.Cache.BlockSize > 0 &&
 		contentLength >= s.config.Cache.BlockSize
+}
+
+// hasBlockModeEntry reports whether a block-mode cache entry (meta with BlockSize > 0) already
+// exists for the object. The full-GET whole-cache path uses this to avoid overwriting a valid
+// block-mode entry with a whole-mode one — e.g. when a full GET falls through to upstream after
+// a *transient* block-assemble failure (budget shed, upstream blip), which leaves the block-mode
+// meta in place. Without this guard that fall-through would demote block mode to whole and
+// re-download the entire object. Returns false when block caching is off (no block entries exist).
+func (s *Service) hasBlockModeEntry(ctx context.Context, bucket, key string) bool {
+	if !s.config.Cache.BlockCachingEnabled {
+		return false
+	}
+	m, found, err := s.cache.GetMeta(ctx, bucket, key)
+	return err == nil && found && m != nil && m.BlockSize > 0
 }
 
 // blockBounds returns the inclusive object-byte bounds [start,end] of block i for an object
@@ -192,17 +207,43 @@ func (s *Service) serveFullObjectFromBlockCache(
 }
 
 // fetchBlocksToCache fetches the given missing blocks from upstream and writes them to cache,
-// concurrently (bounded) and coalesced per block across requests. It returns the first error;
-// on any error the caller must not serve from cache (some blocks may be absent).
+// concurrently (bounded) and coalesced per block across requests. On any error the caller must
+// not serve from cache (some blocks may be absent). It reports a definitive stale-entry signal
+// (ETag mismatch / upstream gone) in preference to a transient one: those two are the only
+// errors ensureBlocksCached acts on to invalidate, so a fast transient failure of one block
+// must not mask a slower stale signal from another (which would leave the stale meta to retry
+// until TTL). Blocks are therefore not canceled on a sibling's error — each runs to completion
+// so its signal is observed — but the caller's ctx still aborts them (e.g. client disconnect).
 func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdxs []int64) error {
-	g, gctx := errgroup.WithContext(ctx)
+	var g errgroup.Group
 	g.SetLimit(maxConcurrentBlockFetches)
+	var mu sync.Mutex
+	var stale, transient error
 	for _, idx := range blockIdxs {
 		g.Go(func() error {
-			return s.fetchOneBlock(gctx, bucket, key, accessKey, secretKey, meta, idx)
+			err := s.fetchOneBlock(ctx, bucket, key, accessKey, secretKey, meta, idx)
+			if err == nil {
+				return nil
+			}
+			mu.Lock()
+			if errors.Is(err, errBlockETagMismatch) || errors.Is(err, errBlockUpstreamGone) {
+				if stale == nil {
+					stale = err
+				}
+			} else if transient == nil {
+				transient = err
+			}
+			mu.Unlock()
+			// Return nil so errgroup neither cancels siblings nor collapses to a single
+			// error; the prioritized result is chosen from the errors collected above.
+			return nil
 		})
 	}
-	return g.Wait()
+	_ = g.Wait()
+	if stale != nil {
+		return stale
+	}
+	return transient
 }
 
 // fetchOneBlock fetches a single block from upstream (an aligned range GET) and writes it to
@@ -358,6 +399,15 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 
 		if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, touched); err != nil {
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block-mode populate skipped - block fetch failed")
+			return
+		}
+		// Re-check that no entry was established concurrently before stamping block-mode meta.
+		// The schedule-time !found gate can go stale during the block fetch above: a racing
+		// full-GET miss may have whole-cached the object. Overwriting that with block-mode meta
+		// would demote a complete whole-mode entry to a partial one, so back off and let it win
+		// (the touched blocks we fetched are harmless orphans that age out).
+		if _, found, _ := s.cache.GetMeta(ctx, bucket, key); found {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Block-mode meta write skipped - entry established concurrently")
 			return
 		}
 		ttl := int(s.config.Cache.TTL.Seconds())
