@@ -255,6 +255,12 @@ func (s *Service) fetchOneBlock(_ context.Context, bucket, key, accessKey, secre
 		if resp.ContentLength != blockLen {
 			return nil, fmt.Errorf("block %d fetch: content-length %d, want %d", blockIdx, resp.ContentLength, blockLen)
 		}
+		// Validate the 206's Content-Range bounds match the block we asked for. A same-length
+		// response at a different offset (a non-conformant upstream) would otherwise be stored
+		// under this block index and served at the wrong object offset.
+		if rs, re, ok := parseContentRangeBounds(resp.Header.Get("Content-Range")); !ok || rs != bStart || re != bEnd {
+			return nil, fmt.Errorf("block %d fetch: content-range bounds %d-%d (ok=%t), want %d-%d", blockIdx, rs, re, ok, bStart, bEnd)
+		}
 		// ETag guard: the block must belong to the exact version meta describes.
 		if respETag := resp.Header.Get("ETag"); respETag != "" && respETag != meta.ETag {
 			return nil, errBlockETagMismatch

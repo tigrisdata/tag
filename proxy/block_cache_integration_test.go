@@ -20,12 +20,13 @@ import (
 // client-range forward (DoRequestWithCreds) and per-block fetches (DoConditionalGetRequest).
 type blockMockForwarder struct {
 	*mockForwarder
-	object             []byte
-	etag               string
-	blockGetETag       string       // ETag returned by per-block fetches (defaults to etag)
-	blockGetWhole2xx   bool         // if set, per-block fetches return 200 with the WHOLE object
-	blockGetUnknownLen bool         // if set, per-block 206 fetches report ContentLength -1
-	blockGets          atomic.Int32 // count of per-block DoConditionalGetRequest calls
+	object              []byte
+	etag                string
+	blockGetETag        string       // ETag returned by per-block fetches (defaults to etag)
+	blockGetWhole2xx    bool         // if set, per-block fetches return 200 with the WHOLE object
+	blockGetUnknownLen  bool         // if set, per-block 206 fetches report ContentLength -1
+	blockGetWrongOffset bool         // if set, per-block 206 Content-Range has wrong (same-length) bounds
+	blockGets           atomic.Int32 // count of per-block DoConditionalGetRequest calls
 }
 
 func newBlockMock(object []byte, etag string) *blockMockForwarder {
@@ -79,6 +80,11 @@ func (m *blockMockForwarder) DoConditionalGetRequest(_ context.Context, _, _, _,
 	resp := m.serveRange(rangeHeader, m.blockGetETag)
 	if m.blockGetUnknownLen {
 		resp.ContentLength = -1 // chunked/unknown length: can't be validated
+	}
+	if m.blockGetWrongOffset {
+		// Same length as the requested block but a different offset (non-conformant upstream).
+		n := resp.ContentLength
+		resp.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", 100, 100+n-1, len(m.object)))
 	}
 	return resp, nil
 }
@@ -253,6 +259,25 @@ func TestBlockCache_WarmOnWriteNoopAboveBoundary(t *testing.T) {
 	}
 	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
 		t.Error("warm-on-write cached a block-mode-sized object whole (want no-op above the boundary)")
+	}
+}
+
+// A 206 whose declared length matches the block but whose Content-Range identifies different
+// byte bounds (a non-conformant upstream) must not be stored under the requested block index.
+func TestBlockCache_WrongContentRangeBoundsNotStored(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	mock.blockGetWrongOffset = true // 206 has the right length but wrong Content-Range bounds
+	svc, c := newBlockService(t, mock)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
+		t.Error("block-mode meta written from a 206 with mismatched Content-Range bounds")
+	}
+	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 0) {
+		t.Error("body stored under block 0 despite wrong Content-Range bounds")
 	}
 }
 

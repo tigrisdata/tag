@@ -795,6 +795,32 @@ func extractTotalSizeFromContentRange(contentRange string) int64 {
 	return total
 }
 
+// parseContentRangeBounds parses START and END from a "bytes START-END/TOTAL" Content-Range
+// header. ok is false if the header is absent or malformed (e.g. a "bytes */TOTAL"
+// unsatisfied-range form, which has no numeric bounds).
+func parseContentRangeBounds(contentRange string) (start, end int64, ok bool) {
+	const prefix = "bytes "
+	if !strings.HasPrefix(contentRange, prefix) {
+		return 0, 0, false
+	}
+	spec := contentRange[len(prefix):]
+	slashIdx := strings.LastIndex(spec, "/")
+	if slashIdx == -1 {
+		return 0, 0, false
+	}
+	rangePart := spec[:slashIdx] // "START-END"
+	dashIdx := strings.IndexByte(rangePart, '-')
+	if dashIdx == -1 {
+		return 0, 0, false
+	}
+	s, err1 := strconv.ParseInt(rangePart[:dashIdx], 10, 64)
+	e, err2 := strconv.ParseInt(rangePart[dashIdx+1:], 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return s, e, true
+}
+
 // GetRegion returns the configured upstream region.
 func (s *Service) GetRegion() string {
 	return s.config.Upstream.Region
