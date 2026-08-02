@@ -244,20 +244,22 @@ func TestBlockCache_FullGetAssemblesAllBlocks(t *testing.T) {
 	}
 }
 
-// Warm-on-write is a no-op for objects larger than warm_on_write_max_size: the whole-object
-// fetch aborts after headers (no read-back), so no entry is created.
-func TestBlockCache_WarmOnWriteNoopAboveMaxSize(t *testing.T) {
+// Warm-on-write is a no-op for block-eligible objects (>= block_size with block caching on):
+// they are populated as blocks on read, not warmed whole. The whole-object fetch aborts after
+// headers (no read-back), so no whole-body entry is created.
+func TestBlockCache_WarmOnWriteNoopForBlockEligible(t *testing.T) {
 	var warmFetches atomic.Int32
 	mock := &mockForwarder{
 		forwardFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
 			w.WriteHeader(http.StatusOK)
 			return nil
 		},
-		doFullObjectFunc: warmObjectResponder(&warmFetches, "ABCDEFGHIJ"), // 10 bytes > cap
+		doFullObjectFunc: warmObjectResponder(&warmFetches, "ABCDEFGHIJ"), // 10 bytes >= block_size
 	}
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
-	svc.config.Cache.WarmOnWriteMaxSize = 8
+	svc.config.Cache.BlockCachingEnabled = true
+	svc.config.Cache.BlockSize = 4 // the 10-byte object is block-eligible (>= 4)
 	svc.config.Cache.SizeThreshold = 1 << 20
 
 	w := httptest.NewRecorder()
@@ -265,7 +267,7 @@ func TestBlockCache_WarmOnWriteNoopAboveMaxSize(t *testing.T) {
 		t.Fatalf("PUT: %v", err)
 	}
 	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
-		t.Error("warm-on-write cached an object larger than warm_on_write_max_size")
+		t.Error("warm-on-write cached a block-eligible object whole (want no-op)")
 	}
 }
 

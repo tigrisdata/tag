@@ -38,11 +38,6 @@ const (
 	// DefaultCacheSizeThreshold is the max object size to cache (1GB).
 	DefaultCacheSizeThreshold = 1024 * 1024 * 1024
 
-	// DefaultCacheWarmOnWriteMaxSize (25 MiB) caps which objects warm-on-write caches on the
-	// write path (whole): a successful write of an object this size or SMALLER is warm-cached,
-	// larger writes are not. It is independent of the read-side block boundary (BlockSize).
-	DefaultCacheWarmOnWriteMaxSize = 25 * 1024 * 1024
-
 	// DefaultCacheBlockSize (4 MiB) is the block granularity AND the read-side whole-vs-block
 	// boundary: a read miss for an object SMALLER than one block is cached as a whole blob
 	// (block-caching a sub-block object is identical to whole-caching it), while an object
@@ -229,13 +224,6 @@ type CacheConfig struct {
 	// best-effort background GET (deduplicated and shed under the populate budget).
 	// It costs one extra upstream GET per write, so it defaults to false.
 	WarmOnWrite bool `yaml:"warm_on_write"`
-	// WarmOnWriteMaxSize caps which objects warm-on-write caches on the write path (whole):
-	// when WarmOnWrite is true, a successful write of an object this size or SMALLER is
-	// warm-cached (via the in-memory write-through tee for objects below BlockSize, or the
-	// streaming read-back for larger ones), and larger writes are not warmed. This is the
-	// write-path knob, independent of the read-side block boundary (BlockSize). 0 or unset
-	// uses DefaultCacheWarmOnWriteMaxSize; clamped to SizeThreshold.
-	WarmOnWriteMaxSize int64 `yaml:"warm_on_write_max_size"`
 	// BlockCachingEnabled turns on block-aligned caching for large objects (RFC 0001):
 	// objects at or above BlockSize are cached at BlockSize granularity on read, so a range
 	// read (e.g. a Parquet footer) populates and serves only the blocks it touches instead of
@@ -371,10 +359,6 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Cache.SizeThreshold == 0 {
 		cfg.Cache.SizeThreshold = DefaultCacheSizeThreshold
-	}
-	// The warm-on-write cap must be positive; 0/unset or a stray negative falls back to default.
-	if cfg.Cache.WarmOnWriteMaxSize <= 0 {
-		cfg.Cache.WarmOnWriteMaxSize = DefaultCacheWarmOnWriteMaxSize
 	}
 	// Block size must be positive (it is a divisor in block arithmetic, and the read-side
 	// whole-vs-block boundary); a zero or negative value — from YAML or a programmatic config —
@@ -530,25 +514,6 @@ func applyEnvOverrides(cfg *Config) {
 			if b, err := strconv.ParseBool(val); err == nil {
 				cfg.Cache.BlockCachingEnabled = b
 			}
-		}
-		// Override the warm-on-write size cap from environment. Only a positive value is
-		// honored; 0/unset keeps the default.
-		if val := os.Getenv("TAG_CACHE_WARM_ON_WRITE_MAX_SIZE"); val != "" {
-			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n > 0 {
-				cfg.Cache.WarmOnWriteMaxSize = n
-			}
-		}
-		// Warn on removed variables rather than silently ignoring a deployment that still sets
-		// them. TAG_CACHE_WRITE_THROUGH_MAX_SIZE and TAG_CACHE_BLOCK_CACHE_MIN_SIZE were folded
-		// into the read-side block_size boundary and the write-side warm_on_write_max_size cap.
-		for _, old := range []string{"TAG_CACHE_WRITE_THROUGH_MAX_SIZE", "TAG_CACHE_BLOCK_CACHE_MIN_SIZE"} {
-			if os.Getenv(old) != "" {
-				fmt.Fprintf(os.Stderr, "WARNING: %s is removed and ignored; the read-side whole-vs-block boundary is now TAG_CACHE_BLOCK_SIZE and the write-side warm cap is TAG_CACHE_WARM_ON_WRITE_MAX_SIZE.\n", old)
-			}
-		}
-		// A warm-cached (whole) object must be cacheable, so the cap can never exceed SizeThreshold.
-		if cfg.Cache.WarmOnWriteMaxSize > cfg.Cache.SizeThreshold {
-			cfg.Cache.WarmOnWriteMaxSize = cfg.Cache.SizeThreshold
 		}
 		// Override the block granularity from environment (0/unset keeps the default).
 		if val := os.Getenv("TAG_CACHE_BLOCK_SIZE"); val != "" {

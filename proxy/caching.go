@@ -410,20 +410,17 @@ func (s *Service) fetchFullObjectToCache(
 		return nil
 	}
 
-	// Size gate, by priority — checked after headers but before the body download, so an
-	// over-size object costs no read-back:
-	//   - warm-on-write: only warm-cache (whole) objects up to WarmOnWriteMaxSize.
-	//   - read-miss: skip block-eligible objects (>= BlockSize); those are cached per-block on
-	//     the range path, never whole-fetched here.
-	if prio == priorityWarmWrite {
-		if resp.ContentLength > 0 && resp.ContentLength > s.config.Cache.WarmOnWriteMaxSize {
-			log.Debug().Str("bucket", bucket).Str("key", key).Int64("size", resp.ContentLength).
-				Int64("warm_max", s.config.Cache.WarmOnWriteMaxSize).Msg("Skipping warm-on-write - over WarmOnWriteMaxSize")
-			return nil
-		}
-	} else if s.isBlockEligibleSize(resp.ContentLength) {
+	// Warm-on-write does not whole-cache objects that are block-cached on read (>= BlockSize
+	// when block caching is on): they are populated as blocks on the range path instead, so
+	// warming them whole would just create an overlapping whole-body entry. Aborting here,
+	// after headers but before the body download, makes warm-on-write a no-op for them at no
+	// read-back cost. Read-miss whole-fetches do NOT skip block-eligible objects — the only
+	// read-miss path that reaches a block-eligible object is the full-GET cold-cancel fallback,
+	// which whole-caches it per Option A (range read misses route block-eligible objects to
+	// block population, never here).
+	if prio == priorityWarmWrite && s.isBlockEligibleSize(resp.ContentLength) {
 		log.Debug().Str("bucket", bucket).Str("key", key).Int64("size", resp.ContentLength).
-			Msg("Skipping whole-object read-miss populate - object is block-mode (cached per-block on read)")
+			Msg("Skipping warm-on-write - object is block-mode (cached per-block on read)")
 		return nil
 	}
 

@@ -100,12 +100,12 @@ On a cold range miss (no meta), write meta from the range response's `Content-Ra
 
 ### Warm-on-write interaction
 
-`warmOnWrite` is a simple **whole-object** size gate, capped by its own knob `warm_on_write_max_size` (independent of the read-side block boundary):
+`warmOnWrite` whole-caches on write, but **not** objects that are block-cached on read — an object that will be populated as blocks shouldn't also get an overlapping whole-body entry. So:
 
-- object **≤ `warm_on_write_max_size`** → whole-object warm (via the in-memory tee for objects below `block_size`, else the streaming read-back). It always produces a whole-mode entry.
-- object **> `warm_on_write_max_size`** → **noop** (the fetch aborts after headers; no read-back).
+- object **block-eligible** (block caching on and `≥ block_size`) → **noop.** It is populated as blocks on the range path instead. (The fetch aborts after headers, no read-back.)
+- otherwise (below `block_size`, or block caching off) → whole-object warm, up to `size_threshold` — via the in-memory tee for objects below `block_size`, else the streaming read-back.
 
-A warmed object is whole-mode regardless of its size, so a later range read serves from the whole body — consistent with the "warm-on-write or full-GET → whole; range-first → blocks" rule. `warm_on_write_max_size` is a blunt instrument (warming a large object whole helps read-in-full objects like manifests, wastes bandwidth for footer-read ones), so it defaults conservative and warming stays opt-in via `warm_on_write`.
+There is no separate warm-size knob: `block_size` is the boundary (block-eligible objects aren't warmed) and `size_threshold` is the ceiling. This keeps warm-on-write and read-miss block population from ever targeting the same object, so there's no whole/block overlap to reconcile.
 
 ### Full-object GET on a block-mode object
 
@@ -117,16 +117,15 @@ An entry is invalidated when a block fetch returns a definitive stale signal —
 
 ### Configuration
 
-The read-side boundary and the write-side warm cap are **separate knobs**; the former `write_through_max_size` and `block_cache_min_size` are both removed (the read boundary is now `block_size`, the write cap is `warm_on_write_max_size`):
+A single size knob, `block_size`, is the whole↔block boundary; the earlier `write_through_max_size` and `block_cache_min_size` are removed:
 
 | Key | Default | Meaning |
 |---|---|---|
 | `cache.block_caching_enabled` | `false` | Rollout flag. |
-| `cache.block_size` | 4 MiB (must be < 64 MB) | Block granularity **and** the read-side whole↔block boundary: a read miss for an object **<** one block is whole-cached (blocking a sub-block object just stores one blob), **≥** one block is block-cached. |
-| `cache.warm_on_write_max_size` | 25 MiB | Write-path cap: with `warm_on_write` on, only objects **≤** this are warm-cached whole. Independent of `block_size`. |
-| `cache.size_threshold` | 1 GB | Unchanged overall cacheability ceiling. Block mode now lets TAG cache *parts* of objects up to this ceiling without downloading the whole thing. |
+| `cache.block_size` | 4 MiB (must be < 64 MB) | Block granularity **and** the whole↔block boundary: below one block → whole-cached (blocking a sub-block object just stores one blob), at/above → block-cached. The write-through tee (in-memory) also gates on this, keeping its buffer sub-block. |
+| `cache.size_threshold` | 1 GB | Overall cacheability ceiling. Block mode lets TAG cache *parts* of objects up to this ceiling without downloading the whole thing. |
 
-Why two knobs: block-caching a sub-block object is identical to whole-caching it, so `block_size` is the natural read boundary — no separate `block_cache_min_size` is needed. And "how big an object do we warm on write" is a distinct decision (bounded by the tee's in-memory buffer for small objects, a streaming read-back for larger), so it gets its own cap.
+Why one knob: block-caching a sub-block object is identical to whole-caching it, so `block_size` is the natural boundary. It governs both directions — read misses of block-eligible objects populate blocks, and the write path (tee + warm-on-write) is a no-op for those same objects (they'd otherwise create an overlapping whole-body entry). Warm-on-write whole-caches only non-block-eligible objects, up to `size_threshold`; no separate warm cap is needed.
 
 ### Invalidation and consistency
 
@@ -149,7 +148,7 @@ Back-compat: legacy whole-body entries (`BlockSize=0`) are served by the existin
 
 1. `meta.BlockSize` + `MakeBlockKey` + config + reader dispatch (block vs whole).
 2. Block-aware range serve: per-block probe + partial-hit fetch (coalesced, concurrent).
-3. Warm-on-write gated to `≤ warm_on_write_max_size`, noop above; read boundary is `block_size`; remove `block_cache_min_size` and `write_through_max_size`.
+3. Warm-on-write (and the tee) skip block-eligible objects (`≥ block_size` with block caching on); the whole↔block boundary is `block_size`; remove `block_cache_min_size` and `write_through_max_size`.
 4. Full-GET block assembly + metrics.
 5. *(optional, later — may or may not do)* ocache block-locality routing for clusters.
 
@@ -165,5 +164,5 @@ Deferred: block-size-vs-footer-fit (single block size for now).
 ## Alternatives considered
 
 - **Option B — ocache sparse blobs.** Store one body key as a sparse blob with a present-ranges map (`PutRange` + hole-aware `GetRangeStream`). Fewer keys and exact-byte population, but a larger change that lands in **ocache** (separate plan/repo). Kept in mind as a possible future evolution; Option A is chosen for phase 1 because it is self-contained in TAG and incremental.
-- **Whole-object multipart write-through (#136).** Pre-warms *whole* bodies on write — right for manifests (read in full), wrong for Parquet (footer + selective ranges). Closed in favor of this RFC. Consequence for manifests: at 300–400 MB they are above the default `warm_on_write_max_size` (25 MiB), so warm-on-write is a noop for them — but because they are **read in full**, their first full-object read is a full-GET miss and lands on the whole-cache path (Option A), so they end up **whole-cached** (the right representation for a read-in-full object), and subsequent reads hit. The only change versus write-time pre-warming is that the first read after each manifest rewrite is a cold full fetch rather than a pre-warmed hit; if that proves material, raise `warm_on_write_max_size` to pre-warm manifests on write.
+- **Whole-object multipart write-through (#136).** Pre-warms *whole* bodies on write — right for manifests (read in full), wrong for Parquet (footer + selective ranges). Closed in favor of this RFC. Consequence for manifests: at 300–400 MB they are block-eligible (`≥ block_size`), so warm-on-write is a noop for them — but because they are **read in full**, their first full-object read is a full-GET miss and lands on the whole-cache path (Option A), so they end up **whole-cached** (the right representation for a read-in-full object), and subsequent reads hit. The only change versus write-time pre-warming is that the first read after each manifest rewrite is a cold full fetch rather than a pre-warmed hit.
 - **Optimize whole-object warm (#136 Approach B — parallel-range fetch / lazy warm).** Subsumed here: block-granular read-demand populate is a strictly better "warm on read-demand," and parallel-range fetch survives as the concurrent block-fill implementation detail.

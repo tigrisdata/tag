@@ -98,9 +98,10 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 		!hasNoAuthCredentials(r) &&
 		size > 0 &&
 		// The tee buffers the whole object in memory, so it applies only to sub-block objects
-		// (size < BlockSize) — small and memory-safe. Larger warm-eligible objects are warmed
-		// via the streaming read-back instead (warmOnWrite, capped at WarmOnWriteMaxSize).
-		// IsCacheable(SizeThreshold) still applies to the meta after the HEAD.
+		// (size < BlockSize) — small and memory-safe. Block-eligible objects (>= BlockSize) are
+		// block-cached on read, so the write path (tee + warm-on-write) is a no-op for them;
+		// non-block-eligible objects at or above BlockSize (e.g. block caching off) are warmed
+		// via the streaming read-back instead. IsCacheable(SizeThreshold) still applies after the HEAD.
 		size < s.config.Cache.BlockSize
 
 	if !eligible {

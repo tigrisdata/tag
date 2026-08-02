@@ -492,42 +492,6 @@ func TestLoad_WarmOnWriteReservedFractionOverrideAndClamp(t *testing.T) {
 	}
 }
 
-func TestLoad_WarmOnWriteMaxSizeDefaultOverrideAndClamp(t *testing.T) {
-	cases := []struct {
-		name string
-		yaml string
-		env  string
-		want int64
-	}{
-		{"default", "cache:\n  enabled: true\n", "", DefaultCacheWarmOnWriteMaxSize},
-		{"env override honored", "cache:\n  enabled: true\n", "8388608", 8388608}, // 8 MiB
-		// The default (25 MiB) exceeds a 1 MiB size_threshold, so it clamps down: a
-		// warm-cached (whole) object must be cacheable.
-		{"clamped to size_threshold", "cache:\n  enabled: true\n  size_threshold: 1048576\n", "", 1048576},
-		// A non-positive cap is meaningless; it must floor to the default, from YAML or env.
-		{"negative yaml floors to default", "cache:\n  enabled: true\n  warm_on_write_max_size: -1\n", "", DefaultCacheWarmOnWriteMaxSize},
-		{"negative env ignored", "cache:\n  enabled: true\n", "-1", DefaultCacheWarmOnWriteMaxSize},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
-			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
-				t.Fatalf("Failed to create temp file: %v", err)
-			}
-			if tc.env != "" {
-				t.Setenv("TAG_CACHE_WARM_ON_WRITE_MAX_SIZE", tc.env)
-			}
-			cfg, err := Load(tmpFile)
-			if err != nil {
-				t.Fatalf("Load() error = %v", err)
-			}
-			if cfg.Cache.WarmOnWriteMaxSize != tc.want {
-				t.Errorf("WarmOnWriteMaxSize = %d, want %d", cfg.Cache.WarmOnWriteMaxSize, tc.want)
-			}
-		})
-	}
-}
-
 func TestLoad_BlockSizeDefaultAndOverride(t *testing.T) {
 	cases := []struct {
 		name string
