@@ -780,6 +780,16 @@ func (s *Service) handleRangeWithBackgroundCache(
 		!s.hasNoCacheHeaders(resp.Header)
 
 	if blockEligible {
+		// If an anonymous range GET succeeded (206) and Tigris didn't set an explicit per-object
+		// ACL, the object inherits public access from the bucket — mirror the whole-object path
+		// and record public-read so later anonymous reads can be served from the block-mode
+		// entry. Without this the entry is stored non-public and every anonymous read is turned
+		// away by the IsPublicRead() gate, defeating the cache for anonymous range traffic. The
+		// inference is sound: in transparent mode the forward carries the client's (absent) auth,
+		// so a 206 means Tigris served an anonymous read.
+		if hasNoAuthCredentials(r) && resp.Header.Get("X-Amz-Acl") == "" {
+			resp.Header.Set("X-Amz-Acl", "public-read")
+		}
 		meta := s.buildBlockMeta(bucket, key, resp.Header, totalSize)
 		if touched := touchedBlocks(r.Header.Get("Range"), totalSize, meta.BlockSize); len(touched) > 0 {
 			// Only establish a block-mode entry when none exists (mirrors the whole-object

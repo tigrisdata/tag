@@ -662,3 +662,57 @@ func TestBlockCache_ConcurrentEntryNotOverwrittenByBlockPopulate(t *testing.T) {
 		t.Fatalf("whole-mode meta demoted by block populate: found=%v BlockSize=%d, want whole mode (0)", found, meta.BlockSize)
 	}
 }
+
+// An anonymous range miss to a public-bucket object must store the block-mode entry as
+// public-read (mirroring the whole-object path); otherwise every later anonymous read is
+// turned away by the IsPublicRead() gate and the block cache is useless for anonymous traffic.
+func TestBlockCache_AnonymousRangeMissMarksPublicRead(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+	// Model transparent mode: an anonymous request validates as AuthNotValidated but still
+	// receives TAG's own creds for background fetches (see ValidateAndGetCredentials).
+	mock.validateFunc = func(r *http.Request) (AuthResult, string, string, error) {
+		if hasNoAuthCredentials(r) {
+			return AuthNotValidated, "access", "secret", nil
+		}
+		return AuthValidated, "access", "secret", nil
+	}
+
+	// Anonymous cold range miss (no Authorization header). Tigris omits X-Amz-Acl for a
+	// bucket-inherited object, so the entry would be non-public without the fix.
+	anon := blockGet(wowBucket, wowKey, "bytes=0-3")
+	anon.Header.Del("Authorization")
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, anon); err != nil {
+		t.Fatalf("anon cold miss: %v", err)
+	}
+	if w.Code != http.StatusPartialContent || w.Body.String() != "ABCD" {
+		t.Fatalf("anon cold miss: code=%d body=%q, want 206 ABCD", w.Code, w.Body.String())
+	}
+
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated after anonymous cold miss")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if !meta.IsPublicRead() {
+		t.Fatalf("anonymous block-mode entry not public-read (ACL=%q); anonymous reads would skip it", meta.ACL)
+	}
+
+	// A second anonymous read within the populated block is served from cache, not turned away.
+	before := mock.blockGets.Load()
+	anon2 := blockGet(wowBucket, wowKey, "bytes=1-2")
+	anon2.Header.Del("Authorization")
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, anon2); err != nil {
+		t.Fatalf("anon cache read: %v", err)
+	}
+	if w2.Code != http.StatusPartialContent || w2.Body.String() != "BC" {
+		t.Fatalf("anon cache read: code=%d body=%q, want 206 BC", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("anon read X-Cache=%q, want %q (public-read block entry should serve anonymously)", got, XCacheHit)
+	}
+	if after := mock.blockGets.Load(); after != before {
+		t.Errorf("block re-fetched on an anonymous hit: blockGets %d -> %d", before, after)
+	}
+}
