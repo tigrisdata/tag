@@ -109,7 +109,11 @@ This lowers warm-on-write's effective cap from `size_threshold` (1 GB) to `block
 
 ### Full-object GET on a block-mode object
 
-Rare for Parseable (it reads ranges) but must be correct: assemble blocks `0…N-1` in order, fetching any missing via `fetchBlocksToCache`, streaming as we go. A full GET thus warms all blocks — acceptable given its rarity.
+Rare for Parseable (it reads ranges) but must be correct: on a **hit**, assemble blocks `0…N-1` in order, fetching any missing via `fetchBlocksToCache`, streaming as we go. A full GET thus warms all blocks — acceptable given its rarity.
+
+On a full-GET **miss** of a block-eligible object, the object is not whole-cached (that would shadow block mode); instead block mode is **established in the background** — all blocks are populated and the block-mode meta written — so full-GET-accessed objects are cached too, not only range-accessed ones, and the `block-eligible == block-mode` invariant holds regardless of access pattern. This re-fetches the object as blocks in the background, so it runs only for block-eligible objects reached via a full GET (never on the range path).
+
+An entry is invalidated when a block fetch returns a definitive stale signal — an ETag mismatch (concurrent overwrite) or 404/403 (deleted / access revoked) — so a stale entry isn't retried on every read until TTL. A client-forced revalidation (`Cache-Control: no-cache`) of a block-mode entry likewise invalidates it and lets the miss path re-establish the current version.
 
 ### Configuration
 

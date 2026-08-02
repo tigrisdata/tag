@@ -26,22 +26,26 @@ type blockMockForwarder struct {
 	blockGetWhole2xx    bool         // if set, per-block fetches return 200 with the WHOLE object
 	blockGetUnknownLen  bool         // if set, per-block 206 fetches report ContentLength -1
 	blockGetWrongOffset bool         // if set, per-block 206 Content-Range has wrong (same-length) bounds
+	blockGet404         bool         // if set, per-block fetches return 404 (object gone)
 	blockGets           atomic.Int32 // count of per-block DoConditionalGetRequest calls
 }
 
 func newBlockMock(object []byte, etag string) *blockMockForwarder {
 	m := &blockMockForwarder{mockForwarder: &mockForwarder{}, object: object, etag: etag, blockGetETag: etag}
-	// The initial client-range forward serves the requested range too.
+	// The client forward serves the requested range, or the whole object for a full GET.
 	m.mockForwarder.doRequestFunc = func(_ context.Context, r *http.Request, _, _ string) (*http.Response, error) {
-		return m.serveRange(r.Header.Get("Range"), m.etag), nil
+		if rng := r.Header.Get("Range"); rng != "" {
+			return m.serveRange(rng, m.etag), nil
+		}
+		return m.wholeObject(m.etag), nil
 	}
 	return m
 }
 
-// wholeObject200 returns the whole object as a 200 (as if upstream ignored the Range).
-func (m *blockMockForwarder) wholeObject200() *http.Response {
+// wholeObject returns the whole object as a 200 with the given ETag.
+func (m *blockMockForwarder) wholeObject(etag string) *http.Response {
 	h := http.Header{}
-	h.Set("ETag", m.blockGetETag)
+	h.Set("ETag", etag)
 	h.Set("Content-Type", "application/octet-stream")
 	h.Set("Content-Length", fmt.Sprintf("%d", len(m.object)))
 	return &http.Response{
@@ -74,8 +78,11 @@ func (m *blockMockForwarder) serveRange(rangeHeader, etag string) *http.Response
 
 func (m *blockMockForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _, _ string, _ int64, rangeHeader string) (*http.Response, error) {
 	m.blockGets.Add(1)
+	if m.blockGet404 {
+		return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}
 	if m.blockGetWhole2xx {
-		return m.wholeObject200(), nil
+		return m.wholeObject(m.blockGetETag), nil
 	}
 	resp := m.serveRange(rangeHeader, m.blockGetETag)
 	if m.blockGetUnknownLen {
@@ -297,6 +304,68 @@ func TestBlockCache_UnknownLengthBlockNotStored(t *testing.T) {
 	}
 	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 0) {
 		t.Error("unknown-length body stored as block 0")
+	}
+}
+
+// A full-object GET of a block-eligible object with no cached entry establishes block mode in
+// the background (populate all blocks + block-mode meta), so full-GET-accessed objects are
+// cached too, not only range-accessed ones.
+func TestBlockCache_FullGetMissEstablishesBlockMode(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Full GET on a cold object: served whole from upstream, block mode established in background.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET: %v", err)
+	}
+	if w.Code != http.StatusOK || w.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("full GET: code=%d body=%q, want 200 ABCDEFGHIJ", w.Code, w.Body.String())
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block mode not established after a full-GET miss")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if meta.BlockSize != 4 {
+		t.Fatalf("meta.BlockSize=%d, want 4 (block-mode)", meta.BlockSize)
+	}
+	for i := int64(0); i <= 2; i++ {
+		if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, i) {
+			t.Errorf("block %d not populated by full-GET establishment", i)
+		}
+	}
+}
+
+// An out-of-band delete (a block fetch returns 404) invalidates the stale block-mode entry
+// rather than retrying failed fetches on every read until TTL.
+func TestBlockCache_Block404InvalidatesStaleMeta(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Establish a block-mode entry (meta + block 0).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated")
+	}
+
+	// The object is deleted out of band: block fetches now 404.
+	mock.blockGet404 = true
+
+	// A full GET assembles blocks; a missing block 404s → the stale entry is invalidated.
+	w2 := httptest.NewRecorder()
+	_ = svc.HandleGetObject(w2, fullGet(wowBucket, wowKey))
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stale block-mode meta not invalidated after a 404 block fetch")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

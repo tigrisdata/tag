@@ -368,9 +368,9 @@ func (s *Service) streamFromUpstream(
 		s.cache.IsEnabled() &&
 		!s.hasNoCacheHeaders(resp.Header) &&
 		s.isWithinSizeThreshold(resp) &&
-		// A full GET of a block-mode-sized object must not create a whole-body entry that
-		// would shadow block mode; such objects are cached per-block on read (RFC 0001).
-		// Full-object assembly from blocks is phase 4; for now these are served but not cached.
+		// A full GET of a block-eligible object must not create a whole-body entry that would
+		// shadow block mode; it is established as a block-mode entry in the background instead
+		// (see below), keeping the block-eligible == block-mode invariant (RFC 0001).
 		!s.isBlockEligibleSize(resp.ContentLength)
 
 	// Set up cache listener if caching (streams directly to cache via pipe)
@@ -382,6 +382,33 @@ func (s *Service) streamFromUpstream(
 		// the buffer ceiling), so small objects don't each reserve the worst case.
 		weight := s.populateWeight(resp.ContentLength)
 		cachePipeWriter, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, writeStartTime)
+	}
+
+	// A full GET of a block-eligible object isn't whole-cached (above). Establish it as a
+	// block-mode entry in the background — populate all its blocks, then write the block-mode
+	// meta — so full-GET-accessed objects are cached too (not only range-accessed ones), and a
+	// forced-revalidation invalidation is rebuilt. Gated on GetMeta(!found) to dedup and never
+	// overwrite an existing entry; needs credentials (block fetches are signed) and an ETag.
+	// This re-fetches the object as blocks, so it runs only for block-eligible objects reached
+	// via a full-object GET, never on the range-read path.
+	if resp.StatusCode == http.StatusOK &&
+		s.cache.IsEnabled() &&
+		!s.hasNoCacheHeaders(resp.Header) &&
+		s.isBlockEligibleSize(resp.ContentLength) &&
+		resp.ContentLength <= s.config.Cache.SizeThreshold &&
+		accessKey != "" && secretKey != "" &&
+		resp.Header.Get("ETag") != "" {
+		meta := s.buildBlockMeta(bucket, key, resp.Header, resp.ContentLength)
+		lastBlock := (resp.ContentLength - 1) / meta.BlockSize
+		all := make([]int64, 0, lastBlock+1)
+		for i := int64(0); i <= lastBlock; i++ {
+			all = append(all, i)
+		}
+		defer func() {
+			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
+				s.triggerBlockModePopulate(bucket, key, accessKey, secretKey, meta, all)
+			}
+		}()
 	}
 
 	// If an anonymous GET succeeded and Tigris didn't set an explicit per-object ACL,

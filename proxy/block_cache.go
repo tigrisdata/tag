@@ -22,6 +22,11 @@ const maxConcurrentBlockFetches = 4
 // version than the meta we hold (a concurrent overwrite), so it must not be cached.
 var errBlockETagMismatch = errors.New("block etag mismatch")
 
+// errBlockUpstreamGone means a block fetch got a definitive "not there for us" status (404
+// object deleted, or 403 access revoked). Like an ETag mismatch, it signals the cached
+// block-mode entry is stale and should be invalidated rather than repeatedly retried.
+var errBlockUpstreamGone = errors.New("block upstream gone")
+
 // isBlockEligibleSize reports whether an object of the given content length is handled by
 // block-mode caching (RFC 0001) rather than whole-object caching: block caching is enabled,
 // the block size is valid, and the object is at or above the block-mode boundary. A
@@ -239,6 +244,11 @@ func (s *Service) fetchOneBlock(_ context.Context, bucket, key, accessKey, secre
 			return nil, rerr
 		}
 		defer resp.Body.Close()
+		// A definitive "gone for us" status (404 deleted, 403 access revoked) means the cached
+		// entry is stale — signal it so the caller invalidates rather than retrying every read.
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden {
+			return nil, errBlockUpstreamGone
+		}
 		// A block fetch must be a 206 whose body is exactly the requested block bytes. A 200
 		// means upstream ignored the Range and returned the whole object (whose byte 0 is the
 		// object start, not this block's offset), and a length that differs from the requested
@@ -295,14 +305,14 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 		return nil
 	}
 	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, missing); err != nil {
-		// A definitive version mismatch means the cached block-mode meta is stale — the object
-		// was overwritten (out of band, since a through-TAG write would have invalidated it).
-		// Invalidate the meta so the caller's fall-through re-establishes the current version,
-		// instead of repeating this mismatch on every request until the meta TTL expires. This
-		// matters most for full-object GETs, whose miss path never re-populates block mode.
-		// Transient failures (budget shed, upstream blip) leave the still-valid meta in place.
-		if errors.Is(err, errBlockETagMismatch) {
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta after ETag mismatch")
+		// A definitive "stale entry" signal — the cached version was overwritten (ETag
+		// mismatch) or the object is gone/forbidden (404/403) out of band — means the cached
+		// block-mode meta is stale. Invalidate it so the caller's fall-through re-establishes
+		// the current state, instead of repeating this failure on every read until the meta
+		// TTL expires. Transient failures (budget shed, 5xx, upstream blip) leave the
+		// still-valid meta in place to retry later.
+		if errors.Is(err, errBlockETagMismatch) || errors.Is(err, errBlockUpstreamGone) {
+			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
 			s.cache.Delete(context.Background(), bucket, key)
 		}
 		return err
