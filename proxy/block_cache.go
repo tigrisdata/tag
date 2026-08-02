@@ -221,15 +221,18 @@ func (s *Service) fetchOneBlock(_ context.Context, bucket, key, accessKey, secre
 			return nil, nil
 		}
 		bStart, bEnd := blockBounds(blockIdx, meta.BlockSize, meta.ContentLength)
-		weight := bEnd - bStart + 1
+		blockLen := bEnd - bStart + 1
 
-		// Non-blocking read-miss reservation by the block's actual size. On decline the block
-		// isn't cached; the caller falls through to a direct upstream range.
-		if !s.acquireCacheSlot(fetchCtx, weight, priorityReadMiss) {
+		// Reserve populate budget by the block size, clamped via populateWeight so a block
+		// larger than the whole budget still acquires (one-at-a-time) instead of being shed
+		// forever. Non-blocking read-miss: on decline the block isn't cached and the caller
+		// falls through to a direct upstream range.
+		reserveWeight := s.populateWeight(blockLen)
+		if !s.acquireCacheSlot(fetchCtx, reserveWeight, priorityReadMiss) {
 			metrics.RecordCachePopulateSkipped(priorityReadMiss.metricSource())
 			return nil, errCachePopulateDeclined
 		}
-		defer s.releaseCacheSlot(weight)
+		defer s.releaseCacheSlot(reserveWeight)
 
 		resp, rerr := s.forwarder.DoConditionalGetRequest(fetchCtx, bucket, key, accessKey, secretKey, "", 0, fmt.Sprintf("bytes=%d-%d", bStart, bEnd))
 		if rerr != nil {
@@ -249,8 +252,8 @@ func (s *Service) fetchOneBlock(_ context.Context, bucket, key, accessKey, secre
 		// (ContentLength < 0), which we can't validate and so must not store (a short or long
 		// body would be served at fixed block-local offsets, corrupting reads). S3/Tigris always
 		// sets Content-Length on a 206, so a well-formed block fetch is never rejected here.
-		if resp.ContentLength != weight {
-			return nil, fmt.Errorf("block %d fetch: content-length %d, want %d", blockIdx, resp.ContentLength, weight)
+		if resp.ContentLength != blockLen {
+			return nil, fmt.Errorf("block %d fetch: content-length %d, want %d", blockIdx, resp.ContentLength, blockLen)
 		}
 		// ETag guard: the block must belong to the exact version meta describes.
 		if respETag := resp.Header.Get("ETag"); respETag != "" && respETag != meta.ETag {
@@ -261,7 +264,7 @@ func (s *Service) fetchOneBlock(_ context.Context, bucket, key, accessKey, secre
 			return nil, perr
 		}
 		metrics.CacheBlockPopulated.Inc()
-		metrics.CacheBlockBytesPopulated.Add(float64(weight))
+		metrics.CacheBlockBytesPopulated.Add(float64(blockLen))
 		return nil, nil
 	})
 	return err

@@ -119,7 +119,17 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			// If the client forced revalidation but there is no whole-body entry to revalidate
 			// (no ETag, or a block-mode entry), fall through to the miss path.
 			if forceRevalidate {
-				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Force revalidate but no ETag, falling through to upstream")
+				// A block-mode entry can't use the conditional-GET revalidate path, and the
+				// fall-through's re-populate is gated on GetMeta(!found), so without invalidating
+				// here a forced revalidation would serve fresh once but leave the (possibly stale)
+				// block-mode entry in place — later normal reads never re-check upstream when their
+				// blocks are already cached. Invalidate so the fall-through re-establishes the
+				// current version.
+				if meta.BlockSize > 0 {
+					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidating block-mode entry for client-forced revalidation")
+					s.cache.Delete(context.Background(), bucket, key)
+				}
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Force revalidate, falling through to upstream")
 				// Fall through to cache miss path below
 			} else {
 				// Fresh cache hit — serve from cache

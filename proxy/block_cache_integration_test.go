@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
+	"github.com/tigrisdata/tag/config"
 )
 
 // blockMockForwarder serves range GETs from a backing object, for both the initial
@@ -101,6 +103,20 @@ func newBlockService(t *testing.T, mock *blockMockForwarder) (*Service, *cache.C
 	svc.config.Cache.BlockSize = 4
 	svc.config.Cache.SizeThreshold = 1 << 20
 	return svc, c
+}
+
+// newBlockServiceWithBudget builds a block-mode service with a specific populate byte budget,
+// set at construction so the byteBudget reflects it (the budget is built in NewService).
+func newBlockServiceWithBudget(t *testing.T, mock *blockMockForwarder, blockSize, budget int64) (*Service, *cache.Cache) {
+	t.Helper()
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockCacheMinSize = 8
+	cfg.Cache.BlockSize = blockSize
+	cfg.Cache.SizeThreshold = 1 << 20
+	cfg.Cache.MaxPopulateMemoryBytes = budget
+	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	return NewService(mock, c, cfg), c
 }
 
 // Cold range miss forwards from upstream, then block-populates in the background; a
@@ -259,6 +275,47 @@ func TestBlockCache_UnknownLengthBlockNotStored(t *testing.T) {
 	}
 }
 
+// A client-forced revalidation (Cache-Control: no-cache) of a block-mode entry must invalidate
+// it — otherwise it serves fresh once but leaves the stale entry for later normal reads (whose
+// already-cached blocks never re-check upstream). After revalidation the entry is re-established
+// at the current version.
+func TestBlockCache_ForceRevalidateInvalidatesBlockEntry(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Establish a block-mode entry at v1.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated")
+	}
+
+	// The object is overwritten out of band to v2.
+	mock.etag = `"v2"`
+	mock.blockGetETag = `"v2"`
+
+	// A forced revalidation for the already-cached range (block 0) must not silently keep v1.
+	req := blockGet(wowBucket, wowKey, "bytes=0-3")
+	req.Header.Set("Cache-Control", "no-cache")
+	w2 := httptest.NewRecorder()
+	_ = svc.HandleGetObject(w2, req)
+
+	// The stale v1 entry is invalidated, then re-established fresh (v2) by the fall-through.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+		if !found || meta.ETag == `"v2"` {
+			break // invalidated, or already refreshed to the current version
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stale v1 block-mode entry not invalidated by forced revalidation (etag=%q)", meta.ETag)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // A config that enables block caching but leaves block_size at 0 (e.g. a Config built directly,
 // bypassing Load's normalization) must not divide by zero: it behaves as block-caching-off and
 // the large object falls back to whole-object caching.
@@ -274,6 +331,22 @@ func TestBlockCache_ZeroBlockSizeNoPanic(t *testing.T) {
 	}
 	if w.Code != http.StatusPartialContent || w.Body.String() != "ABCD" {
 		t.Fatalf("range GET: code=%d body=%q, want 206 ABCD", w.Code, w.Body.String())
+	}
+}
+
+// A block larger than the whole populate budget must still populate: fetchOneBlock reserves
+// via populateWeight (clamped to the budget), not the raw block length, so a small
+// max_populate_memory_bytes doesn't shed every block fetch and silently disable block caching.
+func TestBlockCache_BlockLargerThanBudgetStillPopulates(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // blocks of 4 bytes
+	svc, c := newBlockServiceWithBudget(t, mock, 4 /*block*/, 2 /*budget < block*/)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block not populated when block size exceeds the populate budget (weight not clamped)")
 	}
 }
 
