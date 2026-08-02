@@ -395,11 +395,11 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 // offsets WITHIN the block (0 = first byte of the block), not within the object. Pass the
 // meta's ETag so the block resolves to the exact cached version. Returns ErrNotFound if the
 // block is not in cache. See RFC 0001.
-func (c *Cache) GetBlockRangeStream(ctx context.Context, bucket, key, etag string, blockIdx, start, end int64, w io.Writer) error {
+func (c *Cache) GetBlockRangeStream(ctx context.Context, bucket, key, etag string, blockSize, blockIdx, start, end int64, w io.Writer) error {
 	if !c.IsEnabled() {
 		return ErrCacheDisabled
 	}
-	return c.getRangeStreamByKey(ctx, MakeBlockKey(bucket, key, etag, blockIdx), bucket, key, start, end, w)
+	return c.getRangeStreamByKey(ctx, MakeBlockKey(bucket, key, etag, blockSize, blockIdx), bucket, key, start, end, w)
 }
 
 // getRangeStreamByKey streams an inclusive byte range [start,end] of the blob at cacheKey to
@@ -457,11 +457,11 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 // BlockExists reports whether the given block of a block-mode object is present in cache.
 // It probes the block's first byte (quirk-safe, cheap), so a not-found or any read error
 // returns false — the caller then (re)fetches the block. See RFC 0001.
-func (c *Cache) BlockExists(ctx context.Context, bucket, key, etag string, blockIdx int64) bool {
+func (c *Cache) BlockExists(ctx context.Context, bucket, key, etag string, blockSize, blockIdx int64) bool {
 	if !c.IsEnabled() || etag == "" {
 		return false
 	}
-	err := c.getRangeStreamByKey(ctx, MakeBlockKey(bucket, key, etag, blockIdx), bucket, key, 0, 0, io.Discard)
+	err := c.getRangeStreamByKey(ctx, MakeBlockKey(bucket, key, etag, blockSize, blockIdx), bucket, key, 0, 0, io.Discard)
 	return err == nil
 }
 
@@ -471,7 +471,7 @@ func (c *Cache) BlockExists(ctx context.Context, bucket, key, etag string, block
 // aware via PutMetaTombstoneAware) is the visibility gate, and reads only resolve blocks
 // after a meta hit, so a block written for a since-deleted object is unreachable and
 // harmless. An empty etag is not block-cached (no version discriminator). See RFC 0001.
-func (c *Cache) PutBlockStream(ctx context.Context, bucket, key, etag string, blockIdx int64, r io.Reader, ttl int) error {
+func (c *Cache) PutBlockStream(ctx context.Context, bucket, key, etag string, blockSize, blockIdx int64, r io.Reader, ttl int) error {
 	if !c.IsEnabled() || etag == "" {
 		_, _ = io.Copy(io.Discard, r) // drain so a pipe producer never blocks
 		return nil
@@ -479,7 +479,7 @@ func (c *Cache) PutBlockStream(ctx context.Context, bucket, key, etag string, bl
 	if ttl == 0 {
 		ttl = int(c.defaultTTL)
 	}
-	blockKey := MakeBlockKey(bucket, key, etag, blockIdx)
+	blockKey := MakeBlockKey(bucket, key, etag, blockSize, blockIdx)
 	if err := c.client.PutStream(ctx, blockKey, r, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
 		return err

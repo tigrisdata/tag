@@ -372,7 +372,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cache.SizeThreshold == 0 {
 		cfg.Cache.SizeThreshold = DefaultCacheSizeThreshold
 	}
-	if cfg.Cache.BlockCacheMinSize == 0 {
+	// The boundary must be positive (a non-positive value would make every object block-eligible
+	// and disable the whole-object write path); 0/unset or a stray negative falls back to default.
+	if cfg.Cache.BlockCacheMinSize <= 0 {
 		cfg.Cache.BlockCacheMinSize = DefaultCacheBlockCacheMinSize
 	}
 	// Block size must be positive (it is a divisor in block arithmetic); a zero or negative
@@ -529,12 +531,18 @@ func applyEnvOverrides(cfg *Config) {
 				cfg.Cache.BlockCachingEnabled = b
 			}
 		}
-		// Override the whole-object vs block-mode boundary from environment
-		// (0/unset keeps the default set in applyDefaults).
+		// Override the whole-object vs block-mode boundary from environment. Only a positive
+		// value is honored: a non-positive boundary is meaningless (it would make every object
+		// block-eligible and disable the whole-object write path) and 0/unset keeps the default.
 		if val := os.Getenv("TAG_CACHE_BLOCK_CACHE_MIN_SIZE"); val != "" {
-			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n != 0 {
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n > 0 {
 				cfg.Cache.BlockCacheMinSize = n
 			}
+		}
+		// The former TAG_CACHE_WRITE_THROUGH_MAX_SIZE was renamed; warn rather than silently
+		// ignore a deployment that still sets it (its value would otherwise be dropped).
+		if os.Getenv("TAG_CACHE_WRITE_THROUGH_MAX_SIZE") != "" {
+			fmt.Fprintln(os.Stderr, "WARNING: TAG_CACHE_WRITE_THROUGH_MAX_SIZE is removed; use TAG_CACHE_BLOCK_CACHE_MIN_SIZE (the whole-object vs block-mode boundary). The old variable is ignored.")
 		}
 		// A whole-object-cached object must be cacheable, so the boundary can never exceed
 		// SizeThreshold (an object at/above the boundary is block-cached instead).

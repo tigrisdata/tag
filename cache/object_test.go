@@ -216,19 +216,23 @@ func TestMakeBodyKey(t *testing.T) {
 }
 
 func TestMakeBlockKey(t *testing.T) {
-	// Block keys are ETag-scoped (quotes stripped) and suffixed with the block index.
-	if got := MakeBlockKey("my-bucket", "path/to/object.txt", `"abc123"`, 0); got != "blk|my-bucket|path/to/object.txt|abc123|0" {
-		t.Errorf("MakeBlockKey(idx=0) = %q, want %q", got, "blk|my-bucket|path/to/object.txt|abc123|0")
+	// Block keys are ETag-scoped (quotes stripped) and suffixed with block size + index.
+	if got := MakeBlockKey("my-bucket", "path/to/object.txt", `"abc123"`, 4194304, 0); got != "blk|my-bucket|path/to/object.txt|abc123|4194304|0" {
+		t.Errorf("MakeBlockKey(idx=0) = %q, want %q", got, "blk|my-bucket|path/to/object.txt|abc123|4194304|0")
 	}
-	if got := MakeBlockKey("b", "k", `"abc123"`, 42); got != "blk|b|k|abc123|42" {
-		t.Errorf("MakeBlockKey(idx=42) = %q, want %q", got, "blk|b|k|abc123|42")
+	if got := MakeBlockKey("b", "k", `"abc123"`, 4194304, 42); got != "blk|b|k|abc123|4194304|42" {
+		t.Errorf("MakeBlockKey(idx=42) = %q, want %q", got, "blk|b|k|abc123|4194304|42")
 	}
 	// Distinct indices produce distinct keys; a weak validator never collides with strong.
-	if MakeBlockKey("b", "k", `"abc"`, 1) == MakeBlockKey("b", "k", `"abc"`, 2) {
+	if MakeBlockKey("b", "k", `"abc"`, 4, 1) == MakeBlockKey("b", "k", `"abc"`, 4, 2) {
 		t.Error("different block indices must produce different keys")
 	}
-	if MakeBlockKey("b", "k", `"abc"`, 1) == MakeBlockKey("b", "k", `W/"abc"`, 1) {
+	if MakeBlockKey("b", "k", `"abc"`, 4, 1) == MakeBlockKey("b", "k", `W/"abc"`, 4, 1) {
 		t.Error("weak and strong ETag must not share a block key")
+	}
+	// A different block size must produce a different key (no cross-block_size collision).
+	if MakeBlockKey("b", "k", `"abc"`, 4, 1) == MakeBlockKey("b", "k", `"abc"`, 8, 1) {
+		t.Error("different block sizes must produce different keys (no cross-size collision)")
 	}
 }
 

@@ -32,8 +32,12 @@ type blockMockForwarder struct {
 
 func newBlockMock(object []byte, etag string) *blockMockForwarder {
 	m := &blockMockForwarder{mockForwarder: &mockForwarder{}, object: object, etag: etag, blockGetETag: etag}
-	// The client forward serves the requested range, or the whole object for a full GET.
+	// The client forward serves the requested range, or the whole object for a full GET. A
+	// deleted object (blockGet404) 404s the forward too, not only per-block fetches.
 	m.mockForwarder.doRequestFunc = func(_ context.Context, r *http.Request, _, _ string) (*http.Response, error) {
+		if m.blockGet404 {
+			return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+		}
 		if rng := r.Header.Get("Range"); rng != "" {
 			return m.serveRange(rng, m.etag), nil
 		}
@@ -187,7 +191,7 @@ func TestBlockCache_PartialHitFetchesMissingBlock(t *testing.T) {
 	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
 		t.Fatal("block-mode meta not populated")
 	}
-	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 1) {
+	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 1) {
 		t.Fatal("block 1 unexpectedly present before it was requested")
 	}
 
@@ -203,7 +207,7 @@ func TestBlockCache_PartialHitFetchesMissingBlock(t *testing.T) {
 	if after := mock.blockGets.Load(); after != before+1 {
 		t.Errorf("expected exactly one block fetch, got blockGets %d -> %d", before, after)
 	}
-	if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 1) {
+	if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 1) {
 		t.Error("block 1 not cached after the partial hit")
 	}
 }
@@ -236,7 +240,7 @@ func TestBlockCache_FullGetAssemblesAllBlocks(t *testing.T) {
 	}
 	// Assembly populated the remaining blocks for next time.
 	for i := int64(1); i <= 2; i++ {
-		if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, i) {
+		if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, i) {
 			t.Errorf("block %d not cached after full-object assembly", i)
 		}
 	}
@@ -283,7 +287,7 @@ func TestBlockCache_WrongContentRangeBoundsNotStored(t *testing.T) {
 	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
 		t.Error("block-mode meta written from a 206 with mismatched Content-Range bounds")
 	}
-	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 0) {
+	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 0) {
 		t.Error("body stored under block 0 despite wrong Content-Range bounds")
 	}
 }
@@ -302,19 +306,20 @@ func TestBlockCache_UnknownLengthBlockNotStored(t *testing.T) {
 	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
 		t.Error("block-mode meta written from an unknown-length block fetch")
 	}
-	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 0) {
+	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 0) {
 		t.Error("unknown-length body stored as block 0")
 	}
 }
 
-// A full-object GET of a block-eligible object with no cached entry establishes block mode in
-// the background (populate all blocks + block-mode meta), so full-GET-accessed objects are
-// cached too, not only range-accessed ones.
-func TestBlockCache_FullGetMissEstablishesBlockMode(t *testing.T) {
+// A full-object GET of a block-eligible object with no cached entry is WHOLE-cached (Option A):
+// the whole object was fetched to satisfy the GET, so there is no range-miss amplification to
+// avoid. It becomes a whole-mode entry (BlockSize==0); block mode is established only on the
+// range-read path. A later range read serves from the whole body.
+func TestBlockCache_FullGetMissWholeCaches(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
 	svc, c := newBlockService(t, mock)
 
-	// Full GET on a cold object: served whole from upstream, block mode established in background.
+	// Full GET on a cold object: served whole from upstream and whole-cached.
 	w := httptest.NewRecorder()
 	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
 		t.Fatalf("full GET: %v", err)
@@ -323,16 +328,26 @@ func TestBlockCache_FullGetMissEstablishesBlockMode(t *testing.T) {
 		t.Fatalf("full GET: code=%d body=%q, want 200 ABCDEFGHIJ", w.Code, w.Body.String())
 	}
 	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
-		t.Fatal("block mode not established after a full-GET miss")
+		t.Fatal("object not cached after a full-GET miss")
 	}
 	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
-	if meta.BlockSize != 4 {
-		t.Fatalf("meta.BlockSize=%d, want 4 (block-mode)", meta.BlockSize)
+	if meta.BlockSize != 0 {
+		t.Fatalf("meta.BlockSize=%d, want 0 (whole-mode from full-GET)", meta.BlockSize)
 	}
-	for i := int64(0); i <= 2; i++ {
-		if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, i) {
-			t.Errorf("block %d not populated by full-GET establishment", i)
-		}
+	// A subsequent range read is served from the whole body (whole-mode dispatch).
+	before := mock.blockGets.Load()
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=4-7")); err != nil {
+		t.Fatalf("range read: %v", err)
+	}
+	if w2.Code != http.StatusPartialContent || w2.Body.String() != "EFGH" {
+		t.Fatalf("range read: code=%d body=%q, want 206 EFGH", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q (served from whole body)", got, XCacheHit)
+	}
+	if after := mock.blockGets.Load(); after != before {
+		t.Errorf("whole-cached object triggered a block fetch: %d -> %d", before, after)
 	}
 }
 
@@ -364,6 +379,44 @@ func TestBlockCache_Block404InvalidatesStaleMeta(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("stale block-mode meta not invalidated after a 404 block fetch")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// An overwrite that changes both the ETag and a touched block's length must still be treated as
+// a version mismatch (invalidate), not masked by the length guard. The ETag guard runs before
+// the length/bounds guards precisely so a stale entry self-heals instead of retrying until TTL.
+func TestBlockCache_OverwriteWithLengthChangeInvalidates(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Establish a block-mode entry at v1.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated")
+	}
+
+	// Overwritten out of band to v2, and the block fetch also reports an unvalidatable length
+	// (as if the block's length changed). With the ETag guard checked first this is an ETag
+	// mismatch (invalidate); if the length guard ran first it would be a plain error (no heal).
+	mock.etag = `"v2"`
+	mock.blockGetETag = `"v2"`
+	mock.blockGetUnknownLen = true
+
+	w2 := httptest.NewRecorder()
+	_ = svc.HandleGetObject(w2, fullGet(wowBucket, wowKey))
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+		if !found || meta.ETag == `"v2"` {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stale v1 entry not invalidated on a version+length-changing overwrite (etag=%q)", meta.ETag)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -462,7 +515,7 @@ func TestBlockCache_WholeObject200NotStoredAsBlock(t *testing.T) {
 	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
 		t.Error("block-mode meta written despite a 200 (whole-object) block fetch")
 	}
-	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 0) {
+	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 0) {
 		t.Error("whole-object 200 body was stored as block 0")
 	}
 }
@@ -487,12 +540,21 @@ func TestBlockCache_ETagMismatchInvalidatesStaleMeta(t *testing.T) {
 	mock.etag = `"v2"`
 	mock.blockGetETag = `"v2"`
 
-	// A full GET assembles all blocks; fetching a missing block reports v2 != cached v1, so the
-	// stale meta is invalidated (rather than left to repeat the mismatch on every request).
+	// A full GET assembles all blocks; a missing block reports v2 != cached v1, so the stale v1
+	// entry is invalidated and then re-established from the fall-through as the current version
+	// (whole-cached v2 under Option A). Either way the stale v1 entry must be gone.
 	w2 := httptest.NewRecorder()
 	_ = svc.HandleGetObject(w2, fullGet(wowBucket, wowKey))
-	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
-		t.Error("stale block-mode meta not invalidated after ETag mismatch")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+		if !found || meta.ETag == `"v2"` {
+			break // invalidated, or refreshed to the current version
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stale v1 block-mode entry not invalidated after ETag mismatch (etag=%q)", meta.ETag)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

@@ -27,22 +27,22 @@ func TestBlockRoundTrip(t *testing.T) {
 	// Three 4-byte blocks of the object "AAAABBBBCC" (last block short: 2 bytes).
 	blocks := []string{"AAAA", "BBBB", "CC"}
 	for i, b := range blocks {
-		if err := c.PutBlockStream(ctx, bucket, key, etag, int64(i), strings.NewReader(b), 60); err != nil {
+		if err := c.PutBlockStream(ctx, bucket, key, etag, 4, int64(i), strings.NewReader(b), 60); err != nil {
 			t.Fatalf("PutBlockStream block %d: %v", i, err)
 		}
 	}
 
 	// Existence: written blocks present, an unwritten block absent.
 	for i := range blocks {
-		if !c.BlockExists(ctx, bucket, key, etag, int64(i)) {
+		if !c.BlockExists(ctx, bucket, key, etag, 4, int64(i)) {
 			t.Errorf("BlockExists(block %d) = false, want true", i)
 		}
 	}
-	if c.BlockExists(ctx, bucket, key, etag, 3) {
+	if c.BlockExists(ctx, bucket, key, etag, 4, 3) {
 		t.Error("BlockExists(block 3) = true, want false (never written)")
 	}
 	// A different ETag must not resolve these blocks.
-	if c.BlockExists(ctx, bucket, key, `"v2"`, 0) {
+	if c.BlockExists(ctx, bucket, key, `"v2"`, 4, 0) {
 		t.Error("BlockExists with wrong etag = true, want false")
 	}
 
@@ -58,7 +58,7 @@ func TestBlockRoundTrip(t *testing.T) {
 	}
 	for _, tc := range cases {
 		var buf bytes.Buffer
-		if err := c.GetBlockRangeStream(ctx, bucket, key, etag, tc.blockIdx, tc.start, tc.end, &buf); err != nil {
+		if err := c.GetBlockRangeStream(ctx, bucket, key, etag, 4, tc.blockIdx, tc.start, tc.end, &buf); err != nil {
 			t.Fatalf("GetBlockRangeStream(block %d, %d-%d): %v", tc.blockIdx, tc.start, tc.end, err)
 		}
 		if buf.String() != tc.want {
@@ -67,7 +67,7 @@ func TestBlockRoundTrip(t *testing.T) {
 	}
 
 	// A missing block reads as ErrNotFound.
-	if err := c.GetBlockRangeStream(ctx, bucket, key, etag, 3, 0, 1, &bytes.Buffer{}); err != ErrNotFound {
+	if err := c.GetBlockRangeStream(ctx, bucket, key, etag, 4, 3, 0, 1, &bytes.Buffer{}); err != ErrNotFound {
 		t.Errorf("GetBlockRangeStream(missing block) err = %v, want ErrNotFound", err)
 	}
 }
@@ -80,14 +80,14 @@ func TestBlockRoundTrip_OneByteBlock(t *testing.T) {
 	c := newBlockTestCache(t)
 	ctx := context.Background()
 	bucket, key, etag := "b", "k", `"v1"`
-	if err := c.PutBlockStream(ctx, bucket, key, etag, 5, strings.NewReader("Z"), 60); err != nil {
+	if err := c.PutBlockStream(ctx, bucket, key, etag, 4, 5, strings.NewReader("Z"), 60); err != nil {
 		t.Fatalf("PutBlockStream: %v", err)
 	}
-	if !c.BlockExists(ctx, bucket, key, etag, 5) {
+	if !c.BlockExists(ctx, bucket, key, etag, 4, 5) {
 		t.Error("BlockExists(1-byte block) = false, want true")
 	}
 	var buf bytes.Buffer
-	if err := c.GetBlockRangeStream(ctx, bucket, key, etag, 5, 0, 0, &buf); err != nil {
+	if err := c.GetBlockRangeStream(ctx, bucket, key, etag, 4, 5, 0, 0, &buf); err != nil {
 		t.Fatalf("GetBlockRangeStream(1-byte block, 0-0): %v", err)
 	}
 	if buf.String() != "Z" {
@@ -99,10 +99,10 @@ func TestBlockRoundTrip_OneByteBlock(t *testing.T) {
 func TestPutBlockStream_EmptyETagNotCached(t *testing.T) {
 	c := newBlockTestCache(t)
 	ctx := context.Background()
-	if err := c.PutBlockStream(ctx, "b", "k", "", 0, strings.NewReader("data"), 60); err != nil {
+	if err := c.PutBlockStream(ctx, "b", "k", "", 4, 0, strings.NewReader("data"), 60); err != nil {
 		t.Fatalf("PutBlockStream(empty etag): %v", err)
 	}
-	if c.BlockExists(ctx, "b", "k", "", 0) {
+	if c.BlockExists(ctx, "b", "k", "", 4, 0) {
 		t.Error("BlockExists(empty etag) = true, want false (empty etag not cached)")
 	}
 }

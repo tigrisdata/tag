@@ -504,6 +504,10 @@ func TestLoad_BlockCacheMinSizeDefaultOverrideAndClamp(t *testing.T) {
 		// The default (25 MiB) exceeds a 1 MiB size_threshold, so it clamps down: a
 		// whole-object-cached object must be cacheable.
 		{"clamped to size_threshold", "cache:\n  enabled: true\n  size_threshold: 1048576\n", "", 1048576},
+		// A non-positive boundary is meaningless (would make every object block-eligible and
+		// disable the whole-object write path); it must floor to the default, from YAML or env.
+		{"negative yaml floors to default", "cache:\n  enabled: true\n  block_cache_min_size: -1\n", "", DefaultCacheBlockCacheMinSize},
+		{"negative env ignored", "cache:\n  enabled: true\n", "-1", DefaultCacheBlockCacheMinSize},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -280,14 +280,17 @@ func MakeBodyKey(bucket, key, etag string) string {
 }
 
 // MakeBlockKey creates the cache key for a single block of a block-mode object body
-// ("blk|bucket|key|<etag>|<blockIdx>"). Blocks are ETag-scoped exactly like whole
-// bodies (MakeBodyKey), so a concurrent overwrite writes new block keys under the new
-// ETag and never clobbers the version an in-flight reader resolved; stale blocks age
-// out by TTL. blockIdx is the zero-based index of a fixed-size block within the object.
-// An ETag-less object is not block-cached (no version discriminator), matching the
-// body-key invariant; callers must pass a non-empty etag.
-func MakeBlockKey(bucket, key, etag string, blockIdx int64) string {
-	return blockKeyPrefix + bucket + "|" + key + "|" + etagKeyComponent(etag) + "|" + strconv.FormatInt(blockIdx, 10)
+// ("blk|bucket|key|<etag>|<blockSize>|<blockIdx>"). Blocks are ETag-scoped exactly like
+// whole bodies (MakeBodyKey), so a concurrent overwrite writes new block keys under the new
+// ETag and never clobbers the version an in-flight reader resolved; stale blocks age out by
+// TTL. The blockSize is part of the key so blocks written under one block_size can never be
+// resolved by a meta captured under a different block_size (e.g. after the config changes and
+// the entry is re-established for an unchanged ETag) — that would read a block at the wrong
+// offsets. blockIdx is the zero-based index of the block within the object. An ETag-less
+// object is not block-cached (no version discriminator); callers must pass a non-empty etag.
+func MakeBlockKey(bucket, key, etag string, blockSize, blockIdx int64) string {
+	return blockKeyPrefix + bucket + "|" + key + "|" + etagKeyComponent(etag) + "|" +
+		strconv.FormatInt(blockSize, 10) + "|" + strconv.FormatInt(blockIdx, 10)
 }
 
 // MakeTombstoneKey creates the cache key for invalidation tombstones.

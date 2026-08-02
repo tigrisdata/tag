@@ -124,7 +124,7 @@ func (s *Service) serveRangeFromBlockCache(
 		bStart, bEnd := blockBounds(i, blockSize, meta.ContentLength)
 		localStart := max(rng.start, bStart) - bStart
 		localEnd := min(rng.end, bEnd) - bStart
-		if berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, i, localStart, localEnd, cw); berr != nil {
+		if berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, blockSize, i, localStart, localEnd, cw); berr != nil {
 			// A block was evicted between populate and serve. Headers are already sent, so we
 			// cannot fall through; report the error (the client sees a truncated body).
 			if cw.written > 0 {
@@ -177,7 +177,7 @@ func (s *Service) serveFullObjectFromBlockCache(
 	cw := &countingWriter{w: w}
 	for i := int64(0); i <= lastBlock; i++ {
 		bStart, bEnd := blockBounds(i, blockSize, meta.ContentLength)
-		if berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, i, 0, bEnd-bStart, cw); berr != nil {
+		if berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, blockSize, i, 0, bEnd-bStart, cw); berr != nil {
 			if cw.written > 0 {
 				metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
 			}
@@ -211,18 +211,20 @@ func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey
 // The populate budget is reserved by the block's actual size (read-miss priority, non-blocking);
 // on decline the block is not cached and errCachePopulateDeclined is returned. The fetched
 // block's ETag must match meta.ETag or it is rejected (a concurrent overwrite).
-// The caller's ctx is intentionally not threaded into the singleflight body: the leader's
-// fetch is shared by all waiters, so binding it to one caller's context would let that
-// caller's cancellation fail the block for everyone. The fetch runs under a detached,
-// timeout-bounded context instead.
-func (s *Service) fetchOneBlock(_ context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) error {
-	blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, blockIdx)
-	_, err, _ := s.blockFetch.Do(blockKey, func() (interface{}, error) {
+// The shared fetch (the singleflight leader) runs under a DETACHED, timeout-bounded context,
+// not the caller's: binding it to one caller's context would let that caller's cancellation
+// fail the block for every waiter. But the caller does not block on it indefinitely — via
+// DoChan we select on the caller's ctx, so a caller that goes away (e.g. a disconnected
+// client on the synchronous serve path) stops waiting immediately and returns, while the
+// detached fetch keeps running to populate the cache for any other waiters.
+func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) error {
+	blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, blockIdx)
+	ch := s.blockFetch.DoChan(blockKey, func() (interface{}, error) {
 		fetchCtx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
 
 		// Re-check presence inside the singleflight leader: a prior fetch may have landed.
-		if s.cache.BlockExists(fetchCtx, bucket, key, meta.ETag, blockIdx) {
+		if s.cache.BlockExists(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx) {
 			return nil, nil
 		}
 		bStart, bEnd := blockBounds(blockIdx, meta.BlockSize, meta.ContentLength)
@@ -257,11 +259,19 @@ func (s *Service) fetchOneBlock(_ context.Context, bucket, key, accessKey, secre
 		if resp.StatusCode != http.StatusPartialContent {
 			return nil, fmt.Errorf("block %d fetch: unexpected status %d (want 206)", blockIdx, resp.StatusCode)
 		}
-		// The response length must be exactly the requested block. This rejects a 200 (whole
-		// object) as well as any 206 whose length differs — including an unknown/chunked length
-		// (ContentLength < 0), which we can't validate and so must not store (a short or long
-		// body would be served at fixed block-local offsets, corrupting reads). S3/Tigris always
-		// sets Content-Length on a 206, so a well-formed block fetch is never rejected here.
+		// ETag guard FIRST: the block must belong to the exact version meta describes. Checking
+		// this before the length/bounds guards ensures an out-of-band overwrite (which changes
+		// the ETag, and may also change the touched block's length) is reported as
+		// errBlockETagMismatch — so ensureBlocksCached invalidates the stale entry — rather than
+		// masked by a plain length/bounds error that leaves the stale meta to retry until TTL.
+		if respETag := resp.Header.Get("ETag"); respETag != "" && respETag != meta.ETag {
+			return nil, errBlockETagMismatch
+		}
+		// Same version (ETag matches): the response length must be exactly the requested block.
+		// This rejects a 200 (whole object) and any 206 whose length differs — including an
+		// unknown/chunked length (ContentLength < 0), which we can't validate and so must not
+		// store (a short/long body would be served at fixed block-local offsets, corrupting
+		// reads). S3/Tigris always set Content-Length on a 206, so a well-formed fetch passes.
 		if resp.ContentLength != blockLen {
 			return nil, fmt.Errorf("block %d fetch: content-length %d, want %d", blockIdx, resp.ContentLength, blockLen)
 		}
@@ -271,19 +281,22 @@ func (s *Service) fetchOneBlock(_ context.Context, bucket, key, accessKey, secre
 		if rs, re, ok := parseContentRangeBounds(resp.Header.Get("Content-Range")); !ok || rs != bStart || re != bEnd {
 			return nil, fmt.Errorf("block %d fetch: content-range bounds %d-%d (ok=%t), want %d-%d", blockIdx, rs, re, ok, bStart, bEnd)
 		}
-		// ETag guard: the block must belong to the exact version meta describes.
-		if respETag := resp.Header.Get("ETag"); respETag != "" && respETag != meta.ETag {
-			return nil, errBlockETagMismatch
-		}
 		ttl := int(s.config.Cache.TTL.Seconds())
-		if perr := s.cache.PutBlockStream(fetchCtx, bucket, key, meta.ETag, blockIdx, resp.Body, ttl); perr != nil {
+		if perr := s.cache.PutBlockStream(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, resp.Body, ttl); perr != nil {
 			return nil, perr
 		}
 		metrics.CacheBlockPopulated.Inc()
 		metrics.CacheBlockBytesPopulated.Add(float64(blockLen))
 		return nil, nil
 	})
-	return err
+	select {
+	case res := <-ch:
+		return res.Err
+	case <-ctx.Done():
+		// The caller gave up (e.g. client disconnected). Stop waiting and return promptly; the
+		// detached fetch above keeps running to populate the cache for any remaining waiters.
+		return ctx.Err()
+	}
 }
 
 // ensureBlocksCached makes covering blocks [b0,bK] present in cache: it probes each (recording
@@ -293,7 +306,7 @@ func (s *Service) fetchOneBlock(_ context.Context, bucket, key, accessKey, secre
 func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, b0, bK int64) error {
 	var missing []int64
 	for i := b0; i <= bK; i++ {
-		if s.cache.BlockExists(ctx, bucket, key, meta.ETag, i) {
+		if s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, i) {
 			metrics.CacheBlockHits.Inc()
 		} else {
 			metrics.CacheBlockMisses.Inc()
