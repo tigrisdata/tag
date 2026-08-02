@@ -28,6 +28,7 @@ type blockMockForwarder struct {
 	blockGetWrongOffset bool         // if set, per-block 206 Content-Range has wrong (same-length) bounds
 	blockGet404         bool         // if set, per-block fetches return 404 (object gone)
 	blockGetTransient   bool         // if set, per-block fetches return a transient (non-stale) error
+	blockGetNoETag      bool         // if set, per-block 206 fetches omit the ETag header
 	blockGets           atomic.Int32 // count of per-block DoConditionalGetRequest calls
 }
 
@@ -93,6 +94,9 @@ func (m *blockMockForwarder) DoConditionalGetRequest(_ context.Context, _, _, _,
 		return m.wholeObject(m.blockGetETag), nil
 	}
 	resp := m.serveRange(rangeHeader, m.blockGetETag)
+	if m.blockGetNoETag {
+		resp.Header.Del("ETag") // upstream omitted the ETag: version can't be verified
+	}
 	if m.blockGetUnknownLen {
 		resp.ContentLength = -1 // chunked/unknown length: can't be validated
 	}
@@ -714,5 +718,61 @@ func TestBlockCache_AnonymousRangeMissMarksPublicRead(t *testing.T) {
 	}
 	if after := mock.blockGets.Load(); after != before {
 		t.Errorf("block re-fetched on an anonymous hit: blockGets %d -> %d", before, after)
+	}
+}
+
+// A per-block fetch whose 206 omits the ETag can't be version-verified: a same-size overwrite
+// would otherwise be stored under the old meta.ETag, mixing versions across blocks. Such a
+// fetch must not be cached (and, being unconfirmed rather than a definitive mismatch, must not
+// invalidate an existing entry).
+func TestBlockCache_MissingETagBlockNotStored(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	mock.blockGetNoETag = true // per-block 206 fetches omit the ETag header
+	svc, c := newBlockService(t, mock)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	// The client is still served from the upstream forward (which carries the ETag).
+	if w.Code != http.StatusPartialContent || w.Body.String() != "ABCD" {
+		t.Fatalf("cold miss: code=%d body=%q, want 206 ABCD", w.Code, w.Body.String())
+	}
+	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
+		t.Error("block-mode meta written from an ETag-less block fetch")
+	}
+	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 0) {
+		t.Error("ETag-less body stored as block 0 (version unverifiable)")
+	}
+}
+
+// Missing-ETag is a transient (unconfirmed) failure, not a definitive mismatch: it must leave
+// an already-established block-mode entry intact rather than invalidating it.
+func TestBlockCache_MissingETagDoesNotInvalidateEntry(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Establish a block-mode entry (block 0 + meta) via a normal cold miss.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated after cold miss")
+	}
+
+	// A range touching a not-yet-cached block now fetches it, but upstream omits the ETag.
+	mock.blockGetNoETag = true
+	wf := httptest.NewRecorder()
+	if err := svc.HandleGetObject(wf, blockGet(wowBucket, wowKey, "bytes=4-7")); err != nil {
+		t.Fatalf("partial-hit range: %v", err)
+	}
+	// The still-valid entry must survive (no invalidation on an unconfirmed fetch), and the
+	// ETag-less block must not be cached.
+	if meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || meta.BlockSize != 4 {
+		t.Fatalf("block-mode entry invalidated by an ETag-less fetch: found=%v", found)
+	}
+	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 1) {
+		t.Error("ETag-less body stored as block 1 (version unverifiable)")
 	}
 }

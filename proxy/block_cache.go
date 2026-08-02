@@ -304,7 +304,17 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 		// the ETag, and may also change the touched block's length) is reported as
 		// errBlockETagMismatch — so ensureBlocksCached invalidates the stale entry — rather than
 		// masked by a plain length/bounds error that leaves the stale meta to retry until TTL.
-		if respETag := resp.Header.Get("ETag"); respETag != "" && respETag != meta.ETag {
+		// A block-mode entry is only established from a range response that carried an ETag, so
+		// meta.ETag is always set. If a per-block fetch OMITS its ETag we cannot confirm the
+		// version: a same-size overwrite would otherwise be stored under the old meta.ETag,
+		// mixing versions across blocks. Treat missing-ETag as a transient failure (don't cache,
+		// don't invalidate — it's unconfirmed, not a definitive mismatch); the caller falls
+		// through to a direct upstream range that serves the current bytes.
+		respETag := resp.Header.Get("ETag")
+		if respETag == "" {
+			return nil, fmt.Errorf("block %d fetch: response missing ETag, cannot verify version", blockIdx)
+		}
+		if respETag != meta.ETag {
 			return nil, errBlockETagMismatch
 		}
 		// Same version (ETag matches): the response length must be exactly the requested block.
