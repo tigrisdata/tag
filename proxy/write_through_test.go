@@ -80,7 +80,7 @@ func TestHandlePutObject_WriteThroughTee_CachesFromHead(t *testing.T) {
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
 	svc.config.Cache.SizeThreshold = 1 << 20
-	svc.config.Cache.BlockCacheMinSize = 1 << 20
+	svc.config.Cache.BlockSize = 1 << 20
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
@@ -143,7 +143,7 @@ func TestHandlePutObject_WriteThroughTee_CachesWithNilPopulateBudget(t *testing.
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
 	svc.config.Cache.SizeThreshold = 1 << 20
-	svc.config.Cache.BlockCacheMinSize = 1 << 20
+	svc.config.Cache.BlockSize = 1 << 20
 	svc.populateBudget = nil // byte budget explicitly disabled (max_populate_memory_bytes < 0)
 
 	w := httptest.NewRecorder()
@@ -181,7 +181,7 @@ func TestHandlePutObject_WriteThroughTee_ETagMismatchFallsBackToWarm(t *testing.
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
 	svc.config.Cache.SizeThreshold = 1 << 20
-	svc.config.Cache.BlockCacheMinSize = 1 << 20
+	svc.config.Cache.BlockSize = 1 << 20
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
@@ -215,7 +215,7 @@ func TestHandlePutObject_WriteThroughTee_HeadFailureFallsBackToWarm(t *testing.T
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
 	svc.config.Cache.SizeThreshold = 1 << 20
-	svc.config.Cache.BlockCacheMinSize = 1 << 20
+	svc.config.Cache.BlockSize = 1 << 20
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, "body")); err != nil {
@@ -250,7 +250,7 @@ func TestHandlePutObject_WriteThroughTee_NotCacheableSkipsWarm(t *testing.T) {
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
 	svc.config.Cache.SizeThreshold = 1 << 20
-	svc.config.Cache.BlockCacheMinSize = 1 << 20
+	svc.config.Cache.BlockSize = 1 << 20
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
@@ -290,7 +290,7 @@ func TestHandlePutObject_WriteThroughTee_TombstoneDuringHeadFallsBackToWarm(t *t
 	svc = s
 	svc.config.Cache.WarmOnWrite = true
 	svc.config.Cache.SizeThreshold = 1 << 20
-	svc.config.Cache.BlockCacheMinSize = 1 << 20
+	svc.config.Cache.BlockSize = 1 << 20
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {
@@ -324,7 +324,7 @@ func TestHandlePutObject_WriteThroughTee_DisabledWhenWarmOnWriteOff(t *testing.T
 	}
 	svc, c := newTestService(mock, true) // WarmOnWrite defaults to false
 	svc.config.Cache.SizeThreshold = 1 << 20
-	svc.config.Cache.BlockCacheMinSize = 1 << 20
+	svc.config.Cache.BlockSize = 1 << 20
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, "body")); err != nil {
@@ -338,9 +338,9 @@ func TestHandlePutObject_WriteThroughTee_DisabledWhenWarmOnWriteOff(t *testing.T
 	}
 }
 
-// An object at or above BlockCacheMinSize is not eligible for the tee (it is block-cached
-// on read instead); the write path falls back to the streaming warm-on-write read-back.
-func TestHandlePutObject_WriteThroughTee_FallsBackAboveBlockCacheMinSize(t *testing.T) {
+// An object at or above BlockSize is not eligible for the in-memory tee; the write path falls
+// back to the streaming warm-on-write read-back.
+func TestHandlePutObject_WriteThroughTee_FallsBackAboveBlockSize(t *testing.T) {
 	var puts, warmGets atomic.Int32
 	body := "this-body-exceeds-the-tiny-write-through-cap"
 
@@ -356,10 +356,10 @@ func TestHandlePutObject_WriteThroughTee_FallsBackAboveBlockCacheMinSize(t *test
 	}
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
-	// BlockCacheMinSize sits at or below the PUT body: the tee is skipped (block-mode),
+	// BlockSize sits at or below the PUT body: the tee is skipped (too big to buffer),
 	// but the object is still cacheable (SizeThreshold large) so the warm read-back caches it.
 	svc.config.Cache.SizeThreshold = 1 << 20
-	svc.config.Cache.BlockCacheMinSize = 8
+	svc.config.Cache.BlockSize = 8
 
 	w := httptest.NewRecorder()
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, body)); err != nil {

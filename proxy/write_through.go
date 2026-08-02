@@ -97,12 +97,11 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 		// the object is public-read before caching it; the tee can't make that inference.
 		!hasNoAuthCredentials(r) &&
 		size > 0 &&
-		// The tee is the whole-object write path, which applies only below the block-mode
-		// boundary: objects at or above BlockCacheMinSize are cached at block granularity on
-		// read instead (RFC 0001), so the tee (and warm-on-write) is a no-op for them. This
-		// also bounds the tee's in-memory buffer to < BlockCacheMinSize. IsCacheable(
-		// SizeThreshold) still applies to the meta after the HEAD.
-		size < s.config.Cache.BlockCacheMinSize
+		// The tee buffers the whole object in memory, so it applies only to sub-block objects
+		// (size < BlockSize) — small and memory-safe. Larger warm-eligible objects are warmed
+		// via the streaming read-back instead (warmOnWrite, capped at WarmOnWriteMaxSize).
+		// IsCacheable(SizeThreshold) still applies to the meta after the HEAD.
+		size < s.config.Cache.BlockSize
 
 	if !eligible {
 		return nil, s.forwarder.Forward(ctx, w, r)

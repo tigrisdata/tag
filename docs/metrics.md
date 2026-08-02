@@ -296,7 +296,7 @@ rate(tag_cache_write_through_total[5m]) /
 **Type:** Counter
 
 Block-aligned caching (RFC 0001, `cache.block_caching_enabled`). Objects at or above
-`cache.block_cache_min_size` are cached at `cache.block_size` granularity on read, so a range
+`cache.block_size` are cached at `cache.block_size` granularity on read, so a range
 read (e.g. a Parquet footer) populates and serves only the blocks it touches.
 `tag_cache_block_populated_total` counts blocks fetched from upstream and written to cache;
 `tag_cache_block_bytes_populated_total` is the bytes those fetches pulled. Compare the bytes

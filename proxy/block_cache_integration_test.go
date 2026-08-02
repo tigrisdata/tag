@@ -116,8 +116,7 @@ func newBlockService(t *testing.T, mock *blockMockForwarder) (*Service, *cache.C
 	t.Helper()
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.BlockCachingEnabled = true
-	svc.config.Cache.BlockCacheMinSize = 8 // the 10-byte test object is block-mode
-	svc.config.Cache.BlockSize = 4
+	svc.config.Cache.BlockSize = 4 // boundary: the 10-byte test object (>= 4) is block-mode
 	svc.config.Cache.SizeThreshold = 1 << 20
 	return svc, c
 }
@@ -128,7 +127,6 @@ func newBlockServiceWithBudget(t *testing.T, mock *blockMockForwarder, blockSize
 	t.Helper()
 	cfg := config.NewDefault()
 	cfg.Cache.BlockCachingEnabled = true
-	cfg.Cache.BlockCacheMinSize = 8
 	cfg.Cache.BlockSize = blockSize
 	cfg.Cache.SizeThreshold = 1 << 20
 	cfg.Cache.MaxPopulateMemoryBytes = budget
@@ -246,22 +244,20 @@ func TestBlockCache_FullGetAssemblesAllBlocks(t *testing.T) {
 	}
 }
 
-// Warm-on-write is a no-op for objects at or above the block-mode boundary: they are cached
-// per-block on read (RFC 0001), never warmed whole. The whole-object fetch aborts after
-// headers (no read-back), so no whole-body entry is created.
-func TestBlockCache_WarmOnWriteNoopAboveBoundary(t *testing.T) {
+// Warm-on-write is a no-op for objects larger than warm_on_write_max_size: the whole-object
+// fetch aborts after headers (no read-back), so no entry is created.
+func TestBlockCache_WarmOnWriteNoopAboveMaxSize(t *testing.T) {
 	var warmFetches atomic.Int32
 	mock := &mockForwarder{
 		forwardFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
 			w.WriteHeader(http.StatusOK)
 			return nil
 		},
-		doFullObjectFunc: warmObjectResponder(&warmFetches, "ABCDEFGHIJ"), // 10 bytes >= boundary
+		doFullObjectFunc: warmObjectResponder(&warmFetches, "ABCDEFGHIJ"), // 10 bytes > cap
 	}
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
-	svc.config.Cache.BlockCachingEnabled = true
-	svc.config.Cache.BlockCacheMinSize = 8
+	svc.config.Cache.WarmOnWriteMaxSize = 8
 	svc.config.Cache.SizeThreshold = 1 << 20
 
 	w := httptest.NewRecorder()
@@ -269,7 +265,7 @@ func TestBlockCache_WarmOnWriteNoopAboveBoundary(t *testing.T) {
 		t.Fatalf("PUT: %v", err)
 	}
 	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
-		t.Error("warm-on-write cached a block-mode-sized object whole (want no-op above the boundary)")
+		t.Error("warm-on-write cached an object larger than warm_on_write_max_size")
 	}
 }
 

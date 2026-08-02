@@ -410,12 +410,20 @@ func (s *Service) fetchFullObjectToCache(
 		return nil
 	}
 
-	// Objects at or above the block-mode boundary are cached at block granularity on read
-	// (RFC 0001), never warmed/fetched whole. Aborting here, after headers but before the
-	// body download, makes warm-on-write a true no-op for them (no read-back amplification).
-	if s.isBlockEligibleSize(resp.ContentLength) {
+	// Size gate, by priority — checked after headers but before the body download, so an
+	// over-size object costs no read-back:
+	//   - warm-on-write: only warm-cache (whole) objects up to WarmOnWriteMaxSize.
+	//   - read-miss: skip block-eligible objects (>= BlockSize); those are cached per-block on
+	//     the range path, never whole-fetched here.
+	if prio == priorityWarmWrite {
+		if resp.ContentLength > 0 && resp.ContentLength > s.config.Cache.WarmOnWriteMaxSize {
+			log.Debug().Str("bucket", bucket).Str("key", key).Int64("size", resp.ContentLength).
+				Int64("warm_max", s.config.Cache.WarmOnWriteMaxSize).Msg("Skipping warm-on-write - over WarmOnWriteMaxSize")
+			return nil
+		}
+	} else if s.isBlockEligibleSize(resp.ContentLength) {
 		log.Debug().Str("bucket", bucket).Str("key", key).Int64("size", resp.ContentLength).
-			Msg("Skipping whole-object populate - object is block-mode (cached per-block on read)")
+			Msg("Skipping whole-object read-miss populate - object is block-mode (cached per-block on read)")
 		return nil
 	}
 
