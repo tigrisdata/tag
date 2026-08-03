@@ -909,3 +909,51 @@ func TestPutBlocksFromStream_MidStreamErrorLeavesMetaUnwritten(t *testing.T) {
 		t.Error("block meta written despite a mid-stream error (partial entry made visible)")
 	}
 }
+
+// A cleanly-truncated body (ends before Content-Length with no error signal) must not write the
+// meta OR the short non-final block: BlockExists can't tell a short block from a full one, so a
+// stored short block would serve truncated bytes under the committed length and poison later
+// range-path populates that trust existing blocks.
+func TestPutBlocksFromStream_TruncatedStreamLeavesNoShortBlockOrMeta(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGH"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	h := http.Header{}
+	h.Set("ETag", `"v1"`)
+	h.Set("Content-Length", "8") // claims 8 bytes (two 4-byte blocks)...
+	meta := cache.MetaFromHTTPHeaders(wowBucket, wowKey, http.StatusOK, h)
+	meta.BlockSize = 4
+
+	// ...but the body carries only 6 bytes, ending cleanly (no read error).
+	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, time.Now().UnixNano()); err == nil {
+		t.Fatal("expected an error from the truncated body")
+	}
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
+		t.Error("block meta written for a truncated body (entry made visible)")
+	}
+	// The short second block must not have been stored (it would look present forever).
+	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 1) {
+		t.Error("short non-final block 1 stored from a truncated body")
+	}
+}
+
+// A body longer than Content-Length is rejected before the meta is committed, so the entry can
+// never claim a length its blocks overrun.
+func TestPutBlocksFromStream_OversizedStreamLeavesMetaUnwritten(t *testing.T) {
+	mock := newBlockMock([]byte("ABCD"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	h := http.Header{}
+	h.Set("ETag", `"v1"`)
+	h.Set("Content-Length", "4") // claims 4 bytes (one block)...
+	meta := cache.MetaFromHTTPHeaders(wowBucket, wowKey, http.StatusOK, h)
+	meta.BlockSize = 4
+
+	// ...but the body carries 6 bytes.
+	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, time.Now().UnixNano()); err == nil {
+		t.Fatal("expected an error from the oversized body")
+	}
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
+		t.Error("block meta written for an oversized body (entry made visible)")
+	}
+}

@@ -402,25 +402,35 @@ func (s *Service) buildBlockMeta(bucket, key string, respHeader http.Header, tot
 // (<= block_size) at a time, so peak memory is bounded regardless of object size. This is the
 // shared full-object populate path: block mode is established from ANY full-object fetch (a
 // full-GET read miss or a warm-on-write read-back), not only the range path — the whole-vs-block
-// boundary is size, not access pattern (RFC 0001). On a mid-stream error the meta is left
-// unwritten, so a partially written block set is never made visible.
+// boundary is size, not access pattern (RFC 0001).
+//
+// Each block is read to its EXACT expected length (from blockBounds) and only written if the full
+// length arrived: a short read means the upstream body ended before Content-Length (truncated),
+// and the meta — plus that (partial) block — is left unwritten. This matters because BlockExists
+// only tests presence, not length, so a stored short block would look complete and could serve
+// truncated bytes under a committed length (and poison a later range-path populate that trusts
+// existing blocks). fetchOneBlock validates block length the same way; this keeps the two block
+// writers consistent. A body longer than Content-Length is likewise rejected before the meta.
 func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, writeStartTime int64) error {
 	buf := make([]byte, meta.BlockSize)
-	for idx := int64(0); ; idx++ {
-		n, err := io.ReadFull(r, buf)
-		if n > 0 {
-			if perr := s.cache.PutBlockStream(ctx, bucket, key, meta.ETag, meta.BlockSize, idx, bytes.NewReader(buf[:n]), ttl); perr != nil {
-				return perr
-			}
-			metrics.CacheBlockPopulated.Inc()
-			metrics.CacheBlockBytesPopulated.Add(float64(n))
+	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
+	for idx := int64(0); idx <= lastBlock; idx++ {
+		bStart, bEnd := blockBounds(idx, meta.BlockSize, meta.ContentLength)
+		want := bEnd - bStart + 1
+		if _, err := io.ReadFull(r, buf[:want]); err != nil {
+			return fmt.Errorf("block split: block %d short read (%w) - upstream body shorter than Content-Length %d", idx, err, meta.ContentLength)
 		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break // clean end (n==0, EOF), or the final short block (0<n<blockSize, ErrUnexpectedEOF)
+		if perr := s.cache.PutBlockStream(ctx, bucket, key, meta.ETag, meta.BlockSize, idx, bytes.NewReader(buf[:want]), ttl); perr != nil {
+			return perr
 		}
-		if err != nil {
-			return err
-		}
+		metrics.CacheBlockPopulated.Inc()
+		metrics.CacheBlockBytesPopulated.Add(float64(want))
+	}
+	// The body must be exactly Content-Length: a longer stream (malformed upstream) is rejected
+	// before the meta so the entry can't claim a length its blocks overrun.
+	var probe [1]byte
+	if _, err := io.ReadFull(r, probe[:]); err != io.EOF {
+		return fmt.Errorf("block split: upstream body longer than Content-Length %d", meta.ContentLength)
 	}
 	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime); err != nil {
 		return err
