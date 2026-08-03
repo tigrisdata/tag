@@ -102,7 +102,12 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 		// block-cached on read, so the write path (tee + warm-on-write) is a no-op for them;
 		// non-block-eligible objects at or above BlockSize (e.g. block caching off) are warmed
 		// via the streaming read-back instead. IsCacheable(SizeThreshold) still applies after the HEAD.
-		size < s.config.Cache.BlockSize
+		size < s.config.Cache.BlockSize &&
+		// Never buffer more than we'd ever cache: with a nil populate budget the tee is not
+		// budget-bounded, so a misconfigured BlockSize > SizeThreshold could otherwise let it
+		// buffer an object larger than the cacheability ceiling. Bounds the in-memory buffer
+		// to SizeThreshold (a no-op in any config where BlockSize <= SizeThreshold).
+		size <= s.config.Cache.SizeThreshold
 
 	if !eligible {
 		return nil, s.forwarder.Forward(ctx, w, r)

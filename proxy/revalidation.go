@@ -347,7 +347,7 @@ func (s *Service) handleRevalidation206Range(
 	s.cache.Delete(context.Background(), bucket, key)
 
 	// Determine total object size from Content-Range header
-	totalSize := extractTotalSizeFromContentRange(resp.Header.Get("Content-Range"))
+	_, _, totalSize, _ := parseContentRange(resp.Header.Get("Content-Range"))
 
 	// Stream range response to client
 	copyHeaders(w.Header(), resp.Header)

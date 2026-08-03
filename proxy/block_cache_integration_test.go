@@ -224,16 +224,18 @@ func TestBlockCache_FullGetAssemblesAllBlocks(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
 	svc, c := newBlockService(t, mock)
 
-	// Establish a block-mode entry (meta + block 0) via a cold range miss.
+	// Establish a block-mode entry with blocks 0 and 1 present (a cold miss over bytes 0-7), so
+	// the object is mostly cached (2 of 3 blocks) and a full GET assembles the rest rather than
+	// falling through to a single upstream GET (the mostly-missing amplification guard).
 	w := httptest.NewRecorder()
-	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
 		t.Fatalf("cold miss: %v", err)
 	}
 	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
 		t.Fatal("block-mode meta not populated")
 	}
 
-	// Full GET (no Range): assemble all three blocks (0 present, 1 and 2 fetched), serve whole.
+	// Full GET (no Range): assemble all three blocks (0,1 present, 2 fetched), serve whole.
 	w2 := httptest.NewRecorder()
 	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
 		t.Fatalf("full GET: %v", err)
@@ -244,11 +246,49 @@ func TestBlockCache_FullGetAssemblesAllBlocks(t *testing.T) {
 	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
 		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
 	}
-	// Assembly populated the remaining blocks for next time.
+	// Assembly populated the remaining block for next time.
+	if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 2) {
+		t.Error("block 2 not cached after full-object assembly")
+	}
+}
+
+// A full GET on a mostly-missing block-mode entry (e.g. only a footer block was ever cached)
+// must NOT fan out into a per-block fetch of every missing block — that is a large upstream
+// amplification. It falls through to the miss path (a single streaming upstream GET), still
+// serving correct bytes, while leaving the block-mode entry intact (not whole-cached over).
+func TestBlockCache_FullGetMostlyMissingFallsThrough(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // 3 blocks; establish only block 0
+	svc, c := newBlockService(t, mock)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated")
+	}
+
+	before := mock.blockGets.Load()
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET: %v", err)
+	}
+	// Correct bytes are still served (via the upstream fall-through, not block assembly).
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("full GET: code=%d body=%q, want 200 ABCDEFGHIJ", w2.Code, w2.Body.String())
+	}
+	// No per-block fetch amplification: the fall-through streamed once, blocks 1/2 stay uncached.
+	if after := mock.blockGets.Load(); after != before {
+		t.Errorf("full GET fanned out into per-block fetches: blockGets %d -> %d", before, after)
+	}
 	for i := int64(1); i <= 2; i++ {
-		if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, i) {
-			t.Errorf("block %d not cached after full-object assembly", i)
+		if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, i) {
+			t.Errorf("block %d cached despite mostly-missing fall-through", i)
 		}
+	}
+	// The block-mode entry survives (the fall-through must not whole-cache over it).
+	if meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || meta.BlockSize != 4 {
+		t.Errorf("block-mode entry clobbered by fall-through: found=%v", found)
 	}
 }
 
@@ -363,9 +403,10 @@ func TestBlockCache_Block404InvalidatesStaleMeta(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
 	svc, c := newBlockService(t, mock)
 
-	// Establish a block-mode entry (meta + block 0).
+	// Establish a block-mode entry with blocks 0 and 1 present (mostly cached, so a full GET
+	// assembles the remaining block rather than falling through the amplification guard).
 	w := httptest.NewRecorder()
-	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
 		t.Fatalf("cold miss: %v", err)
 	}
 	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
@@ -375,7 +416,7 @@ func TestBlockCache_Block404InvalidatesStaleMeta(t *testing.T) {
 	// The object is deleted out of band: block fetches now 404.
 	mock.blockGet404 = true
 
-	// A full GET assembles blocks; a missing block 404s → the stale entry is invalidated.
+	// A full GET assembles blocks; the missing block 404s → the stale entry is invalidated.
 	w2 := httptest.NewRecorder()
 	_ = svc.HandleGetObject(w2, fullGet(wowBucket, wowKey))
 	deadline := time.Now().Add(2 * time.Second)
@@ -397,9 +438,10 @@ func TestBlockCache_OverwriteWithLengthChangeInvalidates(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
 	svc, c := newBlockService(t, mock)
 
-	// Establish a block-mode entry at v1.
+	// Establish a block-mode entry at v1 with blocks 0 and 1 present (mostly cached, so a full
+	// GET assembles the remaining block rather than falling through the amplification guard).
 	w := httptest.NewRecorder()
-	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
 		t.Fatalf("cold miss: %v", err)
 	}
 	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
@@ -533,9 +575,10 @@ func TestBlockCache_ETagMismatchInvalidatesStaleMeta(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
 	svc, c := newBlockService(t, mock)
 
-	// Establish a block-mode entry at ETag v1 (meta + block 0).
+	// Establish a block-mode entry at ETag v1 with blocks 0 and 1 present (mostly cached, so a
+	// full GET assembles the remaining block rather than falling through the amplification guard).
 	w := httptest.NewRecorder()
-	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
 		t.Fatalf("cold miss: %v", err)
 	}
 	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
@@ -546,7 +589,7 @@ func TestBlockCache_ETagMismatchInvalidatesStaleMeta(t *testing.T) {
 	mock.etag = `"v2"`
 	mock.blockGetETag = `"v2"`
 
-	// A full GET assembles all blocks; a missing block reports v2 != cached v1, so the stale v1
+	// A full GET assembles all blocks; the missing block reports v2 != cached v1, so the stale v1
 	// entry is invalidated and then re-established from the fall-through as the current version
 	// (whole-cached v2 under Option A). Either way the stale v1 entry must be gone.
 	w2 := httptest.NewRecorder()

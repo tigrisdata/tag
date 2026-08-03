@@ -11,7 +11,6 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
-	"github.com/tigrisdata/tag/s3err"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -110,15 +109,11 @@ func (s *Service) serveRangeFromBlockCache(
 	// return 416 (multi-range from cache is unsupported).
 	ranges, parseErr := parseRangeHeader(rangeHeader, meta.ContentLength)
 	if parseErr != nil || len(ranges) != 1 {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
-		writeCacheStatus(w, XCacheHit)
-		s3err.WriteError(w, r, s3err.ErrInvalidRange)
-		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
+		writeRangeNotSatisfiable(w, r, meta, startTime)
 		return true, nil
 	}
 	rng := ranges[0]
-	blockSize := meta.BlockSize
-	b0, bK := coveringBlocks(rng.start, rng.end, blockSize)
+	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
 
 	// Make the covering blocks present (probe + fetch any missing, coalesced/concurrent).
 	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, b0, bK); ferr != nil {
@@ -133,33 +128,45 @@ func (s *Service) serveRangeFromBlockCache(
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(http.StatusPartialContent)
 
-	cw := &countingWriter{w: w}
-	for i := b0; i <= bK; i++ {
-		bStart, bEnd := blockBounds(i, blockSize, meta.ContentLength)
-		localStart := max(rng.start, bStart) - bStart
-		localEnd := min(rng.end, bEnd) - bStart
-		if berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, blockSize, i, localStart, localEnd, cw); berr != nil {
-			// A block was evicted between populate and serve. Headers are already sent, so we
-			// cannot fall through; report the error (the client sees a truncated body).
-			if cw.written > 0 {
-				metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-			}
-			log.Warn().Err(berr).Str("bucket", bucket).Str("key", key).Int64("block", i).Msg("Block vanished mid-serve")
-			return true, berr
-		}
-	}
-	if cw.written > 0 {
-		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+	if _, berr := s.streamBlockRange(ctx, w, bucket, key, meta, rng.start, rng.end); berr != nil {
+		return true, berr
 	}
 	metrics.RecordRangeFromCacheHit()
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
 	return true, nil
 }
 
+// streamBlockRange streams object bytes [start,end] (inclusive) from a block-mode entry's
+// cached blocks, in order, into w. The caller must have committed the status line + headers and
+// ensured the covering blocks are present. On a block evicted mid-serve it returns a non-nil
+// error; headers are already sent so the caller cannot fall through (the client sees a truncated
+// body). Shared by the range and full-object serve paths.
+func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, bucket, key string, meta *cache.CachedObjectMeta, start, end int64) (written int64, err error) {
+	b0, bK := coveringBlocks(start, end, meta.BlockSize)
+	cw := &countingWriter{w: w}
+	for i := b0; i <= bK; i++ {
+		bStart, bEnd := blockBounds(i, meta.BlockSize, meta.ContentLength)
+		localStart := max(start, bStart) - bStart
+		localEnd := min(end, bEnd) - bStart
+		if berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, cw); berr != nil {
+			if cw.written > 0 {
+				metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+			}
+			log.Warn().Err(berr).Str("bucket", bucket).Str("key", key).Int64("block", i).Msg("Block vanished mid-serve")
+			return cw.written, berr
+		}
+	}
+	if cw.written > 0 {
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+	}
+	return cw.written, nil
+}
+
 // serveFullObjectFromBlockCache serves a full-object GET from a block-mode entry by assembling
 // all of its blocks (fetching any missing), streaming them in order. It returns served=false,
 // without writing anything, when the blocks cannot be populated — the caller then falls through
-// to the miss path.
+// to the miss path. A block-mode meta always has ContentLength >= BlockSize >= 1, so there is no
+// zero-byte case to handle here.
 func (s *Service) serveFullObjectFromBlockCache(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -167,17 +174,25 @@ func (s *Service) serveFullObjectFromBlockCache(
 	meta *cache.CachedObjectMeta,
 	startTime time.Time,
 ) (served bool, err error) {
-	// Zero-byte object: headers only.
-	if meta.ContentLength == 0 {
-		meta.WriteHeaders(w)
-		writeCacheStatus(w, XCacheHit)
-		w.WriteHeader(meta.StatusCode)
-		metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
-		return true, nil
-	}
+	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
 
-	blockSize := meta.BlockSize
-	lastBlock := (meta.ContentLength - 1) / blockSize
+	// A full GET must produce every block. If most are missing (e.g. only a footer range was
+	// ever cached), assembling them as individual aligned range GETs — bounded to
+	// maxConcurrentBlockFetches — is a large request amplification versus one streaming upstream
+	// GET. Fall through to the miss path in that case: it streams the object in a single fetch
+	// and, guarded by the existing block-mode entry, won't whole-cache over it. Only assemble
+	// when the object is already mostly cached, where the per-block fills are cheap and avoid
+	// re-downloading bytes already in cache.
+	present := int64(0)
+	for i := int64(0); i <= lastBlock; i++ {
+		if s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, i) {
+			present++
+		}
+	}
+	if present*2 < lastBlock+1 {
+		log.Debug().Str("bucket", bucket).Str("key", key).Int64("present", present).Int64("blocks", lastBlock+1).Msg("Full-object block assembly would amplify - falling through to single upstream GET")
+		return false, nil
+	}
 
 	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, 0, lastBlock); ferr != nil {
 		log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Full-object block assembly failed - falling through to upstream")
@@ -188,19 +203,8 @@ func (s *Service) serveFullObjectFromBlockCache(
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(meta.StatusCode)
 
-	cw := &countingWriter{w: w}
-	for i := int64(0); i <= lastBlock; i++ {
-		bStart, bEnd := blockBounds(i, blockSize, meta.ContentLength)
-		if berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, blockSize, i, 0, bEnd-bStart, cw); berr != nil {
-			if cw.written > 0 {
-				metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-			}
-			log.Warn().Err(berr).Str("bucket", bucket).Str("key", key).Int64("block", i).Msg("Block vanished mid-assembly")
-			return true, berr
-		}
-	}
-	if cw.written > 0 {
-		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+	if _, berr := s.streamBlockRange(ctx, w, bucket, key, meta, 0, meta.ContentLength-1); berr != nil {
+		return true, berr
 	}
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
 	return true, nil
@@ -328,7 +332,7 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 		// Validate the 206's Content-Range bounds match the block we asked for. A same-length
 		// response at a different offset (a non-conformant upstream) would otherwise be stored
 		// under this block index and served at the wrong object offset.
-		if rs, re, ok := parseContentRangeBounds(resp.Header.Get("Content-Range")); !ok || rs != bStart || re != bEnd {
+		if rs, re, _, ok := parseContentRange(resp.Header.Get("Content-Range")); !ok || rs != bStart || re != bEnd {
 			return nil, fmt.Errorf("block %d fetch: content-range bounds %d-%d (ok=%t), want %d-%d", blockIdx, rs, re, ok, bStart, bEnd)
 		}
 		ttl := int(s.config.Cache.TTL.Seconds())

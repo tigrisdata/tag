@@ -630,6 +630,16 @@ func parseRangeHeader(rangeHeader string, totalSize int64) ([]byteRange, error) 
 }
 
 // serveRangeFromCache serves a Range request from the cached full object.
+// writeRangeNotSatisfiable emits the 416 response for a malformed, empty, or multi-range
+// request served from a cached entry (a bytes */total Content-Range plus ErrInvalidRange).
+// Shared by the whole-body and block-mode range serve paths.
+func writeRangeNotSatisfiable(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, startTime time.Time) {
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
+	writeCacheStatus(w, XCacheHit)
+	s3err.WriteError(w, r, s3err.ErrInvalidRange)
+	metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
+}
+
 // It returns served=true when it has produced a complete client response (a range
 // body, or a definitive error response like 416). It returns served=false, without
 // touching the response, when the cached body cannot be resolved (e.g. the body was
@@ -648,20 +658,14 @@ func (s *Service) serveRangeFromCache(
 	// Parse Range header
 	ranges, parseErr := parseRangeHeader(rangeHeader, meta.ContentLength)
 	if parseErr != nil || len(ranges) == 0 {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
-		writeCacheStatus(w, XCacheHit)
-		s3err.WriteError(w, r, s3err.ErrInvalidRange)
-		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
+		writeRangeNotSatisfiable(w, r, meta, startTime)
 		return true, nil
 	}
 
 	// Only support single range (multi-range is complex and rare)
 	if len(ranges) > 1 {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Multi-range not supported from cache")
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
-		writeCacheStatus(w, XCacheHit)
-		s3err.WriteError(w, r, s3err.ErrInvalidRange)
-		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
+		writeRangeNotSatisfiable(w, r, meta, startTime)
 		return true, nil
 	}
 
@@ -744,7 +748,7 @@ func (s *Service) handleRangeWithBackgroundCache(
 
 	// Determine total object size from Content-Range header
 	// Format: "bytes 0-499/1234" where 1234 is total size
-	totalSize := extractTotalSizeFromContentRange(resp.Header.Get("Content-Range"))
+	_, _, totalSize, _ := parseContentRange(resp.Header.Get("Content-Range"))
 
 	// Decide up front whether this response is cacheable. Conditions:
 	// - Response is 206 Partial Content (successful range response)
