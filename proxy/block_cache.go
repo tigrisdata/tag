@@ -29,6 +29,12 @@ var errBlockETagMismatch = errors.New("block etag mismatch")
 // block-mode entry is stale and should be invalidated rather than repeatedly retried.
 var errBlockUpstreamGone = errors.New("block upstream gone")
 
+// errBlockAssemblyWouldAmplify means ensureBlocksCached bailed (only when the caller opts in via
+// bailIfMostlyMissing) because most covering blocks are absent, so per-block assembly would be a
+// large upstream amplification versus one streaming fetch. The full-object serve path treats it
+// as "fall through to the miss path", not a real error.
+var errBlockAssemblyWouldAmplify = errors.New("block assembly would amplify")
+
 // isBlockEligibleSize reports whether an object of the given content length is block-cached on
 // the read-miss path (RFC 0001): block caching is enabled and the object is at least one block
 // (BlockSize is the whole-vs-block boundary — a sub-block object is whole-cached, since blocking
@@ -103,8 +109,9 @@ func (s *Service) serveRangeFromBlockCache(
 	rng := ranges[0]
 	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
 
-	// Make the covering blocks present (probe + fetch any missing, coalesced/concurrent).
-	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, b0, bK); ferr != nil {
+	// Make the covering blocks present (probe + fetch any missing, coalesced/concurrent). A range
+	// covers few blocks, so there is no amplification concern — never bail.
+	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, b0, bK, false); ferr != nil {
 		// Couldn't populate the missing blocks (budget shed, upstream error, or a concurrent
 		// overwrite). Nothing written yet — let the caller forward upstream.
 		log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Block populate failed - falling through to upstream")
@@ -164,25 +171,16 @@ func (s *Service) serveFullObjectFromBlockCache(
 ) (served bool, err error) {
 	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
 
-	// A full GET must produce every block. If most are missing (e.g. only a footer range was
-	// ever cached), assembling them as individual aligned range GETs — bounded to
-	// maxConcurrentBlockFetches — is a large request amplification versus one streaming upstream
-	// GET. Fall through to the miss path in that case: it streams the object in a single fetch
-	// and, guarded by the existing block-mode entry, won't whole-cache over it. Only assemble
-	// when the object is already mostly cached, where the per-block fills are cheap and avoid
-	// re-downloading bytes already in cache.
-	present := int64(0)
-	for i := int64(0); i <= lastBlock; i++ {
-		if s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, i) {
-			present++
+	// A full GET must produce every block. bailIfMostlyMissing=true asks ensureBlocksCached to
+	// fall through (rather than assemble) when most blocks are absent — e.g. only a footer range
+	// was ever cached — since per-block assembly would be a large amplification versus one
+	// streaming upstream GET. The miss path then streams the object in a single fetch and, being
+	// block-mode, re-splits it. When the object is mostly cached it assembles the few missing.
+	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, 0, lastBlock, true); ferr != nil {
+		if errors.Is(ferr, errBlockAssemblyWouldAmplify) {
+			log.Debug().Str("bucket", bucket).Str("key", key).Int64("blocks", lastBlock+1).Msg("Full-object block assembly would amplify - falling through to single upstream GET")
+			return false, nil
 		}
-	}
-	if present*2 < lastBlock+1 {
-		log.Debug().Str("bucket", bucket).Str("key", key).Int64("present", present).Int64("blocks", lastBlock+1).Msg("Full-object block assembly would amplify - falling through to single upstream GET")
-		return false, nil
-	}
-
-	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, 0, lastBlock); ferr != nil {
 		log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Full-object block assembly failed - falling through to upstream")
 		return false, ferr
 	}
@@ -341,20 +339,32 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 	}
 }
 
-// ensureBlocksCached makes covering blocks [b0,bK] present in cache: it probes each (recording
-// per-block hits/misses), fetches any that are missing, and records whether the request was a
-// full hit or a partial hit. It returns an error only when a missing block could not be
-// populated (budget shed, upstream/ETag failure) — the caller then falls through to upstream.
-func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, b0, bK int64) error {
+// ensureBlocksCached makes covering blocks [b0,bK] present in cache: it probes the range once,
+// fetches any that are missing, and records per-block hits/misses plus whether the serve was a
+// full or partial hit. It returns an error only when a missing block could not be populated
+// (budget shed, upstream/ETag failure) — the caller then falls through to upstream. When
+// bailIfMostlyMissing is set (the full-object serve path), it instead returns
+// errBlockAssemblyWouldAmplify — without fetching or recording serve metrics — if a majority of
+// the covering blocks are absent, so the caller streams the object once rather than fanning out
+// into per-block fetches.
+func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, b0, bK int64, bailIfMostlyMissing bool) error {
 	var missing []int64
 	for i := b0; i <= bK; i++ {
-		if s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, i) {
-			metrics.CacheBlockHits.Inc()
-		} else {
-			metrics.CacheBlockMisses.Inc()
+		if !s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, i) {
 			missing = append(missing, i)
 		}
 	}
+	total := bK - b0 + 1
+	// Full-object serves opt into this (via bailIfMostlyMissing): when most covering blocks are
+	// absent, assembling them as individual aligned range GETs is a large amplification versus one
+	// streaming fetch, so signal the caller to fall through instead. Decided from the single probe
+	// above — no second BlockExists scan. Metrics below record only committed serves, so a bail
+	// (not a serve) records none, matching the prior behavior.
+	if bailIfMostlyMissing && int64(len(missing))*2 > total {
+		return errBlockAssemblyWouldAmplify
+	}
+	metrics.CacheBlockHits.Add(float64(total - int64(len(missing))))
+	metrics.CacheBlockMisses.Add(float64(len(missing)))
 	if len(missing) == 0 {
 		metrics.CacheBlockRangeServed.WithLabelValues("full_hit").Inc()
 		return nil

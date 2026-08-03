@@ -719,19 +719,19 @@ func TestBlockCache_StalePopulateDoesNotOverwriteExistingEntry(t *testing.T) {
 
 	// Drive a stale populate carrying the same meta (as a racing range miss whose schedule-time
 	// !found gate is now stale). It targets block 1 (not yet cached) so the fetch actually runs;
-	// then its re-check finds the entry present and skips the meta write, leaving it intact.
-	before := mock.blockGets.Load()
+	// its re-check then finds the entry present and skips the meta write. Wait for the populate to
+	// finish its work — block 1 written — as a deterministic signal (no fixed sleep), then confirm
+	// it left the existing block-mode entry intact.
 	svc.triggerBlockModePopulate(wowBucket, wowKey, "ak", "sk", seeded, []int64{1})
 	deadline := time.Now().Add(2 * time.Second)
-	for mock.blockGets.Load() == before {
+	for !c.BlockExists(context.Background(), wowBucket, wowKey, seeded.ETag, seeded.BlockSize, 1) {
 		if time.Now().After(deadline) {
-			t.Fatal("block-mode populate never ran")
+			t.Fatal("block-mode populate never wrote block 1")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	time.Sleep(100 * time.Millisecond)
 	if meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || meta.BlockSize != 4 || meta.ETag != seeded.ETag {
-		t.Fatalf("existing entry disturbed by a stale populate: found=%v", found)
+		t.Fatalf("existing entry disturbed by a background populate: found=%v", found)
 	}
 }
 
