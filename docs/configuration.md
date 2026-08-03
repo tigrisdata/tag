@@ -155,12 +155,13 @@ cache:
   # negative disables. Override with TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION env var.
   warm_on_write_reserved_fraction: 0.5
 
-  # Block-aligned caching for large objects (RFC 0001). When enabled, a read miss for an
-  # object at or above block_size is cached at block granularity, so a range read populates
-  # and serves only the blocks it touches. Off by default (opt-in rollout).
+  # Block-aligned caching for large objects (RFC 0001). When enabled, any object at or above
+  # block_size is cached at block granularity regardless of how it was fetched (range read,
+  # full GET, or warm-on-write), so a range read populates and serves only the blocks it
+  # touches. Off by default (opt-in rollout).
   block_caching_enabled: false
 
-  # Block granularity AND the read-side whole-vs-block boundary: a read miss for an object
+  # Block granularity AND the whole-vs-block boundary for every populate path: an object
   # smaller than one block is whole-cached, one this size or larger is block-cached. Must stay
   # below ocache's 64 MB compaction threshold so blocks pack into shared segments. 0/unset =
   # default. Override with TAG_CACHE_BLOCK_SIZE env var.

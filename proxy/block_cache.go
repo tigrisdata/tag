@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -38,20 +40,6 @@ func (s *Service) isBlockEligibleSize(contentLength int64) bool {
 	return s.config.Cache.BlockCachingEnabled &&
 		s.config.Cache.BlockSize > 0 &&
 		contentLength >= s.config.Cache.BlockSize
-}
-
-// hasBlockModeEntry reports whether a block-mode cache entry (meta with BlockSize > 0) already
-// exists for the object. The full-GET whole-cache path uses this to avoid overwriting a valid
-// block-mode entry with a whole-mode one — e.g. when a full GET falls through to upstream after
-// a *transient* block-assemble failure (budget shed, upstream blip), which leaves the block-mode
-// meta in place. Without this guard that fall-through would demote block mode to whole and
-// re-download the entire object. Returns false when block caching is off (no block entries exist).
-func (s *Service) hasBlockModeEntry(ctx context.Context, bucket, key string) bool {
-	if !s.config.Cache.BlockCachingEnabled {
-		return false
-	}
-	m, found, err := s.cache.GetMeta(ctx, bucket, key)
-	return err == nil && found && m != nil && m.BlockSize > 0
 }
 
 // blockBounds returns the inclusive object-byte bounds [start,end] of block i for an object
@@ -396,6 +384,38 @@ func (s *Service) buildBlockMeta(bucket, key string, respHeader http.Header, tot
 	meta.ContentLength = totalSize
 	meta.BlockSize = s.config.Cache.BlockSize
 	return meta
+}
+
+// putBlocksFromStream consumes a full-object body and writes it as fixed-size blocks
+// (meta.BlockSize), then stamps the block-mode meta (tombstone-aware) as the visibility gate —
+// mirroring the range path's "blocks first, meta last" ordering. It buffers at most one block
+// (<= block_size) at a time, so peak memory is bounded regardless of object size. This is the
+// shared full-object populate path: block mode is established from ANY full-object fetch (a
+// full-GET read miss or a warm-on-write read-back), not only the range path — the whole-vs-block
+// boundary is size, not access pattern (RFC 0001). On a mid-stream error the meta is left
+// unwritten, so a partially written block set is never made visible.
+func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, writeStartTime int64) error {
+	buf := make([]byte, meta.BlockSize)
+	for idx := int64(0); ; idx++ {
+		n, err := io.ReadFull(r, buf)
+		if n > 0 {
+			if perr := s.cache.PutBlockStream(ctx, bucket, key, meta.ETag, meta.BlockSize, idx, bytes.NewReader(buf[:n]), ttl); perr != nil {
+				return perr
+			}
+			metrics.CacheBlockPopulated.Inc()
+			metrics.CacheBlockBytesPopulated.Add(float64(n))
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break // clean end (n==0, EOF), or the final short block (0<n<blockSize, ErrUnexpectedEOF)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime); err != nil {
+		return err
+	}
+	return nil
 }
 
 // triggerBlockModePopulate populates a block-mode entry in the background after a cold range

@@ -212,7 +212,18 @@ func (s *Service) setupCacheListener(
 		// Start cache writer goroutine - will call Read() when ready
 		cacheErrCh := make(chan error, 1)
 		go func() {
-			_, cacheErr := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+			var cacheErr error
+			// Block-eligible objects (>= block_size, block caching on) are stored as fixed-size
+			// blocks regardless of how they were fetched — a full-GET read miss or a warm-on-write
+			// read-back. The whole-vs-block boundary is size, not access pattern (RFC 0001): both
+			// full and range paths converge on one representation per size class. Sub-block objects
+			// keep the single whole-body write.
+			if s.isBlockEligibleSize(meta.ContentLength) {
+				meta.BlockSize = s.config.Cache.BlockSize
+				cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+			} else {
+				_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+			}
 			if cacheErr != nil {
 				log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")
 			}
@@ -407,20 +418,6 @@ func (s *Service) fetchFullObjectToCache(
 			Int64("size", resp.ContentLength).
 			Int64("threshold", s.config.Cache.SizeThreshold).
 			Msg("Skipping background cache - object too large")
-		return nil
-	}
-
-	// Warm-on-write does not whole-cache objects that are block-cached on read (>= BlockSize
-	// when block caching is on): they are populated as blocks on the range path instead, so
-	// warming them whole would just create an overlapping whole-body entry. Aborting here,
-	// after headers but before the body download, makes warm-on-write a no-op for them at no
-	// read-back cost. Read-miss whole-fetches do NOT skip block-eligible objects — the only
-	// read-miss path that reaches a block-eligible object is the full-GET cold-cancel fallback,
-	// which whole-caches it per Option A (range read misses route block-eligible objects to
-	// block population, never here).
-	if prio == priorityWarmWrite && s.isBlockEligibleSize(resp.ContentLength) {
-		log.Debug().Str("bucket", bucket).Str("key", key).Int64("size", resp.ContentLength).
-			Msg("Skipping warm-on-write - object is block-mode (cached per-block on read)")
 		return nil
 	}
 

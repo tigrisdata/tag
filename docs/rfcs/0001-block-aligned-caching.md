@@ -98,20 +98,25 @@ New `fetchBlocksToCache(ctx, bucket, key, etag, meta, blockIdxs)`:
 
 On a cold range miss (no meta), write meta from the range response's `Content-Range` total size + headers (ETag etc.) — no extra HEAD — then populate the touched block(s). This replaces the whole-object `triggerBackgroundCacheFetch` in `handleRangeWithBackgroundCache` for block-mode-eligible objects.
 
+### Mode is a function of size, not access pattern
+
+An object's representation is decided purely by size: `≥ block_size` (with block caching on) → **blocks**, below → **whole**. It does **not** depend on whether the object was first touched by a full GET or a range read. This is enforced at a single point — the shared full-object cache writer (`setupCacheListener`, used by both the read-miss inline tee and the warm-on-write read-back) branches on `isBlockEligibleSize(meta.ContentLength)`: block-eligible bodies are split into blocks by `putBlocksFromStream` (buffering one block at a time, so peak memory is bounded regardless of object size), everything else takes the single whole-body write. Blocks are written first, the block-mode meta last (the visibility gate), mirroring the range path.
+
+Because every full-object fetch of a block-eligible object lands as blocks, there is no whole/block ambiguity and none of the collision guards a per-access-pattern rule would need.
+
 ### Warm-on-write interaction
 
-`warmOnWrite` whole-caches on write, but **not** objects that are block-cached on read — an object that will be populated as blocks shouldn't also get an overlapping whole-body entry. So:
-
-- object **block-eligible** (block caching on and `≥ block_size`) → **noop.** It is populated as blocks on the range path instead. (The fetch aborts after headers, no read-back.)
-- otherwise (below `block_size`, or block caching off) → whole-object warm, up to `size_threshold` — via the in-memory tee for objects below `block_size`, else the streaming read-back.
-
-There is no separate warm-size knob: `block_size` is the boundary (block-eligible objects aren't warmed) and `size_threshold` is the ceiling. This keeps warm-on-write and read-miss block population from ever targeting the same object, so there's no whole/block overlap to reconcile.
+`warmOnWrite` populates on write exactly as a read would: a block-eligible object (`≥ block_size`, block caching on) is **block-split** from the read-back stream; a sub-block object is whole-cached (via the in-memory tee where possible, else the streaming read-back). Both directions flow through the same shared cache writer, so warm-on-write and read-miss produce identical representations — there is nothing to reconcile. `block_size` is the whole↔block boundary; `size_threshold` is the ceiling; there is no separate warm-size knob.
 
 ### Full-object GET on a block-mode object
 
-Rare for Parseable (it reads ranges) but must be correct: on a **hit**, assemble blocks `0…N-1` in order, fetching any missing via `fetchBlocksToCache`, streaming as we go. A full GET thus warms all blocks — acceptable given its rarity.
+Rare for Parseable (it reads ranges) but must be correct:
 
-On a full-GET **miss** of a block-eligible object, the object is **whole-cached** (Option A): the whole object was fetched to satisfy the GET, so there is no range-miss amplification to avoid, and caching it whole is a single fetch (no re-download) that also handles ETag-less objects. It becomes a whole-mode entry (`BlockSize=0`); block mode is established only on the **range-read** path. A later range read of a whole-cached object serves its bytes efficiently from the whole body (`GetRangeStream` reads only the requested range). So an object's representation follows its first access: full-GET-first → whole; range-first → block. (Considered and rejected: re-fetching the object as blocks in the background to keep a strict `block-eligible == block-mode` invariant — it doubles upstream egress on every cold full-GET and can't cache ETag-less objects, for no benefit the range path doesn't already give.)
+- **Cold miss:** the object is streamed once from upstream and split into blocks by the shared writer — one upstream fetch, all blocks populated.
+- **Hit, mostly cached:** assemble blocks `0…N-1` in order, fetching any few missing via `fetchBlocksToCache`, streaming as we go.
+- **Hit, mostly missing** (e.g. only a footer block was ever cached): assembling every missing block as a separate aligned range GET would be a large request amplification, so instead fall through to the miss path — a single streaming upstream GET that re-splits into blocks. The threshold (more than half the covering blocks missing) bounds per-block fan-out to the already-mostly-cached case.
+
+So a block-eligible object is **always** block-mode; a full read never produces a competing whole-body entry.
 
 An entry is invalidated when a block fetch returns a definitive stale signal — an ETag mismatch (concurrent overwrite) or 404/403 (deleted / access revoked) — so a stale entry isn't retried on every read until TTL. A client-forced revalidation (`Cache-Control: no-cache`) of a block-mode entry likewise invalidates it and lets the miss path re-establish the current version.
 
@@ -125,7 +130,7 @@ A single size knob, `block_size`, is the whole↔block boundary; the earlier `wr
 | `cache.block_size` | 4 MiB (must be < 64 MB) | Block granularity **and** the whole↔block boundary: below one block → whole-cached (blocking a sub-block object just stores one blob), at/above → block-cached. The write-through tee (in-memory) also gates on this, keeping its buffer sub-block. |
 | `cache.size_threshold` | 1 GB | Overall cacheability ceiling. Block mode lets TAG cache *parts* of objects up to this ceiling without downloading the whole thing. |
 
-Why one knob: block-caching a sub-block object is identical to whole-caching it, so `block_size` is the natural boundary. It governs both directions — read misses of block-eligible objects populate blocks, and the write path (tee + warm-on-write) is a no-op for those same objects (they'd otherwise create an overlapping whole-body entry). Warm-on-write whole-caches only non-block-eligible objects, up to `size_threshold`; no separate warm cap is needed.
+Why one knob: block-caching a sub-block object is identical to whole-caching it, so `block_size` is the natural boundary. It governs every populate path uniformly — read misses, full-GET misses, and warm-on-write all split block-eligible objects into blocks and whole-cache the rest — so representation is a function of size alone, with no separate warm cap and no per-access-pattern collision to guard.
 
 ### Invalidation and consistency
 
@@ -148,8 +153,8 @@ Back-compat: legacy whole-body entries (`BlockSize=0`) are served by the existin
 
 1. `meta.BlockSize` + `MakeBlockKey` + config + reader dispatch (block vs whole).
 2. Block-aware range serve: per-block probe + partial-hit fetch (coalesced, concurrent).
-3. Warm-on-write (and the tee) skip block-eligible objects (`≥ block_size` with block caching on); the whole↔block boundary is `block_size`; remove `block_cache_min_size` and `write_through_max_size`.
-4. Full-GET block assembly + metrics.
+3. Single shared cache writer splits block-eligible objects into blocks on every full-object populate path (read miss, full-GET miss, warm-on-write read-back); the tee stays sub-block; the whole↔block boundary is `block_size`; remove `block_cache_min_size` and `write_through_max_size`.
+4. Full-GET block assembly (mostly-cached) + single-stream re-split fallback (mostly-missing) + metrics.
 5. *(optional, later — may or may not do)* ocache block-locality routing for clusters.
 
 Deferred: block-size-vs-footer-fit (single block size for now).
@@ -164,5 +169,5 @@ Deferred: block-size-vs-footer-fit (single block size for now).
 ## Alternatives considered
 
 - **Option B — ocache sparse blobs.** Store one body key as a sparse blob with a present-ranges map (`PutRange` + hole-aware `GetRangeStream`). Fewer keys and exact-byte population, but a larger change that lands in **ocache** (separate plan/repo). Kept in mind as a possible future evolution; Option A is chosen for phase 1 because it is self-contained in TAG and incremental.
-- **Whole-object multipart write-through (#136).** Pre-warms *whole* bodies on write — right for manifests (read in full), wrong for Parquet (footer + selective ranges). Closed in favor of this RFC. Consequence for manifests: at 300–400 MB they are block-eligible (`≥ block_size`), so warm-on-write is a noop for them — but because they are **read in full**, their first full-object read is a full-GET miss and lands on the whole-cache path (Option A), so they end up **whole-cached** (the right representation for a read-in-full object), and subsequent reads hit. The only change versus write-time pre-warming is that the first read after each manifest rewrite is a cold full fetch rather than a pre-warmed hit.
+- **Whole-object multipart write-through (#136).** Pre-warms *whole* bodies on write — right for manifests (read in full), wrong for Parquet (footer + selective ranges). Closed in favor of this RFC. Consequence for manifests: at 300–400 MB they are block-eligible (`≥ block_size`), so with `warm_on_write` on they are **block-split** on write (and otherwise on their first full read). A full read of a manifest then assembles its blocks from cache. Reassembly is `N` cache reads instead of one whole-body stream, but that overhead is dwarfed by the byte transfer; the uniform size-only rule was chosen over Option A's "whole for read-in-full" adaptivity because Parseable's large objects are range-read-dominated, where whole-caching rarely pays off.
 - **Optimize whole-object warm (#136 Approach B — parallel-range fetch / lazy warm).** Subsumed here: block-granular read-demand populate is a strictly better "warm on read-demand," and parallel-range fetch survives as the concurrent block-fill implementation detail.

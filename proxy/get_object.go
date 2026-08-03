@@ -363,18 +363,15 @@ func (s *Service) streamFromUpstream(
 	}
 	defer resp.Body.Close()
 
-	// Determine if we should cache this response. A full GET is whole-cached even for
-	// block-eligible sizes: the whole object was fetched to satisfy this GET, so there is no
-	// range-miss amplification to avoid, and a later range read serves its bytes efficiently
-	// from the whole body (RFC 0001 — block mode is established only on the range-read path).
-	// Exception: if a block-mode entry already exists, do not whole-cache over it. This full GET
-	// may be the fall-through after a *transient* block-assemble failure; overwriting would
-	// demote the still-valid block entry to whole and re-download the whole object.
+	// Determine if we should cache this response. The whole-vs-block decision is made downstream
+	// in the shared cache writer (setupCacheListener) by size: a block-eligible object (>=
+	// block_size, block caching on) is stored as blocks, everything else whole. A full GET of a
+	// block-eligible object therefore block-splits the stream — the same representation a range
+	// read would establish (RFC 0001), so there is no whole/block collision to guard against.
 	shouldCache := resp.StatusCode == http.StatusOK &&
 		s.cache.IsEnabled() &&
 		!s.hasNoCacheHeaders(resp.Header) &&
-		s.isWithinSizeThreshold(resp) &&
-		!s.hasBlockModeEntry(ctx, bucket, key)
+		s.isWithinSizeThreshold(resp)
 
 	// Set up cache listener if caching (streams directly to cache via pipe)
 	var cachePipeWriter *io.PipeWriter

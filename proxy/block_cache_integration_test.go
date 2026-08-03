@@ -254,9 +254,10 @@ func TestBlockCache_FullGetAssemblesAllBlocks(t *testing.T) {
 
 // A full GET on a mostly-missing block-mode entry (e.g. only a footer block was ever cached)
 // must NOT fan out into a per-block fetch of every missing block — that is a large upstream
-// amplification. It falls through to the miss path (a single streaming upstream GET), still
-// serving correct bytes, while leaving the block-mode entry intact (not whole-cached over).
-func TestBlockCache_FullGetMostlyMissingFallsThrough(t *testing.T) {
+// amplification. It falls through to the miss path (a single streaming upstream GET), which
+// re-streams the object through the block splitter: all blocks are populated in one fetch, with
+// no per-block round-trips, and the entry stays block-mode.
+func TestBlockCache_FullGetMostlyMissingFallsThroughAndBlockSplits(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // 3 blocks; establish only block 0
 	svc, c := newBlockService(t, mock)
 
@@ -277,32 +278,53 @@ func TestBlockCache_FullGetMostlyMissingFallsThrough(t *testing.T) {
 	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
 		t.Fatalf("full GET: code=%d body=%q, want 200 ABCDEFGHIJ", w2.Code, w2.Body.String())
 	}
-	// No per-block fetch amplification: the fall-through streamed once, blocks 1/2 stay uncached.
+	// The fall-through re-stream block-splits the object; wait for the missing blocks to land.
+	deadline := time.Now().Add(2 * time.Second)
+	for !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 2) {
+		if time.Now().After(deadline) {
+			t.Fatal("blocks not populated by the fall-through block-split")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for i := int64(1); i <= 2; i++ {
+		if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, i) {
+			t.Errorf("block %d not populated by fall-through block-split", i)
+		}
+	}
+	// No per-block fetch amplification: the fall-through streamed once via the forward, not one
+	// aligned range GET per missing block.
 	if after := mock.blockGets.Load(); after != before {
 		t.Errorf("full GET fanned out into per-block fetches: blockGets %d -> %d", before, after)
 	}
-	for i := int64(1); i <= 2; i++ {
-		if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, i) {
-			t.Errorf("block %d cached despite mostly-missing fall-through", i)
-		}
-	}
-	// The block-mode entry survives (the fall-through must not whole-cache over it).
+	// The entry stays block-mode (never whole-cached).
 	if meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || meta.BlockSize != 4 {
-		t.Errorf("block-mode entry clobbered by fall-through: found=%v", found)
+		t.Errorf("entry not block-mode after fall-through: found=%v", found)
 	}
 }
 
-// Warm-on-write is a no-op for block-eligible objects (>= block_size with block caching on):
-// they are populated as blocks on read, not warmed whole. The whole-object fetch aborts after
-// headers (no read-back), so no whole-body entry is created.
-func TestBlockCache_WarmOnWriteNoopForBlockEligible(t *testing.T) {
-	var warmFetches atomic.Int32
+// Warm-on-write stores a block-eligible object (>= block_size with block caching on) as blocks:
+// the write-path read-back streams through the same block-splitting cache writer as a read miss,
+// so the whole-vs-block boundary is size, not access pattern (RFC 0001).
+func TestBlockCache_WarmOnWriteBlockSplitsBlockEligible(t *testing.T) {
 	mock := &mockForwarder{
 		forwardFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
 			w.WriteHeader(http.StatusOK)
 			return nil
 		},
-		doFullObjectFunc: warmObjectResponder(&warmFetches, "ABCDEFGHIJ"), // 10 bytes >= block_size
+		// A full-object read-back with a real Content-Length header (10 bytes >= block_size), so
+		// the shared cache writer sees a block-eligible size and splits it.
+		doFullObjectFunc: func(_ context.Context, _, _, _, _ string) (*http.Response, error) {
+			h := http.Header{}
+			h.Set("ETag", `"warm-etag"`)
+			h.Set("Content-Type", "application/octet-stream")
+			h.Set("Content-Length", "10")
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        h,
+				Body:          io.NopCloser(strings.NewReader("ABCDEFGHIJ")),
+				ContentLength: 10,
+			}, nil
+		},
 	}
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
@@ -314,8 +336,18 @@ func TestBlockCache_WarmOnWriteNoopForBlockEligible(t *testing.T) {
 	if err := svc.HandlePutObject(w, authedPut(wowBucket, wowKey, "ABCDEFGHIJ")); err != nil {
 		t.Fatalf("PUT: %v", err)
 	}
-	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
-		t.Error("warm-on-write cached a block-eligible object whole (want no-op)")
+	// The read-back warm populates a block-mode entry (blocks first, meta last as the gate).
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("warm-on-write did not cache the block-eligible object")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if meta.BlockSize != 4 {
+		t.Fatalf("meta.BlockSize=%d, want 4 (block-mode warm)", meta.BlockSize)
+	}
+	for i := int64(0); i <= 2; i++ {
+		if !c.BlockExists(context.Background(), wowBucket, wowKey, meta.ETag, 4, i) {
+			t.Errorf("block %d not populated by warm-on-write block-split", i)
+		}
 	}
 }
 
@@ -357,15 +389,15 @@ func TestBlockCache_UnknownLengthBlockNotStored(t *testing.T) {
 	}
 }
 
-// A full-object GET of a block-eligible object with no cached entry is WHOLE-cached (Option A):
-// the whole object was fetched to satisfy the GET, so there is no range-miss amplification to
-// avoid. It becomes a whole-mode entry (BlockSize==0); block mode is established only on the
-// range-read path. A later range read serves from the whole body.
-func TestBlockCache_FullGetMissWholeCaches(t *testing.T) {
+// A full-object GET of a block-eligible object with no cached entry is stored as BLOCKS: the
+// shared cache writer splits the streamed body into fixed-size blocks (RFC 0001 — the
+// whole-vs-block boundary is size, not access pattern). A later range read is served from the
+// blocks with no upstream fetch.
+func TestBlockCache_FullGetMissBlockSplits(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
 	svc, c := newBlockService(t, mock)
 
-	// Full GET on a cold object: served whole from upstream and whole-cached.
+	// Full GET on a cold object: served whole from upstream, cached as blocks.
 	w := httptest.NewRecorder()
 	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
 		t.Fatalf("full GET: %v", err)
@@ -373,14 +405,20 @@ func TestBlockCache_FullGetMissWholeCaches(t *testing.T) {
 	if w.Code != http.StatusOK || w.Body.String() != "ABCDEFGHIJ" {
 		t.Fatalf("full GET: code=%d body=%q, want 200 ABCDEFGHIJ", w.Code, w.Body.String())
 	}
+	// meta is written last (the visibility gate), so its presence implies all blocks landed.
 	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
 		t.Fatal("object not cached after a full-GET miss")
 	}
 	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
-	if meta.BlockSize != 0 {
-		t.Fatalf("meta.BlockSize=%d, want 0 (whole-mode from full-GET)", meta.BlockSize)
+	if meta.BlockSize != 4 {
+		t.Fatalf("meta.BlockSize=%d, want 4 (block-mode from full-GET split)", meta.BlockSize)
 	}
-	// A subsequent range read is served from the whole body (whole-mode dispatch).
+	for i := int64(0); i <= 2; i++ {
+		if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, i) {
+			t.Errorf("block %d not populated by full-GET split", i)
+		}
+	}
+	// A subsequent range read is served from the blocks with no upstream fetch.
 	before := mock.blockGets.Load()
 	w2 := httptest.NewRecorder()
 	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=4-7")); err != nil {
@@ -390,10 +428,10 @@ func TestBlockCache_FullGetMissWholeCaches(t *testing.T) {
 		t.Fatalf("range read: code=%d body=%q, want 206 EFGH", w2.Code, w2.Body.String())
 	}
 	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
-		t.Errorf("X-Cache=%q, want %q (served from whole body)", got, XCacheHit)
+		t.Errorf("X-Cache=%q, want %q (served from blocks)", got, XCacheHit)
 	}
 	if after := mock.blockGets.Load(); after != before {
-		t.Errorf("whole-cached object triggered a block fetch: %d -> %d", before, after)
+		t.Errorf("range read of a fully-split object triggered a block fetch: %d -> %d", before, after)
 	}
 }
 
@@ -628,27 +666,24 @@ func TestBlockCache_ETagMismatchDoesNotCache(t *testing.T) {
 	}
 }
 
-// A full GET that falls through to upstream after a *transient* block-assemble failure (an
-// upstream blip, not an ETag mismatch or 404) must not whole-cache over the still-valid
-// block-mode entry: doing so would demote block mode to whole and re-download the whole object.
-func TestBlockCache_TransientBlockFailureKeepsBlockMode(t *testing.T) {
+// A full GET on a mostly-cached block entry that hits a *transient* per-block fetch failure
+// during assembly falls through to the miss path, which re-streams the object through the block
+// splitter. The entry stays block-mode (never demoted to whole) and remains servable.
+func TestBlockCache_TransientBlockFailureFallsThroughToBlockSplit(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // 10 bytes → blocks [0..3][4..7][8..9]
 	svc, c := newBlockService(t, mock)
 
-	// Establish a block-mode entry (block 0 + block-mode meta) via a cold range miss.
+	// Establish blocks 0 and 1 (mostly cached: a full GET assembles rather than short-circuiting
+	// via the mostly-missing guard).
 	w := httptest.NewRecorder()
-	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
 		t.Fatalf("cold miss: %v", err)
 	}
 	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
 		t.Fatal("block-mode meta not populated after cold miss")
 	}
-	if meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey); meta.BlockSize != 4 {
-		t.Fatalf("meta.BlockSize=%d, want 4 (block mode)", meta.BlockSize)
-	}
 
-	// A full GET now needs the not-yet-cached blocks 1 and 2; make those fetches fail
-	// transiently so serveFullObjectFromBlockCache gives up and falls through to upstream.
+	// Assembling the remaining block fails transiently → fall through to upstream.
 	mock.blockGetTransient = true
 	wf := httptest.NewRecorder()
 	if err := svc.HandleGetObject(wf, fullGet(wowBucket, wowKey)); err != nil {
@@ -658,42 +693,35 @@ func TestBlockCache_TransientBlockFailureKeepsBlockMode(t *testing.T) {
 	if wf.Code != http.StatusOK || wf.Body.String() != "ABCDEFGHIJ" {
 		t.Fatalf("full GET: code=%d body=%q, want 200 ABCDEFGHIJ", wf.Code, wf.Body.String())
 	}
-	// The block-mode entry must survive: the transient fall-through must NOT whole-cache over it.
+	// The entry stays block-mode (never whole-cached over).
 	meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
 	if !found || meta.BlockSize != 4 {
-		t.Fatalf("block-mode meta clobbered by transient fall-through: found=%v BlockSize=%d, want block mode (4)", found, meta.BlockSize)
+		t.Fatalf("entry not block-mode after transient fall-through: found=%v BlockSize=%d", found, meta.BlockSize)
 	}
 }
 
-// If an entry is established concurrently (e.g. a racing full-GET whole-caches the object)
-// while a block-mode populate is in flight, the populate must not overwrite it — otherwise a
-// complete whole-mode entry is demoted to a partial block-mode one.
-func TestBlockCache_ConcurrentEntryNotOverwrittenByBlockPopulate(t *testing.T) {
+// triggerBlockModePopulate re-checks for a concurrently-established entry before stamping meta,
+// so a stale scheduled populate (its schedule-time !found gate gone stale while it was fetching)
+// does not overwrite an entry that landed in the meantime.
+func TestBlockCache_StalePopulateDoesNotOverwriteExistingEntry(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
 	svc, c := newBlockService(t, mock)
 
-	// Seed a whole-mode entry via a full-GET cold miss (whole-caches, BlockSize 0).
-	wf := httptest.NewRecorder()
-	if err := svc.HandleGetObject(wf, fullGet(wowBucket, wowKey)); err != nil {
-		t.Fatalf("full GET: %v", err)
+	// Establish a block-mode entry.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
 	}
 	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
-		t.Fatal("whole-mode meta not populated after full-GET cold miss")
+		t.Fatal("block-mode meta not populated")
 	}
 	seeded, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
-	if seeded.BlockSize != 0 {
-		t.Fatalf("seeded meta.BlockSize=%d, want 0 (whole mode)", seeded.BlockSize)
-	}
 
-	// Now drive a block-mode populate for the same object (as a racing range miss would).
-	// Its schedule-time !found gate is already stale — the whole entry above exists — so the
-	// re-check before the meta write must make it a no-op.
-	blockMeta := *seeded
-	blockMeta.BlockSize = 4
+	// Drive a stale populate carrying the same meta (as a racing range miss whose schedule-time
+	// !found gate is now stale). It targets block 1 (not yet cached) so the fetch actually runs;
+	// then its re-check finds the entry present and skips the meta write, leaving it intact.
 	before := mock.blockGets.Load()
-	svc.triggerBlockModePopulate(wowBucket, wowKey, "ak", "sk", &blockMeta, []int64{0})
-
-	// Wait for the populate goroutine to actually run (it fetches block 0) ...
+	svc.triggerBlockModePopulate(wowBucket, wowKey, "ak", "sk", seeded, []int64{1})
 	deadline := time.Now().Add(2 * time.Second)
 	for mock.blockGets.Load() == before {
 		if time.Now().After(deadline) {
@@ -701,12 +729,9 @@ func TestBlockCache_ConcurrentEntryNotOverwrittenByBlockPopulate(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	// ... then confirm it left the whole-mode meta intact rather than stamping block-mode meta.
-	// A brief settle covers the window between the block fetch and the (skipped) meta write.
 	time.Sleep(100 * time.Millisecond)
-	meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
-	if !found || meta.BlockSize != 0 {
-		t.Fatalf("whole-mode meta demoted by block populate: found=%v BlockSize=%d, want whole mode (0)", found, meta.BlockSize)
+	if meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || meta.BlockSize != 4 || meta.ETag != seeded.ETag {
+		t.Fatalf("existing entry disturbed by a stale populate: found=%v", found)
 	}
 }
 
@@ -817,5 +842,70 @@ func TestBlockCache_MissingETagDoesNotInvalidateEntry(t *testing.T) {
 	}
 	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 1) {
 		t.Error("ETag-less body stored as block 1 (version unverifiable)")
+	}
+}
+
+// errAfter reads n good bytes across calls, then fails — to exercise a mid-stream body error.
+type errAfterReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, fmt.Errorf("simulated mid-stream read error")
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+// putBlocksFromStream writes an exact-multiple object as whole blocks with no phantom trailing
+// block, and gates visibility on the meta written last.
+func TestPutBlocksFromStream_ExactMultipleNoPhantomBlock(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGH"), `"v1"`) // 8 bytes = exactly two 4-byte blocks
+	svc, c := newBlockService(t, mock)
+
+	h := http.Header{}
+	h.Set("ETag", `"v1"`)
+	h.Set("Content-Length", "8")
+	meta := cache.MetaFromHTTPHeaders(wowBucket, wowKey, http.StatusOK, h)
+	meta.BlockSize = 4
+
+	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEFGH"), 60, time.Now().UnixNano()); err != nil {
+		t.Fatalf("putBlocksFromStream: %v", err)
+	}
+	for i := int64(0); i <= 1; i++ {
+		if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, i) {
+			t.Errorf("block %d not written", i)
+		}
+	}
+	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 2) {
+		t.Error("phantom block 2 written for an exact-multiple object")
+	}
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
+		t.Error("block meta not written after a successful split")
+	}
+}
+
+// A mid-stream body error aborts the split and leaves the meta unwritten, so a partially written
+// block set is never made visible.
+func TestPutBlocksFromStream_MidStreamErrorLeavesMetaUnwritten(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGH"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	h := http.Header{}
+	h.Set("ETag", `"v1"`)
+	h.Set("Content-Length", "8")
+	meta := cache.MetaFromHTTPHeaders(wowBucket, wowKey, http.StatusOK, h)
+	meta.BlockSize = 4
+
+	// One full block, then a read error before the second.
+	r := &errAfterReader{data: []byte("ABCD")}
+	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, r, 60, time.Now().UnixNano()); err == nil {
+		t.Fatal("expected an error from the mid-stream read failure")
+	}
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
+		t.Error("block meta written despite a mid-stream error (partial entry made visible)")
 	}
 }
