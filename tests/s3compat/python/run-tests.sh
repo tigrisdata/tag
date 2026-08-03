@@ -318,7 +318,12 @@ test_buckets=(
     "test_bucket_delete_notexist"
     # "test_bucket_create_exists"
     "test_bucket_create_exists_nonowner"
-    "test_buckets_create_then_list"
+    # test_buckets_create_then_list: excluded — account-state dependent, not a TAG issue. Tigris
+    # paginates ListBuckets at 1000/page (response carries a ContinuationToken), but this ceph
+    # test's get_buckets_list() reads only the first page. The shared account has ~1600 buckets, so
+    # a newly created bucket that sorts past position 1000 is absent from page 1 and the test fails
+    # (via its own buggy NameError path). Re-enable once the account is pruned below the page size.
+    # "test_buckets_create_then_list"
     "test_buckets_list_ctime"
     # "test_bucket_recreate_not_overriding"
     "test_bucket_recreate_new_acl"
