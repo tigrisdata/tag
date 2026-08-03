@@ -24,9 +24,11 @@ const maxConcurrentBlockFetches = 4
 // version than the meta we hold (a concurrent overwrite), so it must not be cached.
 var errBlockETagMismatch = errors.New("block etag mismatch")
 
-// errBlockUpstreamGone means a block fetch got a definitive "not there for us" status (404
-// object deleted, or 403 access revoked). Like an ETag mismatch, it signals the cached
-// block-mode entry is stale and should be invalidated rather than repeatedly retried.
+// errBlockUpstreamGone means a block fetch got a 404 — the object was deleted out of band. Like
+// an ETag mismatch, it is an object-level signal that the cached block-mode entry is stale and
+// should be invalidated rather than repeatedly retried. A 403 is deliberately NOT included: it is
+// principal-level (access denied for these credentials), not proof the object is gone, so it must
+// not invalidate an entry shared across principals.
 var errBlockUpstreamGone = errors.New("block upstream gone")
 
 // errBlockAssemblyWouldAmplify means ensureBlocksCached bailed (only when the caller opts in via
@@ -282,9 +284,13 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 			return nil, rerr
 		}
 		defer resp.Body.Close()
-		// A definitive "gone for us" status (404 deleted, 403 access revoked) means the cached
-		// entry is stale — signal it so the caller invalidates rather than retrying every read.
-		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden {
+		// A 404 is an object-level "gone" — the cached entry is stale, so signal it for
+		// invalidation. A 403 is NOT: it is principal/permission-level (these credentials can't
+		// read the object right now), not proof the object is gone, so it must not invalidate the
+		// block-mode entry shared across all principals — otherwise one caller's denial would wipe
+		// a valid entry for everyone. A 403 falls through to the generic non-206 failure below
+		// (fail this fetch, no invalidation); the caller then forwards the request upstream.
+		if resp.StatusCode == http.StatusNotFound {
 			return nil, errBlockUpstreamGone
 		}
 		// A block fetch must be a 206 whose body is exactly the requested block bytes. A 200

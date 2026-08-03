@@ -27,6 +27,7 @@ type blockMockForwarder struct {
 	blockGetUnknownLen  bool         // if set, per-block 206 fetches report ContentLength -1
 	blockGetWrongOffset bool         // if set, per-block 206 Content-Range has wrong (same-length) bounds
 	blockGet404         bool         // if set, per-block fetches return 404 (object gone)
+	blockGet403         bool         // if set, per-block fetches return 403 (access denied)
 	blockGetTransient   bool         // if set, per-block fetches return a transient (non-stale) error
 	blockGetNoETag      bool         // if set, per-block 206 fetches omit the ETag header
 	blockGetShortBody   bool         // if set, per-block 206 body is shorter than its Content-Length
@@ -90,6 +91,9 @@ func (m *blockMockForwarder) DoConditionalGetRequest(_ context.Context, _, _, _,
 	}
 	if m.blockGet404 {
 		return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}
+	if m.blockGet403 {
+		return &http.Response{StatusCode: http.StatusForbidden, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
 	}
 	if m.blockGetWhole2xx {
 		return m.wholeObject(m.blockGetETag), nil
@@ -1042,5 +1046,39 @@ func TestBlockCache_ShortBlockBodyNotStored(t *testing.T) {
 	}
 	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 0) {
 		t.Error("short block body stored as block 0")
+	}
+}
+
+// A 403 on a per-block fetch is principal/permission-level, not object-level, so it must NOT
+// invalidate the block-mode entry shared across all principals (unlike a 404). The fetch fails
+// and the request falls through to upstream, but the entry stays put for other principals.
+func TestBlockCache_Block403DoesNotInvalidateSharedEntry(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Establish a block-mode entry (block 0 + meta).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("entry not populated")
+	}
+	seeded, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+
+	// A range needing an uncached block now gets 403 on the block fetch. The forward still serves
+	// (only per-block fetches are forbidden), so the client is served, but the entry must survive.
+	mock.blockGet403 = true
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=4-7")); err != nil {
+		t.Fatalf("range read: %v", err)
+	}
+	if w2.Code != http.StatusPartialContent || w2.Body.String() != "EFGH" {
+		t.Fatalf("range read: code=%d body=%q, want 206 EFGH (served via forward fall-through)", w2.Code, w2.Body.String())
+	}
+	// Give any (incorrect) async invalidation a chance, then assert the entry is intact.
+	time.Sleep(50 * time.Millisecond)
+	if meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || meta.ETag != seeded.ETag {
+		t.Fatalf("block-mode entry wiped by a 403 block fetch: found=%v (a 403 is principal-level, not object-gone)", found)
 	}
 }

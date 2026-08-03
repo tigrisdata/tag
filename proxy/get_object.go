@@ -127,7 +127,10 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				// current version.
 				if meta.BlockSize > 0 {
 					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidating block-mode entry for client-forced revalidation")
-					s.cache.Delete(context.Background(), bucket, key)
+					// Version-guarded: only drop the entry this client is revalidating, never a
+					// newer version a concurrent request re-established after an overwrite (an
+					// unconditional Delete would wipe that fresh entry and force needless churn).
+					s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
 				}
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Force revalidate, falling through to upstream")
 				// Fall through to cache miss path below
