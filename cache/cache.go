@@ -458,11 +458,28 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 // It probes the block's first byte (quirk-safe, cheap), so a not-found or any read error
 // returns false — the caller then (re)fetches the block. See RFC 0001.
 func (c *Cache) BlockExists(ctx context.Context, bucket, key, etag string, blockSize, blockIdx int64) bool {
+	present, _ := c.BlockExistsErr(ctx, bucket, key, etag, blockSize, blockIdx)
+	return present
+}
+
+// BlockExistsErr reports whether a block is present, distinguishing genuine absence (present=false,
+// err=nil) from a transient probe failure (present=false, err!=nil) such as a canceled context or a
+// cluster gRPC error. Callers that make invalidation/amplification decisions from block presence
+// must NOT treat a transient probe error as "absent" — doing so could, e.g., delete a still-valid
+// entry when a network blip makes present blocks look missing. BlockExists (bool) collapses both to
+// false and is only safe where a probe error is equivalent to absent (a plain cache miss).
+func (c *Cache) BlockExistsErr(ctx context.Context, bucket, key, etag string, blockSize, blockIdx int64) (present bool, err error) {
 	if !c.IsEnabled() || etag == "" {
-		return false
+		return false, nil
 	}
-	err := c.getRangeStreamByKey(ctx, MakeBlockKey(bucket, key, etag, blockSize, blockIdx), bucket, key, 0, 0, io.Discard)
-	return err == nil
+	e := c.getRangeStreamByKey(ctx, MakeBlockKey(bucket, key, etag, blockSize, blockIdx), bucket, key, 0, 0, io.Discard)
+	if e == nil {
+		return true, nil
+	}
+	if errors.Is(e, ErrNotFound) {
+		return false, nil // genuinely absent
+	}
+	return false, e // transient failure — not proof of absence
 }
 
 // PutBlockStream writes a single block of a block-mode object to cache. Blocks are

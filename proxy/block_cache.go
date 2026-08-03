@@ -20,6 +20,14 @@ import (
 // upstream concurrently.
 const maxConcurrentBlockFetches = 4
 
+// maxRangeBlockFanout caps how many absent blocks a single range read (serve or background
+// populate) will fetch as individual aligned GETs. A footer or row-group read touches only a few
+// blocks and assembles inline; a pathologically large client range (e.g. most of a multi-hundred-MB
+// object in one Range header) exceeds this and is instead served from a single upstream range GET
+// with no block population, bounding the per-request upstream fan-out. At the 4 MiB default block
+// size this is ~128 MiB of range before the cap engages.
+const maxRangeBlockFanout = 32
+
 // errBlockETagMismatch means a block fetched from upstream belongs to a different object
 // version than the meta we hold (a concurrent overwrite), so it must not be cached.
 var errBlockETagMismatch = errors.New("block etag mismatch")
@@ -111,9 +119,17 @@ func (s *Service) serveRangeFromBlockCache(
 	rng := ranges[0]
 	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
 
-	// Make the covering blocks present (probe + fetch any missing, coalesced/concurrent). A range
-	// covers few blocks, so there is no amplification concern — never bail.
-	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, b0, bK, false); ferr != nil {
+	// Make the covering blocks present (probe + fetch any missing, coalesced/concurrent). Cap the
+	// per-request fan-out (maxRangeBlockFanout): a normal footer/row-group read assembles its few
+	// blocks inline, but a pathologically large client range whose covering blocks are mostly
+	// absent bails to a single upstream range GET instead of a fetch storm.
+	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, b0, bK, false, maxRangeBlockFanout); ferr != nil {
+		if errors.Is(ferr, errBlockAssemblyWouldAmplify) {
+			// Too many absent blocks to assemble; serve this range from a single upstream GET. The
+			// entry is still valid (other blocks may be cached) — do NOT invalidate it here.
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range block assembly would amplify - falling through to single upstream range GET")
+			return false, nil
+		}
 		// Couldn't populate the missing blocks (budget shed, upstream error, or a concurrent
 		// overwrite). Nothing written yet — let the caller forward upstream.
 		log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Block populate failed - falling through to upstream")
@@ -178,7 +194,7 @@ func (s *Service) serveFullObjectFromBlockCache(
 	// was ever cached — since per-block assembly would be a large amplification versus one
 	// streaming upstream GET. The miss path then streams the object in a single fetch and, being
 	// block-mode, re-splits it. When the object is mostly cached it assembles the few missing.
-	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, 0, lastBlock, true); ferr != nil {
+	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, 0, lastBlock, true, 0); ferr != nil {
 		if errors.Is(ferr, errBlockAssemblyWouldAmplify) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Int64("blocks", lastBlock+1).Msg("Full-object block assembly would amplify - falling through to single upstream GET")
 			// Don't leave the mostly-missing entry in place: the bail skips the per-block staleness
@@ -378,25 +394,36 @@ func (s *Service) invalidateStaleBlockMeta(bucket, key, staleETag string) {
 // ensureBlocksCached makes covering blocks [b0,bK] present in cache: it probes the range once,
 // fetches any that are missing, and records per-block hits/misses plus whether the serve was a
 // full or partial hit. It returns an error only when a missing block could not be populated
-// (budget shed, upstream/ETag failure) — the caller then falls through to upstream. When
-// bailIfMostlyMissing is set (the full-object serve path), it instead returns
-// errBlockAssemblyWouldAmplify — without fetching or recording serve metrics — if a majority of
-// the covering blocks are absent, so the caller streams the object once rather than fanning out
-// into per-block fetches.
-func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, b0, bK int64, bailIfMostlyMissing bool) error {
+// (budget shed, upstream/ETag failure) — the caller then falls through to upstream.
+//
+// It returns errBlockAssemblyWouldAmplify — without fetching or recording serve metrics — when
+// fanning out into per-block fetches would be a large amplification versus one streaming fetch, so
+// the caller falls through instead. Two amplification gates: bailIfMostlyMissing (the full-object
+// serve path) bails when a MAJORITY of covering blocks are absent (assemble only a mostly-cached
+// object, else stream it once); maxFetchFanout>0 (the range serve path) bails on an ABSOLUTE count
+// of absent blocks, so a footer/row-group read still assembles its few blocks but a pathologically
+// large client range doesn't fan out into hundreds of aligned GETs.
+//
+// Probing uses BlockExistsErr so a transient probe failure (canceled ctx, cluster gRPC blip) is
+// NOT counted as a missing block: it returns that error immediately instead, so a network hiccup
+// can't inflate the missing count into a false amplify-bail (which the full-object caller would
+// then act on by DELETING a still-valid entry).
+func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, b0, bK int64, bailIfMostlyMissing bool, maxFetchFanout int64) error {
 	var missing []int64
 	for i := b0; i <= bK; i++ {
-		if !s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, i) {
+		present, perr := s.cache.BlockExistsErr(ctx, bucket, key, meta.ETag, meta.BlockSize, i)
+		if perr != nil {
+			return perr // transient probe failure — abort without bailing or invalidating
+		}
+		if !present {
 			missing = append(missing, i)
 		}
 	}
 	total := bK - b0 + 1
-	// Full-object serves opt into this (via bailIfMostlyMissing): when most covering blocks are
-	// absent, assembling them as individual aligned range GETs is a large amplification versus one
-	// streaming fetch, so signal the caller to fall through instead. Decided from the single probe
-	// above — no second BlockExists scan. Metrics below record only committed serves, so a bail
-	// (not a serve) records none, matching the prior behavior.
-	if bailIfMostlyMissing && int64(len(missing))*2 > total {
+	// Decided from the single probe above — no second scan. Metrics below record only committed
+	// serves, so a bail (not a serve) records none, matching the prior behavior.
+	if (bailIfMostlyMissing && int64(len(missing))*2 > total) ||
+		(maxFetchFanout > 0 && int64(len(missing)) > maxFetchFanout) {
 		return errBlockAssemblyWouldAmplify
 	}
 	metrics.CacheBlockHits.Add(float64(total - int64(len(missing))))
@@ -489,6 +516,14 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 // block-mode meta (tombstone-aware, the visibility gate). It never touches the original
 // request or its response body — blocks are fetched with fresh aligned range GETs.
 func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, touched []int64) {
+	// Cap the background fan-out (same bound as the range serve): a request that touched a huge
+	// number of blocks (a very large client range) would fetch them all as individual aligned GETs,
+	// a per-block upstream storm. Skip populating this range — it was already served from upstream,
+	// and the object still gets block-cached by later footer/row-group reads that touch few blocks.
+	if int64(len(touched)) > maxRangeBlockFanout {
+		log.Debug().Str("bucket", bucket).Str("key", key).Int("touched", len(touched)).Msg("Block-mode populate skipped - range touches too many blocks (would amplify)")
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()

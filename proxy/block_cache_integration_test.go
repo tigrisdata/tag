@@ -769,6 +769,11 @@ func TestBlockCache_AnonymousRangeMissMarksPublicRead(t *testing.T) {
 	if w.Code != http.StatusPartialContent || w.Body.String() != "ABCD" {
 		t.Fatalf("anon cold miss: code=%d body=%q, want 206 ABCD", w.Code, w.Body.String())
 	}
+	// The public-read ACL is inferred for the CACHE only; the origin's 206 had no X-Amz-Acl, so the
+	// client's response must not carry a synthetic one.
+	if got := w.Header().Get("X-Amz-Acl"); got != "" {
+		t.Errorf("client 206 leaked a synthetic X-Amz-Acl=%q (origin sent none)", got)
+	}
 
 	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
 		t.Fatal("block-mode meta not populated after anonymous cold miss")
@@ -1076,9 +1081,74 @@ func TestBlockCache_Block403DoesNotInvalidateSharedEntry(t *testing.T) {
 	if w2.Code != http.StatusPartialContent || w2.Body.String() != "EFGH" {
 		t.Fatalf("range read: code=%d body=%q, want 206 EFGH (served via forward fall-through)", w2.Code, w2.Body.String())
 	}
-	// Give any (incorrect) async invalidation a chance, then assert the entry is intact.
-	time.Sleep(50 * time.Millisecond)
+	// The block fetch (and any invalidation it would wrongly trigger) is synchronous within
+	// HandleGetObject, so the entry state is settled on return — assert directly, no wait needed.
 	if meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || meta.ETag != seeded.ETag {
 		t.Fatalf("block-mode entry wiped by a 403 block fetch: found=%v (a 403 is principal-level, not object-gone)", found)
+	}
+}
+
+// A pathologically large client range whose covering blocks are mostly uncached must NOT fan out
+// into one aligned GET per block (a request storm). serveRangeFromBlockCache bails to a single
+// upstream range GET, without touching the still-valid entry.
+func TestBlockCache_LargeRangeServeBailsInsteadOfFanningOut(t *testing.T) {
+	obj := make([]byte, 200) // block_size 4 -> 50 covering blocks, > maxRangeBlockFanout (32)
+	for i := range obj {
+		obj[i] = byte('A' + i%26)
+	}
+	mock := newBlockMock(obj, `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Establish the block-mode entry with a small read (block 0 + meta).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("small read: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("entry not established")
+	}
+	before := mock.blockGets.Load()
+
+	// A range spanning all 50 blocks (~49 missing > cap) must bail to one upstream range GET.
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=0-199")); err != nil {
+		t.Fatalf("large range: %v", err)
+	}
+	if w2.Code != http.StatusPartialContent || w2.Body.Len() != 200 {
+		t.Fatalf("large range: code=%d len=%d, want 206 with 200 bytes", w2.Code, w2.Body.Len())
+	}
+	if after := mock.blockGets.Load(); after != before {
+		t.Errorf("large range fanned out into per-block fetches: blockGets %d -> %d", before, after)
+	}
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
+		t.Error("range amplify-bail wrongly invalidated the entry")
+	}
+}
+
+// A cold single range read that touches more than maxRangeBlockFanout blocks must skip the
+// background block populate (serving from upstream instead of a per-block fetch storm), so no meta
+// is written and no per-block fetches are issued.
+func TestBlockCache_ColdLargeRangeSkipsPopulate(t *testing.T) {
+	obj := make([]byte, 200) // 50 blocks > maxRangeBlockFanout (32)
+	for i := range obj {
+		obj[i] = byte('A' + i%26)
+	}
+	mock := newBlockMock(obj, `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	before := mock.blockGets.Load()
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-199")); err != nil {
+		t.Fatalf("cold large range: %v", err)
+	}
+	if w.Code != http.StatusPartialContent || w.Body.Len() != 200 {
+		t.Fatalf("cold large range: code=%d len=%d", w.Code, w.Body.Len())
+	}
+	// Populate skipped: no meta appears within the window, and no per-block fetches were issued.
+	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
+		t.Error("block-mode meta written for an over-large cold range (populate should be skipped)")
+	}
+	if after := mock.blockGets.Load(); after != before {
+		t.Errorf("cold large range fanned out into per-block fetches: %d -> %d", before, after)
 	}
 }

@@ -18,6 +18,26 @@ func newBlockTestCache(t *testing.T) *Cache {
 	return NewCacheWithClient(mem, &cfg.Cache)
 }
 
+// BlockExistsErr distinguishes a present block (true, nil) from a genuinely-absent one
+// (false, nil). Both must report err=nil so callers don't mistake a plain cache miss for a
+// transient probe failure (the transient case, present=false with err!=nil, is what lets callers
+// avoid counting a network blip as a missing block).
+func TestBlockExistsErr_PresentVsAbsentAreNotErrors(t *testing.T) {
+	c := newBlockTestCache(t)
+	ctx := context.Background()
+	bucket, key, etag := "b", "k", `"v1"`
+
+	if err := c.PutBlockStream(ctx, bucket, key, etag, 4, 0, strings.NewReader("AAAA"), 60); err != nil {
+		t.Fatalf("PutBlockStream: %v", err)
+	}
+	if present, err := c.BlockExistsErr(ctx, bucket, key, etag, 4, 0); !present || err != nil {
+		t.Errorf("present block: got (present=%v, err=%v), want (true, nil)", present, err)
+	}
+	if present, err := c.BlockExistsErr(ctx, bucket, key, etag, 4, 1); present || err != nil {
+		t.Errorf("absent block: got (present=%v, err=%v), want (false, nil)", present, err)
+	}
+}
+
 // Blocks round-trip: write a few blocks, probe existence, and read block-local sub-ranges.
 func TestBlockRoundTrip(t *testing.T) {
 	c := newBlockTestCache(t)
