@@ -179,6 +179,12 @@ func (s *Service) serveFullObjectFromBlockCache(
 	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, 0, lastBlock, true); ferr != nil {
 		if errors.Is(ferr, errBlockAssemblyWouldAmplify) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Int64("blocks", lastBlock+1).Msg("Full-object block assembly would amplify - falling through to single upstream GET")
+			// Don't leave the mostly-missing entry in place: the bail skips the per-block staleness
+			// check, so if the object was deleted/overwritten out of band its already-cached blocks
+			// would keep serving stale bytes on later range reads until TTL. Invalidate it (only if
+			// still this version, so a concurrently re-established entry isn't wiped) and let the
+			// miss path re-establish the current version via a single streaming re-split.
+			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
 			return false, nil
 		}
 		log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Full-object block assembly failed - falling through to upstream")
@@ -321,8 +327,18 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 		if rs, re, _, ok := parseContentRange(resp.Header.Get("Content-Range")); !ok || rs != bStart || re != bEnd {
 			return nil, fmt.Errorf("block %d fetch: content-range bounds %d-%d (ok=%t), want %d-%d", blockIdx, rs, re, ok, bStart, bEnd)
 		}
+		// Read the full block into memory before storing: the guards above validate the 206's
+		// headers, not that the body actually delivered blockLen bytes. A body that ends short
+		// (truncated response) streamed straight into PutBlockStream could persist a short block,
+		// which BlockExists can't distinguish from a complete one — so it would later serve
+		// truncated bytes. io.ReadFull errors on a short body, so a partial block is never stored.
+		// blockLen <= block_size, bounded by maxConcurrentBlockFetches concurrent fetches.
+		blockBuf := make([]byte, blockLen)
+		if _, rerr := io.ReadFull(resp.Body, blockBuf); rerr != nil {
+			return nil, fmt.Errorf("block %d fetch: short body (%w), want %d bytes", blockIdx, rerr, blockLen)
+		}
 		ttl := int(s.config.Cache.TTL.Seconds())
-		if perr := s.cache.PutBlockStream(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, resp.Body, ttl); perr != nil {
+		if perr := s.cache.PutBlockStream(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, bytes.NewReader(blockBuf), ttl); perr != nil {
 			return nil, perr
 		}
 		metrics.CacheBlockPopulated.Inc()
@@ -337,6 +353,20 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 		// detached fetch above keeps running to populate the cache for any remaining waiters.
 		return ctx.Err()
 	}
+}
+
+// invalidateStaleBlockMeta deletes the object's cache entry only if the stored meta still carries
+// the given (stale) ETag. A request that detected staleness for version X must not wipe a newer
+// entry that another request re-established after an out-of-band overwrite (X' != X): deleting that
+// fresh entry would force needless re-population and churn under concurrency. There is a small
+// GetMeta→Delete window, but this narrows it from "always deletes whatever is stored" to "deletes
+// only the version we just observed as stale".
+func (s *Service) invalidateStaleBlockMeta(bucket, key, staleETag string) {
+	ctx := context.Background()
+	if m, found, err := s.cache.GetMeta(ctx, bucket, key); err != nil || !found || m == nil || m.ETag != staleETag {
+		return // already gone, or replaced by a newer version — leave it
+	}
+	s.cache.Delete(ctx, bucket, key)
 }
 
 // ensureBlocksCached makes covering blocks [b0,bK] present in cache: it probes the range once,
@@ -378,7 +408,7 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 		// still-valid meta in place to retry later.
 		if errors.Is(err, errBlockETagMismatch) || errors.Is(err, errBlockUpstreamGone) {
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
-			s.cache.Delete(context.Background(), bucket, key)
+			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
 		}
 		return err
 	}
@@ -411,7 +441,17 @@ func (s *Service) buildBlockMeta(bucket, key string, respHeader http.Header, tot
 // truncated bytes under a committed length (and poison a later range-path populate that trusts
 // existing blocks). fetchOneBlock validates block length the same way; this keeps the two block
 // writers consistent. A body longer than Content-Length is likewise rejected before the meta.
-func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, writeStartTime int64) error {
+func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, writeStartTime int64) (err error) {
+	// On any early return, drain the rest of r. setupCacheListener feeds this from an io.Pipe; if
+	// we stop reading with bytes still queued (a mid-object PutBlockStream error, or an oversize
+	// body), the pipe writer goroutine blocks forever on Write, leaking it and never releasing the
+	// reserved populate budget. On the short-read/EOF paths r is already drained, so this is a
+	// no-op there.
+	defer func() {
+		if err != nil {
+			_, _ = io.Copy(io.Discard, r)
+		}
+	}()
 	buf := make([]byte, meta.BlockSize)
 	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
 	for idx := int64(0); idx <= lastBlock; idx++ {

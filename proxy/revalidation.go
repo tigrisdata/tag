@@ -208,16 +208,26 @@ func (s *Service) handleRevalidation200(
 	pr, pw := io.Pipe()
 	ttl := int(s.config.Cache.TTL.Seconds())
 
-	// Background goroutine: write to cache from pipe reader
+	// Background goroutine: write to cache from pipe reader. Block-eligible objects are stored as
+	// blocks (size-only mode, RFC 0001) exactly as the read-miss/warm paths do — a revalidated
+	// whole-mode entry that grew into a block-eligible object must not be re-stored as one whole
+	// blob. Sub-block objects keep the whole-body write.
 	cacheErrCh := make(chan error, 1)
 	go func() {
-		_, cacheErr := s.cache.PutWithMetaStreamTombstoneAware(
-			context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime,
-		)
+		var cacheErr error
+		if s.isBlockEligibleSize(newMeta.ContentLength) {
+			newMeta.BlockSize = s.config.Cache.BlockSize
+			cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime)
+		} else {
+			_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(
+				context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime,
+			)
+		}
 		if cacheErr != nil {
 			log.Warn().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write failed during revalidation update")
-			// Drain remaining pipe data so the foreground TeeReader doesn't block.
-			// Without this, io.Pipe's zero-buffer causes pw.Write to hang.
+			// Drain remaining pipe data so the foreground TeeReader doesn't block. Without this,
+			// io.Pipe's zero-buffer causes pw.Write to hang. (putBlocksFromStream also drains on
+			// error; this covers the whole-body path and is harmless when already drained.)
 			io.Copy(io.Discard, pr)
 		}
 		cacheErrCh <- cacheErr

@@ -29,6 +29,7 @@ type blockMockForwarder struct {
 	blockGet404         bool         // if set, per-block fetches return 404 (object gone)
 	blockGetTransient   bool         // if set, per-block fetches return a transient (non-stale) error
 	blockGetNoETag      bool         // if set, per-block 206 fetches omit the ETag header
+	blockGetShortBody   bool         // if set, per-block 206 body is shorter than its Content-Length
 	blockGets           atomic.Int32 // count of per-block DoConditionalGetRequest calls
 }
 
@@ -96,6 +97,11 @@ func (m *blockMockForwarder) DoConditionalGetRequest(_ context.Context, _, _, _,
 	resp := m.serveRange(rangeHeader, m.blockGetETag)
 	if m.blockGetNoETag {
 		resp.Header.Del("ETag") // upstream omitted the ETag: version can't be verified
+	}
+	if m.blockGetShortBody {
+		// Keep the Content-Length header/field (so the length guard passes) but deliver a body
+		// that ends early — a truncated response.
+		resp.Body = io.NopCloser(strings.NewReader("x"))
 	}
 	if m.blockGetUnknownLen {
 		resp.ContentLength = -1 // chunked/unknown length: can't be validated
@@ -278,15 +284,17 @@ func TestBlockCache_FullGetMostlyMissingFallsThroughAndBlockSplits(t *testing.T)
 	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
 		t.Fatalf("full GET: code=%d body=%q, want 200 ABCDEFGHIJ", w2.Code, w2.Body.String())
 	}
-	// The fall-through re-stream block-splits the object; wait for the missing blocks to land.
-	deadline := time.Now().Add(2 * time.Second)
-	for !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 2) {
-		if time.Now().After(deadline) {
-			t.Fatal("blocks not populated by the fall-through block-split")
-		}
-		time.Sleep(5 * time.Millisecond)
+	// The amplify bail invalidates the mostly-missing entry, then the fall-through re-stream
+	// block-splits the whole object and writes the block-mode meta last (the visibility gate).
+	// Poll on the meta as the completion signal, then assert the full block set is present.
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode entry not re-established by the fall-through block-split")
 	}
-	for i := int64(1); i <= 2; i++ {
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if meta.BlockSize != 4 {
+		t.Fatalf("entry not block-mode after fall-through: BlockSize=%d", meta.BlockSize)
+	}
+	for i := int64(0); i <= 2; i++ {
 		if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, i) {
 			t.Errorf("block %d not populated by fall-through block-split", i)
 		}
@@ -295,10 +303,6 @@ func TestBlockCache_FullGetMostlyMissingFallsThroughAndBlockSplits(t *testing.T)
 	// aligned range GET per missing block.
 	if after := mock.blockGets.Load(); after != before {
 		t.Errorf("full GET fanned out into per-block fetches: blockGets %d -> %d", before, after)
-	}
-	// The entry stays block-mode (never whole-cached).
-	if meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || meta.BlockSize != 4 {
-		t.Errorf("entry not block-mode after fall-through: found=%v", found)
 	}
 }
 
@@ -955,5 +959,88 @@ func TestPutBlocksFromStream_OversizedStreamLeavesMetaUnwritten(t *testing.T) {
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
 		t.Error("block meta written for an oversized body (entry made visible)")
+	}
+}
+
+// invalidateStaleBlockMeta must delete only the version the caller observed as stale — never a
+// newer entry another request re-established after an overwrite (finding: stale delete races
+// newer entry).
+func TestBlockCache_InvalidateStaleBlockMetaOnlyMatchingETag(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v2"`)
+	svc, c := newBlockService(t, mock)
+
+	// Seed a current v2 block-mode entry (cold range miss populates block 0 + meta at v2).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("v2 entry not populated")
+	}
+
+	// A lagging request that saw v1 as stale must NOT wipe the newer v2 entry.
+	svc.invalidateStaleBlockMeta(wowBucket, wowKey, `"v1"`)
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
+		t.Error("v2 entry wrongly deleted by a stale-v1 invalidation")
+	}
+
+	// Invalidating the matching (current) version does delete it.
+	svc.invalidateStaleBlockMeta(wowBucket, wowKey, `"v2"`)
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
+		t.Error("v2 entry not deleted by a matching-version invalidation")
+	}
+}
+
+// A full GET on a mostly-missing entry whose object was deleted out of band must not leave the
+// stale entry in place (its cached blocks would keep serving deleted bytes on later range reads).
+// The amplify bail invalidates it and the 404 fall-through leaves it gone.
+func TestBlockCache_AmplifyBailInvalidatesDeletedObject(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Establish a mostly-missing entry (only block 0 cached).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("entry not populated")
+	}
+
+	// The object is deleted out of band: forward + block fetches now 404.
+	mock.blockGet404 = true
+	wf := httptest.NewRecorder()
+	_ = svc.HandleGetObject(wf, fullGet(wowBucket, wowKey)) // amplify-bail -> invalidate -> 404 fall-through
+
+	// The stale entry must be gone (not left serving deleted bytes until TTL).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stale block-mode entry not invalidated after amplify-bail on a deleted object")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A per-block fetch whose 206 body ends short of its Content-Length must not be stored: a short
+// block is indistinguishable from a complete one via BlockExists and would later serve truncated
+// bytes. fetchOneBlock reads the full block before storing, so a short body errors out uncached.
+func TestBlockCache_ShortBlockBodyNotStored(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	mock.blockGetShortBody = true // 206 header says a full block, body delivers 1 byte
+	svc, c := newBlockService(t, mock)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if metaCached(c, wowBucket, wowKey, 300*time.Millisecond) {
+		t.Error("block-mode meta written from a short-body block fetch")
+	}
+	if c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 0) {
+		t.Error("short block body stored as block 0")
 	}
 }
