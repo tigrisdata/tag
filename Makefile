@@ -10,10 +10,14 @@ GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 # Local test/bench data directory for embedded cache
 TAG_CACHE_DATA_DIR := /tmp/tag-cache-data
 
-# Block size used by the block-mode e2e target (s3-test-local-blocks). Intentionally small so
-# ordinary s3-test object sizes span multiple blocks, exercising block populate/assembly/range
-# paths. Tunable if a large-object test's block count becomes a problem.
-TAG_TEST_BLOCK_SIZE ?= 4096
+# Block size used by the block-mode e2e targets (s3-test-local-blocks / -cluster-blocks). Small
+# enough that ordinary s3-test object sizes span multiple blocks (exercising block
+# populate/assembly/range paths), but not so small that a large object explodes into a huge block
+# count: a full-object serve assembles every block, and in cluster mode the non-local ones are
+# fetched one at a time over gRPC, so an over-tiny block size makes cross-node assembly slow enough
+# to break the client read mid-stream (e.g. 4 KiB -> a 1 MB multipart object is ~244 blocks). 64
+# KiB keeps that object at ~16 blocks. Tunable.
+TAG_TEST_BLOCK_SIZE ?= 65536
 
 # TLS test certificate directory
 TAG_TEST_CERTS_DIR := /tmp/tag-test-certs
