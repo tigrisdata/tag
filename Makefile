@@ -10,6 +10,11 @@ GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 # Local test/bench data directory for embedded cache
 TAG_CACHE_DATA_DIR := /tmp/tag-cache-data
 
+# Block size used by the block-mode e2e target (s3-test-local-blocks). Intentionally small so
+# ordinary s3-test object sizes span multiple blocks, exercising block populate/assembly/range
+# paths. Tunable if a large-object test's block count becomes a problem.
+TAG_TEST_BLOCK_SIZE ?= 4096
+
 # TLS test certificate directory
 TAG_TEST_CERTS_DIR := /tmp/tag-test-certs
 
@@ -353,6 +358,7 @@ help:
 	@echo ""
 	@echo "S3 compatibility test targets:"
 	@echo "  s3-test-local          - Start TAG locally with embedded cache"
+	@echo "  s3-test-local-blocks   - Start TAG locally with block-aligned caching on (small block_size)"
 	@echo "  s3-test-local-cluster  - Start TAG locally as a 2-node cluster"
 	@echo "  s3-tests               - Run S3 compatibility tests (Python s3-tests)"
 	@echo "  s3-tests-clean         - Remove cloned s3-tests repository"
@@ -382,6 +388,7 @@ help:
 	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
 	@echo "    export AWS_SECRET_ACCESS_KEY=<your-secret>"
 	@echo "    make s3-test-local      # Start TAG with embedded cache (HTTP)"
+	@echo "    make s3-test-local-blocks # Start TAG with block-aligned caching enabled"
 	@echo "    make s3-test-local-tls  # Start TAG with embedded cache (HTTPS)"
 	@echo "    make s3-tests           # Run S3 compatibility tests"
 	@echo "    make s3-tests-tls       # Run S3 compatibility tests (TLS)"
@@ -419,6 +426,8 @@ s3-test-local: build
 		TAG_CACHE_DISK_PATH=$(TAG_CACHE_DATA_DIR) \
 		TAG_CACHE_CLUSTER_ADDR=:$(TAG_LOCAL_CLUSTER_PORT) \
 		TAG_CACHE_GRPC_ADDR=:$(TAG_LOCAL_GRPC_PORT) \
+		TAG_CACHE_BLOCK_CACHING_ENABLED=$${TAG_CACHE_BLOCK_CACHING_ENABLED:-false} \
+		TAG_CACHE_BLOCK_SIZE=$${TAG_CACHE_BLOCK_SIZE:-} \
 		TAG_LOG_LEVEL=$${TAG_LOG_LEVEL:-info} \
 		TAG_PPROF_ENABLED=true \
 		./$(BINARY_NAME) &
@@ -436,6 +445,16 @@ s3-test-local-down:
 	-@lsof -ti:$(TAG_LOCAL_HTTP_PORT) | xargs kill 2>/dev/null || true
 	@echo "Cleaning up cache data directory..."
 	-@rm -rf $(TAG_CACHE_DATA_DIR)
+
+# Same single-node setup as s3-test-local but with block-aligned caching enabled and a small
+# block size (RFC 0001), so the S3 compatibility suite exercises the block populate/assembly/range
+# paths. Stop it with s3-test-local-down (same process, ports, and data dir).
+.PHONY: s3-test-local-blocks
+s3-test-local-blocks:
+	@echo "Starting TAG with block-aligned caching (block_size=$(TAG_TEST_BLOCK_SIZE))..."
+	@TAG_CACHE_BLOCK_CACHING_ENABLED=true \
+		TAG_CACHE_BLOCK_SIZE=$(TAG_TEST_BLOCK_SIZE) \
+		$(MAKE) s3-test-local
 
 # Local development: Run a 2-node TAG cluster on host with embedded cache
 # Uses non-default ports to avoid macOS conflicts (AirPlay uses 7000)
