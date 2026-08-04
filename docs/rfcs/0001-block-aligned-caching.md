@@ -12,9 +12,9 @@ Cache large objects at **block granularity** instead of as whole bodies, so a ra
 
 TAG caches the **whole object body** (`body|bucket|key|<etag>`). To serve *any* range from cache, the entire object must first be downloaded and stored (`fetchFullObjectToCache`). For an access pattern that only ever reads a small tail plus a few interior ranges of a large object, that is a large, mostly-wasted download.
 
-Parseable's query path (DataFusion) is exactly that pattern: it reads a small **footer** tail of *many* Parquet files for pruning, then **selected row-group ranges** of the files that survive pruning — never whole objects. Recent Parseable changes push it further that way: bloom filters in the footer prune harder (more files touched footer-only), a 50 GB in-querier footer cache, and explicit ranged downloads for large objects.
+Columnar analytics readers (Parquet/ORC over engines such as DataFusion, Spark, Trino) are exactly that pattern: they read a small **footer** tail of *many* files for pruning, then **selected row-group ranges** of the files that survive pruning — never whole objects. Footer-heavy pruning (footer/bloom-filter caches, explicit ranged downloads) pushes it further still: many files are touched footer-only.
 
-Measured object sizes (prod `parseable-prod-ca-toronto-1`, one day, 53,157 objects): median **88 MiB**, p99 **203 MiB**, ~66% of objects > 25 MiB. A Parquet footer is tens–hundreds of KB. Caching a whole 88 MiB object to serve a ~100 KB footer is on the order of **~800× populate amplification**, and for footer-only-pruned files essentially all of that bandwidth and cache space is wasted.
+For large objects on the order of tens to hundreds of MiB with footers of tens–hundreds of KB, caching a whole 88 MiB object just to serve a ~100 KB footer is on the order of **~800× populate amplification**, and for footer-only-pruned files essentially all of that bandwidth and cache space is wasted.
 
 ## Goals
 
@@ -22,13 +22,13 @@ Measured object sizes (prod `parseable-prod-ca-toronto-1`, one day, 53,157 objec
 - Serve partial hits: cached blocks from cache, missing blocks fetched on demand and cached for next time.
 - Cut populate amplification and populate-budget pressure for range-read workloads.
 - Preserve the existing whole-object path for small objects and full-object GETs.
-- Self-contained in TAG for single-node deployments (Parseable's current shape); no ocache changes required for phase 1.
+- Self-contained in TAG for single-node deployments; no ocache changes required for phase 1.
 
 ## Non-goals
 
 - Sparse/partial blobs inside ocache (that is "Option B" — see Alternatives).
-- Cross-node block-locality routing (deferred; see Distributed considerations).
-- Footer-specific block sizing / special-casing (deferred).
+- Cross-node block-locality routing — blocks distribute across cluster nodes by design (see Distributed caching); co-locating an object's blocks is a possible future ocache option, not needed here.
+- Footer-specific block sizing / special-casing (a single block size for now).
 - Changing multipart upload handling.
 
 ## Background
@@ -110,7 +110,7 @@ Because every full-object fetch of a block-eligible object lands as blocks, ther
 
 ### Full-object GET on a block-mode object
 
-Rare for Parseable (it reads ranges) but must be correct:
+Rare for a range-read-dominated workload but must be correct:
 
 - **Cold miss:** the object is streamed once from upstream and split into blocks by the shared writer — one upstream fetch, all blocks populated.
 - **Hit, mostly cached:** assemble blocks `0…N-1` in order, fetching any few missing via `fetchBlocksToCache`, streaming as we go.
@@ -139,13 +139,11 @@ Why one knob: block-caching a sub-block object is identical to whole-caching it,
 - Meta `Delete` orphans blocks (age out); the next read re-populates meta + touched blocks.
 - The ETag guard on each block fetch prevents mixing versions under one ETag's keys.
 
-## Distributed considerations (deferred)
+## Distributed caching
 
-ocache routes **per key** via consistent hashing, so appending `blockIdx` distributes an object's blocks across nodes. This is the standard sharded-cache design (ceph and most sharded stores work this way) and is often beneficial — it spreads load and allows parallel block fetches from multiple nodes. It is **not** treated as a problem here.
+In cluster mode ocache routes **per key** via consistent hashing, so a block key (`blk|bucket|key|<etag>|<blockSize>|<blockIdx>`) is routed independently — an object's blocks distribute across cluster nodes. This is intended, not a problem to work around: it is how other sharded caches operate (ceph and most chunked/sharded stores shard at block granularity), and it is beneficial — distributing blocks spreads load evenly across the cluster and lets a multi-block read fetch its blocks from several owners in parallel. Correctness is independent of placement: block presence is probed per key and any missing block is fetched via the same routing, so a read works regardless of which node owns which block.
 
-The only reason to revisit it would be TAG-specific: prod measured this deployment's cross-node gRPC *data plane* as expensive (a large share of burst CPU, and a warm-p95 tax in the 1-vs-2-node test). But that measurement was for **whole-object** fan-out (one key → one remote owner → whole object over gRPC); block-level transfers have a different profile and we don't yet know their cross-node impact — it may be neutral or better. That per-hop gRPC overhead is also an implementation cost being addressed separately, not a property of block distribution.
-
-**Decision:** ship with block distribution as-is; measure block-level cross-node behavior in a cluster before deciding anything. Block caching defaults **off** (`block_caching_enabled`), and single-node deployments (Parseable's current shape) are unaffected regardless. *If* the data later shows a cluster problem, an optional block-locality routing mode — hashing on object identity `bucket|key|etag` so an object's blocks co-locate on one owner — is an **ocache-side** change (per the OCache-vs-TAG plan split) that can be added then. It is explicitly not a prerequisite for this work.
+Co-locating an object's blocks on a single owner (hashing on object identity `bucket|key|etag` rather than the block key) was considered and deliberately not adopted — block distribution is the desired behavior. A block-locality routing mode remains a possible **ocache-side** option should a future workload ever want it, but it is not required by this design.
 
 ## Rollout and phasing
 
@@ -155,7 +153,7 @@ Back-compat: legacy whole-body entries (`BlockSize=0`) are served by the existin
 2. Block-aware range serve: per-block probe + partial-hit fetch (coalesced, concurrent).
 3. Single shared cache writer splits block-eligible objects into blocks on every full-object populate path (read miss, full-GET miss, warm-on-write read-back); the tee stays sub-block; the whole↔block boundary is `block_size`; remove `block_cache_min_size` and `write_through_max_size`.
 4. Full-GET block assembly (mostly-cached) + single-stream re-split fallback (mostly-missing) + metrics.
-5. *(optional, later — may or may not do)* ocache block-locality routing for clusters.
+5. *(optional, not required)* ocache block-locality routing for clusters — only if a future workload ever wants an object's blocks co-located.
 
 Deferred: block-size-vs-footer-fit (single block size for now).
 
@@ -169,5 +167,5 @@ Deferred: block-size-vs-footer-fit (single block size for now).
 ## Alternatives considered
 
 - **Option B — ocache sparse blobs.** Store one body key as a sparse blob with a present-ranges map (`PutRange` + hole-aware `GetRangeStream`). Fewer keys and exact-byte population, but a larger change that lands in **ocache** (separate plan/repo). Kept in mind as a possible future evolution; Option A is chosen for phase 1 because it is self-contained in TAG and incremental.
-- **Whole-object multipart write-through (#136).** Pre-warms *whole* bodies on write — right for manifests (read in full), wrong for Parquet (footer + selective ranges). Closed in favor of this RFC. Consequence for manifests: at 300–400 MB they are block-eligible (`≥ block_size`), so with `warm_on_write` on they are **block-split** on write (and otherwise on their first full read). A full read of a manifest then assembles its blocks from cache. Reassembly is `N` cache reads instead of one whole-body stream, but that overhead is dwarfed by the byte transfer; the uniform size-only rule was chosen over Option A's "whole for read-in-full" adaptivity because Parseable's large objects are range-read-dominated, where whole-caching rarely pays off.
+- **Whole-object multipart write-through (#136).** Pre-warms *whole* bodies on write — right for manifests (read in full), wrong for Parquet (footer + selective ranges). Closed in favor of this RFC. Consequence for manifests: at 300–400 MB they are block-eligible (`≥ block_size`), so with `warm_on_write` on they are **block-split** on write (and otherwise on their first full read). A full read of a manifest then assembles its blocks from cache. Reassembly is `N` cache reads instead of one whole-body stream, but that overhead is dwarfed by the byte transfer; the uniform size-only rule was chosen over Option A's "whole for read-in-full" adaptivity because the target workload's large objects are range-read-dominated, where whole-caching rarely pays off.
 - **Optimize whole-object warm (#136 Approach B — parallel-range fetch / lazy warm).** Subsumed here: block-granular read-demand populate is a strictly better "warm on read-demand," and parallel-range fetch survives as the concurrent block-fill implementation detail.
