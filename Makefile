@@ -634,7 +634,7 @@ test-sdk: rocksdb-static
 		echo "  Start TAG with: make s3-test-local"; \
 		exit 1; \
 	fi
-	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) $(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -timeout 300s $(TESTFLAGS) ./tests/s3compat/sdk/...
+	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) TAG_TEST_BLOCK_SIZE=$(TAG_TEST_BLOCK_SIZE) $(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -timeout 300s $(TESTFLAGS) ./tests/s3compat/sdk/...
 
 # Benchmark TAG's core S3 operations with warp (requires a running TAG + AWS creds).
 # Start TAG first with: make s3-test-local
