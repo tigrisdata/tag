@@ -47,14 +47,17 @@ jobs:
       - name: Install system dependencies
         run: make install-deps
 
-      # cache_mode selects the TAG target: 'blocks' enables block-aligned caching (small block
-      # size on the local node), anything else (default, or an empty value for scheduled/push
-      # runs) uses the default whole-object path.
+      # cache_mode='blocks' enables block-aligned caching at the DEFAULT (production) 4 MiB block
+      # size — not the tiny e2e block size, which would make warp's 4 MiB range reads span dozens
+      # of blocks and trip the range fan-out cap, bypassing the block serve path. At 4 MiB blocks a
+      # 4 MiB range of the 100 MiB range-object touches ~1 block, which is what the feature targets.
+      # Anything else (default, or the empty value on scheduled/push runs) uses the whole-object path.
       - name: Start TAG (local mode)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: make ${{ inputs.cache_mode == 'blocks' && 's3-test-local-blocks' || 's3-test-local' }}
+          TAG_CACHE_BLOCK_CACHING_ENABLED: ${{ inputs.cache_mode == 'blocks' && 'true' || 'false' }}
+        run: make s3-test-local
 
       - name: Run warp benchmarks
         env:
