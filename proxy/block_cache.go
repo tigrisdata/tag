@@ -420,15 +420,16 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 		}
 	}
 	total := bK - b0 + 1
-	// Decided from the single probe above — no second scan. Metrics below record only committed
-	// serves, so a bail (not a serve) records none, matching the prior behavior.
+	// Decided from the single probe above — no second scan. Hit/miss and serve metrics are all
+	// recorded ONLY on a committed block-cache serve below, so a bail or a failed fetch (both fall
+	// through to upstream, not a block serve) records none — matching CacheBlockRangeServed and
+	// avoiding a hit-ratio skew (failed fetches correlate with more-missing requests).
 	if (bailIfMostlyMissing && int64(len(missing))*2 > total) ||
 		(maxFetchFanout > 0 && int64(len(missing)) > maxFetchFanout) {
 		return errBlockAssemblyWouldAmplify
 	}
-	metrics.CacheBlockHits.Add(float64(total - int64(len(missing))))
-	metrics.CacheBlockMisses.Add(float64(len(missing)))
 	if len(missing) == 0 {
+		metrics.CacheBlockHits.Add(float64(total))
 		metrics.CacheBlockRangeServed.WithLabelValues("full_hit").Inc()
 		return nil
 	}
@@ -445,6 +446,9 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 		}
 		return err
 	}
+	// Committed partial-hit serve: the covering blocks are now all present.
+	metrics.CacheBlockHits.Add(float64(total - int64(len(missing))))
+	metrics.CacheBlockMisses.Add(float64(len(missing)))
 	metrics.CacheBlockRangeServed.WithLabelValues("partial_hit").Inc()
 	return nil
 }
