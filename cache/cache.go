@@ -402,6 +402,19 @@ func (c *Cache) GetBlockRangeStream(ctx context.Context, bucket, key, etag strin
 	return c.getRangeStreamByKey(ctx, MakeBlockKey(bucket, key, etag, blockSize, blockIdx), bucket, key, start, end, w)
 }
 
+// countingWriter wraps an io.Writer and counts the bytes written through it, so a range read
+// can distinguish an absent key (embedded backend returns nil + zero bytes) from a real read.
+type countingWriter struct {
+	w       io.Writer
+	written int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.written += int64(n)
+	return n, err
+}
+
 // getRangeStreamByKey streams an inclusive byte range [start,end] of the blob at cacheKey to
 // w, mapping ocache's not-found to ErrNotFound and handling ocache's read-byte-0 quirk.
 // bucket/key are used for logging only.
@@ -419,16 +432,30 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 			}
 			return err
 		}
+		// Absent-key gap: the embedded (RocksDB) backend returns a nil error with ZERO bytes for
+		// a missing key on a range read, rather than the not-found the whole-blob GetStream path
+		// surfaces. A present block always has a byte at offset 0, so zero bytes here means the
+		// key is absent — map it to ErrNotFound. Without this a presence probe (BlockExistsErr,
+		// which reads [0,0]) treats a never-stored block as present, so fetchOneBlock skips the
+		// fetch (the block is never stored) yet the block-mode meta is still written, and a later
+		// serve streams an empty body. See RFC 0001.
+		if buf.Len() == 0 {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
+			return ErrNotFound
+		}
 		c.recordServeLocality(cacheKey)
 		// Write only the first byte
-		if buf.Len() > 0 {
-			_, err = w.Write(buf.Bytes()[:1])
-		}
+		_, err = w.Write(buf.Bytes()[:1])
 		return err
 	}
 
-	// ocache now uses inclusive end (same as HTTP Range semantics)
-	err := c.client.GetRangeStream(ctx, cacheKey, start, end, w)
+	// ocache now uses inclusive end (same as HTTP Range semantics). Count bytes written so the
+	// absent-key gap (embedded returns nil + zero bytes rather than not-found) is mapped to
+	// ErrNotFound below: the requested range [start,end] is inclusive and non-empty here, and an
+	// in-bounds read of a present block always yields at least one byte, so zero bytes with no
+	// error means the key is absent — not a legitimately empty read.
+	cw := &countingWriter{w: w}
+	err := c.client.GetRangeStream(ctx, cacheKey, start, end, cw)
 	if err != nil {
 		if isNotFoundError(err) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
@@ -441,6 +468,10 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 			Int64("end", end).
 			Msg("Cache range get error")
 		return err
+	}
+	if cw.written == 0 {
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
+		return ErrNotFound
 	}
 
 	c.recordServeLocality(cacheKey)

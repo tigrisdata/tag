@@ -1108,3 +1108,86 @@ func TestCache_ConcurrentPutsSameKey(t *testing.T) {
 		})
 	}
 }
+
+// TestBlockCache_ServeInteriorBlockRangeThroughHandler reproduces the warp get-range failure
+// through the real handler + real embedded cache, isolating the SERVE path from populate. It
+// pre-stores several 4 MiB blocks and a block-mode meta (BlockSize>0), then issues a real HTTP
+// Range GET covering an interior block. The dispatch keys only on meta.BlockSize>0, so this
+// exercises serveRangeFromBlockCache -> streamBlockRange against a real http.ResponseWriter,
+// exactly as production does. A 0-byte / short body reproduces the 278K "unexpected EOF".
+func TestBlockCache_ServeInteriorBlockRangeThroughHandler(t *testing.T) {
+	env := NewTestEnvironmentWithCache()
+	defer env.Close()
+	ctx := context.Background()
+
+	const blockSize = int64(4 * 1024 * 1024)
+	const numBlocks = 3
+	total := blockSize * numBlocks
+	bucket, key, etag := "blk-serve", "obj", `"serve-v1"`
+
+	full := make([]byte, 0, total)
+	for i := 0; i < numBlocks; i++ {
+		b := make([]byte, blockSize)
+		for j := range b {
+			b[j] = byte('A' + i)
+		}
+		full = append(full, b...)
+		require.NoError(t, env.Cache.PutBlockStream(ctx, bucket, key, etag, blockSize, int64(i), bytes.NewReader(b), 300))
+	}
+
+	meta := &cache.CachedObjectMeta{
+		Bucket: bucket, Key: key, ETag: etag,
+		ContentType:   "application/octet-stream",
+		ContentLength: total, StatusCode: 200, BlockSize: blockSize,
+		LastModified: time.Now().Unix(),
+	}
+	wrote, err := env.Cache.PutMetaTombstoneAware(ctx, bucket, key, meta, 300, time.Now().UnixNano())
+	require.NoError(t, err)
+	require.True(t, wrote, "block-mode meta write skipped")
+
+	// Range covering all of interior block 1 (block-aligned) — the benchmark's hot case.
+	start, end := blockSize, 2*blockSize-1
+	req, err := env.SignedRequest("GET", "/"+bucket+"/"+key, nil)
+	require.NoError(t, err)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	t.Logf("status=%d X-Cache=%q Content-Range=%q got=%d want=%d",
+		resp.StatusCode, resp.Header.Get("X-Cache"), resp.Header.Get("Content-Range"), len(body), end-start+1)
+	require.Equal(t, http.StatusPartialContent, resp.StatusCode)
+	require.Equal(t, int(end-start+1), len(body), "range serve returned wrong byte count (0 = the benchmark bug)")
+	require.Equal(t, full[start:end+1], body, "range serve content mismatch")
+}
+
+// TestBlockCache_EmbeddedMissingBlockNotFound is the minimal reproduction of the warp block-mode
+// range failure. The MEMORY cache (cache/block_cache_test.go) returns ErrNotFound for a missing
+// block, but the EMBEDDED (RocksDB) backend was observed to return nil + 0 bytes for a missing
+// key's range read. That makes BlockExistsErr report an ABSENT block as PRESENT, so fetchOneBlock
+// skips the upstream fetch (block never stored) while meta is still written — and the warm serve
+// then streams an empty body (client "IncompleteRead(0 bytes)"). Reads of a never-stored block
+// MUST surface not-found.
+func TestBlockCache_EmbeddedMissingBlockNotFound(t *testing.T) {
+	env := NewTestEnvironmentWithCache()
+	defer env.Close()
+	ctx := context.Background()
+	bucket, key, etag := "blk-missing", "obj", `"v1"`
+	const blockSize = int64(4 * 1024 * 1024)
+
+	// A never-stored block must not be reported present.
+	present, err := env.Cache.BlockExistsErr(ctx, bucket, key, etag, blockSize, 0)
+	require.NoError(t, err)
+	require.False(t, present, "BlockExistsErr reports a never-stored block as PRESENT (root cause)")
+
+	// Probe-sized read (the (0,0) quirk path BlockExistsErr uses).
+	var pb bytes.Buffer
+	perr := env.Cache.GetBlockRangeStream(ctx, bucket, key, etag, blockSize, 0, 0, 0, &pb)
+	require.ErrorIs(t, perr, cache.ErrNotFound, "missing block [0,0] read: err=%v bytes=%d (want ErrNotFound)", perr, pb.Len())
+
+	// Full-block range read (what streamBlockRange issues on serve).
+	var fb bytes.Buffer
+	ferr := env.Cache.GetBlockRangeStream(ctx, bucket, key, etag, blockSize, 0, 0, blockSize-1, &fb)
+	require.ErrorIs(t, ferr, cache.ErrNotFound, "missing block [0,N] read: err=%v bytes=%d (want ErrNotFound)", ferr, fb.Len())
+}
