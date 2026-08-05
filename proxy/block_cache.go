@@ -92,8 +92,11 @@ func touchedBlocks(rangeHeader string, totalSize, blockSize int64) []int64 {
 }
 
 // serveRangeFromBlockCache serves a single-range request from a block-mode cache entry
-// (meta.BlockSize > 0). It probes the covering blocks, fetches any that are missing (from
-// upstream, coalesced), then streams the requested bytes assembled from those blocks.
+// (meta.BlockSize > 0). A range no longer than one block — the hot footer/row-group pattern —
+// is assembled probe-free into a pooled buffer (serveAssembledRange): each present block is
+// read exactly once, with the read itself acting as the existence check. Larger ranges (and
+// small ones the assembly-buffer budget declines) take the probe-first path: probe the
+// covering blocks, fetch any missing, then stream.
 //
 // It returns served=true when it has produced a complete client response (a 206 body, or a
 // definitive 416). It returns served=false, without having written anything to w, when the
@@ -117,6 +120,27 @@ func (s *Service) serveRangeFromBlockCache(
 		return true, nil
 	}
 	rng := ranges[0]
+
+	// Probe-free hot path: a range no longer than one block covers at most two blocks, so the
+	// requested bytes are assembled into a pooled buffer BEFORE anything is committed. Each
+	// present block is read exactly ONCE (the read doubles as the existence probe, halving
+	// warm-serve cache ops versus the probe-then-stream path below); a missing block is
+	// discovered by that same read and fetched pre-commit, so every failure still leaves the
+	// response unwritten for a clean upstream fall-through — identical semantics, fewer ops.
+	// The buffer (<= one block) is reserved against the populate byte budget — but NOT a
+	// cacheSemaphore count slot, which bounds concurrent cache WRITES and must not be held
+	// across a (possibly slow) client write. On budget decline, serve via the probe path.
+	if rangeLen := rng.end - rng.start + 1; rangeLen <= meta.BlockSize {
+		weight := s.populateWeight(rangeLen)
+		if s.populateBudget == nil || s.populateBudget.tryAcquireReadMiss(weight) {
+			if s.populateBudget != nil {
+				defer s.populateBudget.release(weight)
+			}
+			return s.serveAssembledRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng, startTime)
+		}
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Assembly buffer budget declined - serving range via probe path")
+	}
+
 	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
 
 	// Make the covering blocks present (probe + fetch any missing, coalesced/concurrent). Cap the
@@ -143,6 +167,150 @@ func (s *Service) serveRangeFromBlockCache(
 
 	if _, berr := s.streamBlockRange(ctx, w, bucket, key, meta, rng.start, rng.end); berr != nil {
 		return true, berr
+	}
+	metrics.RecordRangeFromCacheHit()
+	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	return true, nil
+}
+
+// sliceWriter writes into a fixed destination slice, failing on overflow. Used to land a
+// block's bytes at their exact offset in a pre-commit assembly buffer.
+type sliceWriter struct {
+	dst []byte
+	off int64
+}
+
+func (sw *sliceWriter) Write(p []byte) (int, error) {
+	n := copy(sw.dst[sw.off:], p)
+	sw.off += int64(n)
+	if n < len(p) {
+		return n, io.ErrShortBuffer // more bytes than the requested block-local range
+	}
+	return n, nil
+}
+
+// maxPooledAssemblyBufBytes caps the capacity of assembly buffers the pool retains, so an
+// entry written under an unusually large historical block_size can't pin oversized buffers
+// in the pool forever.
+const maxPooledAssemblyBufBytes = 4 << 20
+
+// assemblyBufPool recycles pre-commit range-assembly buffers. Buffers are handed out by
+// capacity; a request larger than a pooled buffer's capacity allocates fresh.
+var assemblyBufPool sync.Pool
+
+func getAssemblyBuf(n int64) *[]byte {
+	if v := assemblyBufPool.Get(); v != nil {
+		bp := v.(*[]byte)
+		if int64(cap(*bp)) >= n {
+			return bp
+		}
+		assemblyBufPool.Put(bp) // too small for this request; keep it for a smaller one
+	}
+	b := make([]byte, n)
+	return &b
+}
+
+func putAssemblyBuf(bp *[]byte) {
+	if int64(cap(*bp)) <= maxPooledAssemblyBufBytes {
+		assemblyBufPool.Put(bp)
+	}
+}
+
+// serveAssembledRange serves a single-range request (spanning at most two blocks) by
+// assembling the requested bytes from the entry's blocks into a pooled buffer before
+// committing anything. Present blocks are read exactly once — the read itself is the
+// existence check, there is no separate probe pass — and blocks the read reports absent are
+// fetched (coalesced, bounded) and re-read, all BEFORE headers are written. It returns
+// served=true only once the 206 is committed; any assembly failure returns served=false with
+// the response untouched, so the caller falls through to upstream exactly as the probe-first
+// path would. Block hit/miss and range-served metrics are recorded only on a committed
+// serve, and a definitive stale signal invalidates the entry — both matching
+// ensureBlocksCached.
+func (s *Service) serveAssembledRange(
+	ctx context.Context,
+	w http.ResponseWriter,
+	bucket, key, accessKey, secretKey string,
+	meta *cache.CachedObjectMeta,
+	rng byteRange,
+	startTime time.Time,
+) (served bool, err error) {
+	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
+	rangeLen := rng.end - rng.start + 1
+	bufp := getAssemblyBuf(rangeLen)
+	defer putAssemblyBuf(bufp)
+	buf := (*bufp)[:rangeLen]
+
+	// Pass 1: read every covering block's slice of the range into place. ErrNotFound marks
+	// the block missing (exactly what the old probe detected). Any other error is transient —
+	// abort with nothing committed. A nil-error short read means the cache delivered fewer
+	// bytes than the in-bounds request, which a present block never legitimately does — also
+	// treated as transient rather than as a missing block.
+	type gap struct{ idx, off, localStart, localEnd int64 }
+	var missing []gap
+	off := int64(0)
+	for i := b0; i <= bK; i++ {
+		bStart, bEnd := blockBounds(i, meta.BlockSize, meta.ContentLength)
+		localStart := max(rng.start, bStart) - bStart
+		localEnd := min(rng.end, bEnd) - bStart
+		n := localEnd - localStart + 1
+		sw := &sliceWriter{dst: buf[off : off+n]}
+		rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, sw)
+		switch {
+		case errors.Is(rerr, cache.ErrNotFound):
+			missing = append(missing, gap{idx: i, off: off, localStart: localStart, localEnd: localEnd})
+		case rerr != nil:
+			return false, rerr
+		case sw.off != n:
+			return false, fmt.Errorf("block %d assembly: short read %d of %d bytes", i, sw.off, n)
+		}
+		off += n
+	}
+
+	// Fetch whatever pass 1 found missing (coalesced across requests, bounded fan-out, stale
+	// signals prioritized over transient ones), then fill the gaps. Still pre-commit: a fetch
+	// or re-read failure falls through with the response untouched, and a definitive stale
+	// signal invalidates the entry so the fall-through re-establishes the current version.
+	if len(missing) > 0 {
+		idxs := make([]int64, len(missing))
+		for j, g := range missing {
+			idxs[j] = g.idx
+		}
+		if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, idxs); ferr != nil {
+			if errors.Is(ferr, errBlockETagMismatch) || errors.Is(ferr, errBlockUpstreamGone) {
+				log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
+				s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+			}
+			return false, ferr
+		}
+		for _, g := range missing {
+			n := g.localEnd - g.localStart + 1
+			sw := &sliceWriter{dst: buf[g.off : g.off+n]}
+			rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, g.idx, g.localStart, g.localEnd, sw)
+			if rerr != nil || sw.off != n {
+				return false, fmt.Errorf("block %d assembly: fetched block unreadable (err=%v, %d of %d bytes)", g.idx, rerr, sw.off, n)
+			}
+		}
+	}
+
+	// Committed serve: record hit/miss + serve metrics (only here, never on a fall-through),
+	// then write the response.
+	total := bK - b0 + 1
+	metrics.CacheBlockHits.Add(float64(total - int64(len(missing))))
+	if len(missing) == 0 {
+		metrics.CacheBlockRangeServed.WithLabelValues("full_hit").Inc()
+	} else {
+		metrics.CacheBlockMisses.Add(float64(len(missing)))
+		metrics.CacheBlockRangeServed.WithLabelValues("partial_hit").Inc()
+	}
+	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
+	writeCacheStatus(w, XCacheHit)
+	w.WriteHeader(http.StatusPartialContent)
+	n, werr := w.Write(buf)
+	if n > 0 {
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+	}
+	if werr != nil {
+		return true, werr
 	}
 	metrics.RecordRangeFromCacheHit()
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
