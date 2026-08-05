@@ -48,14 +48,22 @@ var errBlockAssemblyWouldAmplify = errors.New("block assembly would amplify")
 // isBlockEligibleSize reports whether an object of the given content length is block-cached on
 // the read-miss path (RFC 0001): block caching is enabled and the object is at least one block
 // (BlockSize is the whole-vs-block boundary — a sub-block object is whole-cached, since blocking
-// it would just store a single blob). A negative/unknown length is not eligible. Requiring
-// BlockSize > 0 keeps a config that enables block caching but leaves BlockSize at 0 (e.g. a
-// Config built directly, bypassing Load's normalization) from dividing by zero in block
-// arithmetic. A read miss for a block-eligible object populates blocks, not a whole blob.
+// it would just store a single blob). BlockMinObjectSize raises that boundary when set: objects
+// below it are whole-cached even though they span multiple blocks, because a whole-cached warm
+// GET costs 2 cache ops while a block-mode one is linear in block count — block caching only
+// pays off once an object is large enough that whole-caching it is wasteful. A negative/unknown
+// length is not eligible. Requiring BlockSize > 0 keeps a config that enables block caching but
+// leaves BlockSize at 0 (e.g. a Config built directly, bypassing Load's normalization) from
+// dividing by zero in block arithmetic. A read miss for a block-eligible object populates
+// blocks, not a whole blob.
 func (s *Service) isBlockEligibleSize(contentLength int64) bool {
+	boundary := s.config.Cache.BlockSize
+	if s.config.Cache.BlockMinObjectSize > boundary {
+		boundary = s.config.Cache.BlockMinObjectSize
+	}
 	return s.config.Cache.BlockCachingEnabled &&
 		s.config.Cache.BlockSize > 0 &&
-		contentLength >= s.config.Cache.BlockSize
+		contentLength >= boundary
 }
 
 // blockBounds returns the inclusive object-byte bounds [start,end] of block i for an object

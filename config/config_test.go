@@ -1155,3 +1155,39 @@ func TestTLS_DisabledByDefault(t *testing.T) {
 		t.Error("TLSEnabled() = true, want false (disabled by default)")
 	}
 }
+
+func TestLoad_BlockMinObjectSizeOverrideByEnv(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		env  string
+		want int64
+	}{
+		{"default unset", "cache:\n  enabled: true\n", "", 0},
+		{"yaml value", "cache:\n  enabled: true\n  block_min_object_size: 67108864\n", "", 67108864},
+		{"env overrides yaml", "cache:\n  enabled: true\n  block_min_object_size: 67108864\n", "134217728", 134217728},
+		// Zero/negative env values are ignored (0 means "boundary stays at BlockSize").
+		{"zero env keeps yaml", "cache:\n  enabled: true\n  block_min_object_size: 67108864\n", "0", 67108864},
+		{"invalid env keeps yaml", "cache:\n  enabled: true\n  block_min_object_size: 67108864\n", "notanumber", 67108864},
+		// A negative yaml value normalizes to unset.
+		{"negative yaml normalizes", "cache:\n  enabled: true\n  block_min_object_size: -5\n", "", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			if tc.env != "" {
+				t.Setenv("TAG_CACHE_BLOCK_MIN_OBJECT_SIZE", tc.env)
+			}
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.BlockMinObjectSize != tc.want {
+				t.Errorf("BlockMinObjectSize = %d, want %d", cfg.Cache.BlockMinObjectSize, tc.want)
+			}
+		})
+	}
+}

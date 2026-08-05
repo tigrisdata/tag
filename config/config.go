@@ -235,6 +235,16 @@ type CacheConfig struct {
 	// shared segments. 0 or unset uses DefaultCacheBlockSize (4 MiB). Only meaningful when
 	// BlockCachingEnabled is true.
 	BlockSize int64 `yaml:"block_size"`
+	// BlockMinObjectSize raises the whole-vs-block boundary above BlockSize: objects smaller
+	// than this are whole-cached even when block caching is enabled, so they never pay the
+	// per-block serve overhead (a whole-cached warm GET is 2 cache ops; a block-mode one is
+	// linear in block count). Block caching's win — range reads fetching only their covering
+	// blocks — only matters for objects large enough that whole-caching them is wasteful, so
+	// deployments serving full-object GETs of small/medium objects should set this well above
+	// BlockSize (e.g. 8-16x). 0 or unset keeps the boundary at BlockSize (RFC 0001 behavior);
+	// values at or below BlockSize are equivalent to unset. Only meaningful when
+	// BlockCachingEnabled is true.
+	BlockMinObjectSize int64 `yaml:"block_min_object_size"`
 	// WarmOnWriteReservedFraction caps the fraction of the populate memory budget
 	// that warm-on-write populates may reserve ahead of read-miss warms, so
 	// warm-on-write is never starved by the read-miss full-object warm flood. The
@@ -365,6 +375,11 @@ func applyDefaults(cfg *Config) {
 	// falls back to the default.
 	if cfg.Cache.BlockSize <= 0 {
 		cfg.Cache.BlockSize = DefaultCacheBlockSize
+	}
+	// A negative min-object-size (programmatic or YAML) means unset — the boundary stays at
+	// BlockSize.
+	if cfg.Cache.BlockMinObjectSize < 0 {
+		cfg.Cache.BlockMinObjectSize = 0
 	}
 	if cfg.Cache.DiskPath == "" {
 		cfg.Cache.DiskPath = DefaultCacheDiskPath
@@ -519,6 +534,12 @@ func applyEnvOverrides(cfg *Config) {
 		if val := os.Getenv("TAG_CACHE_BLOCK_SIZE"); val != "" {
 			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n > 0 {
 				cfg.Cache.BlockSize = n
+			}
+		}
+		// Override the whole-vs-block boundary from environment (0/unset keeps it at BlockSize).
+		if val := os.Getenv("TAG_CACHE_BLOCK_MIN_OBJECT_SIZE"); val != "" {
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n > 0 {
+				cfg.Cache.BlockMinObjectSize = n
 			}
 		}
 		// Override the warm-on-write populate reservation fraction from environment.

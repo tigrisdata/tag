@@ -1387,3 +1387,43 @@ func TestBlockCache_AssemblyBudgetContentionRetriesViaProbePath(t *testing.T) {
 		t.Error("block 1 not cached after probe-path retry")
 	}
 }
+
+// An object at or above BlockSize but below block_min_object_size is whole-cached: it never
+// pays per-block serve overhead, and warm serves come from the whole-body path.
+func TestBlockCache_MinObjectSizeWholeCachesSmallObjects(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // 10 bytes: >= BlockSize(4), < min(20)
+	svc, c := newBlockService(t, mock)
+	svc.config.Cache.BlockMinObjectSize = 20
+
+	// Cold full GET: the miss path must whole-cache, not block-split.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if w.Code != http.StatusOK || w.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("cold full GET: code=%d body=%q", w.Code, w.Body.String())
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated after cold full GET")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if meta.BlockSize != 0 {
+		t.Fatalf("meta.BlockSize = %d, want 0 (whole-cached below block_min_object_size)", meta.BlockSize)
+	}
+
+	// Warm full GET and range both serve from the whole-body entry.
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("warm full GET: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" || w2.Header().Get("X-Cache") != XCacheHit {
+		t.Fatalf("warm full GET: code=%d body=%q x-cache=%q", w2.Code, w2.Body.String(), w2.Header().Get("X-Cache"))
+	}
+	w3 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w3, blockGet(wowBucket, wowKey, "bytes=2-5")); err != nil {
+		t.Fatalf("warm range: %v", err)
+	}
+	if w3.Code != http.StatusPartialContent || w3.Body.String() != "CDEF" {
+		t.Fatalf("warm range: code=%d body=%q, want 206 CDEF", w3.Code, w3.Body.String())
+	}
+}
