@@ -14,6 +14,10 @@ on:
         description: "Block size in bytes for blocks mode (empty = 4 MiB default). e.g. 65536 to match the 64 KiB GET RANGE size."
         type: string
         default: ""
+      block_min_object_size:
+        description: "Whole-vs-block boundary in bytes for blocks mode (empty = block_size). Objects below it are whole-cached."
+        type: string
+        default: ""
       duration:
         description: "Per-operation duration (empty = 30s default), e.g. 60s."
         type: string
@@ -34,6 +38,10 @@ on:
         default: default
       block_size:
         description: "Block size in bytes for blocks mode (empty = 4 MiB default)"
+        type: string
+        default: ""
+      block_min_object_size:
+        description: "Whole-vs-block boundary in bytes for blocks mode (empty = block_size)"
         type: string
         default: ""
       duration:
@@ -91,6 +99,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           TAG_CACHE_BLOCK_CACHING_ENABLED: ${{ inputs.cache_mode == 'blocks' && 'true' || 'false' }}
           TAG_CACHE_BLOCK_SIZE: ${{ inputs.block_size }}
+          TAG_CACHE_BLOCK_MIN_OBJECT_SIZE: ${{ inputs.block_min_object_size }}
         run: make s3-test-local
 
       # Warp knobs pass through as env; empty values fall back to run-warp.sh's defaults
