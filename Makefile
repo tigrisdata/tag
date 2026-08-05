@@ -381,6 +381,7 @@ help:
 	@echo "Benchmark test targets (warp):"
 	@echo "  bench-warp             - Benchmark core S3 ops with warp (requires running TAG + AWS creds)"
 	@echo "  bench-warp-clean       - Remove cached warp binary and benchmark results"
+	@echo "  bench-clean-buckets    - Delete a per-run warp bucket (BUCKET=...) and sweep leaked tag-warp-ci-* buckets (requires AWS creds)"
 	@echo ""
 	@echo "  Benchmark usage:"
 	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
@@ -658,5 +659,13 @@ bench-warp:
 bench-warp-clean:
 	@echo "Cleaning up warp benchmark artifacts..."
 	rm -rf tests/benchmark/.bin tests/benchmark/results
+
+.PHONY: bench-clean-buckets
+bench-clean-buckets:
+	@if [ -z "$$AWS_ACCESS_KEY_ID" ] || [ -z "$$AWS_SECRET_ACCESS_KEY" ]; then \
+		echo "Error: AWS credentials not set."; \
+		exit 1; \
+	fi
+	bash tests/benchmark/clean-buckets.sh
 
 .DEFAULT_GOAL := help

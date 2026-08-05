@@ -155,20 +155,7 @@ jobs:
           AWS_EC2_METADATA_DISABLED: "true"
           ENDPOINT: https://t3.storage.dev
           BUCKET: tag-warp-ci-${{ github.run_id }}
-        run: |
-          set -u
-          aws --endpoint-url "$ENDPOINT" s3 rm "s3://$BUCKET" --recursive --only-show-errors || true
-          aws --endpoint-url "$ENDPOINT" s3api delete-bucket --bucket "$BUCKET" || true
-          cutoff=$(date -u -d '1 day ago' +%s)
-          aws --endpoint-url "$ENDPOINT" s3api list-buckets \
-            --query 'Buckets[?starts_with(Name, `tag-warp-ci-`)].[Name,CreationDate]' --output text |
-          while read -r name created; do
-            [ -n "$name" ] || continue
-            [ "$(date -u -d "$created" +%s)" -lt "$cutoff" ] || continue
-            echo "Sweeping leaked benchmark bucket: $name (created $created)"
-            aws --endpoint-url "$ENDPOINT" s3 rm "s3://$name" --recursive --only-show-errors || true
-            aws --endpoint-url "$ENDPOINT" s3api delete-bucket --bucket "$name" || true
-          done || true
+        run: make bench-clean-buckets
 
       - name: Cleanup
         if: always()
