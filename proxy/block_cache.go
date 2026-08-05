@@ -184,7 +184,12 @@ func (s *Service) serveRangeFromBlockCache(
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(http.StatusPartialContent)
 
-	if _, berr := s.streamBlockRange(ctx, w, bucket, key, meta, rng.start, rng.end); berr != nil {
+	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng.start, rng.end); berr != nil {
+		// A definitive stale signal from a mid-serve inline fetch invalidates the entry even
+		// though this response truncates: leaving it would repeat the truncation until TTL.
+		if errors.Is(berr, errBlockETagMismatch) || errors.Is(berr, errBlockUpstreamGone) {
+			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		}
 		return true, berr
 	}
 	metrics.RecordRangeFromCacheHit()
@@ -339,29 +344,150 @@ func (s *Service) serveAssembledRange(
 }
 
 // streamBlockRange streams object bytes [start,end] (inclusive) from a block-mode entry's
-// cached blocks, in order, into w. The caller must have committed the status line + headers and
-// ensured the covering blocks are present. On a block evicted mid-serve it returns a non-nil
-// error; headers are already sent so the caller cannot fall through (the client sees a truncated
-// body). Shared by the range and full-object serve paths.
-func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, bucket, key string, meta *cache.CachedObjectMeta, start, end int64) (written int64, err error) {
-	b0, bK := coveringBlocks(start, end, meta.BlockSize)
+// cached blocks, in order, into w. The caller must have committed the status line + headers.
+// A block the cache reports absent (evicted since the caller last saw it) is fetched from
+// upstream (coalesced, budget-gated) and re-read instead of failing the serve; only a fetch or
+// re-read failure returns a non-nil error, which truncates the client body since headers are
+// already sent. Returns how many blocks were inline-fetched.
+//
+// Multi-block serves are PIPELINED: a reader goroutine prefetches block i+1 into a pooled
+// buffer while block i's bytes are being written to the client, so the cache read latency and
+// the client write latency overlap instead of adding up — the structural stall that made warm
+// multi-block GETs trail whole-object serves (whose single contiguous body never waits
+// per-block). The pipeline holds at most two block buffers (one draining to the client, one
+// filling), reserved against the populate byte budget; on decline — and for single-block
+// serves, where there is nothing to overlap — it degrades to the direct sequential path.
+func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (fetched int64, err error) {
 	cw := &countingWriter{w: w}
+	defer func() {
+		if cw.written > 0 {
+			metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+		}
+		if err != nil {
+			log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block stream failed mid-serve")
+		}
+	}()
+	b0, bK := coveringBlocks(start, end, meta.BlockSize)
+	if b0 == bK {
+		return s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
+	}
+	weight := s.populateWeight(2 * meta.BlockSize)
+	if s.populateBudget != nil {
+		if !s.populateBudget.tryAcquireReadMiss(weight) {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Pipeline buffer budget declined - streaming blocks sequentially")
+			return s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
+		}
+		defer s.populateBudget.release(weight)
+	}
+	return s.streamBlockRangePipelined(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
+}
+
+// streamBlockRangePipelined is streamBlockRange's overlapped core: an unbuffered channel
+// hands each prefetched block from the reader goroutine to the write loop, so exactly one
+// block is filling while one is draining (double buffering — two pooled buffers alive at
+// peak, which is what streamBlockRange reserved). Absent blocks are recovered by the reader
+// via readBlockSlice before the handoff; the first reader error ends the stream in order,
+// exactly where the sequential path would have failed. The stop channel unwinds the reader
+// (and returns its in-flight buffer) when the write loop exits early on a client write error.
+func (s *Service) streamBlockRangePipelined(ctx context.Context, cw *countingWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (fetched int64, err error) {
+	b0, bK := coveringBlocks(start, end, meta.BlockSize)
+	type blockRead struct {
+		bufp      *[]byte
+		n         int64
+		fetchedIt bool
+		err       error
+	}
+	results := make(chan blockRead)
+	stop := make(chan struct{})
+	go func() {
+		defer close(results)
+		for i := b0; i <= bK; i++ {
+			bStart, bEnd := blockBounds(i, meta.BlockSize, meta.ContentLength)
+			localStart := max(start, bStart) - bStart
+			localEnd := min(end, bEnd) - bStart
+			br := blockRead{n: localEnd - localStart + 1}
+			br.bufp = getBlockBuf(br.n)
+			br.fetchedIt, br.err = s.readBlockSlice(ctx, bucket, key, accessKey, secretKey, meta, i, localStart, localEnd, (*br.bufp)[:br.n])
+			select {
+			case results <- br:
+			case <-stop:
+				putBlockBuf(br.bufp)
+				return
+			}
+			if br.err != nil {
+				return
+			}
+		}
+	}()
+	defer close(stop)
+	for br := range results {
+		if br.err != nil {
+			putBlockBuf(br.bufp)
+			return fetched, br.err
+		}
+		if br.fetchedIt {
+			fetched++
+		}
+		_, werr := cw.Write((*br.bufp)[:br.n])
+		putBlockBuf(br.bufp)
+		if werr != nil {
+			return fetched, werr
+		}
+	}
+	return fetched, nil
+}
+
+// readBlockSlice reads block idx's local byte range [localStart,localEnd] into dst
+// (len(dst) == the range length). A block the cache reports absent is fetched from upstream
+// (coalesced, budget-gated) and re-read — dst is scratch, never client-visible, so the retry
+// can't duplicate bytes in the response the way a direct-to-client re-read could. A nil-error
+// short read is reported as an error: a present block never legitimately under-delivers an
+// in-bounds range.
+func (s *Service) readBlockSlice(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, idx, localStart, localEnd int64, dst []byte) (fetched bool, err error) {
+	read := func() error {
+		sw := &sliceWriter{dst: dst}
+		rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, idx, localStart, localEnd, sw)
+		if rerr == nil && sw.off != int64(len(dst)) {
+			return fmt.Errorf("block %d stream: short read %d of %d bytes", idx, sw.off, len(dst))
+		}
+		return rerr
+	}
+	rerr := read()
+	if errors.Is(rerr, cache.ErrNotFound) {
+		if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{idx}); ferr != nil {
+			return false, ferr
+		}
+		fetched = true
+		rerr = read()
+	}
+	return fetched, rerr
+}
+
+// streamBlockRangeSequential is streamBlockRange's unbuffered fallback (single-block serves,
+// or the pipeline's buffer budget declined): each block streams from cache directly into the
+// client writer with no staging buffer. Because the read target IS the response body here, an
+// absent block is refetched and re-read only when its failed read delivered nothing — a
+// partial write followed by a re-read would duplicate bytes in the response.
+func (s *Service) streamBlockRangeSequential(ctx context.Context, cw *countingWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (fetched int64, err error) {
+	b0, bK := coveringBlocks(start, end, meta.BlockSize)
 	for i := b0; i <= bK; i++ {
 		bStart, bEnd := blockBounds(i, meta.BlockSize, meta.ContentLength)
 		localStart := max(start, bStart) - bStart
 		localEnd := min(end, bEnd) - bStart
-		if berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, cw); berr != nil {
-			if cw.written > 0 {
-				metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+		before := cw.written
+		berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, cw)
+		if errors.Is(berr, cache.ErrNotFound) && cw.written == before {
+			if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{i}); ferr != nil {
+				return fetched, ferr
 			}
-			log.Warn().Err(berr).Str("bucket", bucket).Str("key", key).Int64("block", i).Msg("Block vanished mid-serve")
-			return cw.written, berr
+			fetched++
+			berr = s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, cw)
+		}
+		if berr != nil {
+			return fetched, berr
 		}
 	}
-	if cw.written > 0 {
-		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-	}
-	return cw.written, nil
+	return fetched, nil
 }
 
 // serveFullObjectFromBlockCache serves a full-object GET from a block-mode entry. A complete
@@ -452,7 +578,12 @@ func (s *Service) serveFullObjectFromBlockCache(
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(meta.StatusCode)
 
-	if _, berr := s.streamBlockRange(ctx, w, bucket, key, meta, 0, meta.ContentLength-1); berr != nil {
+	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, 0, meta.ContentLength-1); berr != nil {
+		// Same rationale as the range path above: a stale signal surfaced by a mid-serve
+		// inline fetch must invalidate even though the response truncates.
+		if errors.Is(berr, errBlockETagMismatch) || errors.Is(berr, errBlockUpstreamGone) {
+			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		}
 		return true, berr
 	}
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
@@ -521,7 +652,7 @@ func (s *Service) serveCompleteFromBlocks(
 		berr = werr
 	} else if lastBlock > 0 {
 		var streamed int64
-		streamed, berr = s.streamBlockRangeInlineFetch(ctx, w, bucket, key, accessKey, secretKey, meta, firstEnd+1, meta.ContentLength-1)
+		streamed, berr = s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, firstEnd+1, meta.ContentLength-1)
 		fetched += streamed
 		// A definitive stale signal from a mid-serve inline fetch must still invalidate,
 		// even though headers are committed (this response truncates either way): leaving
@@ -545,44 +676,6 @@ func (s *Service) serveCompleteFromBlocks(
 	}
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
 	return true, nil
-}
-
-// streamBlockRangeInlineFetch streams object bytes [start,end] from a block-mode entry's
-// blocks like streamBlockRange, but a block the read reports absent is fetched from upstream
-// (coalesced, budget-gated) and re-read instead of failing the serve — recovering blocks
-// evicted after a BlocksComplete meta was written. Headers are already committed, so a fetch
-// or re-read failure still returns a non-nil error (truncated body). Returns how many blocks
-// were inline-fetched.
-func (s *Service) streamBlockRangeInlineFetch(ctx context.Context, w http.ResponseWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (fetched int64, err error) {
-	b0, bK := coveringBlocks(start, end, meta.BlockSize)
-	cw := &countingWriter{w: w}
-	defer func() {
-		if cw.written > 0 {
-			metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-		}
-	}()
-	for i := b0; i <= bK; i++ {
-		bStart, bEnd := blockBounds(i, meta.BlockSize, meta.ContentLength)
-		localStart := max(start, bStart) - bStart
-		localEnd := min(end, bEnd) - bStart
-		before := cw.written
-		berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, cw)
-		// Retry only a block whose read delivered NOTHING (an absent key never writes): a
-		// partial write followed by a re-read would duplicate bytes in the response.
-		if errors.Is(berr, cache.ErrNotFound) && cw.written == before {
-			if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{i}); ferr != nil {
-				log.Warn().Err(ferr).Str("bucket", bucket).Str("key", key).Int64("block", i).Msg("Block vanished mid-serve and inline fetch failed")
-				return fetched, ferr
-			}
-			fetched++
-			berr = s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, cw)
-		}
-		if berr != nil {
-			log.Warn().Err(berr).Str("bucket", bucket).Str("key", key).Int64("block", i).Msg("Block unreadable mid-serve")
-			return fetched, berr
-		}
-	}
-	return fetched, nil
 }
 
 // fetchBlocksToCache fetches the given missing blocks from upstream and writes them to cache,

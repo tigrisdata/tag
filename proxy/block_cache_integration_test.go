@@ -1633,3 +1633,124 @@ func TestBlockCache_CompleteEntryBudgetContentionRetriesViaProbePath(t *testing.
 		t.Errorf("X-Cache=%q, want %q (probe-path retry should serve from cache)", got, XCacheHit)
 	}
 }
+
+// A warm multi-block serve whose pipeline buffer reservation the budget declines degrades to
+// the direct sequential stream and still serves byte-exact from cache — budget pressure slows
+// a warm serve down, it never surrenders it to upstream. Budget of 5: the complete path's
+// first-block reservation (2) leaves 3, so the pipeline's two-buffer reservation (4) declines.
+func TestBlockCache_PipelineBudgetDeclineDegradesToSequential(t *testing.T) {
+	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes → 20 2-byte blocks
+	mock := newBlockMock(object, `"v1"`)
+	svc, c := newBlockServiceWithBudget(t, mock, 2, 5)
+
+	// Cold full GET: the populate reserves min(40, budget)=5 and releases before the meta lands.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated after cold full GET")
+	}
+
+	before := mock.blockGets.Load()
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("warm full GET under budget pressure: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != string(object) {
+		t.Fatalf("warm full GET: code=%d body=%q, want the exact object", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
+	}
+	if after := mock.blockGets.Load(); after != before {
+		t.Errorf("warm sequential serve fetched %d blocks from upstream, want 0", after-before)
+	}
+}
+
+// A warm range wider than one block takes the probe-first path and streams its covering blocks
+// through the pipeline; a block the probe found missing is fetched first, and the assembled 206
+// is byte-exact across all block boundaries.
+func TestBlockCache_WarmMultiBlockRangeServesPipelined(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // blocks [0..3][4..7][8..9]
+	svc, c := newBlockService(t, mock)
+
+	// Cold miss on bytes=0-7 populates blocks 0 and 1 (and the meta) in the background.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated")
+	}
+
+	// bytes=0-9 (10 bytes > BlockSize 4) skips the assembled-range path: probe finds block 2
+	// missing, fetches it, then the three blocks stream pipelined.
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=0-9")); err != nil {
+		t.Fatalf("warm multi-block range: %v", err)
+	}
+	if w2.Code != http.StatusPartialContent || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("multi-block range: code=%d body=%q, want 206 ABCDEFGHIJ", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
+	}
+	if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 2) {
+		t.Error("block 2 not cached after the probe-path fetch")
+	}
+}
+
+// failAfterWriter fails every Write once `remaining` bytes have been accepted, simulating a
+// client that disconnects mid-body.
+type failAfterWriter struct {
+	http.ResponseWriter
+	remaining int
+}
+
+func (f *failAfterWriter) Write(p []byte) (int, error) {
+	if f.remaining <= 0 {
+		return 0, errors.New("client gone")
+	}
+	if len(p) > f.remaining {
+		p = p[:f.remaining]
+	}
+	n, err := f.ResponseWriter.Write(p)
+	f.remaining -= n
+	if err != nil {
+		return n, err
+	}
+	if f.remaining == 0 {
+		return n, errors.New("client gone")
+	}
+	return n, nil
+}
+
+// A client write failure mid-pipeline must unwind the prefetching reader promptly (returning
+// its in-flight buffer) instead of leaving it blocked on the handoff forever. The serve returns
+// without hanging; -race would flag an unsynchronized unwind.
+func TestBlockCache_PipelineClientWriteFailureUnwindsCleanly(t *testing.T) {
+	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes → 20 2-byte blocks
+	mock := newBlockMock(object, `"v1"`)
+	svc, c := newBlockServiceWithBudget(t, mock, 2, 1<<20)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated after cold full GET")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fw := &failAfterWriter{ResponseWriter: httptest.NewRecorder(), remaining: 9}
+		_ = svc.HandleGetObject(fw, fullGet(wowBucket, wowKey))
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after a mid-body client write failure (pipeline reader stuck?)")
+	}
+}
