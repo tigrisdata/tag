@@ -26,6 +26,10 @@ on:
         description: "Object size for GET/PUT (empty = 4MiB). e.g. 64MiB to make full GETs span many blocks in blocks mode."
         type: string
         default: ""
+      max_populate_memory:
+        description: "Populate memory budget in bytes (empty = 1GiB default). Diagnostic knob for budget-contention hypotheses."
+        type: string
+        default: ""
       range_objects:
         description: "Distinct objects for GET RANGE (empty = 8). Shrinking the working set (e.g. 1) makes the run warm-hit-dominated instead of cold-miss-dominated."
         type: string
@@ -54,6 +58,10 @@ on:
         default: ""
       obj_size:
         description: "Object size for GET/PUT (empty = 4MiB)"
+        type: string
+        default: ""
+      max_populate_memory:
+        description: "Populate memory budget in bytes (empty = 1GiB default)"
         type: string
         default: ""
       range_objects:
@@ -115,6 +123,7 @@ jobs:
           TAG_CACHE_BLOCK_CACHING_ENABLED: ${{ inputs.cache_mode == 'blocks' && 'true' || 'false' }}
           TAG_CACHE_BLOCK_SIZE: ${{ inputs.block_size }}
           TAG_CACHE_BLOCK_MIN_OBJECT_SIZE: ${{ inputs.block_min_object_size }}
+          TAG_CACHE_MAX_POPULATE_MEMORY: ${{ inputs.max_populate_memory }}
         run: make s3-test-local
 
       # Warp knobs pass through as env; empty values fall back to run-warp.sh's defaults
