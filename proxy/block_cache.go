@@ -208,30 +208,32 @@ func (sw *sliceWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// maxPooledAssemblyBufBytes caps the capacity of assembly buffers the pool retains, so an
-// entry written under an unusually large historical block_size can't pin oversized buffers
-// in the pool forever.
-const maxPooledAssemblyBufBytes = 4 << 20
+// maxPooledBlockBufBytes caps the capacity of block buffers the pool retains, so an entry
+// written under an unusually large historical block_size can't pin oversized buffers in the
+// pool forever.
+const maxPooledBlockBufBytes = 4 << 20
 
-// assemblyBufPool recycles pre-commit range-assembly buffers. Buffers are handed out by
-// capacity; a request larger than a pooled buffer's capacity allocates fresh.
-var assemblyBufPool sync.Pool
+// blockBufPool recycles block-sized scratch buffers: pre-commit range/first-block assembly on
+// the serve paths, and the block staging buffers on the populate paths (fetchOneBlock,
+// putBlocksFromStream). Buffers are handed out by capacity; a request larger than a pooled
+// buffer's capacity allocates fresh.
+var blockBufPool sync.Pool
 
-func getAssemblyBuf(n int64) *[]byte {
-	if v := assemblyBufPool.Get(); v != nil {
+func getBlockBuf(n int64) *[]byte {
+	if v := blockBufPool.Get(); v != nil {
 		bp := v.(*[]byte)
 		if int64(cap(*bp)) >= n {
 			return bp
 		}
-		assemblyBufPool.Put(bp) // too small for this request; keep it for a smaller one
+		blockBufPool.Put(bp) // too small for this request; keep it for a smaller one
 	}
 	b := make([]byte, n)
 	return &b
 }
 
-func putAssemblyBuf(bp *[]byte) {
-	if int64(cap(*bp)) <= maxPooledAssemblyBufBytes {
-		assemblyBufPool.Put(bp)
+func putBlockBuf(bp *[]byte) {
+	if int64(cap(*bp)) <= maxPooledBlockBufBytes {
+		blockBufPool.Put(bp)
 	}
 }
 
@@ -255,8 +257,8 @@ func (s *Service) serveAssembledRange(
 ) (served bool, err error) {
 	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
 	rangeLen := rng.end - rng.start + 1
-	bufp := getAssemblyBuf(rangeLen)
-	defer putAssemblyBuf(bufp)
+	bufp := getBlockBuf(rangeLen)
+	defer putBlockBuf(bufp)
 	buf := (*bufp)[:rangeLen]
 
 	// Pass 1: read every covering block's slice of the range into place. ErrNotFound marks
@@ -477,8 +479,8 @@ func (s *Service) serveCompleteFromBlocks(
 	_, firstEnd := blockBounds(0, meta.BlockSize, meta.ContentLength)
 	firstLen := firstEnd + 1
 
-	bufp := getAssemblyBuf(firstLen)
-	defer putAssemblyBuf(bufp)
+	bufp := getBlockBuf(firstLen)
+	defer putBlockBuf(bufp)
 	buf := (*bufp)[:firstLen]
 
 	fetched := int64(0)
@@ -717,8 +719,12 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 		// (truncated response) streamed straight into PutBlockStream could persist a short block,
 		// which BlockExists can't distinguish from a complete one — so it would later serve
 		// truncated bytes. io.ReadFull errors on a short body, so a partial block is never stored.
-		// blockLen <= block_size, bounded by maxConcurrentBlockFetches concurrent fetches.
-		blockBuf := make([]byte, blockLen)
+		// blockLen <= block_size, bounded by maxConcurrentBlockFetches concurrent fetches. The
+		// buffer is pooled and safely returned on exit: PutBlockStream consumes the reader
+		// fully before returning, so nothing references it afterwards.
+		bufp := getBlockBuf(blockLen)
+		defer putBlockBuf(bufp)
+		blockBuf := (*bufp)[:blockLen]
 		if _, rerr := io.ReadFull(resp.Body, blockBuf); rerr != nil {
 			return nil, fmt.Errorf("block %d fetch: short body (%w), want %d bytes", blockIdx, rerr, blockLen)
 		}
@@ -852,7 +858,11 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 			_, _ = io.Copy(io.Discard, r)
 		}
 	}()
-	buf := make([]byte, meta.BlockSize)
+	// Pooled and safely returned on exit: each PutBlockStream consumes its reader fully
+	// before returning, so no block write outlives the loop iteration that staged it.
+	bufp := getBlockBuf(meta.BlockSize)
+	defer putBlockBuf(bufp)
+	buf := (*bufp)[:meta.BlockSize]
 	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
 	for idx := int64(0); idx <= lastBlock; idx++ {
 		bStart, bEnd := blockBounds(idx, meta.BlockSize, meta.ContentLength)
