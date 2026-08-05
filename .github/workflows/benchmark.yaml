@@ -22,6 +22,10 @@ on:
         description: "Per-operation duration (empty = 30s default), e.g. 60s."
         type: string
         default: ""
+      obj_size:
+        description: "Object size for GET/PUT (empty = 4MiB). e.g. 64MiB to make full GETs span many blocks in blocks mode."
+        type: string
+        default: ""
       range_objects:
         description: "Distinct objects for GET RANGE (empty = 8). Shrinking the working set (e.g. 1) makes the run warm-hit-dominated instead of cold-miss-dominated."
         type: string
@@ -46,6 +50,10 @@ on:
         default: ""
       duration:
         description: "Per-operation duration (empty = 30s default)"
+        type: string
+        default: ""
+      obj_size:
+        description: "Object size for GET/PUT (empty = 4MiB)"
         type: string
         default: ""
       range_objects:
@@ -120,6 +128,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           WARP_BUCKET: tag-warp-ci-${{ github.run_id }}
           WARP_DURATION: ${{ inputs.duration }}
+          WARP_OBJ_SIZE: ${{ inputs.obj_size }}
           WARP_RANGE_OBJECTS: ${{ inputs.range_objects }}
           WARP_RANGE_OBJ_SIZE: ${{ inputs.range_obj_size }}
         run: make bench-warp
