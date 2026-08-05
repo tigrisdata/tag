@@ -60,13 +60,12 @@ on:
     # Nightly at 07:00 UTC (runs the default-mode benchmark)
     - cron: "0 7 * * *"
 
-# All benchmark runs share one Tigris bucket (tag-warp-benchmark), and warp clears that bucket
-# before and after every op — two runs executing concurrently delete each other's objects
+# Each run benchmarks against its own bucket (tag-warp-ci-<run id>): warp clears its bucket
+# before and after every op, so two runs sharing a bucket would delete each other's objects
 # mid-measurement (observed as sustained NoSuchKey download errors and garbage numbers).
-# Serialize the whole workflow: queued runs wait for the active one instead of racing it.
-concurrency:
-  group: warp-benchmark-bucket
-  cancel-in-progress: false
+# Per-run buckets make concurrent runs data-safe; they still share the Tigris account's
+# bandwidth, so avoid overlapping heavy runs unless a simultaneous A/B pair is the point.
+# The delete-bucket step below removes the run's bucket and sweeps any leaked ones.
 
 env:
   GO_VERSION: "1.24.2"
@@ -119,6 +118,7 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          WARP_BUCKET: tag-warp-ci-${{ github.run_id }}
           WARP_DURATION: ${{ inputs.duration }}
           WARP_RANGE_OBJECTS: ${{ inputs.range_objects }}
           WARP_RANGE_OBJ_SIZE: ${{ inputs.range_obj_size }}
@@ -131,6 +131,35 @@ jobs:
           name: benchmark-results
           path: tests/benchmark/results/
           if-no-files-found: warn
+
+      # Best-effort, never fails the job. warp's after-op clear leaves the bucket empty on a
+      # clean run; the recursive rm covers ops that died mid-run. The sweep catches buckets
+      # leaked by hard-killed jobs (cancelled/timed out before this step) — only per-run
+      # (tag-warp-ci-*) buckets older than a day, so an in-flight run's bucket is never touched.
+      - name: Delete benchmark bucket
+        if: always()
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          ENDPOINT: https://t3.storage.dev
+          BUCKET: tag-warp-ci-${{ github.run_id }}
+        run: |
+          set -u
+          aws --endpoint-url "$ENDPOINT" s3 rm "s3://$BUCKET" --recursive --only-show-errors || true
+          aws --endpoint-url "$ENDPOINT" s3api delete-bucket --bucket "$BUCKET" || true
+          cutoff=$(date -u -d '1 day ago' +%s)
+          aws --endpoint-url "$ENDPOINT" s3api list-buckets \
+            --query 'Buckets[?starts_with(Name, `tag-warp-ci-`)].[Name,CreationDate]' --output text |
+          while read -r name created; do
+            [ -n "$name" ] || continue
+            [ "$(date -u -d "$created" +%s)" -lt "$cutoff" ] || continue
+            echo "Sweeping leaked benchmark bucket: $name (created $created)"
+            aws --endpoint-url "$ENDPOINT" s3 rm "s3://$name" --recursive --only-show-errors || true
+            aws --endpoint-url "$ENDPOINT" s3api delete-bucket --bucket "$name" || true
+          done || true
 
       - name: Cleanup
         if: always()
