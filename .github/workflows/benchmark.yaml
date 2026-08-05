@@ -60,6 +60,14 @@ on:
     # Nightly at 07:00 UTC (runs the default-mode benchmark)
     - cron: "0 7 * * *"
 
+# All benchmark runs share one Tigris bucket (tag-warp-benchmark), and warp clears that bucket
+# before and after every op — two runs executing concurrently delete each other's objects
+# mid-measurement (observed as sustained NoSuchKey download errors and garbage numbers).
+# Serialize the whole workflow: queued runs wait for the active one instead of racing it.
+concurrency:
+  group: warp-benchmark-bucket
+  cancel-in-progress: false
+
 env:
   GO_VERSION: "1.24.2"
 
