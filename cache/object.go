@@ -48,6 +48,13 @@ type CachedObjectMeta struct {
 	// as fixed-size blocks (MakeBlockKey) of this size. Captured at populate time so an
 	// entry keeps its block layout even if the block_size config later changes.
 	BlockSize int64 `json:"block_size,omitempty"`
+	// BlocksComplete records that every block of a block-mode entry was present when this
+	// meta was written (a full-stream split, or a promotion after a successful full
+	// assembly). Full-object serves use it to skip the per-block existence probe pass and
+	// stream optimistically — a block evicted since is recovered by an inline fetch. It is a
+	// hint, not an invariant: false (including on entries written before the field existed)
+	// only means the probe-first path is used.
+	BlocksComplete bool `json:"blocks_complete,omitempty"`
 }
 
 // MetaFromHTTPHeaders builds CachedObjectMeta from S3 response headers.

@@ -1427,3 +1427,122 @@ func TestBlockCache_MinObjectSizeWholeCachesSmallObjects(t *testing.T) {
 		t.Fatalf("warm range: code=%d body=%q, want 206 CDEF", w3.Code, w3.Body.String())
 	}
 }
+
+// A full-stream split marks the entry BlocksComplete; a block evicted afterwards is recovered
+// by an inline fetch mid-serve — the client still gets the complete, byte-exact object.
+func TestBlockCache_CompleteEntryInlineFetchRecoversEvictedBlock(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // blocks [0..3][4..7][8..9]
+	memCache := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// Cold full GET → block split → complete entry.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if !meta.BlocksComplete {
+		t.Fatal("entry from full-stream split not marked BlocksComplete")
+	}
+
+	// Evict block 1 out from under the complete entry.
+	if err := memCache.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 1)); err != nil {
+		t.Fatalf("delete block 1: %v", err)
+	}
+	before := mock.blockGets.Load()
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("warm full GET with evicted block: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("inline-fetch serve: code=%d body=%q, want 200 ABCDEFGHIJ", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
+	}
+	if after := mock.blockGets.Load(); after != before+1 {
+		t.Errorf("inline fetches = %d, want exactly 1 (the evicted block)", after-before)
+	}
+}
+
+// A complete entry whose FIRST block is gone and unrecoverable (upstream failing) must fall
+// through pre-commit: the client gets a clean 200 from the miss path, never a truncated body.
+func TestBlockCache_CompleteEntryFirstBlockGoneFallsThroughCleanly(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	memCache := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	if err := memCache.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 0)); err != nil {
+		t.Fatalf("delete block 0: %v", err)
+	}
+	mock.blockGetTransient = true // the pre-commit recovery fetch fails
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET with gone first block: %v", err)
+	}
+	// Served whole from the miss-path forward — a complete body, not a truncated one.
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("fall-through: code=%d body=%q, want 200 ABCDEFGHIJ", w2.Code, w2.Body.String())
+	}
+}
+
+// An entry established from a range (not complete) is promoted to BlocksComplete after its
+// first successful full assembly, so later full GETs skip the probe pass.
+func TestBlockCache_PartialEntryPromotedAfterFullAssembly(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, c := newBlockService(t, mock)
+
+	// Establish blocks 0 and 1 via a cold range miss (block 2 missing → not complete).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if meta.BlocksComplete {
+		t.Fatal("range-established entry unexpectedly marked complete")
+	}
+
+	// Full GET assembles (fetching block 2) and serves; the promotion lands asynchronously.
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("full GET: code=%d body=%q", w2.Code, w2.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+		if found && m.BlocksComplete {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("entry not promoted to BlocksComplete after successful full assembly")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

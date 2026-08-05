@@ -362,11 +362,16 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 	return cw.written, nil
 }
 
-// serveFullObjectFromBlockCache serves a full-object GET from a block-mode entry by assembling
-// all of its blocks (fetching any missing), streaming them in order. It returns served=false,
-// without writing anything, when the blocks cannot be populated — the caller then falls through
-// to the miss path. A block-mode meta always has ContentLength >= BlockSize >= 1, so there is no
-// zero-byte case to handle here.
+// serveFullObjectFromBlockCache serves a full-object GET from a block-mode entry. A complete
+// entry (meta.BlocksComplete — every block present when the meta was written) is served
+// probe-free: the first block is read into a pooled buffer pre-commit (so a gone-first-block
+// still falls through cleanly), then the rest stream with an inline fetch recovering any block
+// evicted since populate — one cache op per block instead of the probe pass's two. Entries not
+// known complete take the probe-first path (the mostly-missing amplification bail needs the
+// up-front missing count) and are promoted to complete after a successful full assembly, so
+// they pay the probe pass at most once. It returns served=false, without writing anything, when
+// the blocks cannot be produced — the caller then falls through to the miss path. A block-mode
+// meta always has ContentLength >= BlockSize >= 1, so there is no zero-byte case to handle here.
 func (s *Service) serveFullObjectFromBlockCache(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -375,6 +380,32 @@ func (s *Service) serveFullObjectFromBlockCache(
 	startTime time.Time,
 ) (served bool, err error) {
 	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
+
+	// Probe-free fast path for complete entries. The first-block buffer (<= one block) is
+	// reserved against the populate byte budget like the assembled-range path; on decline the
+	// probe-first path below still serves.
+	if meta.BlocksComplete {
+		firstLen := min(meta.BlockSize, meta.ContentLength)
+		weight := s.populateWeight(firstLen)
+		if s.populateBudget == nil || s.populateBudget.tryAcquireReadMiss(weight) {
+			served, err = s.serveCompleteFromBlocks(ctx, w, bucket, key, accessKey, secretKey, meta, startTime)
+			if s.populateBudget != nil {
+				s.populateBudget.release(weight)
+			}
+			if served || err != nil {
+				return served, err
+			}
+			// (false, nil): first block unrecoverable pre-commit — fall through to the miss
+			// path via the caller (a probe pass over an entry we already failed to read
+			// would just repeat the failure).
+			return false, nil
+		}
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Complete-serve buffer budget declined - serving via probe path")
+	}
+
+	// Stamp the promotion's write-start BEFORE the assembly work below: any invalidation that
+	// lands during it is then provably newer and blocks the promoted meta write.
+	writeStartTime := startTime.UnixNano()
 
 	// A full GET must produce every block. bailIfMostlyMissing=true asks ensureBlocksCached to
 	// fall through (rather than assemble) when most blocks are absent — e.g. only a footer range
@@ -396,6 +427,23 @@ func (s *Service) serveFullObjectFromBlockCache(
 		return false, ferr
 	}
 
+	// Every block is now present: promote the entry to complete (async, tombstone-aware with
+	// the pre-assembly timestamp, so a racing invalidation blocks the write) — later full GETs
+	// then take the probe-free path instead of re-probing every block. Best-effort: a skipped
+	// or failed promotion only means the next full GET probes again.
+	if !meta.BlocksComplete {
+		promoted := *meta
+		promoted.BlocksComplete = true
+		ttl := int(s.config.Cache.TTL.Seconds())
+		go func() {
+			pctx, cancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
+			defer cancel()
+			if _, perr := s.cache.PutMetaTombstoneAware(pctx, bucket, key, &promoted, ttl, writeStartTime); perr != nil {
+				log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Blocks-complete promotion failed")
+			}
+		}()
+	}
+
 	meta.WriteHeaders(w)
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(meta.StatusCode)
@@ -405,6 +453,124 @@ func (s *Service) serveFullObjectFromBlockCache(
 	}
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
 	return true, nil
+}
+
+// serveCompleteFromBlocks serves a full-object GET from a BlocksComplete entry with one cache
+// op per block and no probe pass. The first block is read into a pooled buffer BEFORE headers
+// commit: if it is absent (evicted since populate) it is fetched pre-commit, and if that fails
+// the response is untouched — (false, nil) lets the caller fall through to the miss path, and a
+// definitive stale signal invalidates the entry first. After commit, the remaining blocks
+// stream with an inline fetch recovering any absent one; only a fetch failure there truncates
+// (headers are already sent), which is the same terminal behavior the probe path has for a
+// block evicted between probe and stream. Hit/miss metrics count inline-fetched blocks as
+// misses, recorded once the serve outcome is known.
+func (s *Service) serveCompleteFromBlocks(
+	ctx context.Context,
+	w http.ResponseWriter,
+	bucket, key, accessKey, secretKey string,
+	meta *cache.CachedObjectMeta,
+	startTime time.Time,
+) (served bool, err error) {
+	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
+	_, firstEnd := blockBounds(0, meta.BlockSize, meta.ContentLength)
+	firstLen := firstEnd + 1
+
+	bufp := getAssemblyBuf(firstLen)
+	defer putAssemblyBuf(bufp)
+	buf := (*bufp)[:firstLen]
+
+	fetched := int64(0)
+	readFirst := func() error {
+		sw := &sliceWriter{dst: buf}
+		rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, 0, 0, firstEnd, sw)
+		if rerr == nil && sw.off != firstLen {
+			return fmt.Errorf("block 0 complete-serve: short read %d of %d bytes", sw.off, firstLen)
+		}
+		return rerr
+	}
+	rerr := readFirst()
+	if errors.Is(rerr, cache.ErrNotFound) {
+		// Evicted since populate: recover pre-commit, exactly like the assembled-range path.
+		if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{0}); ferr != nil {
+			if errors.Is(ferr, errBlockETagMismatch) || errors.Is(ferr, errBlockUpstreamGone) {
+				log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
+				s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+			}
+			return false, ferr
+		}
+		fetched++
+		rerr = readFirst()
+	}
+	if rerr != nil {
+		return false, rerr
+	}
+
+	meta.WriteHeaders(w)
+	writeCacheStatus(w, XCacheHit)
+	w.WriteHeader(meta.StatusCode)
+	n, werr := w.Write(buf)
+	if n > 0 {
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+	}
+	var berr error
+	if werr != nil {
+		berr = werr
+	} else if lastBlock > 0 {
+		var streamed int64
+		streamed, berr = s.streamBlockRangeInlineFetch(ctx, w, bucket, key, accessKey, secretKey, meta, firstEnd+1, meta.ContentLength-1)
+		fetched += streamed
+	}
+	total := lastBlock + 1
+	metrics.CacheBlockHits.Add(float64(total - fetched))
+	if fetched == 0 {
+		metrics.CacheBlockRangeServed.WithLabelValues("full_hit").Inc()
+	} else {
+		metrics.CacheBlockMisses.Add(float64(fetched))
+		metrics.CacheBlockRangeServed.WithLabelValues("partial_hit").Inc()
+	}
+	if berr != nil {
+		return true, berr
+	}
+	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	return true, nil
+}
+
+// streamBlockRangeInlineFetch streams object bytes [start,end] from a block-mode entry's
+// blocks like streamBlockRange, but a block the read reports absent is fetched from upstream
+// (coalesced, budget-gated) and re-read instead of failing the serve — recovering blocks
+// evicted after a BlocksComplete meta was written. Headers are already committed, so a fetch
+// or re-read failure still returns a non-nil error (truncated body). Returns how many blocks
+// were inline-fetched.
+func (s *Service) streamBlockRangeInlineFetch(ctx context.Context, w http.ResponseWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (fetched int64, err error) {
+	b0, bK := coveringBlocks(start, end, meta.BlockSize)
+	cw := &countingWriter{w: w}
+	defer func() {
+		if cw.written > 0 {
+			metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+		}
+	}()
+	for i := b0; i <= bK; i++ {
+		bStart, bEnd := blockBounds(i, meta.BlockSize, meta.ContentLength)
+		localStart := max(start, bStart) - bStart
+		localEnd := min(end, bEnd) - bStart
+		before := cw.written
+		berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, cw)
+		// Retry only a block whose read delivered NOTHING (an absent key never writes): a
+		// partial write followed by a re-read would duplicate bytes in the response.
+		if errors.Is(berr, cache.ErrNotFound) && cw.written == before {
+			if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{i}); ferr != nil {
+				log.Warn().Err(ferr).Str("bucket", bucket).Str("key", key).Int64("block", i).Msg("Block vanished mid-serve and inline fetch failed")
+				return fetched, ferr
+			}
+			fetched++
+			berr = s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, cw)
+		}
+		if berr != nil {
+			log.Warn().Err(berr).Str("bucket", bucket).Str("key", key).Int64("block", i).Msg("Block unreadable mid-serve")
+			return fetched, berr
+		}
+	}
+	return fetched, nil
 }
 
 // fetchBlocksToCache fetches the given missing blocks from upstream and writes them to cache,
@@ -696,6 +862,9 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 	if _, err := io.ReadFull(r, probe[:]); err != io.EOF {
 		return fmt.Errorf("block split: upstream body longer than Content-Length %d", meta.ContentLength)
 	}
+	// Every block was just written, so stamp the meta complete: full-object serves can skip
+	// the per-block probe pass and stream optimistically.
+	meta.BlocksComplete = true
 	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime); err != nil {
 		return err
 	}
