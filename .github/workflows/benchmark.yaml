@@ -14,6 +14,18 @@ on:
         description: "Block size in bytes for blocks mode (empty = 4 MiB default). e.g. 65536 to match the 64 KiB GET RANGE size."
         type: string
         default: ""
+      duration:
+        description: "Per-operation duration (empty = 30s default), e.g. 60s."
+        type: string
+        default: ""
+      range_objects:
+        description: "Distinct objects for GET RANGE (empty = 8). Shrinking the working set (e.g. 1) makes the run warm-hit-dominated instead of cold-miss-dominated."
+        type: string
+        default: ""
+      range_obj_size:
+        description: "Object size for GET RANGE (empty = 256MiB), e.g. 64MiB to shrink the block working set."
+        type: string
+        default: ""
   workflow_call:
     inputs:
       cache_mode:
@@ -22,6 +34,18 @@ on:
         default: default
       block_size:
         description: "Block size in bytes for blocks mode (empty = 4 MiB default)"
+        type: string
+        default: ""
+      duration:
+        description: "Per-operation duration (empty = 30s default)"
+        type: string
+        default: ""
+      range_objects:
+        description: "Distinct objects for GET RANGE (empty = 8)"
+        type: string
+        default: ""
+      range_obj_size:
+        description: "Object size for GET RANGE (empty = 256MiB)"
         type: string
         default: ""
   schedule:
@@ -69,10 +93,18 @@ jobs:
           TAG_CACHE_BLOCK_SIZE: ${{ inputs.block_size }}
         run: make s3-test-local
 
+      # Warp knobs pass through as env; empty values fall back to run-warp.sh's defaults
+      # (the script expands with ':-', which treats empty the same as unset). A
+      # warm-hit-dominated GET RANGE run: range_objects=1 range_obj_size=64MiB shrinks the
+      # block working set to ~1k blocks, so a standard-duration run's ~25k random reads hit
+      # warm blocks almost entirely — measuring the serve path instead of upstream fetches.
       - name: Run warp benchmarks
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          WARP_DURATION: ${{ inputs.duration }}
+          WARP_RANGE_OBJECTS: ${{ inputs.range_objects }}
+          WARP_RANGE_OBJ_SIZE: ${{ inputs.range_obj_size }}
         run: make bench-warp
 
       - name: Upload benchmark results
