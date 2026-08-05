@@ -120,10 +120,17 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		serveStagingBudget = newByteBudget(cfg.Cache.MaxPopulateMemoryBytes, 0, perPopulateCap)
 	}
 
+	// The block buffer pool's retention cap must track the configured block size, or every
+	// block staging buffer in a larger-block deployment would be allocated fresh and dropped.
+	if bs := cfg.Cache.BlockSize; bs > maxPooledBlockBufBytes.Load() {
+		maxPooledBlockBufBytes.Store(bs)
+	}
+
 	log.Info().
 		Int("max_concurrent_writes", cfg.Cache.MaxConcurrentWrites).
 		Int64("max_populate_memory_bytes", cfg.Cache.MaxPopulateMemoryBytes).
 		Int64("per_populate_buffer_cap_bytes", perPopulateCap).
+		Int64("serve_staging_budget_bytes", cfg.Cache.MaxPopulateMemoryBytes).
 		Msg("Cache-populate limits configured")
 
 	return &Service{
@@ -178,6 +185,24 @@ func (s *Service) populateWeight(contentLength int64) int64 {
 		w = budget
 	}
 	return w
+}
+
+// stagingWeight is the byte weight a block-serve staging buffer reserves against the
+// serve-staging budget: the buffer's ACTUAL size, clamped only by the total budget (so a
+// buffer larger than the whole budget still serves one-at-a-time, mirroring populateWeight).
+// Unlike populateWeight it is NOT capped at perPopulateCap — that ceiling models the
+// broadcast pipeline's buffering, which has no relationship to raw block-sized staging
+// buffers; clamping to it would let the budget admit more bytes than are actually allocated
+// (e.g. two 64 MiB pipeline buffers reserved as one 80 MiB cap), silently breaking the very
+// bound the budget exists to enforce.
+func (s *Service) stagingWeight(n int64) int64 {
+	if n < 1 {
+		n = 1
+	}
+	if budget := s.config.Cache.MaxPopulateMemoryBytes; budget > 0 && n > budget {
+		n = budget
+	}
+	return n
 }
 
 // populatePriority classifies a cache-populate for admission against the byte

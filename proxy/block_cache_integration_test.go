@@ -1349,20 +1349,16 @@ func TestBlockCache_WarmFullGetManyBlocksServesFromCache(t *testing.T) {
 	}
 }
 
-// Under budget pressure where the assembly buffer's reservation leaves no room for the
-// missing-block fetch's own reservation (budget fits one but not both), the serve must not
-// give up and fall through to upstream: the assembly reservation is released and the probe
-// path retries, whose fetch can use the freed budget — the block is populated and the range
-// served from cache. Pins the double-reservation fix.
-func TestBlockCache_AssemblyBudgetContentionRetriesViaProbePath(t *testing.T) {
+// With the populate budget saturated by other work, an assembled range whose missing-block
+// fetch declines falls through to a clean upstream forward — no truncation, no invalidation —
+// and serves from cache again once the budget frees. (The staging and populate budgets are
+// independent pools, so a decline means real global populate pressure; retrying via the probe
+// path would draw on the same budget and just repeat it.)
+func TestBlockCache_AssemblyFetchDeclineFallsThroughToUpstream(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
-	// Budget of 5 bytes: the 4-byte assembly buffer reservation leaves 1 byte, so the 4-byte
-	// block-fetch reservation inside assembly must decline; once assembly releases, the probe
-	// path's fetch fits.
-	svc, c := newBlockServiceWithBudget(t, mock, 4, 5)
+	svc, c := newBlockServiceWithBudget(t, mock, 4, 100)
 
-	// Establish only block 0 (the populate's own reservation completes and releases first —
-	// metaCached gates on the meta write, which happens after the fetch releases).
+	// Establish only block 0.
 	w := httptest.NewRecorder()
 	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
 		t.Fatalf("cold miss: %v", err)
@@ -1371,20 +1367,33 @@ func TestBlockCache_AssemblyBudgetContentionRetriesViaProbePath(t *testing.T) {
 		t.Fatal("block-mode meta not populated")
 	}
 
-	// Block 1 is missing. Assembly's fetch is budget-starved by the buffer reservation; the
-	// retry via the probe path must still fetch, cache, and serve it as a HIT.
+	// Saturate the populate budget so block 1's fetch declines.
+	if !svc.populateBudget.tryAcquireReadMiss(100) {
+		t.Fatal("could not saturate populate budget")
+	}
+
 	w2 := httptest.NewRecorder()
 	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=4-7")); err != nil {
-		t.Fatalf("partial hit under budget pressure: %v", err)
+		t.Fatalf("range under populate saturation: %v", err)
 	}
 	if w2.Code != http.StatusPartialContent || w2.Body.String() != "EFGH" {
-		t.Fatalf("partial hit: code=%d body=%q, want 206 EFGH", w2.Code, w2.Body.String())
+		t.Fatalf("range under saturation: code=%d body=%q, want 206 EFGH (upstream forward)", w2.Code, w2.Body.String())
 	}
-	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
-		t.Errorf("X-Cache=%q, want %q (probe-path retry should serve from cache)", got, XCacheHit)
+	if got := w2.Header().Get("X-Cache"); got == XCacheHit {
+		t.Errorf("X-Cache=%q, want a non-HIT upstream forward under populate saturation", got)
 	}
-	if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 1) {
-		t.Error("block 1 not cached after probe-path retry")
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
+		t.Fatal("still-valid entry was invalidated by a budget decline")
+	}
+
+	// Budget freed: the fetch fits again and the range serves from cache.
+	svc.populateBudget.release(100)
+	w3 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w3, blockGet(wowBucket, wowKey, "bytes=4-7")); err != nil {
+		t.Fatalf("range after budget freed: %v", err)
+	}
+	if w3.Code != http.StatusPartialContent || w3.Body.String() != "EFGH" || w3.Header().Get("X-Cache") != XCacheHit {
+		t.Fatalf("after budget freed: code=%d body=%q x-cache=%q, want 206 EFGH HIT", w3.Code, w3.Body.String(), w3.Header().Get("X-Cache"))
 	}
 }
 
@@ -1547,24 +1556,21 @@ func TestBlockCache_CompleteEntryMidServeStaleSignalInvalidates(t *testing.T) {
 	}
 }
 
-// A budget-declined recovery fetch for the first block of a complete entry retries via the
-// probe path (whose fetch can use the freed buffer reservation) instead of surrendering the
-// serve to a full upstream GET.
-func TestBlockCache_CompleteEntryBudgetContentionRetriesViaProbePath(t *testing.T) {
+// A populate-budget decline for a block AFTER headers are committed must not truncate the
+// response: the serve salvages the remaining bytes with one uncached upstream range GET and
+// the still-valid entry survives (a transient decline is not a degenerate entry).
+func TestBlockCache_CompleteEntryFetchDeclineSalvagesViaRemainder(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
-	// Budget of 5: the 4-byte first-block buffer reservation leaves 1, so the recovery
-	// fetch's own 4-byte reservation declines inside the complete path; the probe-path
-	// retry (buffer released) fits.
 	memCache := cacheclient.NewMemoryCache()
 	cfg := config.NewDefault()
 	cfg.Cache.BlockCachingEnabled = true
 	cfg.Cache.BlockSize = 4
 	cfg.Cache.SizeThreshold = 1 << 20
-	cfg.Cache.MaxPopulateMemoryBytes = 5
+	cfg.Cache.MaxPopulateMemoryBytes = 100
 	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
 	svc := NewService(mock, c, cfg)
 
-	// Complete entry via a cold full GET (its populate reserves and releases first).
+	// Complete entry via a cold full GET.
 	w := httptest.NewRecorder()
 	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
 		t.Fatalf("cold full GET: %v", err)
@@ -1572,25 +1578,103 @@ func TestBlockCache_CompleteEntryBudgetContentionRetriesViaProbePath(t *testing.
 	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
 		t.Fatal("meta not populated")
 	}
-	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
-	if !meta.BlocksComplete {
-		t.Fatal("entry not marked complete")
-	}
 
-	// Evict block 0 so the complete path needs a recovery fetch it cannot budget.
-	if err := memCache.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 0)); err != nil {
-		t.Fatalf("delete block 0: %v", err)
+	// Evict a MID-stream block and saturate the populate budget: the inline recovery fetch
+	// declines only after the 200 is committed.
+	if err := memCache.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 1)); err != nil {
+		t.Fatalf("delete block 1: %v", err)
 	}
+	if !svc.populateBudget.tryAcquireReadMiss(100) {
+		t.Fatal("could not saturate populate budget")
+	}
+	defer svc.populateBudget.release(100)
 
 	w2 := httptest.NewRecorder()
 	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
-		t.Fatalf("full GET under budget pressure: %v", err)
+		t.Fatalf("full GET under populate saturation: %v", err)
 	}
 	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
-		t.Fatalf("full GET: code=%d body=%q, want 200 ABCDEFGHIJ", w2.Code, w2.Body.String())
+		t.Fatalf("degraded serve: code=%d body=%q, want the COMPLETE object (no truncation)", w2.Code, w2.Body.String())
 	}
-	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
-		t.Errorf("X-Cache=%q, want %q (probe-path retry should serve from cache)", got, XCacheHit)
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
+		t.Fatal("entry invalidated by a transient budget decline")
+	}
+}
+
+// A BlocksComplete meta surviving mass block eviction must not turn one full GET into N
+// serial upstream fetches: after maxInlineFetchesPerServe recoveries the serve switches to a
+// single uncached upstream remainder stream, and the degenerate entry is invalidated so the
+// next GET re-establishes it with one streaming re-split.
+func TestBlockCache_CompleteEntryMassEvictionBoundsUpstreamFanout(t *testing.T) {
+	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes -> 20 2-byte blocks
+	mock := newBlockMock(object, `"v1"`)
+	memCache := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockSize = 2
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	// Mass-evict blocks 3..19 out from under the complete meta.
+	for i := int64(3); i <= 19; i++ {
+		if err := memCache.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 2, i)); err != nil {
+			t.Fatalf("delete block %d: %v", i, err)
+		}
+	}
+
+	before := mock.blockGets.Load()
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("degraded full GET: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != string(object) {
+		t.Fatalf("degraded serve: code=%d body=%q, want the exact object", w2.Code, w2.Body.String())
+	}
+	// Bounded fan-out: at most the inline-fetch cap in aligned GETs plus ONE remainder GET —
+	// never one upstream round trip per missing block (17 here).
+	if got := mock.blockGets.Load() - before; int(got) > maxInlineFetchesPerServe+1 {
+		t.Errorf("degraded serve made %d upstream requests, want <= %d", got, maxInlineFetchesPerServe+1)
+	}
+	// The degenerate entry is invalidated so the next GET re-splits in one streaming fetch.
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
+		t.Fatal("degenerate mass-evicted entry survived the degraded serve")
+	}
+}
+
+// Promotion must never extend an entry's lifetime: the rewritten meta carries only the
+// REMAINING TTL computed from CachedAt, and entries with unknown age (or already expired)
+// are not rewritten at all.
+func TestRemainingMetaTTL(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	svc, _ := newBlockService(t, mock)
+	svc.config.Cache.TTL = time.Hour
+	now := time.Now().Unix()
+	cases := []struct {
+		name     string
+		cachedAt int64
+		min, max int
+	}{
+		{"fresh entry keeps ~full TTL", now, 3590, 3600},
+		{"aged entry keeps only the remainder", now - 3500, 90, 110},
+		{"expired entry is not rewritten", now - 4000, 0, 0},
+		{"unknown age is not rewritten", 0, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := svc.remainingMetaTTL(&cache.CachedObjectMeta{CachedAt: tc.cachedAt})
+			if got < tc.min || got > tc.max {
+				t.Errorf("remainingMetaTTL(age=%ds) = %d, want in [%d,%d]", now-tc.cachedAt, got, tc.min, tc.max)
+			}
+		})
 	}
 }
 

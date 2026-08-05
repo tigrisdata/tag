@@ -352,7 +352,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `delete_batch_size`     | int      | `1000`           | File deletions processed per deletion-queue batch                                   |
 | `recovery_workers`      | int      | `16`             | Parallel workers for startup file recovery                                          |
 | `max_concurrent_writes` | int      | `256`            | Max concurrent cache-populate operations (`0`/unset = default, negative = disabled) |
-| `max_populate_memory_bytes` | int  | `1073741824`     | Aggregate memory budget for concurrent cache-populate buffering; each populate reserves its size (capped at the buffer ceiling), applied independently of `max_concurrent_writes` (`0`/unset = default 1 GiB, negative = memory cap disabled) |
+| `max_populate_memory_bytes` | int  | `1073741824`     | Aggregate memory budget for concurrent cache-populate buffering; each populate reserves its size (capped at the buffer ceiling), applied independently of `max_concurrent_writes` (`0`/unset = default 1 GiB, negative = disables both budgets). Also sizes a second, independent budget of the same value for block-serve staging buffers, so total budget-bounded buffering is up to **2×** this value — size container headroom accordingly |
 
 **TTL Format:**
 

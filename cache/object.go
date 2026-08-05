@@ -55,6 +55,13 @@ type CachedObjectMeta struct {
 	// hint, not an invariant: false (including on entries written before the field existed)
 	// only means the probe-first path is used.
 	BlocksComplete bool `json:"blocks_complete,omitempty"`
+	// CachedAt is the Unix time (seconds) this meta was built from a live upstream response.
+	// Rewrites of an existing meta that do NOT consult upstream (the blocks-complete
+	// promotion) use it to compute the entry's remaining TTL so they never extend its
+	// lifetime — re-stamping a full TTL would reset the staleness clock and let the meta
+	// outlive its blocks. 0 (entries written before the field existed) means the age is
+	// unknown and no lifetime-sensitive rewrite is allowed.
+	CachedAt int64 `json:"cached_at,omitempty"`
 }
 
 // MetaFromHTTPHeaders builds CachedObjectMeta from S3 response headers.
@@ -63,6 +70,7 @@ func MetaFromHTTPHeaders(bucket, key string, statusCode int, headers http.Header
 		Key:                  key,
 		Bucket:               bucket,
 		StatusCode:           statusCode,
+		CachedAt:             time.Now().Unix(),
 		ETag:                 headers.Get("ETag"),
 		ContentType:          headers.Get("Content-Type"),
 		CacheControl:         headers.Get("Cache-Control"),

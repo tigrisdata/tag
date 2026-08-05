@@ -215,6 +215,13 @@ type CacheConfig struct {
 	// Applied independently of MaxConcurrentWrites (both limits apply). 0 or unset
 	// uses DefaultCacheMaxPopulateMemoryBytes; a negative value disables the memory
 	// cap (count-only, prior behavior).
+	//
+	// This value ALSO sizes a second, independent budget for block-serve staging
+	// buffers (see proxy.NewService): warm block serves hold staging bytes for a whole
+	// response and must not crowd populates out of a shared pool, so the aggregate
+	// budget-bounded buffering is up to 2x this value under combined populate +
+	// warm-serve load. Size container memory headroom accordingly. A negative value
+	// disables both budgets.
 	MaxPopulateMemoryBytes int64 `yaml:"max_populate_memory_bytes"`
 	// WarmOnWrite, when true, repopulates the cache after a successful write
 	// (PutObject / CompleteMultipartUpload / CopyObject) by triggering a background
