@@ -68,6 +68,7 @@ type Service struct {
 	config                  *config.Config
 	cacheSemaphore          chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
 	populateBudget          *byteBudget        // Byte budget bounding aggregate populate buffering (nil = unlimited)
+	serveStagingBudget      *byteBudget        // Byte budget bounding block-serve staging buffers (nil = unlimited)
 	perPopulateCap          int64              // Max bytes a single populate can buffer (reservation ceiling)
 	broadcastManager        *broadcast.Manager // For streaming request coalescing
 	activeBackgroundFetches sync.Map           // Dedup for background full-object fetches (range caching)
@@ -98,6 +99,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 	perPopulateCap := perPopulateBufferBytes(cfg)
 
 	var populateBudget *byteBudget
+	var serveStagingBudget *byteBudget
 	if cfg.Cache.MaxPopulateMemoryBytes > 0 {
 		// Reserve a share of the budget for warm-on-write only when it's enabled;
 		// otherwise there's no warm path to protect.
@@ -106,6 +108,16 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 			reserveFraction = cfg.Cache.WarmOnWriteReservedFraction
 		}
 		populateBudget = newByteBudget(cfg.Cache.MaxPopulateMemoryBytes, reserveFraction, perPopulateCap)
+		// Block-serve staging buffers (pre-commit range/first-block assembly, the
+		// streaming pipeline's double buffers) get their OWN budget of the same size,
+		// never the populate budget: a warm multi-block serve holds its staging bytes
+		// for the whole (possibly multi-second) response, and at high concurrency
+		// those long holds would crowd cold-miss populates out of a shared budget —
+		// objects get served but never cached, and the working set stays cold
+		// (measured as a ~3x warm-GET collapse). Staging memory is still bounded (by
+		// this budget — declines degrade the serve, never fail it); it just cannot
+		// starve populates. Warm-on-write reservation semantics don't apply here.
+		serveStagingBudget = newByteBudget(cfg.Cache.MaxPopulateMemoryBytes, 0, perPopulateCap)
 	}
 
 	log.Info().
@@ -115,13 +127,14 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		Msg("Cache-populate limits configured")
 
 	return &Service{
-		forwarder:        forwarder,
-		cache:            cache,
-		config:           cfg,
-		cacheSemaphore:   cacheSem,
-		populateBudget:   populateBudget,
-		perPopulateCap:   perPopulateCap,
-		broadcastManager: broadcast.NewManager(channelBuf),
+		forwarder:          forwarder,
+		cache:              cache,
+		config:             cfg,
+		cacheSemaphore:     cacheSem,
+		populateBudget:     populateBudget,
+		serveStagingBudget: serveStagingBudget,
+		perPopulateCap:     perPopulateCap,
+		broadcastManager:   broadcast.NewManager(channelBuf),
 	}
 }
 

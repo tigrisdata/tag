@@ -135,21 +135,21 @@ func (s *Service) serveRangeFromBlockCache(
 	// warm-serve cache ops versus the probe-then-stream path below); a missing block is
 	// discovered by that same read and fetched pre-commit, so every failure still leaves the
 	// response unwritten for a clean upstream fall-through — identical semantics, fewer ops.
-	// The buffer (<= one block) is reserved against the populate byte budget — but NOT a
-	// cacheSemaphore count slot, which bounds concurrent cache WRITES and must not be held
-	// across a (possibly slow) client write. On budget decline, serve via the probe path.
+	// The buffer (<= one block) is reserved against the serve-staging byte budget (NOT the
+	// populate budget — long-held serve buffers must not crowd out cold-miss populates — and
+	// NOT a cacheSemaphore count slot, which bounds concurrent cache WRITES and must not be
+	// held across a (possibly slow) client write). On budget decline, serve via the probe path.
 	if rangeLen := rng.end - rng.start + 1; rangeLen <= meta.BlockSize {
 		weight := s.populateWeight(rangeLen)
-		if s.populateBudget == nil || s.populateBudget.tryAcquireReadMiss(weight) {
+		if s.serveStagingBudget == nil || s.serveStagingBudget.tryAcquireReadMiss(weight) {
 			assembled, aerr := s.serveAssembledRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng, startTime)
-			if s.populateBudget != nil {
-				s.populateBudget.release(weight)
+			if s.serveStagingBudget != nil {
+				s.serveStagingBudget.release(weight)
 			}
-			// A budget-declined block fetch during assembly may have been starved by our own
-			// buffer reservation (assembly holds `weight` while the fetch reserves the block
-			// size on top). Nothing is committed on that path, and the reservation is released
-			// above — so retry via the probe path below, whose fetch can use the freed budget,
-			// instead of falling through to upstream a serve the probe path could still cache.
+			// A budget-declined block fetch during assembly means the populate budget is
+			// saturated. Nothing is committed on that path, so retry via the probe path below
+			// — populate budget may have freed by then, and a still-declined fetch there falls
+			// through to upstream exactly as this path would have.
 			if !assembled && errors.Is(aerr, errCachePopulateDeclined) {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Assembly block fetch budget-declined - retrying via probe path")
 			} else {
@@ -355,8 +355,9 @@ func (s *Service) serveAssembledRange(
 // the client write latency overlap instead of adding up — the structural stall that made warm
 // multi-block GETs trail whole-object serves (whose single contiguous body never waits
 // per-block). The pipeline holds at most two block buffers (one draining to the client, one
-// filling), reserved against the populate byte budget; on decline — and for single-block
-// serves, where there is nothing to overlap — it degrades to the direct sequential path.
+// filling), reserved against the serve-staging byte budget (never the populate budget — see
+// NewService); on decline — and for single-block serves, where there is nothing to overlap —
+// it degrades to the direct sequential path.
 func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (fetched int64, err error) {
 	cw := &countingWriter{w: w}
 	defer func() {
@@ -372,12 +373,12 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 		return s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
 	}
 	weight := s.populateWeight(2 * meta.BlockSize)
-	if s.populateBudget != nil {
-		if !s.populateBudget.tryAcquireReadMiss(weight) {
+	if s.serveStagingBudget != nil {
+		if !s.serveStagingBudget.tryAcquireReadMiss(weight) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Pipeline buffer budget declined - streaming blocks sequentially")
 			return s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
 		}
-		defer s.populateBudget.release(weight)
+		defer s.serveStagingBudget.release(weight)
 	}
 	return s.streamBlockRangePipelined(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
 }
@@ -510,19 +511,19 @@ func (s *Service) serveFullObjectFromBlockCache(
 	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
 
 	// Probe-free fast path for complete entries. The first-block buffer (<= one block) is
-	// reserved against the populate byte budget like the assembled-range path; on decline the
-	// probe-first path below still serves.
+	// reserved against the serve-staging byte budget like the assembled-range path; on
+	// decline the probe-first path below still serves.
 	if meta.BlocksComplete {
 		firstLen := min(meta.BlockSize, meta.ContentLength)
 		weight := s.populateWeight(firstLen)
-		if s.populateBudget == nil || s.populateBudget.tryAcquireReadMiss(weight) {
+		if s.serveStagingBudget == nil || s.serveStagingBudget.tryAcquireReadMiss(weight) {
 			served, err = s.serveCompleteFromBlocks(ctx, w, bucket, key, accessKey, secretKey, meta, startTime)
-			if s.populateBudget != nil {
-				s.populateBudget.release(weight)
+			if s.serveStagingBudget != nil {
+				s.serveStagingBudget.release(weight)
 			}
-			// A budget-declined first-block fetch may have been starved by our own buffer
-			// reservation (released above); the probe path below can still assemble and serve
-			// from cache, so retry there instead of surrendering to a full upstream GET.
+			// A budget-declined first-block fetch means the populate budget is saturated; the
+			// probe path below can still assemble and serve from cache if budget frees, so
+			// retry there instead of surrendering directly to a full upstream GET.
 			if !served && errors.Is(err, errCachePopulateDeclined) {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Complete-serve block fetch budget-declined - retrying via probe path")
 			} else {
