@@ -1546,3 +1546,90 @@ func TestBlockCache_PartialEntryPromotedAfterFullAssembly(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// A definitive stale signal (upstream 404) surfacing from a mid-serve inline fetch must
+// invalidate the BlocksComplete entry even though headers are already committed — otherwise
+// every later full GET commits and truncates the same way until the meta TTL expires.
+func TestBlockCache_CompleteEntryMidServeStaleSignalInvalidates(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	memCache := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// Complete entry via a cold full GET.
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	// Evict block 1, then delete the object out of band: the mid-serve inline fetch 404s.
+	if err := memCache.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 1)); err != nil {
+		t.Fatalf("delete block 1: %v", err)
+	}
+	mock.blockGet404 = true
+
+	w2 := httptest.NewRecorder()
+	err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey))
+	if err == nil {
+		t.Fatal("mid-serve stale fetch: want a (truncation) error, got nil")
+	}
+	// The stale entry must be gone so the next GET re-resolves upstream instead of
+	// repeating the truncation.
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
+		t.Fatal("stale BlocksComplete entry survived a definitive mid-serve stale signal")
+	}
+}
+
+// A budget-declined recovery fetch for the first block of a complete entry retries via the
+// probe path (whose fetch can use the freed buffer reservation) instead of surrendering the
+// serve to a full upstream GET.
+func TestBlockCache_CompleteEntryBudgetContentionRetriesViaProbePath(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	// Budget of 5: the 4-byte first-block buffer reservation leaves 1, so the recovery
+	// fetch's own 4-byte reservation declines inside the complete path; the probe-path
+	// retry (buffer released) fits.
+	memCache := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	cfg.Cache.MaxPopulateMemoryBytes = 5
+	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// Complete entry via a cold full GET (its populate reserves and releases first).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if !meta.BlocksComplete {
+		t.Fatal("entry not marked complete")
+	}
+
+	// Evict block 0 so the complete path needs a recovery fetch it cannot budget.
+	if err := memCache.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 0)); err != nil {
+		t.Fatalf("delete block 0: %v", err)
+	}
+
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET under budget pressure: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("full GET: code=%d body=%q, want 200 ABCDEFGHIJ", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q (probe-path retry should serve from cache)", got, XCacheHit)
+	}
+}

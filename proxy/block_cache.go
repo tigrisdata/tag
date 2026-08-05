@@ -392,15 +392,17 @@ func (s *Service) serveFullObjectFromBlockCache(
 			if s.populateBudget != nil {
 				s.populateBudget.release(weight)
 			}
-			if served || err != nil {
+			// A budget-declined first-block fetch may have been starved by our own buffer
+			// reservation (released above); the probe path below can still assemble and serve
+			// from cache, so retry there instead of surrendering to a full upstream GET.
+			if !served && errors.Is(err, errCachePopulateDeclined) {
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Complete-serve block fetch budget-declined - retrying via probe path")
+			} else {
 				return served, err
 			}
-			// (false, nil): first block unrecoverable pre-commit — fall through to the miss
-			// path via the caller (a probe pass over an entry we already failed to read
-			// would just repeat the failure).
-			return false, nil
+		} else {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Complete-serve buffer budget declined - serving via probe path")
 		}
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Complete-serve buffer budget declined - serving via probe path")
 	}
 
 	// Stamp the promotion's write-start BEFORE the assembly work below: any invalidation that
@@ -519,6 +521,14 @@ func (s *Service) serveCompleteFromBlocks(
 		var streamed int64
 		streamed, berr = s.streamBlockRangeInlineFetch(ctx, w, bucket, key, accessKey, secretKey, meta, firstEnd+1, meta.ContentLength-1)
 		fetched += streamed
+		// A definitive stale signal from a mid-serve inline fetch must still invalidate,
+		// even though headers are committed (this response truncates either way): leaving
+		// the stale BlocksComplete entry in place would have every later full GET commit
+		// and truncate the same way until the meta TTL expires.
+		if errors.Is(berr, errBlockETagMismatch) || errors.Is(berr, errBlockUpstreamGone) {
+			log.Debug().Err(berr).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
+			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		}
 	}
 	total := lastBlock + 1
 	metrics.CacheBlockHits.Add(float64(total - fetched))
