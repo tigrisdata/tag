@@ -1798,3 +1798,30 @@ func TestBlockCache_PipelineClientWriteFailureUnwindsCleanly(t *testing.T) {
 		t.Fatal("serve did not return after a mid-body client write failure (pipeline reader stuck?)")
 	}
 }
+
+// A client write failure on the SEQUENTIAL stream path (where cache bytes write straight
+// into the client connection) must not trigger the upstream remainder salvage: the client is
+// broken, not the cache, so retrying from upstream would waste a round trip on a dead
+// connection. Pins the clientWriteTracker classification.
+func TestBlockCache_SequentialClientWriteFailureDoesNotFetchRemainder(t *testing.T) {
+	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes → 20 2-byte blocks
+	mock := newBlockMock(object, `"v1"`)
+	// Budget 5: the complete path's first-block reservation (2) leaves 3, so the pipeline's
+	// two-buffer reservation (4) declines and the stream takes the sequential path.
+	svc, c := newBlockServiceWithBudget(t, mock, 2, 5)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	before := mock.blockGets.Load()
+	fw := &failAfterWriter{ResponseWriter: httptest.NewRecorder(), remaining: 9}
+	_ = svc.HandleGetObject(fw, fullGet(wowBucket, wowKey))
+	if got := mock.blockGets.Load() - before; got != 0 {
+		t.Errorf("client write failure triggered %d upstream requests, want 0 (no remainder salvage)", got)
+	}
+}

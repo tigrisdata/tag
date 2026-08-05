@@ -392,7 +392,7 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 	if err == nil {
 		return out, nil
 	}
-	if errors.Is(err, errBlockStreamDegraded) && ctx.Err() == nil {
+	if errors.Is(err, errBlockStreamDegraded) && ctx.Err() == nil && start+cw.written <= end {
 		// The committed response can still be completed byte-exact from upstream: cw.written
 		// counts exactly the bytes delivered so far (buffered blocks are written whole; a
 		// direct-streamed partial block advances it precisely), so the remainder picks up at
@@ -527,6 +527,25 @@ func (s *Service) readBlockSlice(ctx context.Context, bucket, key, accessKey, se
 	}
 }
 
+// clientWriteTracker distinguishes write-side failures from cache-read failures on the
+// sequential path, where cache bytes stream STRAIGHT into the client connection: an error
+// surfaced by GetBlockRangeStream could have originated on either side, and only cache-side
+// failures are salvageable by an upstream remainder stream — retrying a broken client write
+// from upstream would waste a round trip on a dead connection (and a bytes-plus-error final
+// write could even mask a fully delivered body).
+type clientWriteTracker struct {
+	w        io.Writer
+	writeErr error
+}
+
+func (t *clientWriteTracker) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if err != nil && t.writeErr == nil {
+		t.writeErr = err
+	}
+	return n, err
+}
+
 // streamBlockRangeSequential is streamBlockRange's unbuffered fallback (single-block serves,
 // or the pipeline's buffer budget declined): each block streams from cache directly into the
 // client writer with no staging buffer. Because the read target IS the response body here, an
@@ -536,11 +555,12 @@ func (s *Service) readBlockSlice(ctx context.Context, bucket, key, accessKey, se
 func (s *Service) streamBlockRangeSequential(ctx context.Context, cw *countingWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (out streamOutcome, err error) {
 	b0, bK := coveringBlocks(start, end, meta.BlockSize)
 	fetchesLeft := int64(maxInlineFetchesPerServe)
+	tw := &clientWriteTracker{w: cw}
 	for i := b0; i <= bK; i++ {
 		localStart, localEnd := blockLocalRange(i, start, end, meta.BlockSize, meta.ContentLength)
 		before := cw.written
 		wasFetched := false
-		berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, cw)
+		berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, tw)
 		if errors.Is(berr, cache.ErrNotFound) && cw.written == before {
 			if fetchesLeft <= 0 {
 				return out, errBlocksMostlyAbsent
@@ -554,9 +574,14 @@ func (s *Service) streamBlockRangeSequential(ctx context.Context, cw *countingWr
 			}
 			out.fetched++
 			wasFetched = true
-			berr = s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, cw)
+			berr = s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, tw)
 		}
 		if berr != nil {
+			// A write-side failure is the client's, not the cache's: return it raw so the
+			// caller truncates instead of attempting an upstream remainder salvage.
+			if tw.writeErr != nil {
+				return out, berr
+			}
 			return out, fmt.Errorf("block %d stream failed (%w): %w", i, berr, errBlockStreamDegraded)
 		}
 		if !wasFetched {
