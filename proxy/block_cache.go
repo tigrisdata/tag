@@ -133,12 +133,23 @@ func (s *Service) serveRangeFromBlockCache(
 	if rangeLen := rng.end - rng.start + 1; rangeLen <= meta.BlockSize {
 		weight := s.populateWeight(rangeLen)
 		if s.populateBudget == nil || s.populateBudget.tryAcquireReadMiss(weight) {
+			assembled, aerr := s.serveAssembledRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng, startTime)
 			if s.populateBudget != nil {
-				defer s.populateBudget.release(weight)
+				s.populateBudget.release(weight)
 			}
-			return s.serveAssembledRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng, startTime)
+			// A budget-declined block fetch during assembly may have been starved by our own
+			// buffer reservation (assembly holds `weight` while the fetch reserves the block
+			// size on top). Nothing is committed on that path, and the reservation is released
+			// above — so retry via the probe path below, whose fetch can use the freed budget,
+			// instead of falling through to upstream a serve the probe path could still cache.
+			if !assembled && errors.Is(aerr, errCachePopulateDeclined) {
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Assembly block fetch budget-declined - retrying via probe path")
+			} else {
+				return assembled, aerr
+			}
+		} else {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Assembly buffer budget declined - serving range via probe path")
 		}
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Assembly buffer budget declined - serving range via probe path")
 	}
 
 	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)

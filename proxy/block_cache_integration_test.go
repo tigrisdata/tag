@@ -1348,3 +1348,42 @@ func TestBlockCache_WarmFullGetManyBlocksServesFromCache(t *testing.T) {
 		t.Errorf("warm serve fetched %d blocks from upstream, want 0", got)
 	}
 }
+
+// Under budget pressure where the assembly buffer's reservation leaves no room for the
+// missing-block fetch's own reservation (budget fits one but not both), the serve must not
+// give up and fall through to upstream: the assembly reservation is released and the probe
+// path retries, whose fetch can use the freed budget — the block is populated and the range
+// served from cache. Pins the double-reservation fix.
+func TestBlockCache_AssemblyBudgetContentionRetriesViaProbePath(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	// Budget of 5 bytes: the 4-byte assembly buffer reservation leaves 1 byte, so the 4-byte
+	// block-fetch reservation inside assembly must decline; once assembly releases, the probe
+	// path's fetch fits.
+	svc, c := newBlockServiceWithBudget(t, mock, 4, 5)
+
+	// Establish only block 0 (the populate's own reservation completes and releases first —
+	// metaCached gates on the meta write, which happens after the fetch releases).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("block-mode meta not populated")
+	}
+
+	// Block 1 is missing. Assembly's fetch is budget-starved by the buffer reservation; the
+	// retry via the probe path must still fetch, cache, and serve it as a HIT.
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=4-7")); err != nil {
+		t.Fatalf("partial hit under budget pressure: %v", err)
+	}
+	if w2.Code != http.StatusPartialContent || w2.Body.String() != "EFGH" {
+		t.Fatalf("partial hit: code=%d body=%q, want 206 EFGH", w2.Code, w2.Body.String())
+	}
+	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q (probe-path retry should serve from cache)", got, XCacheHit)
+	}
+	if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 1) {
+		t.Error("block 1 not cached after probe-path retry")
+	}
+}
