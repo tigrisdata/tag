@@ -99,15 +99,10 @@ const (
 	// cache-populate operations.
 	DefaultCacheMaxConcurrentWrites = 256
 
-	// DefaultCacheMaxPopulateMemoryBytes bounds the aggregate memory buffered by all cache
-	// buffering — cache-populate AND block-serve staging, which share this one budget (2 GiB).
-	// Each populate reserves the object's size, capped at the per-populate buffer ceiling (roughly
-	// (channel_buffer + max(channel_buffer/4, 64)) × chunk_size); block-serve staging draws from
-	// the same pool, capped at half of it so it can't starve populates. A byte-unaware count alone
-	// (MaxConcurrentWrites) can pin gigabytes under large-object fan-out — e.g. 256 large populates
-	// × ~80 MB ≈ 20 GB — so this budget, not the count, is what actually bounds populate memory.
-	// It is an honest total: buffering never exceeds this value (block caching used to add a second
-	// same-size budget, silently doubling it; now the two share one pool).
+	// DefaultCacheMaxPopulateMemoryBytes is the default for MaxPopulateMemoryBytes (2 GiB); see
+	// that field for the budget's contract. A byte-unaware count alone (MaxConcurrentWrites) can
+	// pin gigabytes under large-object fan-out — e.g. 256 large populates × ~80 MB ≈ 20 GB — so a
+	// byte budget, not the count, is what actually bounds this memory.
 	DefaultCacheMaxPopulateMemoryBytes = 2 << 30
 
 	// DefaultWarmOnWriteReservedFraction is the default cap on the fraction of the
@@ -221,8 +216,7 @@ type CacheConfig struct {
 	// Block-serve staging buffers (see proxy.NewService) draw from this SAME budget but are
 	// capped at half of it, so warm block serves — which hold staging bytes for a whole response —
 	// can never starve cold-miss populates, while populates can still use the entire budget when
-	// no serve is staging. (Block caching previously sized a second, same-size budget from this
-	// value, silently doubling the effective ceiling; it is now a single shared pool.)
+	// no serve is staging.
 	MaxPopulateMemoryBytes int64 `yaml:"max_populate_memory_bytes"`
 	// WarmOnWrite, when true, repopulates the cache after a successful write
 	// (PutObject / CompleteMultipartUpload / CopyObject) by triggering a background
