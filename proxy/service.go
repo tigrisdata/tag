@@ -111,18 +111,17 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		populateBudget = newByteBudget(total, reserveFraction, perPopulateCap)
 		// Block-serve staging buffers (pre-commit range/first-block assembly, the streaming
 		// pipeline's double buffers) draw from this SAME budget — so max_populate_memory_bytes is
-		// an honest total, not a hidden 2x — but are capped at half of it. A warm multi-block
+		// an honest total, not a hidden 2x — but are capped at HALF of it. A warm multi-block
 		// serve holds its staging bytes for the whole (possibly multi-second) response, and at
 		// high concurrency those long holds would crowd cold-miss populates out of a shared,
 		// uncapped budget (objects served but never cached, working set stays cold — a ~3x
-		// warm-GET collapse; see #141). The cap guarantees populates a floor of total-stagingCap;
-		// staging still uses the whole free budget when populates are idle, and declines only
-		// degrade a serve (never fail it). Floor the cap so at least one max staging buffer (an
-		// assembled range spans <= 2 blocks) fits even at a small budget with large blocks.
+		// warm-GET collapse; see #141). The half cap guarantees populates a constant floor of
+		// total/2; staging still uses that whole half when populates are idle, and populates use
+		// the whole budget when nothing is staging. The 2 GiB default dwarfs any realistic block,
+		// so a staging buffer always fits; only a misconfigured budget of a few blocks or fewer
+		// makes a buffer exceed the cap, and then that serve simply takes a degraded path
+		// (probe-first / sequential / uncached remainder) — never a failed request.
 		stagingCap = total / 2
-		if minStaging := 2 * cfg.Cache.BlockSize; minStaging > stagingCap && minStaging <= total {
-			stagingCap = minStaging
-		}
 		populateBudget.stagingCap = stagingCap
 	}
 
