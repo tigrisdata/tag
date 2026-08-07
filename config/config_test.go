@@ -533,7 +533,7 @@ func TestLoad_BlockCachingEnabledOverrideByEnv(t *testing.T) {
 		env  string
 		want bool
 	}{
-		{"default off", "cache:\n  enabled: true\n", "", false},
+		{"default on", "cache:\n  enabled: true\n", "", true},
 		{"yaml on", "cache:\n  enabled: true\n  block_caching_enabled: true\n", "", true},
 		{"env enables", "cache:\n  enabled: true\n", "true", true},
 		{"env disables over yaml", "cache:\n  enabled: true\n  block_caching_enabled: true\n", "false", false},
@@ -553,8 +553,8 @@ func TestLoad_BlockCachingEnabledOverrideByEnv(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
 			}
-			if cfg.Cache.BlockCachingEnabled != tc.want {
-				t.Errorf("BlockCachingEnabled = %v, want %v", cfg.Cache.BlockCachingEnabled, tc.want)
+			if cfg.Cache.IsBlockCachingEnabled() != tc.want {
+				t.Errorf("BlockCachingEnabled = %v, want %v", cfg.Cache.IsBlockCachingEnabled(), tc.want)
 			}
 		})
 	}
