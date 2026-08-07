@@ -165,10 +165,10 @@ func (s *Service) serveRangeFromBlockCache(
 	// on the same populate budget, so retrying there could only repeat the outcome.
 	if rangeLen := rng.end - rng.start + 1; rangeLen <= meta.BlockSize {
 		weight := s.stagingWeight(rangeLen)
-		if s.serveStagingBudget == nil || s.serveStagingBudget.tryAcquireReadMiss(weight) {
+		if s.populateBudget == nil || s.populateBudget.tryAcquireStaging(weight) {
 			assembled, aerr := s.serveAssembledRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng, startTime)
-			if s.serveStagingBudget != nil {
-				s.serveStagingBudget.release(weight)
+			if s.populateBudget != nil {
+				s.populateBudget.releaseStaging(weight)
 			}
 			return assembled, aerr
 		}
@@ -380,9 +380,9 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 	b0, bK := coveringBlocks(start, end, meta.BlockSize)
 	if b0 == bK {
 		out, err = s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
-	} else if weight := s.stagingWeight(2 * meta.BlockSize); s.serveStagingBudget == nil || s.serveStagingBudget.tryAcquireReadMiss(weight) {
-		if s.serveStagingBudget != nil {
-			defer s.serveStagingBudget.release(weight)
+	} else if weight := s.stagingWeight(2 * meta.BlockSize); s.populateBudget == nil || s.populateBudget.tryAcquireStaging(weight) {
+		if s.populateBudget != nil {
+			defer s.populateBudget.releaseStaging(weight)
 		}
 		out, err = s.streamBlockRangePipelined(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
 	} else {
@@ -658,10 +658,10 @@ func (s *Service) serveFullObjectFromBlockCache(
 	if meta.BlocksComplete {
 		firstLen := min(meta.BlockSize, meta.ContentLength)
 		weight := s.stagingWeight(firstLen)
-		if s.serveStagingBudget == nil || s.serveStagingBudget.tryAcquireReadMiss(weight) {
+		if s.populateBudget == nil || s.populateBudget.tryAcquireStaging(weight) {
 			served, err = s.serveCompleteFromBlocks(ctx, w, bucket, key, accessKey, secretKey, meta, startTime)
-			if s.serveStagingBudget != nil {
-				s.serveStagingBudget.release(weight)
+			if s.populateBudget != nil {
+				s.populateBudget.releaseStaging(weight)
 			}
 			// Any pre-commit failure (including a budget-declined first-block fetch) returns
 			// served=false with the response untouched and the caller forwards upstream — the

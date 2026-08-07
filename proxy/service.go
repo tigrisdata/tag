@@ -67,8 +67,7 @@ type Service struct {
 	cache                   *cache.Cache
 	config                  *config.Config
 	cacheSemaphore          chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
-	populateBudget          *byteBudget        // Byte budget bounding aggregate populate buffering (nil = unlimited)
-	serveStagingBudget      *byteBudget        // Byte budget bounding block-serve staging buffers (nil = unlimited)
+	populateBudget          *byteBudget        // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
 	perPopulateCap          int64              // Max bytes a single populate can buffer (reservation ceiling)
 	broadcastManager        *broadcast.Manager // For streaming request coalescing
 	activeBackgroundFetches sync.Map           // Dedup for background full-object fetches (range caching)
@@ -99,25 +98,32 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 	perPopulateCap := perPopulateBufferBytes(cfg)
 
 	var populateBudget *byteBudget
-	var serveStagingBudget *byteBudget
+	// stagingCap is the share of the budget block-serve staging may hold; logged below.
+	var stagingCap int64
 	if cfg.Cache.MaxPopulateMemoryBytes > 0 {
+		total := cfg.Cache.MaxPopulateMemoryBytes
 		// Reserve a share of the budget for warm-on-write only when it's enabled;
 		// otherwise there's no warm path to protect.
 		reserveFraction := 0.0
 		if cfg.Cache.WarmOnWrite {
 			reserveFraction = cfg.Cache.WarmOnWriteReservedFraction
 		}
-		populateBudget = newByteBudget(cfg.Cache.MaxPopulateMemoryBytes, reserveFraction, perPopulateCap)
-		// Block-serve staging buffers (pre-commit range/first-block assembly, the
-		// streaming pipeline's double buffers) get their OWN budget of the same size,
-		// never the populate budget: a warm multi-block serve holds its staging bytes
-		// for the whole (possibly multi-second) response, and at high concurrency
-		// those long holds would crowd cold-miss populates out of a shared budget —
-		// objects get served but never cached, and the working set stays cold
-		// (measured as a ~3x warm-GET collapse). Staging memory is still bounded (by
-		// this budget — declines degrade the serve, never fail it); it just cannot
-		// starve populates. Warm-on-write reservation semantics don't apply here.
-		serveStagingBudget = newByteBudget(cfg.Cache.MaxPopulateMemoryBytes, 0, perPopulateCap)
+		populateBudget = newByteBudget(total, reserveFraction, perPopulateCap)
+		// Block-serve staging buffers (pre-commit range/first-block assembly, the streaming
+		// pipeline's double buffers) draw from this SAME budget — so max_populate_memory_bytes is
+		// an honest total, not a hidden 2x — but are capped at half of it. A warm multi-block
+		// serve holds its staging bytes for the whole (possibly multi-second) response, and at
+		// high concurrency those long holds would crowd cold-miss populates out of a shared,
+		// uncapped budget (objects served but never cached, working set stays cold — a ~3x
+		// warm-GET collapse; see #141). The cap guarantees populates a floor of total-stagingCap;
+		// staging still uses the whole free budget when populates are idle, and declines only
+		// degrade a serve (never fail it). Floor the cap so at least one max staging buffer (an
+		// assembled range spans <= 2 blocks) fits even at a small budget with large blocks.
+		stagingCap = total / 2
+		if minStaging := 2 * cfg.Cache.BlockSize; minStaging > stagingCap && minStaging <= total {
+			stagingCap = minStaging
+		}
+		populateBudget.stagingCap = stagingCap
 	}
 
 	// The block buffer pool's retention cap must track the configured block size, or every
@@ -130,18 +136,17 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		Int("max_concurrent_writes", cfg.Cache.MaxConcurrentWrites).
 		Int64("max_populate_memory_bytes", cfg.Cache.MaxPopulateMemoryBytes).
 		Int64("per_populate_buffer_cap_bytes", perPopulateCap).
-		Int64("serve_staging_budget_bytes", cfg.Cache.MaxPopulateMemoryBytes).
+		Int64("serve_staging_cap_bytes", stagingCap).
 		Msg("Cache-populate limits configured")
 
 	return &Service{
-		forwarder:          forwarder,
-		cache:              cache,
-		config:             cfg,
-		cacheSemaphore:     cacheSem,
-		populateBudget:     populateBudget,
-		serveStagingBudget: serveStagingBudget,
-		perPopulateCap:     perPopulateCap,
-		broadcastManager:   broadcast.NewManager(channelBuf),
+		forwarder:        forwarder,
+		cache:            cache,
+		config:           cfg,
+		cacheSemaphore:   cacheSem,
+		populateBudget:   populateBudget,
+		perPopulateCap:   perPopulateCap,
+		broadcastManager: broadcast.NewManager(channelBuf),
 	}
 }
 
@@ -243,7 +248,13 @@ type byteBudget struct {
 	cond        *sync.Cond // signaled on release so waiting warm-on-write acquirers wake
 	remaining   int64
 	pendingWarm int64 // sum of weights of warm-on-write acquirers currently waiting
-	reserveCap  int64 // max bytes read-miss will hold back for pending warm-on-write
+	reserveCap  int64 // max bytes read-miss/staging will hold back for pending warm-on-write
+	// Block-serve staging buffers draw from this SAME budget (one honest total) but are bounded
+	// to stagingCap, guaranteeing populates a floor of (remaining not below total-stagingCap) so
+	// long-held serve buffers can never starve cold-miss populates (the #141 isolation). Staging
+	// is unrestricted (stagingCap == total) unless a caller sets a smaller cap.
+	stagingInUse int64 // bytes currently held by block-serve staging buffers
+	stagingCap   int64 // max bytes staging may hold at once
 }
 
 // newByteBudget creates a budget of `total` bytes. reserveFraction (clamped to
@@ -268,7 +279,9 @@ func newByteBudget(total int64, reserveFraction float64, perPopulateCap int64) *
 	if cap > total {
 		cap = total
 	}
-	b := &byteBudget{remaining: total, reserveCap: cap}
+	// Default: staging may use the whole budget (no extra cap). Callers that run block-serve
+	// staging (NewService) set a smaller stagingCap to guarantee populates a floor.
+	b := &byteBudget{remaining: total, reserveCap: cap, stagingCap: total}
 	b.cond = sync.NewCond(&b.mu)
 	return b
 }
@@ -325,6 +338,42 @@ func (b *byteBudget) acquireWarm(ctx context.Context, n int64) bool {
 func (b *byteBudget) release(n int64) {
 	b.mu.Lock()
 	b.remaining += n
+	b.cond.Broadcast() // wake warm-on-write waiters to re-check the freed budget
+	b.mu.Unlock()
+}
+
+// tryAcquireStaging reserves n bytes for a block-serve staging buffer without blocking. Staging
+// draws from the same pool as populates, so the configured budget is an honest total, but is
+// additionally bounded to stagingCap — this guarantees populates a floor (the budget can't drop
+// below total-stagingCap through staging alone), so long-held serve buffers never starve
+// cold-miss populates (without this isolation, warm-GET throughput collapsed ~3x; see #141). Like
+// read-miss it also leaves room for pending warm-on-write, so warm is never starved regardless of
+// how stagingCap and the warm reserve are configured. Pair a true return with releaseStaging(n).
+func (b *byteBudget) tryAcquireStaging(n int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.stagingInUse+n > b.stagingCap {
+		return false
+	}
+	reserve := b.pendingWarm
+	if reserve > b.reserveCap {
+		reserve = b.reserveCap
+	}
+	if b.remaining-n < reserve {
+		return false
+	}
+	b.remaining -= n
+	b.stagingInUse += n
+	return true
+}
+
+// releaseStaging returns n staging bytes to the pool. It MUST pair with a successful
+// tryAcquireStaging(n): using the plain release() would leave stagingInUse elevated, permanently
+// shrinking the effective staging cap until restart.
+func (b *byteBudget) releaseStaging(n int64) {
+	b.mu.Lock()
+	b.remaining += n
+	b.stagingInUse -= n
 	b.cond.Broadcast() // wake warm-on-write waiters to re-check the freed budget
 	b.mu.Unlock()
 }

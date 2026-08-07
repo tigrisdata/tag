@@ -135,7 +135,7 @@ A single size knob, `block_size`, is the whole↔block boundary; the earlier `wr
 
 Why one knob: block-caching a sub-block object is identical to whole-caching it, so `block_size` is the natural boundary. It governs every populate path uniformly — read misses, full-GET misses, and warm-on-write all split block-eligible objects into blocks and whole-cache the rest — so representation is a function of size alone, with no separate warm cap and no per-access-pattern collision to guard. (A `block_min_object_size` knob raising the boundary was trialed and removed: with pipelined serving, block mode sits within ~7% of the whole-object ceiling even at 4 blocks/object, so the extra config surface wasn't warranted.)
 
-The existing `cache.max_populate_memory_bytes` additionally sizes the serve-staging budget — see Memory bounds; no new memory knob is introduced.
+The existing `cache.max_populate_memory_bytes` also bounds serve-staging (one shared budget — see Memory bounds); no new memory knob is introduced.
 
 ### Invalidation and consistency
 
@@ -146,10 +146,10 @@ The existing `cache.max_populate_memory_bytes` additionally sizes the serve-stag
 
 ### Memory bounds
 
-Two independent byte budgets, both sized by `cache.max_populate_memory_bytes` (so the aggregate budget-bounded buffering is up to **2×** that value; negative disables both):
+One byte budget sized by `cache.max_populate_memory_bytes` bounds **all** cache buffering — populate and serve-staging together — so the config value is an honest total (buffering never exceeds it; negative disables the budget). Two classes draw from it:
 
-- **Populate budget** (pre-existing): every block fetch reserves the block's actual size (read-miss priority, non-blocking). A declined fetch means the bytes are served from upstream uncached this time — never a failed request.
-- **Serve-staging budget** (new, independent): the assembled-range buffer, the complete-serve first-block buffer, and the pipeline's two staging buffers reserve their **actual sizes** here, never against the populate budget — a warm serve holds staging bytes for its whole (possibly multi-second) response, and sharing one pool let high-concurrency serving starve cold-miss populates, keeping the working set cold. Staging declines degrade the serve (probe-first path, sequential stream); they never fail it.
+- **Populate** (pre-existing): every block fetch reserves the block's actual size (read-miss priority, non-blocking). A declined fetch means the bytes are served from upstream uncached this time — never a failed request.
+- **Serve-staging**: the assembled-range buffer, the complete-serve first-block buffer, and the pipeline's two staging buffers reserve their **actual sizes** against the same budget, but capped at **half** of it. A warm serve holds staging bytes for its whole (possibly multi-second) response; the cap guarantees populates a floor (the budget can't drop below `total − cap` through staging alone) so high-concurrency serving can't starve cold-miss populates and leave the working set cold — while populates can still use the whole budget when nothing is staging. Staging declines degrade the serve (probe-first path, sequential stream); they never fail it.
 
 Block staging buffers are pooled (`sync.Pool`); the pool's retention cap tracks the configured `block_size` so pooling isn't silently disabled for larger-block deployments.
 

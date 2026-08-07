@@ -98,14 +98,16 @@ const (
 	// cache-populate operations.
 	DefaultCacheMaxConcurrentWrites = 256
 
-	// DefaultCacheMaxPopulateMemoryBytes bounds the aggregate memory buffered by
-	// concurrent cache-populate operations (1 GiB). Each populate reserves the
-	// object's size, capped at the per-populate buffer ceiling (roughly
-	// (channel_buffer + max(channel_buffer/4, 64)) × chunk_size). A byte-unaware
-	// count alone (MaxConcurrentWrites) can pin gigabytes under large-object
-	// fan-out — e.g. 256 large populates × ~80 MB ≈ 20 GB — so this budget, not the
-	// count, is what actually bounds populate memory.
-	DefaultCacheMaxPopulateMemoryBytes = 1 << 30
+	// DefaultCacheMaxPopulateMemoryBytes bounds the aggregate memory buffered by all cache
+	// buffering — cache-populate AND block-serve staging, which share this one budget (2 GiB).
+	// Each populate reserves the object's size, capped at the per-populate buffer ceiling (roughly
+	// (channel_buffer + max(channel_buffer/4, 64)) × chunk_size); block-serve staging draws from
+	// the same pool, capped at half of it so it can't starve populates. A byte-unaware count alone
+	// (MaxConcurrentWrites) can pin gigabytes under large-object fan-out — e.g. 256 large populates
+	// × ~80 MB ≈ 20 GB — so this budget, not the count, is what actually bounds populate memory.
+	// It is an honest total: buffering never exceeds this value (block caching used to add a second
+	// same-size budget, silently doubling it; now the two share one pool).
+	DefaultCacheMaxPopulateMemoryBytes = 2 << 30
 
 	// DefaultWarmOnWriteReservedFraction is the default cap on the fraction of the
 	// cache-populate memory budget reserved for warm-on-write populates (when
@@ -205,23 +207,21 @@ type CacheConfig struct {
 	// unbounded. 0 or unset uses DefaultCacheMaxConcurrentWrites; a negative
 	// value disables the limit.
 	MaxConcurrentWrites int `yaml:"max_concurrent_writes"`
-	// MaxPopulateMemoryBytes bounds the aggregate memory buffered by concurrent
-	// cache-populate operations. Each populate reserves its object size, capped at
-	// the per-populate buffer ceiling (~(channel_buffer + max(channel_buffer/4, 64))
-	// × chunk_size), against this budget; when it can't fit, the object is served
-	// from upstream uncached. Small objects reserve little (high concurrency) while
-	// a burst of large objects is throttled — this is what actually bounds populate
-	// memory, since a byte-unaware count can pin many GB under large-object fan-out.
-	// Applied independently of MaxConcurrentWrites (both limits apply). 0 or unset
-	// uses DefaultCacheMaxPopulateMemoryBytes; a negative value disables the memory
-	// cap (count-only, prior behavior).
+	// MaxPopulateMemoryBytes bounds the aggregate memory buffered by ALL cache buffering —
+	// cache-populate and block-serve staging together — as one honest total: buffering never
+	// exceeds this value. Each populate reserves its object size, capped at the per-populate
+	// buffer ceiling (~(channel_buffer + max(channel_buffer/4, 64)) × chunk_size); when it can't
+	// fit, the object is served from upstream uncached. Small objects reserve little (high
+	// concurrency) while a burst of large objects is throttled — this is what actually bounds
+	// populate memory, since a byte-unaware count can pin many GB under large-object fan-out.
+	// Applied independently of MaxConcurrentWrites (both limits apply). 0 or unset uses
+	// DefaultCacheMaxPopulateMemoryBytes; a negative value disables the budget (count-only).
 	//
-	// This value ALSO sizes a second, independent budget for block-serve staging
-	// buffers (see proxy.NewService): warm block serves hold staging bytes for a whole
-	// response and must not crowd populates out of a shared pool, so the aggregate
-	// budget-bounded buffering is up to 2x this value under combined populate +
-	// warm-serve load. Size container memory headroom accordingly. A negative value
-	// disables both budgets.
+	// Block-serve staging buffers (see proxy.NewService) draw from this SAME budget but are
+	// capped at half of it, so warm block serves — which hold staging bytes for a whole response —
+	// can never starve cold-miss populates, while populates can still use the entire budget when
+	// no serve is staging. (Block caching previously sized a second, same-size budget from this
+	// value, silently doubling the effective ceiling; it is now a single shared pool.)
 	MaxPopulateMemoryBytes int64 `yaml:"max_populate_memory_bytes"`
 	// WarmOnWrite, when true, repopulates the cache after a successful write
 	// (PutObject / CompleteMultipartUpload / CopyObject) by triggering a background

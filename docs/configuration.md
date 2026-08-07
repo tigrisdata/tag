@@ -28,7 +28,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_DELETE_BATCH_SIZE`     | File deletions processed per deletion-queue batch                               | `1000`                   |
 | `TAG_CACHE_RECOVERY_WORKERS`      | Parallel workers for startup file recovery                                      | `16`                     |
 | `TAG_CACHE_MAX_CONCURRENT_WRITES` | Max concurrent cache-populate operations                                        | `256`                    |
-| `TAG_CACHE_MAX_POPULATE_MEMORY`   | Aggregate memory budget (bytes) for concurrent cache-populate buffering         | `1073741824` (1 GiB)     |
+| `TAG_CACHE_MAX_POPULATE_MEMORY`   | Aggregate memory budget (bytes) for all cache buffering — populate + block-serve staging (one honest total) | `2147483648` (2 GiB)     |
 | `TAG_MAX_INFLIGHT_REQUESTS`       | Max concurrently-served S3 requests before shedding with 503 SlowDown           | `1024`                   |
 | `TAG_LOG_LEVEL`                   | Log level: `debug`, `info`, `warn`, `error`                                     | `info`                   |
 | `TAG_LOG_FORMAT`                  | Log format: `json` or `console`                                                 | `json`                   |
@@ -207,16 +207,17 @@ cache:
   # Override with TAG_CACHE_MAX_CONCURRENT_WRITES env var
   max_concurrent_writes: 256
 
-  # Aggregate memory budget for concurrent cache-populate buffering. Each populate
-  # reserves its object size (capped at the per-populate buffer ceiling,
-  # ~(channel_buffer + max(channel_buffer/4, 64)) x chunk_size) against this budget;
-  # when it can't fit, the object is served from upstream uncached. Small objects
-  # reserve little (high concurrency) while a burst of large objects is throttled.
+  # Aggregate memory budget for ALL cache buffering — cache-populate and block-serve
+  # staging share this one pool, so the value is an honest total (buffering never
+  # exceeds it). Each populate reserves its object size (capped at the per-populate
+  # buffer ceiling, ~(channel_buffer + max(channel_buffer/4, 64)) x chunk_size); when
+  # it can't fit, the object is served from upstream uncached. Block-serve staging
+  # draws from the same budget, capped at half of it so it can't starve populates.
   # Applied independently of max_concurrent_writes (both limits apply). This is what
   # actually bounds populate memory — a byte-unaware count can pin many GB.
-  # Default: 1073741824 (1 GiB) (0 or unset = default; negative = memory cap disabled)
+  # Default: 2147483648 (2 GiB) (0 or unset = default; negative = budget disabled)
   # Override with TAG_CACHE_MAX_POPULATE_MEMORY env var
-  max_populate_memory_bytes: 1073741824
+  max_populate_memory_bytes: 2147483648
 
 # Broadcast configuration (request coalescing)
 broadcast:
@@ -352,7 +353,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `delete_batch_size`     | int      | `1000`           | File deletions processed per deletion-queue batch                                   |
 | `recovery_workers`      | int      | `16`             | Parallel workers for startup file recovery                                          |
 | `max_concurrent_writes` | int      | `256`            | Max concurrent cache-populate operations (`0`/unset = default, negative = disabled) |
-| `max_populate_memory_bytes` | int  | `1073741824`     | Aggregate memory budget for concurrent cache-populate buffering; each populate reserves its size (capped at the buffer ceiling), applied independently of `max_concurrent_writes` (`0`/unset = default 1 GiB, negative = disables both budgets). Also sizes a second, independent budget of the same value for block-serve staging buffers, so total budget-bounded buffering is up to **2×** this value — size container headroom accordingly |
+| `max_populate_memory_bytes` | int  | `2147483648`     | Aggregate memory budget for ALL cache buffering — cache-populate and block-serve staging share this one pool, so it is an honest total (buffering never exceeds it). Each populate reserves its size (capped at the buffer ceiling); block-serve staging draws from the same budget capped at half of it, so it can't starve populates. Applied independently of `max_concurrent_writes` (`0`/unset = default 2 GiB, negative = disables the budget) |
 
 **TTL Format:**
 
