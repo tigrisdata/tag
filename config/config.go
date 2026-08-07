@@ -39,13 +39,15 @@ const (
 	// DefaultCacheSizeThreshold is the max object size to cache (1GB).
 	DefaultCacheSizeThreshold = 1024 * 1024 * 1024
 
-	// DefaultCacheBlockSize (4 MiB) is the block granularity AND the read-side whole-vs-block
+	// DefaultCacheBlockSize (1 MiB) is the block granularity AND the read-side whole-vs-block
 	// boundary: a read miss for an object SMALLER than one block is cached as a whole blob
 	// (block-caching a sub-block object is identical to whole-caching it), while an object
-	// this size or LARGER is cached at block granularity. It must stay below ocache's 64 MB
-	// CompactThreshold so blocks pack into shared segments rather than each becoming a
-	// standalone file (see RFC 0001).
-	DefaultCacheBlockSize = 4 * 1024 * 1024
+	// this size or LARGER is cached at block granularity. Sized to typical analytics read
+	// granularity (Parquet footers/row-groups, SST blocks); tune it to your workload's read
+	// size, since an oversized block over-fetches on every miss and amplifies upstream. It must
+	// stay below ocache's 64 MB CompactThreshold so blocks pack into shared segments rather than
+	// each becoming a standalone file (see RFC 0001).
+	DefaultCacheBlockSize = 1 * 1024 * 1024
 
 	// DefaultCacheDiskPath is the default disk path for embedded cache storage.
 	DefaultCacheDiskPath = "/var/cache/tag"
@@ -236,7 +238,7 @@ type CacheConfig struct {
 	// BlockSize is the block granularity AND the read-side whole-vs-block boundary: a read
 	// miss for an object smaller than one block is whole-cached, an object this size or larger
 	// is block-cached. It must stay below ocache's 64 MB CompactThreshold so blocks pack into
-	// shared segments. 0 or unset uses DefaultCacheBlockSize (4 MiB). Only meaningful when
+	// shared segments. 0 or unset uses DefaultCacheBlockSize (1 MiB). Only meaningful when
 	// BlockCachingEnabled is true.
 	BlockSize int64 `yaml:"block_size"`
 	// WarmOnWriteReservedFraction caps the fraction of the populate memory budget
