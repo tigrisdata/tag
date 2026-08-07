@@ -1155,3 +1155,58 @@ func TestTLS_DisabledByDefault(t *testing.T) {
 		t.Error("TLSEnabled() = true, want false (disabled by default)")
 	}
 }
+
+// A stray leading/trailing space in a numeric env override must be tolerated (trimmed), not
+// silently discarded — the exact failure that made a "4 GiB" populate-budget override fall back
+// to the 1 GiB default in a benchmark run.
+func TestLoad_MaxPopulateMemoryOverrideTrimsWhitespace(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	t.Setenv("TAG_CACHE_MAX_POPULATE_MEMORY", "  4294967296 ") // leading + trailing space
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.MaxPopulateMemoryBytes != 4294967296 {
+		t.Errorf("MaxPopulateMemoryBytes = %d, want 4294967296 (whitespace-padded override must apply)", cfg.Cache.MaxPopulateMemoryBytes)
+	}
+}
+
+// A genuinely malformed numeric override falls back to the default (does not crash, does not
+// zero the value) — and Load still succeeds.
+func TestLoad_MaxPopulateMemoryMalformedFallsBackToDefault(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	t.Setenv("TAG_CACHE_MAX_POPULATE_MEMORY", "4GB") // not a plain byte count
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.MaxPopulateMemoryBytes != DefaultCacheMaxPopulateMemoryBytes {
+		t.Errorf("MaxPopulateMemoryBytes = %d, want default %d (malformed override must not apply)",
+			cfg.Cache.MaxPopulateMemoryBytes, DefaultCacheMaxPopulateMemoryBytes)
+	}
+}
+
+// The negative-disables contract survives trimming: "-1" (padded) still disables the budget.
+func TestLoad_MaxPopulateMemoryNegativeDisables(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	t.Setenv("TAG_CACHE_MAX_POPULATE_MEMORY", " -1 ")
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.MaxPopulateMemoryBytes != -1 {
+		t.Errorf("MaxPopulateMemoryBytes = %d, want -1 (negative disables, even whitespace-padded)", cfg.Cache.MaxPopulateMemoryBytes)
+	}
+}

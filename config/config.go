@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"gopkg.in/yaml.v3"
 )
 
@@ -420,6 +421,70 @@ func applyDefaults(cfg *Config) {
 	}
 }
 
+// envInt64 reads env var `key` as a base-10 int64, tolerating surrounding whitespace. It
+// returns ok=false when unset/blank. A non-empty but unparseable value (stray space that
+// isn't just leading/trailing, a typo, "4GB") is logged and treated as unset — the override
+// falls back to YAML/default instead of silently no-opping, so a bad override surfaces.
+func envInt64(key string) (int64, bool) {
+	raw, present := os.LookupEnv(key)
+	if !present {
+		return 0, false
+	}
+	val := strings.TrimSpace(raw)
+	if val == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		log.Warn().Str("env", key).Str("value", raw).Msg("Ignoring malformed integer env override; using config/default")
+		return 0, false
+	}
+	return n, true
+}
+
+// envInt is envInt64 narrowed to int (for count-style knobs).
+func envInt(key string) (int, bool) {
+	n, ok := envInt64(key)
+	return int(n), ok
+}
+
+// envFloat is envInt64's float64 counterpart (trim + warn-on-malformed).
+func envFloat(key string) (float64, bool) {
+	raw, present := os.LookupEnv(key)
+	if !present {
+		return 0, false
+	}
+	val := strings.TrimSpace(raw)
+	if val == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		log.Warn().Str("env", key).Str("value", raw).Msg("Ignoring malformed float env override; using config/default")
+		return 0, false
+	}
+	return f, true
+}
+
+// envBool is envInt64's bool counterpart (trim + warn-on-malformed). Note: security-sensitive
+// booleans that must fail closed do their own explicit parsing and are NOT routed through here.
+func envBool(key string) (bool, bool) {
+	raw, present := os.LookupEnv(key)
+	if !present {
+		return false, false
+	}
+	val := strings.TrimSpace(raw)
+	if val == "" {
+		return false, false
+	}
+	b, err := strconv.ParseBool(val)
+	if err != nil {
+		log.Warn().Str("env", key).Str("value", raw).Msg("Ignoring malformed boolean env override; using config/default")
+		return false, false
+	}
+	return b, true
+}
+
 // applyEnvOverrides applies environment variable overrides to configuration.
 func applyEnvOverrides(cfg *Config) {
 	// Override upstream endpoint from environment
@@ -487,10 +552,8 @@ func applyEnvOverrides(cfg *Config) {
 			}
 		}
 		// Override startup recovery worker count from environment
-		if val := os.Getenv("TAG_CACHE_RECOVERY_WORKERS"); val != "" {
-			if workers, err := strconv.Atoi(val); err == nil && workers > 0 {
-				cfg.Cache.RecoveryWorkers = workers
-			}
+		if workers, ok := envInt("TAG_CACHE_RECOVERY_WORKERS"); ok && workers > 0 {
+			cfg.Cache.RecoveryWorkers = workers
 		}
 		// Override eviction policy from environment ("lru" or "fifo").
 		// Ignore a blank/whitespace-only value so it can't wipe a valid YAML or
@@ -499,43 +562,31 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Cache.EvictionPolicy = val
 		}
 		// Override concurrent cache-write limit from environment
-		if val := os.Getenv("TAG_CACHE_MAX_CONCURRENT_WRITES"); val != "" {
-			if n, err := strconv.Atoi(val); err == nil && n > 0 {
-				cfg.Cache.MaxConcurrentWrites = n
-			}
+		if n, ok := envInt("TAG_CACHE_MAX_CONCURRENT_WRITES"); ok && n > 0 {
+			cfg.Cache.MaxConcurrentWrites = n
 		}
 		// Override cache-populate memory budget from environment (negative disables)
-		if val := os.Getenv("TAG_CACHE_MAX_POPULATE_MEMORY"); val != "" {
-			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n != 0 {
-				cfg.Cache.MaxPopulateMemoryBytes = n
-			}
+		if n, ok := envInt64("TAG_CACHE_MAX_POPULATE_MEMORY"); ok && n != 0 {
+			cfg.Cache.MaxPopulateMemoryBytes = n
 		}
 		// Override cache-warm-on-write from environment (accepts true/false/1/0)
-		if val := os.Getenv("TAG_CACHE_WARM_ON_WRITE"); val != "" {
-			if b, err := strconv.ParseBool(val); err == nil {
-				cfg.Cache.WarmOnWrite = b
-			}
+		if b, ok := envBool("TAG_CACHE_WARM_ON_WRITE"); ok {
+			cfg.Cache.WarmOnWrite = b
 		}
 		// Override block-aligned caching from environment (accepts true/false/1/0).
-		if val := os.Getenv("TAG_CACHE_BLOCK_CACHING_ENABLED"); val != "" {
-			if b, err := strconv.ParseBool(val); err == nil {
-				cfg.Cache.BlockCachingEnabled = b
-			}
+		if b, ok := envBool("TAG_CACHE_BLOCK_CACHING_ENABLED"); ok {
+			cfg.Cache.BlockCachingEnabled = b
 		}
 		// Override the block granularity from environment (0/unset keeps the default).
-		if val := os.Getenv("TAG_CACHE_BLOCK_SIZE"); val != "" {
-			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n > 0 {
-				cfg.Cache.BlockSize = n
-			}
+		if n, ok := envInt64("TAG_CACHE_BLOCK_SIZE"); ok && n > 0 {
+			cfg.Cache.BlockSize = n
 		}
 		// Override the warm-on-write populate reservation fraction from environment.
 		// f != 0 mirrors the sibling budget overrides: an env "0" means "use the
 		// default" (per the documented 0-or-unset contract), not "disable" — a
 		// negative value disables.
-		if val := os.Getenv("TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION"); val != "" {
-			if f, err := strconv.ParseFloat(val, 64); err == nil && f != 0 {
-				cfg.Cache.WarmOnWriteReservedFraction = f
-			}
+		if f, ok := envFloat("TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION"); ok && f != 0 {
+			cfg.Cache.WarmOnWriteReservedFraction = f
 		}
 	}
 	// Clamp the reservation fraction to [0, 1] (negative disables the reservation).
