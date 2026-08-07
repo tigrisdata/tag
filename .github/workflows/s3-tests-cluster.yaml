@@ -28,6 +28,16 @@ jobs:
       contents: read
       packages: write
 
+    # Run the 2-node cluster suite twice: whole-object caching (default) and block-aligned caching
+    # (small block size) enabled on both nodes, so cross-node block routing/fetch gets end-to-end
+    # coverage. fail-fast off so one mode's failure doesn't cancel the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        cache_mode: [default, blocks]
+
+    name: s3-compat-tests-cluster (${{ matrix.cache_mode }})
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -48,7 +58,7 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: make s3-test-local-cluster
+        run: make ${{ matrix.cache_mode == 'blocks' && 's3-test-local-cluster-blocks' || 's3-test-local-cluster' }}
 
       - name: Run S3 compatibility tests
         env:

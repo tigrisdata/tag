@@ -190,6 +190,15 @@ func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) ba
 // originalReq is the original client request, passed to the response interceptor
 // for parsing auth info. It can be nil if no interceptor is set.
 func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) error {
+	_, _, err := b.executeAndStreamReturningMeta(w, fwdReq, inContentLength, originalReq)
+	return err
+}
+
+// executeAndStreamReturningMeta is executeAndStream that also returns the upstream
+// status code and a clone of the upstream response headers. Used by the write-through
+// tee path, which needs the response ETag to build cache metadata for the just-written
+// object without a read-back GET. On a transport error it returns (0, nil, err).
+func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (int, http.Header, error) {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
 	}
@@ -199,7 +208,7 @@ func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Req
 	metrics.RecordUpstreamRequest(fwdReq.Method, time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("method", fwdReq.Method).Str("path", fwdReq.URL.Path).Msg("Failed to forward request")
-		return err
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 
@@ -207,6 +216,10 @@ func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Req
 	if b.responseInterceptor != nil {
 		b.responseInterceptor(resp, originalReq)
 	}
+
+	// Clone response headers before streaming so callers can read the upstream ETag
+	// after the body is consumed.
+	respHeaders := resp.Header.Clone()
 
 	// Stream response back to client
 	copyHeaders(w.Header(), resp.Header)
@@ -218,7 +231,7 @@ func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Req
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 
 	logUpstreamResponse(fwdReq, originalReq, resp.StatusCode, upstreamStart)
-	return nil
+	return resp.StatusCode, respHeaders, nil
 }
 
 // executeAndCapture executes the request, streams to client, and captures the response.

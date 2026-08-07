@@ -272,6 +272,60 @@ enabled. The warm's own outcome (success / failure / shed) is recorded by the
 `tag_background_fetches_*` and `tag_cache_populate_skipped_total` metrics; this counts
 how often a write initiated one.
 
+#### tag_cache_write_through_total
+
+**Type:** Counter
+
+Number of objects cached by teeing the `PutObject` body on the write path
+(write-through): the body is captured as it's forwarded and the object's metadata is sourced
+from a lightweight HEAD (which returns the same headers a GET would, without the body), so
+**no full-object read-back GET** is needed. Applies to authenticated single PUTs within
+`cache.size_threshold` in signing mode. Compare with `tag_warm_on_write_triggered_total`
+(the read-back full GET, used for multipart completions, `CopyObject`, over-threshold or
+anonymous writes, when the populate budget is saturated, and when the tee's HEAD can't
+confirm the just-written version).
+
+```promql
+# Share of write-triggered cache populates served by the write-through tee (no read-back)
+rate(tag_cache_write_through_total[5m]) /
+(rate(tag_cache_write_through_total[5m]) + rate(tag_warm_on_write_triggered_total[5m]))
+```
+
+#### tag_cache_block_populated_total / tag_cache_block_bytes_populated_total
+
+**Type:** Counter
+
+Block-aligned caching (RFC 0001, `cache.block_caching_enabled`). Objects at or above
+`cache.block_size` are cached at `cache.block_size` granularity on read, so a range
+read (e.g. a Parquet footer) populates and serves only the blocks it touches.
+`tag_cache_block_populated_total` counts blocks fetched from upstream and written to cache;
+`tag_cache_block_bytes_populated_total` is the bytes those fetches pulled. Compare the bytes
+against `tag_bytes_transferred_total{direction="out"}` to gauge populate-vs-served amplification.
+
+#### tag_cache_block_hits_total / tag_cache_block_misses_total
+
+**Type:** Counter
+
+Per-covering-block presence when serving a request from block mode: `hits` were already cached,
+`misses` had to be fetched. The block cache-hit ratio is:
+
+```promql
+rate(tag_cache_block_hits_total[5m]) /
+(rate(tag_cache_block_hits_total[5m]) + rate(tag_cache_block_misses_total[5m]))
+```
+
+#### tag_cache_block_range_served_total
+
+**Type:** Counter (labeled by `result`)
+
+Requests served from block mode, labeled `full_hit` (every covering block was already cached)
+or `partial_hit` (at least one covering block had to be fetched). Partial-hit rate:
+
+```promql
+rate(tag_cache_block_range_served_total{result="partial_hit"}[5m]) /
+rate(tag_cache_block_range_served_total[5m])
+```
+
 #### tag_cache_populate_skipped_total
 
 **Type:** Counter

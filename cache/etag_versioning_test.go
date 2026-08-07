@@ -128,7 +128,7 @@ func TestETagVersionedBody_EmptyETagNotCachedViaStream(t *testing.T) {
 
 	body := bytes.NewReader([]byte("body-bytes"))
 	meta := &CachedObjectMeta{Bucket: bucket, Key: key, ETag: "", ContentLength: 10, StatusCode: 200}
-	if err := c.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, body, 60, 1); err != nil {
+	if _, err := c.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, body, 60, 1); err != nil {
 		t.Fatalf("PutWithMetaStreamTombstoneAware: %v", err)
 	}
 	if _, found, _ := c.GetMeta(ctx, bucket, key); found {

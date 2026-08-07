@@ -492,6 +492,74 @@ func TestLoad_WarmOnWriteReservedFractionOverrideAndClamp(t *testing.T) {
 	}
 }
 
+func TestLoad_BlockSizeDefaultAndOverride(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		env  string
+		want int64
+	}{
+		{"default", "cache:\n  enabled: true\n", "", DefaultCacheBlockSize},
+		{"env override honored", "cache:\n  enabled: true\n", "1048576", 1048576}, // 1 MiB
+		{"non-positive env ignored", "cache:\n  enabled: true\n", "-1", DefaultCacheBlockSize},
+		// A negative block_size must never reach block arithmetic (it is a divisor): it
+		// falls back to the default rather than passing through.
+		{"negative yaml defaults", "cache:\n  enabled: true\n  block_size: -4096\n", "", DefaultCacheBlockSize},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			if tc.env != "" {
+				t.Setenv("TAG_CACHE_BLOCK_SIZE", tc.env)
+			}
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.BlockSize != tc.want {
+				t.Errorf("BlockSize = %d, want %d", cfg.Cache.BlockSize, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_BlockCachingEnabledOverrideByEnv(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		env  string
+		want bool
+	}{
+		{"default off", "cache:\n  enabled: true\n", "", false},
+		{"yaml on", "cache:\n  enabled: true\n  block_caching_enabled: true\n", "", true},
+		{"env enables", "cache:\n  enabled: true\n", "true", true},
+		{"env disables over yaml", "cache:\n  enabled: true\n  block_caching_enabled: true\n", "false", false},
+		// An unparseable value is ignored (ParseBool errors), leaving the yaml value intact.
+		{"invalid env keeps yaml", "cache:\n  enabled: true\n  block_caching_enabled: true\n", "notabool", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			if tc.env != "" {
+				t.Setenv("TAG_CACHE_BLOCK_CACHING_ENABLED", tc.env)
+			}
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.BlockCachingEnabled != tc.want {
+				t.Errorf("BlockCachingEnabled = %v, want %v", cfg.Cache.BlockCachingEnabled, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoad_StorageTuningInvalidEnvIgnored(t *testing.T) {
 	content := `
 cache:
@@ -1085,5 +1153,60 @@ func TestTLS_DisabledByDefault(t *testing.T) {
 	cfg := NewDefault()
 	if cfg.Server.TLSEnabled() {
 		t.Error("TLSEnabled() = true, want false (disabled by default)")
+	}
+}
+
+// A stray leading/trailing space in a numeric env override must be tolerated (trimmed), not
+// silently discarded — the exact failure that made a "4 GiB" populate-budget override fall back
+// to the 1 GiB default in a benchmark run.
+func TestLoad_MaxPopulateMemoryOverrideTrimsWhitespace(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	t.Setenv("TAG_CACHE_MAX_POPULATE_MEMORY", "  4294967296 ") // leading + trailing space
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.MaxPopulateMemoryBytes != 4294967296 {
+		t.Errorf("MaxPopulateMemoryBytes = %d, want 4294967296 (whitespace-padded override must apply)", cfg.Cache.MaxPopulateMemoryBytes)
+	}
+}
+
+// A genuinely malformed numeric override falls back to the default (does not crash, does not
+// zero the value) — and Load still succeeds.
+func TestLoad_MaxPopulateMemoryMalformedFallsBackToDefault(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	t.Setenv("TAG_CACHE_MAX_POPULATE_MEMORY", "4GB") // not a plain byte count
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.MaxPopulateMemoryBytes != DefaultCacheMaxPopulateMemoryBytes {
+		t.Errorf("MaxPopulateMemoryBytes = %d, want default %d (malformed override must not apply)",
+			cfg.Cache.MaxPopulateMemoryBytes, DefaultCacheMaxPopulateMemoryBytes)
+	}
+}
+
+// The negative-disables contract survives trimming: "-1" (padded) still disables the budget.
+func TestLoad_MaxPopulateMemoryNegativeDisables(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	t.Setenv("TAG_CACHE_MAX_POPULATE_MEMORY", " -1 ")
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.MaxPopulateMemoryBytes != -1 {
+		t.Errorf("MaxPopulateMemoryBytes = %d, want -1 (negative disables, even whitespace-padded)", cfg.Cache.MaxPopulateMemoryBytes)
 	}
 }

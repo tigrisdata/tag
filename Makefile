@@ -10,6 +10,15 @@ GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 # Local test/bench data directory for embedded cache
 TAG_CACHE_DATA_DIR := /tmp/tag-cache-data
 
+# Block size used by the block-mode e2e targets (s3-test-local-blocks / -cluster-blocks). Small
+# enough that ordinary s3-test object sizes span multiple blocks (exercising block
+# populate/assembly/range paths), but not so small that a large object explodes into a huge block
+# count: a full-object serve assembles every block, and in cluster mode the non-local ones are
+# fetched one at a time over gRPC, so an over-tiny block size makes cross-node assembly slow enough
+# to break the client read mid-stream (e.g. 4 KiB -> a 1 MB multipart object is ~244 blocks). 64
+# KiB keeps that object at ~16 blocks. Tunable.
+TAG_TEST_BLOCK_SIZE ?= 65536
+
 # TLS test certificate directory
 TAG_TEST_CERTS_DIR := /tmp/tag-test-certs
 
@@ -353,7 +362,9 @@ help:
 	@echo ""
 	@echo "S3 compatibility test targets:"
 	@echo "  s3-test-local          - Start TAG locally with embedded cache"
+	@echo "  s3-test-local-blocks   - Start TAG locally with block-aligned caching on (small block_size)"
 	@echo "  s3-test-local-cluster  - Start TAG locally as a 2-node cluster"
+	@echo "  s3-test-local-cluster-blocks - Start a 2-node cluster with block-aligned caching on"
 	@echo "  s3-tests               - Run S3 compatibility tests (Python s3-tests)"
 	@echo "  s3-tests-clean         - Remove cloned s3-tests repository"
 	@echo "  s3-test-local-down     - Stop local TAG and cleanup"
@@ -370,6 +381,7 @@ help:
 	@echo "Benchmark test targets (warp):"
 	@echo "  bench-warp             - Benchmark core S3 ops with warp (requires running TAG + AWS creds)"
 	@echo "  bench-warp-clean       - Remove cached warp binary and benchmark results"
+	@echo "  bench-clean-buckets    - Delete a per-run warp bucket (BUCKET=...) and sweep leaked tag-warp-ci-* buckets (requires AWS creds)"
 	@echo ""
 	@echo "  Benchmark usage:"
 	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
@@ -382,6 +394,7 @@ help:
 	@echo "    export AWS_ACCESS_KEY_ID=<your-key>"
 	@echo "    export AWS_SECRET_ACCESS_KEY=<your-secret>"
 	@echo "    make s3-test-local      # Start TAG with embedded cache (HTTP)"
+	@echo "    make s3-test-local-blocks # Start TAG with block-aligned caching enabled"
 	@echo "    make s3-test-local-tls  # Start TAG with embedded cache (HTTPS)"
 	@echo "    make s3-tests           # Run S3 compatibility tests"
 	@echo "    make s3-tests-tls       # Run S3 compatibility tests (TLS)"
@@ -419,6 +432,8 @@ s3-test-local: build
 		TAG_CACHE_DISK_PATH=$(TAG_CACHE_DATA_DIR) \
 		TAG_CACHE_CLUSTER_ADDR=:$(TAG_LOCAL_CLUSTER_PORT) \
 		TAG_CACHE_GRPC_ADDR=:$(TAG_LOCAL_GRPC_PORT) \
+		TAG_CACHE_BLOCK_CACHING_ENABLED=$${TAG_CACHE_BLOCK_CACHING_ENABLED:-false} \
+		TAG_CACHE_BLOCK_SIZE=$${TAG_CACHE_BLOCK_SIZE:-} \
 		TAG_LOG_LEVEL=$${TAG_LOG_LEVEL:-info} \
 		TAG_PPROF_ENABLED=true \
 		./$(BINARY_NAME) &
@@ -436,6 +451,16 @@ s3-test-local-down:
 	-@lsof -ti:$(TAG_LOCAL_HTTP_PORT) | xargs kill 2>/dev/null || true
 	@echo "Cleaning up cache data directory..."
 	-@rm -rf $(TAG_CACHE_DATA_DIR)
+
+# Same single-node setup as s3-test-local but with block-aligned caching enabled and a small
+# block size (RFC 0001), so the S3 compatibility suite exercises the block populate/assembly/range
+# paths. Stop it with s3-test-local-down (same process, ports, and data dir).
+.PHONY: s3-test-local-blocks
+s3-test-local-blocks:
+	@echo "Starting TAG with block-aligned caching (block_size=$(TAG_TEST_BLOCK_SIZE))..."
+	@TAG_CACHE_BLOCK_CACHING_ENABLED=true \
+		TAG_CACHE_BLOCK_SIZE=$(TAG_TEST_BLOCK_SIZE) \
+		$(MAKE) s3-test-local
 
 # Local development: Run a 2-node TAG cluster on host with embedded cache
 # Uses non-default ports to avoid macOS conflicts (AirPlay uses 7000)
@@ -468,6 +493,8 @@ s3-test-local-cluster: build
 		TAG_CACHE_GRPC_ADDR=:$(TAG_CLUSTER_NODE1_GRPC_PORT) \
 		TAG_CACHE_ADVERTISE_ADDR=localhost:$(TAG_CLUSTER_NODE1_GRPC_PORT) \
 		TAG_CACHE_SEED_NODES=localhost:$(TAG_CLUSTER_NODE1_CLUSTER_PORT),localhost:$(TAG_CLUSTER_NODE2_CLUSTER_PORT) \
+		TAG_CACHE_BLOCK_CACHING_ENABLED=$${TAG_CACHE_BLOCK_CACHING_ENABLED:-false} \
+		TAG_CACHE_BLOCK_SIZE=$${TAG_CACHE_BLOCK_SIZE:-} \
 		TAG_LOG_LEVEL=$${TAG_LOG_LEVEL:-info} \
 		TAG_PPROF_ENABLED=true \
 		./$(BINARY_NAME) &
@@ -481,6 +508,8 @@ s3-test-local-cluster: build
 		TAG_CACHE_ADVERTISE_ADDR=localhost:$(TAG_CLUSTER_NODE2_GRPC_PORT) \
 		TAG_CACHE_SEED_NODES=localhost:$(TAG_CLUSTER_NODE1_CLUSTER_PORT),localhost:$(TAG_CLUSTER_NODE2_CLUSTER_PORT) \
 		TAG_HTTP_PORT=$(TAG_CLUSTER_NODE2_HTTP_PORT) \
+		TAG_CACHE_BLOCK_CACHING_ENABLED=$${TAG_CACHE_BLOCK_CACHING_ENABLED:-false} \
+		TAG_CACHE_BLOCK_SIZE=$${TAG_CACHE_BLOCK_SIZE:-} \
 		TAG_LOG_LEVEL=$${TAG_LOG_LEVEL:-info} \
 		TAG_PPROF_ENABLED=true \
 		./$(BINARY_NAME) &
@@ -505,6 +534,17 @@ s3-test-local-cluster-down:
 	-@lsof -ti:$(TAG_CLUSTER_NODE2_CLUSTER_PORT) | xargs kill 2>/dev/null || true
 	@echo "Cleaning up cluster cache data directories..."
 	-@rm -rf $(TAG_CLUSTER_CACHE_DIR_1) $(TAG_CLUSTER_CACHE_DIR_2)
+
+# Same 2-node cluster as s3-test-local-cluster but with block-aligned caching enabled and a small
+# block size on BOTH nodes (they must agree: block keys embed block_size and are routed by
+# consistent hashing), so the S3 suite exercises cross-node block routing/fetch. Stop it with
+# s3-test-local-cluster-down.
+.PHONY: s3-test-local-cluster-blocks
+s3-test-local-cluster-blocks:
+	@echo "Starting TAG 2-node cluster with block-aligned caching (block_size=$(TAG_TEST_BLOCK_SIZE))..."
+	@TAG_CACHE_BLOCK_CACHING_ENABLED=true \
+		TAG_CACHE_BLOCK_SIZE=$(TAG_TEST_BLOCK_SIZE) \
+		$(MAKE) s3-test-local-cluster
 
 .PHONY: s3-tests
 s3-tests:
@@ -595,7 +635,7 @@ test-sdk: rocksdb-static
 		echo "  Start TAG with: make s3-test-local"; \
 		exit 1; \
 	fi
-	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) $(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -timeout 300s $(TESTFLAGS) ./tests/s3compat/sdk/...
+	TAG_ENDPOINT=http://localhost:$(TAG_LOCAL_HTTP_PORT) TAG_TEST_BLOCK_SIZE=$(TAG_TEST_BLOCK_SIZE) $(CGO_ENV) go test $(BUILD_TAGS) $(TEST_LDFLAGS) -v -timeout 300s $(TESTFLAGS) ./tests/s3compat/sdk/...
 
 # Benchmark TAG's core S3 operations with warp (requires a running TAG + AWS creds).
 # Start TAG first with: make s3-test-local
@@ -619,5 +659,13 @@ bench-warp:
 bench-warp-clean:
 	@echo "Cleaning up warp benchmark artifacts..."
 	rm -rf tests/benchmark/.bin tests/benchmark/results
+
+.PHONY: bench-clean-buckets
+bench-clean-buckets:
+	@if [ -z "$$AWS_ACCESS_KEY_ID" ] || [ -z "$$AWS_SECRET_ACCESS_KEY" ]; then \
+		echo "Error: AWS credentials not set."; \
+		exit 1; \
+	fi
+	bash tests/benchmark/clean-buckets.sh
 
 .DEFAULT_GOAL := help

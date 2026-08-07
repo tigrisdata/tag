@@ -14,6 +14,7 @@ import (
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy/broadcast"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -66,10 +67,11 @@ type Service struct {
 	cache                   *cache.Cache
 	config                  *config.Config
 	cacheSemaphore          chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
-	populateBudget          *byteBudget        // Byte budget bounding aggregate populate buffering (nil = unlimited)
+	populateBudget          *byteBudget        // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
 	perPopulateCap          int64              // Max bytes a single populate can buffer (reservation ceiling)
 	broadcastManager        *broadcast.Manager // For streaming request coalescing
 	activeBackgroundFetches sync.Map           // Dedup for background full-object fetches (range caching)
+	blockFetch              singleflight.Group // Coalesce concurrent fetches of the same block (RFC 0001)
 }
 
 // NewService creates a new proxy service.
@@ -96,20 +98,44 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 	perPopulateCap := perPopulateBufferBytes(cfg)
 
 	var populateBudget *byteBudget
+	// stagingCap is the share of the budget block-serve staging may hold; logged below.
+	var stagingCap int64
 	if cfg.Cache.MaxPopulateMemoryBytes > 0 {
+		total := cfg.Cache.MaxPopulateMemoryBytes
 		// Reserve a share of the budget for warm-on-write only when it's enabled;
 		// otherwise there's no warm path to protect.
 		reserveFraction := 0.0
 		if cfg.Cache.WarmOnWrite {
 			reserveFraction = cfg.Cache.WarmOnWriteReservedFraction
 		}
-		populateBudget = newByteBudget(cfg.Cache.MaxPopulateMemoryBytes, reserveFraction, perPopulateCap)
+		populateBudget = newByteBudget(total, reserveFraction, perPopulateCap)
+		// Block-serve staging buffers (pre-commit range/first-block assembly, the streaming
+		// pipeline's double buffers) draw from this SAME budget — so max_populate_memory_bytes is
+		// an honest total, not a hidden 2x — but are capped at HALF of it. A warm multi-block
+		// serve holds its staging bytes for the whole (possibly multi-second) response, and at
+		// high concurrency those long holds would crowd cold-miss populates out of a shared,
+		// uncapped budget (objects served but never cached, working set stays cold — a ~3x
+		// warm-GET collapse; see #141). The half cap guarantees populates a constant floor of
+		// total/2; staging still uses that whole half when populates are idle, and populates use
+		// the whole budget when nothing is staging. The 2 GiB default dwarfs any realistic block,
+		// so a staging buffer always fits; only a misconfigured budget of a few blocks or fewer
+		// makes a buffer exceed the cap, and then that serve simply takes a degraded path
+		// (probe-first / sequential / uncached remainder) — never a failed request.
+		stagingCap = total / 2
+		populateBudget.stagingCap = stagingCap
+	}
+
+	// The block buffer pool's retention cap must track the configured block size, or every
+	// block staging buffer in a larger-block deployment would be allocated fresh and dropped.
+	if bs := cfg.Cache.BlockSize; bs > maxPooledBlockBufBytes.Load() {
+		maxPooledBlockBufBytes.Store(bs)
 	}
 
 	log.Info().
 		Int("max_concurrent_writes", cfg.Cache.MaxConcurrentWrites).
 		Int64("max_populate_memory_bytes", cfg.Cache.MaxPopulateMemoryBytes).
 		Int64("per_populate_buffer_cap_bytes", perPopulateCap).
+		Int64("serve_staging_cap_bytes", stagingCap).
 		Msg("Cache-populate limits configured")
 
 	return &Service{
@@ -165,6 +191,24 @@ func (s *Service) populateWeight(contentLength int64) int64 {
 	return w
 }
 
+// stagingWeight is the byte weight a block-serve staging buffer reserves against the
+// serve-staging budget: the buffer's ACTUAL size, clamped only by the total budget (so a
+// buffer larger than the whole budget still serves one-at-a-time, mirroring populateWeight).
+// Unlike populateWeight it is NOT capped at perPopulateCap — that ceiling models the
+// broadcast pipeline's buffering, which has no relationship to raw block-sized staging
+// buffers; clamping to it would let the budget admit more bytes than are actually allocated
+// (e.g. two 64 MiB pipeline buffers reserved as one 80 MiB cap), silently breaking the very
+// bound the budget exists to enforce.
+func (s *Service) stagingWeight(n int64) int64 {
+	if n < 1 {
+		n = 1
+	}
+	if budget := s.config.Cache.MaxPopulateMemoryBytes; budget > 0 && n > budget {
+		n = budget
+	}
+	return n
+}
+
 // populatePriority classifies a cache-populate for admission against the byte
 // budget. warmWrite populates (cache-warm-on-write, which pre-cache data about to
 // be read) get a reserved, prioritized slice of the budget so the read-miss
@@ -203,7 +247,13 @@ type byteBudget struct {
 	cond        *sync.Cond // signaled on release so waiting warm-on-write acquirers wake
 	remaining   int64
 	pendingWarm int64 // sum of weights of warm-on-write acquirers currently waiting
-	reserveCap  int64 // max bytes read-miss will hold back for pending warm-on-write
+	reserveCap  int64 // max bytes read-miss/staging will hold back for pending warm-on-write
+	// Block-serve staging buffers draw from this SAME budget (one honest total) but are bounded
+	// to stagingCap, guaranteeing populates a floor of (remaining not below total-stagingCap) so
+	// long-held serve buffers can never starve cold-miss populates (the #141 isolation). Staging
+	// is unrestricted (stagingCap == total) unless a caller sets a smaller cap.
+	stagingInUse int64 // bytes currently held by block-serve staging buffers
+	stagingCap   int64 // max bytes staging may hold at once
 }
 
 // newByteBudget creates a budget of `total` bytes. reserveFraction (clamped to
@@ -228,7 +278,9 @@ func newByteBudget(total int64, reserveFraction float64, perPopulateCap int64) *
 	if cap > total {
 		cap = total
 	}
-	b := &byteBudget{remaining: total, reserveCap: cap}
+	// Default: staging may use the whole budget (no extra cap). Callers that run block-serve
+	// staging (NewService) set a smaller stagingCap to guarantee populates a floor.
+	b := &byteBudget{remaining: total, reserveCap: cap, stagingCap: total}
 	b.cond = sync.NewCond(&b.mu)
 	return b
 }
@@ -285,6 +337,42 @@ func (b *byteBudget) acquireWarm(ctx context.Context, n int64) bool {
 func (b *byteBudget) release(n int64) {
 	b.mu.Lock()
 	b.remaining += n
+	b.cond.Broadcast() // wake warm-on-write waiters to re-check the freed budget
+	b.mu.Unlock()
+}
+
+// tryAcquireStaging reserves n bytes for a block-serve staging buffer without blocking. Staging
+// draws from the same pool as populates, so the configured budget is an honest total, but is
+// additionally bounded to stagingCap — this guarantees populates a floor (the budget can't drop
+// below total-stagingCap through staging alone), so long-held serve buffers never starve
+// cold-miss populates (without this isolation, warm-GET throughput collapsed ~3x; see #141). Like
+// read-miss it also leaves room for pending warm-on-write, so warm is never starved regardless of
+// how stagingCap and the warm reserve are configured. Pair a true return with releaseStaging(n).
+func (b *byteBudget) tryAcquireStaging(n int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.stagingInUse+n > b.stagingCap {
+		return false
+	}
+	reserve := b.pendingWarm
+	if reserve > b.reserveCap {
+		reserve = b.reserveCap
+	}
+	if b.remaining-n < reserve {
+		return false
+	}
+	b.remaining -= n
+	b.stagingInUse += n
+	return true
+}
+
+// releaseStaging returns n staging bytes to the pool. It MUST pair with a successful
+// tryAcquireStaging(n): using the plain release() would leave stagingInUse elevated, permanently
+// shrinking the effective staging cap until restart.
+func (b *byteBudget) releaseStaging(n int64) {
+	b.mu.Lock()
+	b.remaining += n
+	b.stagingInUse -= n
 	b.cond.Broadcast() // wake warm-on-write waiters to re-check the freed budget
 	b.mu.Unlock()
 }
@@ -398,9 +486,11 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
 	s.invalidateObject(context.Background(), bucket, key)
 
-	// Forward to Tigris, recording the upstream status.
+	// Forward to Tigris, recording the upstream status. When eligible, forwardPutMaybeTee
+	// tees the decoded body so we can populate the cache directly (write-through) instead of
+	// a read-back warm-on-write GET; teed is non-nil only when a tee was attempted.
 	rec := &statusRecorder{ResponseWriter: w}
-	err := s.forwarder.Forward(r.Context(), rec, r)
+	teed, err := s.forwardPutMaybeTee(r.Context(), rec, r, bucket, key)
 
 	// Re-invalidate AFTER upstream confirms the write. A GET that raced the
 	// in-flight PUT may have fetched the pre-PUT object and begun re-caching it;
@@ -413,7 +503,20 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
 		s.invalidateObject(context.Background(), bucket, key)
-		s.warmOnWrite(r, bucket, key)
+		cached := false
+		if teed != nil {
+			// writeThroughCache takes ownership of the reserved populate budget.
+			cached = s.writeThroughCache(bucket, key, teed)
+			teed = nil
+		}
+		if !cached {
+			s.warmOnWrite(r, bucket, key)
+		}
+	}
+	// Forward errored or upstream rejected the write: nothing cached, so release any budget
+	// reserved for the tee.
+	if teed != nil {
+		s.releaseCacheSlot(teed.weight)
 	}
 
 	status := "success"
@@ -751,31 +854,39 @@ func isAnonymousRequest(r *http.Request, result AuthResult, authErr error) bool 
 	return authErr == nil && result == AuthNotValidated && hasNoAuthCredentials(r)
 }
 
-// extractTotalSizeFromContentRange extracts total size from Content-Range header.
-// Header format: "bytes start-end/total" (e.g., "bytes 0-499/1234")
-// Returns 0 if header is missing or malformed.
-func extractTotalSizeFromContentRange(contentRange string) int64 {
+// parseContentRange parses a "bytes START-END/TOTAL" Content-Range header. total is the object
+// size (0 if the header is absent, the total is "*", or it is unparseable — total extraction is
+// prefix-independent to preserve historical behavior). hasBounds is true only when the "bytes "
+// prefix and numeric START-END are present and parsed, so the unsatisfied-range form
+// "bytes */TOTAL" yields total>0 with hasBounds=false.
+func parseContentRange(contentRange string) (start, end, total int64, hasBounds bool) {
 	if contentRange == "" {
-		return 0
+		return 0, 0, 0, false
 	}
-
-	// Find the slash separator
 	slashIdx := strings.LastIndex(contentRange, "/")
 	if slashIdx == -1 {
-		return 0
+		return 0, 0, 0, false
 	}
-
-	totalStr := contentRange[slashIdx+1:]
-	if totalStr == "*" {
-		// Unknown total size
-		return 0
+	if totalStr := contentRange[slashIdx+1:]; totalStr != "*" {
+		if t, err := strconv.ParseInt(totalStr, 10, 64); err == nil {
+			total = t
+		}
 	}
-
-	total, err := strconv.ParseInt(totalStr, 10, 64)
-	if err != nil {
-		return 0
+	const prefix = "bytes "
+	if !strings.HasPrefix(contentRange, prefix) {
+		return 0, 0, total, false
 	}
-	return total
+	rangePart := contentRange[len(prefix):slashIdx] // "START-END" or "*"
+	dashIdx := strings.IndexByte(rangePart, '-')
+	if dashIdx == -1 {
+		return 0, 0, total, false
+	}
+	s, err1 := strconv.ParseInt(rangePart[:dashIdx], 10, 64)
+	e, err2 := strconv.ParseInt(rangePart[dashIdx+1:], 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, total, false
+	}
+	return s, e, total, true
 }
 
 // GetRegion returns the configured upstream region.

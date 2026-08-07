@@ -18,6 +18,8 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_EVICTION_POLICY`       | Eviction order when the disk cap is hit: `lru` or `fifo` (oldest-written first)  | `lru`                    |
 | `TAG_CACHE_WARM_ON_WRITE`         | Warm the cache after a successful write via a background fetch (`true`/`false`)  | `false`                  |
 | `TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION` | Fraction of the populate memory budget reserved (elastically) for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; negative disables) | `0.5` |
+| `TAG_CACHE_BLOCK_CACHING_ENABLED`  | Enable block-aligned caching for large objects (RFC 0001): a read miss for an object at/above `block_size` is cached at block granularity (`true`/`false`) | `false`                  |
+| `TAG_CACHE_BLOCK_SIZE`             | Block granularity **and** the read-side whole-vs-block boundary (bytes): a read miss below this is whole-cached, at/above it is block-cached; must stay below ocache's 64 MB compaction threshold | `4194304` (4 MiB)        |
 | `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
 | `TAG_CACHE_CLUSTER_ADDR`          | Address for memberlist gossip                                                   | `:7000`                  |
 | `TAG_CACHE_GRPC_ADDR`             | Address for gRPC server                                                         | `:9000`                  |
@@ -26,7 +28,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_DELETE_BATCH_SIZE`     | File deletions processed per deletion-queue batch                               | `1000`                   |
 | `TAG_CACHE_RECOVERY_WORKERS`      | Parallel workers for startup file recovery                                      | `16`                     |
 | `TAG_CACHE_MAX_CONCURRENT_WRITES` | Max concurrent cache-populate operations                                        | `256`                    |
-| `TAG_CACHE_MAX_POPULATE_MEMORY`   | Aggregate memory budget (bytes) for concurrent cache-populate buffering         | `1073741824` (1 GiB)     |
+| `TAG_CACHE_MAX_POPULATE_MEMORY`   | Aggregate memory budget (bytes) for all cache buffering — populate + block-serve staging (one honest total) | `2147483648` (2 GiB)     |
 | `TAG_MAX_INFLIGHT_REQUESTS`       | Max concurrently-served S3 requests before shedding with 503 SlowDown           | `1024`                   |
 | `TAG_LOG_LEVEL`                   | Log level: `debug`, `info`, `warn`, `error`                                     | `info`                   |
 | `TAG_LOG_FORMAT`                  | Log format: `json` or `console`                                                 | `json`                   |
@@ -153,6 +155,18 @@ cache:
   # negative disables. Override with TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION env var.
   warm_on_write_reserved_fraction: 0.5
 
+  # Block-aligned caching for large objects (RFC 0001). When enabled, any object at or above
+  # block_size is cached at block granularity regardless of how it was fetched (range read,
+  # full GET, or warm-on-write), so a range read populates and serves only the blocks it
+  # touches. Off by default (opt-in rollout).
+  block_caching_enabled: false
+
+  # Block granularity AND the whole-vs-block boundary for every populate path: an object
+  # smaller than one block is whole-cached, one this size or larger is block-cached. Must stay
+  # below ocache's 64 MB compaction threshold so blocks pack into shared segments. 0/unset =
+  # default. Override with TAG_CACHE_BLOCK_SIZE env var.
+  block_size: 4194304
+
   # Unique node identifier for cluster mode
   # Required for multi-node deployments
   node_id: "tag-node-1"
@@ -193,16 +207,17 @@ cache:
   # Override with TAG_CACHE_MAX_CONCURRENT_WRITES env var
   max_concurrent_writes: 256
 
-  # Aggregate memory budget for concurrent cache-populate buffering. Each populate
-  # reserves its object size (capped at the per-populate buffer ceiling,
-  # ~(channel_buffer + max(channel_buffer/4, 64)) x chunk_size) against this budget;
-  # when it can't fit, the object is served from upstream uncached. Small objects
-  # reserve little (high concurrency) while a burst of large objects is throttled.
+  # Aggregate memory budget for ALL cache buffering — cache-populate and block-serve
+  # staging share this one pool, so the value is an honest total (buffering never
+  # exceeds it). Each populate reserves its object size (capped at the per-populate
+  # buffer ceiling, ~(channel_buffer + max(channel_buffer/4, 64)) x chunk_size); when
+  # it can't fit, the object is served from upstream uncached. Block-serve staging
+  # draws from the same budget, capped at half of it so it can't starve populates.
   # Applied independently of max_concurrent_writes (both limits apply). This is what
   # actually bounds populate memory — a byte-unaware count can pin many GB.
-  # Default: 1073741824 (1 GiB) (0 or unset = default; negative = memory cap disabled)
+  # Default: 2147483648 (2 GiB) (0 or unset = default; negative = budget disabled)
   # Override with TAG_CACHE_MAX_POPULATE_MEMORY env var
-  max_populate_memory_bytes: 1073741824
+  max_populate_memory_bytes: 2147483648
 
 # Broadcast configuration (request coalescing)
 broadcast:
@@ -323,6 +338,8 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `enabled`               | bool     | `true`           | Enable caching                                                                      |
 | `ttl`                   | duration | `24h`            | Default TTL for cached objects                                                      |
 | `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
+| `block_caching_enabled` | bool     | `false`          | Enable block-aligned caching for large objects (RFC 0001)                           |
+| `block_size`            | int64    | `4194304`        | Block granularity **and** the read-side whole-vs-block boundary (must stay below ocache's 64 MB compaction threshold) |
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |
 | `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |
 | `eviction_policy`       | string   | `lru`            | Eviction order when the disk cap is hit: `lru` or `fifo` (only applies when `max_disk_usage_bytes` > 0) |
@@ -336,7 +353,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `delete_batch_size`     | int      | `1000`           | File deletions processed per deletion-queue batch                                   |
 | `recovery_workers`      | int      | `16`             | Parallel workers for startup file recovery                                          |
 | `max_concurrent_writes` | int      | `256`            | Max concurrent cache-populate operations (`0`/unset = default, negative = disabled) |
-| `max_populate_memory_bytes` | int  | `1073741824`     | Aggregate memory budget for concurrent cache-populate buffering; each populate reserves its size (capped at the buffer ceiling), applied independently of `max_concurrent_writes` (`0`/unset = default 1 GiB, negative = memory cap disabled) |
+| `max_populate_memory_bytes` | int  | `2147483648`     | Aggregate memory budget for ALL cache buffering — cache-populate and block-serve staging share this one pool, so it is an honest total (buffering never exceeds it). Each populate reserves its size (capped at the buffer ceiling); block-serve staging draws from the same budget capped at half of it, so it can't starve populates. Applied independently of `max_concurrent_writes` (`0`/unset = default 2 GiB, negative = disables the budget) |
 
 **TTL Format:**
 

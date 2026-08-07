@@ -105,7 +105,10 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 			// Client-triggered revalidation: Cache-Control: no-cache/max-age=0
 			// For range requests, the Range header is included in the conditional GET
 			// so upstream returns 304 (serve range from cache) or 206 (stream range to client).
-			if forceRevalidate && meta.ETag != "" {
+			// revalidateAndServe uses the whole-body serve/populate helpers, which don't
+			// understand block-mode entries — so for a block-mode entry (BlockSize>0) fall
+			// through to the miss path instead, which re-forwards fresh and re-populates blocks.
+			if forceRevalidate && meta.ETag != "" && meta.BlockSize == 0 {
 				log.Debug().
 					Str("bucket", bucket).
 					Str("key", key).
@@ -113,9 +116,23 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				return s.revalidateAndServe(ctx, w, r, bucket, key, accessKey, secretKey, meta, start)
 			}
 
-			// If client forced revalidation but no ETag available, fall through to full miss
+			// If the client forced revalidation but there is no whole-body entry to revalidate
+			// (no ETag, or a block-mode entry), fall through to the miss path.
 			if forceRevalidate {
-				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Force revalidate but no ETag, falling through to upstream")
+				// A block-mode entry can't use the conditional-GET revalidate path, and the
+				// fall-through's re-populate is gated on GetMeta(!found), so without invalidating
+				// here a forced revalidation would serve fresh once but leave the (possibly stale)
+				// block-mode entry in place — later normal reads never re-check upstream when their
+				// blocks are already cached. Invalidate so the fall-through re-establishes the
+				// current version.
+				if meta.BlockSize > 0 {
+					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidating block-mode entry for client-forced revalidation")
+					// Version-guarded: only drop the entry this client is revalidating, never a
+					// newer version a concurrent request re-established after an overwrite (an
+					// unconditional Delete would wipe that fresh entry and force needless churn).
+					s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+				}
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Force revalidate, falling through to upstream")
 				// Fall through to cache miss path below
 			} else {
 				// Fresh cache hit — serve from cache
@@ -123,6 +140,16 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				// If this is a Range request and we have the full object cached,
 				// serve the range from the cached object
 				if rangeHeader != "" {
+					// Block-mode entry (RFC 0001): serve the range from its blocks, fetching any
+					// missing covering blocks. On a non-serve (budget shed / fetch failure), forward
+					// the range with a background (block) populate.
+					if meta.BlockSize > 0 {
+						served, rangeErr := s.serveRangeFromBlockCache(ctx, w, r, bucket, key, accessKey, secretKey, meta, rangeHeader, start)
+						if served {
+							return rangeErr
+						}
+						return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start, XCacheMiss)
+					}
 					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Serving range from cached full object")
 					served, rangeErr := s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
 					if served {
@@ -166,8 +193,17 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					}
 				}
 
-				// Serve full response from cache
-				if cacheBodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); cacheBodyErr != nil {
+				// Serve full response from cache.
+				if meta.BlockSize > 0 {
+					// Block-mode entry: assemble the full object from its blocks (RFC 0001),
+					// fetching any that are missing. On a non-serve (budget shed / fetch
+					// failure) fall through to the miss path rather than serving stale data.
+					served, assembleErr := s.serveFullObjectFromBlockCache(ctx, w, bucket, key, accessKey, secretKey, meta, start)
+					if served {
+						return assembleErr
+					}
+					// Fall through to cache miss path
+				} else if cacheBodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); cacheBodyErr != nil {
 					log.Warn().Err(cacheBodyErr).Str("bucket", bucket).Str("key", key).Msg("Cache body unavailable, falling through to upstream")
 					// Invalidate only when the body is genuinely gone: the metadata is then
 					// orphaned, and clearing it stops a meta-hit/body-miss loop that repeats
@@ -330,7 +366,11 @@ func (s *Service) streamFromUpstream(
 	}
 	defer resp.Body.Close()
 
-	// Determine if we should cache this response
+	// Determine if we should cache this response. The whole-vs-block decision is made downstream
+	// in the shared cache writer (setupCacheListener) by size: a block-eligible object (>=
+	// block_size, block caching on) is stored as blocks, everything else whole. A full GET of a
+	// block-eligible object therefore block-splits the stream — the same representation a range
+	// read would establish (RFC 0001), so there is no whole/block collision to guard against.
 	shouldCache := resp.StatusCode == http.StatusOK &&
 		s.cache.IsEnabled() &&
 		!s.hasNoCacheHeaders(resp.Header) &&
@@ -590,6 +630,16 @@ func parseRangeHeader(rangeHeader string, totalSize int64) ([]byteRange, error) 
 }
 
 // serveRangeFromCache serves a Range request from the cached full object.
+// writeRangeNotSatisfiable emits the 416 response for a malformed, empty, or multi-range
+// request served from a cached entry (a bytes */total Content-Range plus ErrInvalidRange).
+// Shared by the whole-body and block-mode range serve paths.
+func writeRangeNotSatisfiable(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, startTime time.Time) {
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
+	writeCacheStatus(w, XCacheHit)
+	s3err.WriteError(w, r, s3err.ErrInvalidRange)
+	metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
+}
+
 // It returns served=true when it has produced a complete client response (a range
 // body, or a definitive error response like 416). It returns served=false, without
 // touching the response, when the cached body cannot be resolved (e.g. the body was
@@ -608,20 +658,14 @@ func (s *Service) serveRangeFromCache(
 	// Parse Range header
 	ranges, parseErr := parseRangeHeader(rangeHeader, meta.ContentLength)
 	if parseErr != nil || len(ranges) == 0 {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
-		writeCacheStatus(w, XCacheHit)
-		s3err.WriteError(w, r, s3err.ErrInvalidRange)
-		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
+		writeRangeNotSatisfiable(w, r, meta, startTime)
 		return true, nil
 	}
 
 	// Only support single range (multi-range is complex and rare)
 	if len(ranges) > 1 {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Multi-range not supported from cache")
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
-		writeCacheStatus(w, XCacheHit)
-		s3err.WriteError(w, r, s3err.ErrInvalidRange)
-		metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
+		writeRangeNotSatisfiable(w, r, meta, startTime)
 		return true, nil
 	}
 
@@ -704,7 +748,7 @@ func (s *Service) handleRangeWithBackgroundCache(
 
 	// Determine total object size from Content-Range header
 	// Format: "bytes 0-499/1234" where 1234 is total size
-	totalSize := extractTotalSizeFromContentRange(resp.Header.Get("Content-Range"))
+	_, _, totalSize, _ := parseContentRange(resp.Header.Get("Content-Range"))
 
 	// Decide up front whether this response is cacheable. Conditions:
 	// - Response is 206 Partial Content (successful range response)
@@ -729,7 +773,47 @@ func (s *Service) handleRangeWithBackgroundCache(
 	// detached, deduplicated (activeBackgroundFetches), and guarded by
 	// GetMeta(!found), so the cost is bounded to at most one background fetch per
 	// key and it's a no-op once the object is cached.
-	if cacheable {
+	// Objects at or above the block-mode boundary are cached at block granularity (RFC 0001)
+	// rather than fetched whole: capture the block-mode meta + the blocks this request touched
+	// (from the response headers, before its body is streamed), and populate them in the
+	// background. buildBlockMeta/triggerBlockModePopulate never reuse resp.Body — blocks are
+	// fetched with fresh aligned range GETs.
+	blockEligible := s.isBlockEligibleSize(totalSize) &&
+		cacheable &&
+		resp.Header.Get("ETag") != "" &&
+		!s.hasNoCacheHeaders(resp.Header)
+
+	if blockEligible {
+		// If an anonymous range GET succeeded (206) and Tigris didn't set an explicit per-object
+		// ACL, the object inherits public access from the bucket — mirror the whole-object path
+		// and record public-read so later anonymous reads can be served from the block-mode
+		// entry. Without this the entry is stored non-public and every anonymous read is turned
+		// away by the IsPublicRead() gate, defeating the cache for anonymous range traffic. The
+		// inference is sound: in transparent mode the forward carries the client's (absent) auth,
+		// so a 206 means Tigris served an anonymous read.
+		meta := s.buildBlockMeta(bucket, key, resp.Header, totalSize)
+		// Record public-read on the cached META only — NOT on resp.Header — so this synthetic ACL is
+		// never streamed back to the client (its 206 must reflect only what the origin returned;
+		// matches the whole-object range path). An anonymous 206 means Tigris served an anonymous
+		// read of a bucket-inherited public object, so later anonymous reads can be served from this
+		// block-mode entry instead of being turned away by the IsPublicRead() gate.
+		if hasNoAuthCredentials(r) && meta.ACL == "" {
+			meta.ACL = "public-read"
+		}
+		if touched := touchedBlocks(r.Header.Get("Range"), totalSize, meta.BlockSize); len(touched) > 0 {
+			// Only establish a block-mode entry when none exists (mirrors the whole-object
+			// path's GetMeta(!found) dedup). A fall-through after a failed block serve must not
+			// rewrite an existing entry's meta: if block_size changed since the entry was
+			// written, its cached blocks would be reinterpreted at the new boundaries (index
+			// collisions → wrong bytes). Existing entries are filled incrementally by the serve
+			// path under their own captured BlockSize instead.
+			defer func() {
+				if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
+					s.triggerBlockModePopulate(bucket, key, accessKey, secretKey, meta, touched)
+				}
+			}()
+		}
+	} else if cacheable {
 		defer func() {
 			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
 				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss)

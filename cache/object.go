@@ -13,9 +13,10 @@ import (
 
 const (
 	// Cache key prefixes for separate metadata and body storage
-	metaKeyPrefix = "meta|"
-	bodyKeyPrefix = "body|"
-	tombKeyPrefix = "tomb|"
+	metaKeyPrefix  = "meta|"
+	bodyKeyPrefix  = "body|"
+	blockKeyPrefix = "blk|"
+	tombKeyPrefix  = "tomb|"
 )
 
 // CachedObjectMeta represents cached S3 object metadata.
@@ -42,6 +43,25 @@ type CachedObjectMeta struct {
 	PartsCount           string            `json:"parts_count,omitempty"`            // x-amz-mp-parts-count
 	UserMetadata         map[string]string `json:"user_metadata,omitempty"`          // x-amz-meta-*
 	StatusCode           int               `json:"status_code"`                      // Original HTTP status (200, etc.)
+	// BlockSize records the block granularity for a block-mode entry (RFC 0001). 0 means
+	// the body is stored as a single whole blob (MakeBodyKey); >0 means the body is stored
+	// as fixed-size blocks (MakeBlockKey) of this size. Captured at populate time so an
+	// entry keeps its block layout even if the block_size config later changes.
+	BlockSize int64 `json:"block_size,omitempty"`
+	// BlocksComplete records that every block of a block-mode entry was present when this
+	// meta was written (a full-stream split, or a promotion after a successful full
+	// assembly). Full-object serves use it to skip the per-block existence probe pass and
+	// stream optimistically — a block evicted since is recovered by an inline fetch. It is a
+	// hint, not an invariant: false (including on entries written before the field existed)
+	// only means the probe-first path is used.
+	BlocksComplete bool `json:"blocks_complete,omitempty"`
+	// CachedAt is the Unix time (seconds) this meta was built from a live upstream response.
+	// Rewrites of an existing meta that do NOT consult upstream (the blocks-complete
+	// promotion) use it to compute the entry's remaining TTL so they never extend its
+	// lifetime — re-stamping a full TTL would reset the staleness clock and let the meta
+	// outlive its blocks. 0 (entries written before the field existed) means the age is
+	// unknown and no lifetime-sensitive rewrite is allowed.
+	CachedAt int64 `json:"cached_at,omitempty"`
 }
 
 // MetaFromHTTPHeaders builds CachedObjectMeta from S3 response headers.
@@ -50,6 +70,7 @@ func MetaFromHTTPHeaders(bucket, key string, statusCode int, headers http.Header
 		Key:                  key,
 		Bucket:               bucket,
 		StatusCode:           statusCode,
+		CachedAt:             time.Now().Unix(),
 		ETag:                 headers.Get("ETag"),
 		ContentType:          headers.Get("Content-Type"),
 		CacheControl:         headers.Get("Cache-Control"),
@@ -271,6 +292,20 @@ func MakeBodyKey(bucket, key, etag string) string {
 		return bodyKeyPrefix + bucket + "|" + key
 	}
 	return bodyKeyPrefix + bucket + "|" + key + "|" + etagKeyComponent(etag)
+}
+
+// MakeBlockKey creates the cache key for a single block of a block-mode object body
+// ("blk|bucket|key|<etag>|<blockSize>|<blockIdx>"). Blocks are ETag-scoped exactly like
+// whole bodies (MakeBodyKey), so a concurrent overwrite writes new block keys under the new
+// ETag and never clobbers the version an in-flight reader resolved; stale blocks age out by
+// TTL. The blockSize is part of the key so blocks written under one block_size can never be
+// resolved by a meta captured under a different block_size (e.g. after the config changes and
+// the entry is re-established for an unchanged ETag) — that would read a block at the wrong
+// offsets. blockIdx is the zero-based index of the block within the object. An ETag-less
+// object is not block-cached (no version discriminator); callers must pass a non-empty etag.
+func MakeBlockKey(bucket, key, etag string, blockSize, blockIdx int64) string {
+	return blockKeyPrefix + bucket + "|" + key + "|" + etagKeyComponent(etag) + "|" +
+		strconv.FormatInt(blockSize, 10) + "|" + strconv.FormatInt(blockIdx, 10)
 }
 
 // MakeTombstoneKey creates the cache key for invalidation tombstones.

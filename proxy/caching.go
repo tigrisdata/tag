@@ -212,7 +212,18 @@ func (s *Service) setupCacheListener(
 		// Start cache writer goroutine - will call Read() when ready
 		cacheErrCh := make(chan error, 1)
 		go func() {
-			cacheErr := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+			var cacheErr error
+			// Block-eligible objects (>= block_size, block caching on) are stored as fixed-size
+			// blocks regardless of how they were fetched — a full-GET read miss or a warm-on-write
+			// read-back. The whole-vs-block boundary is size, not access pattern (RFC 0001): both
+			// full and range paths converge on one representation per size class. Sub-block objects
+			// keep the single whole-body write.
+			if s.isBlockEligibleSize(meta.ContentLength) {
+				meta.BlockSize = s.config.Cache.BlockSize
+				cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+			} else {
+				_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+			}
 			if cacheErr != nil {
 				log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")
 			}
