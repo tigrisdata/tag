@@ -9,6 +9,7 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 - **Embedded Cache**: High-performance RocksDB-based cache with automatic cluster discovery
 - **Request Coalescing**: Streaming broadcast pattern reduces duplicate upstream requests under concurrent load
 - **Range Request Caching**: Background fetch of full objects on range cache miss for optimal ML training workloads
+- **Block-Aligned Caching** *(opt-in)*: Cache large objects as fixed-size blocks (RFC 0001) so a small range read fetches and caches only the covering blocks instead of the whole object — ideal for sparse reads of large files (Parquet footers/row-groups, SST blocks). Size `block_size` to your workload's read granularity.
 - **Conditional Requests**: Supports If-None-Match and If-Modified-Since for efficient cache validation
 - **AWS SigV4 Authentication**: Full AWS Signature Version 4 validation and re-signing
 - **Prometheus Metrics**: Comprehensive metrics for monitoring cache efficiency and performance
@@ -99,9 +100,10 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 - Objects larger than `size_threshold` are not cached
 - Objects with `Cache-Control: no-store` or `private` are not cached
 - Range requests trigger background fetch of full object (if within threshold)
+- With block caching enabled (`block_caching_enabled`), objects at/above `block_size` are instead cached as fixed-size blocks, so a range read fetches only the covering blocks
 - PUT/DELETE operations invalidate the cache entry
 
-See [docs/cache-control.md](docs/cache-control.md) for detailed cache control and revalidation documentation.
+See [docs/cache-control.md](docs/cache-control.md) for detailed cache control and revalidation documentation. For enabling and sizing block caching in production, see [docs/deploy.md](docs/deploy.md#block-aligned-caching-optional).
 
 ## Configuration
 
