@@ -44,7 +44,7 @@ Each release publishes the install script, run script, and a matching `config.ya
 curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
 
 # A specific release
-curl -fsSL https://tag-releases.t3.storage.dev/v1.14.0/install.sh | bash
+curl -fsSL https://tag-releases.t3.storage.dev/v1.17.0/install.sh | bash
 ```
 
 The script installs the `tag` binary to `/usr/local/bin` and a default config to `/etc/tag/config.yaml`.
@@ -99,7 +99,7 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 
 - Objects larger than `size_threshold` are not cached
 - Objects with `Cache-Control: no-store` or `private` are not cached
-- Objects at or above `block_size` are cached as fixed-size blocks (block caching, on by default), so a range read fetches only the covering blocks; smaller objects are whole-cached
+- Among cacheable objects (within `size_threshold`), those at or above `block_size` are cached as fixed-size blocks (block caching, on by default), so a range read fetches only the covering blocks; smaller objects are whole-cached
 - Set `block_caching_enabled: false` to cache whole objects instead — a range request then triggers a background fetch of the full object (if within threshold)
 - PUT/DELETE operations invalidate the cache entry
 

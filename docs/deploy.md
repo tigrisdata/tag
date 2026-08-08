@@ -109,7 +109,7 @@ env:
 
 Start near your median read size; the `1048576` (1 MiB) default suits typical analytics footers/row-groups — raise it for larger reads, or lower it (e.g. `65536` for 64 KiB reads). Then verify with Prometheus:
 
-- **Upstream amplification** — `sum(rate(tag_bytes_transferred_total{direction="in"}[5m])) / sum(rate(tag_bytes_transferred_total{direction="out"}[5m]))`. Aim for **≤ 1** (the cache serves more than it fetches); a value well above 1 means the block size is too large for the read pattern.
+- **Upstream read amplification** — `sum(rate(tag_cache_block_bytes_populated_total[5m])) / sum(rate(tag_bytes_transferred_total{direction="out"}[5m]))` — bytes fetched from upstream into blocks vs bytes served to clients. Aim for **≤ 1**; well above 1 means the block size is too large for the read pattern. (Do **not** use `tag_bytes_transferred_total{direction="in"}` — that counts client upload bodies, not upstream fetches.)
 - **Block hit ratio** — `tag_cache_block_hits_total / (tag_cache_block_hits_total + tag_cache_block_misses_total)`.
 - **Serve latency** — `histogram_quantile(0.95, sum(rate(tag_request_duration_seconds_bucket[5m])) by (le))`.
 
