@@ -69,7 +69,7 @@ resources:
   - ../../base
 images:
   - name: tigrisdata/tag
-    newTag: v1.16.0
+    newTag: v1.17.0
 ```
 
 ## Production Considerations
@@ -88,16 +88,18 @@ images:
 
 > **Memory note:** high pod memory is expected and healthy — most of it is reclaimable Linux page cache over the on-disk RocksDB cache, not the TAG process (its RSS is typically well under 1 GiB). It plateaus below the pod limit; treat it as page cache, not a leak. Only raise the memory limit (never lower the disk cache) if the working set trends up to the limit.
 
-### Block-aligned caching (optional)
+### Block-aligned caching
 
-By default TAG caches whole objects. For workloads that read **small ranges of large objects** (Parquet footers/row-groups, SlateDB/SST blocks, columnar analytics), enable **block-aligned caching** ([RFC 0001](rfcs/0001-block-aligned-caching.md)) so a range read fetches and caches only the covering blocks instead of the whole object:
+**Block-aligned caching is on by default** ([RFC 0001](rfcs/0001-block-aligned-caching.md)): any object at or above `block_size` is cached as fixed-size blocks, so a range read fetches and caches only the covering blocks instead of the whole object — ideal for **small ranges of large objects** (Parquet footers/row-groups, SlateDB/SST blocks, columnar analytics). The one knob that matters is `block_size`:
 
 ```yaml
 env:
-  - name: TAG_CACHE_BLOCK_CACHING_ENABLED
-    value: "true"
+  # Block caching is on by default at 1 MiB. Tune block_size to your read granularity:
   - name: TAG_CACHE_BLOCK_SIZE
-    value: "1048576" # 1 MiB — size to your read granularity (see below)
+    value: "1048576" # 1 MiB (default)
+  # ...or opt out entirely to cache whole objects:
+  # - name: TAG_CACHE_BLOCK_CACHING_ENABLED
+  #   value: "false"
 ```
 
 **Sizing `block_size` to your workload's dominant read size is the critical tuning knob:**
@@ -105,7 +107,7 @@ env:
 - **Too large** and every cache miss pulls a full block to serve a small range — upstream **read amplification**. A 4 MiB block serving ~400 KB reads amplifies upstream traffic several-fold and can be *worse* than whole-object caching.
 - **Too small** adds per-block bookkeeping and more fetches per read.
 
-Start near your median read size (often 256 KiB–1 MiB for analytics footers/row-groups; the `4194304` default is tuned for larger reads). Then verify with Prometheus:
+Start near your median read size; the `1048576` (1 MiB) default suits typical analytics footers/row-groups — raise it for larger reads, or lower it (e.g. `65536` for 64 KiB reads). Then verify with Prometheus:
 
 - **Upstream amplification** — `sum(rate(tag_bytes_transferred_total{direction="in"}[5m])) / sum(rate(tag_bytes_transferred_total{direction="out"}[5m]))`. Aim for **≤ 1** (the cache serves more than it fetches); a value well above 1 means the block size is too large for the read pattern.
 - **Block hit ratio** — `tag_cache_block_hits_total / (tag_cache_block_hits_total + tag_cache_block_misses_total)`.
