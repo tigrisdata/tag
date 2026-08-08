@@ -134,7 +134,7 @@ func fullGet(bucket, key string) *http.Request {
 func newBlockService(t *testing.T, mock *blockMockForwarder) (*Service, *cache.Cache) {
 	t.Helper()
 	svc, c := newTestService(mock, true)
-	svc.config.Cache.BlockCachingEnabled = true
+	svc.config.Cache.SetBlockCachingEnabled(true)
 	svc.config.Cache.BlockSize = 4 // boundary: the 10-byte test object (>= 4) is block-mode
 	svc.config.Cache.SizeThreshold = 1 << 20
 	return svc, c
@@ -145,7 +145,7 @@ func newBlockService(t *testing.T, mock *blockMockForwarder) (*Service, *cache.C
 func newBlockServiceWithBudget(t *testing.T, mock *blockMockForwarder, blockSize, budget int64) (*Service, *cache.Cache) {
 	t.Helper()
 	cfg := config.NewDefault()
-	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.SetBlockCachingEnabled(true)
 	cfg.Cache.BlockSize = blockSize
 	cfg.Cache.SizeThreshold = 1 << 20
 	cfg.Cache.MaxPopulateMemoryBytes = budget
@@ -337,7 +337,7 @@ func TestBlockCache_WarmOnWriteBlockSplitsBlockEligible(t *testing.T) {
 	}
 	svc, c := newTestService(mock, true)
 	svc.config.Cache.WarmOnWrite = true
-	svc.config.Cache.BlockCachingEnabled = true
+	svc.config.Cache.SetBlockCachingEnabled(true)
 	svc.config.Cache.BlockSize = 4 // the 10-byte object is block-eligible (>= 4)
 	svc.config.Cache.SizeThreshold = 1 << 20
 
@@ -1245,7 +1245,7 @@ func TestBlockCache_AssemblyCacheReadFailureFallsThroughWithoutInvalidating(t *t
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
 	faulty := &blockReadFaultClient{CacheClient: cacheclient.NewMemoryCache()}
 	cfg := config.NewDefault()
-	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.SetBlockCachingEnabled(true)
 	cfg.Cache.BlockSize = 4
 	cfg.Cache.SizeThreshold = 1 << 20
 	c := cache.NewCacheWithClient(faulty, &cfg.Cache)
@@ -1283,7 +1283,7 @@ func TestBlockCache_ProbePathTransientFailureAbortsWithoutInvalidating(t *testin
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
 	faulty := &blockReadFaultClient{CacheClient: cacheclient.NewMemoryCache()}
 	cfg := config.NewDefault()
-	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.SetBlockCachingEnabled(true)
 	cfg.Cache.BlockSize = 4
 	cfg.Cache.SizeThreshold = 1 << 20
 	c := cache.NewCacheWithClient(faulty, &cfg.Cache)
@@ -1403,7 +1403,7 @@ func TestBlockCache_CompleteEntryInlineFetchRecoversEvictedBlock(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // blocks [0..3][4..7][8..9]
 	memCache := cacheclient.NewMemoryCache()
 	cfg := config.NewDefault()
-	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.SetBlockCachingEnabled(true)
 	cfg.Cache.BlockSize = 4
 	cfg.Cache.SizeThreshold = 1 << 20
 	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
@@ -1448,7 +1448,7 @@ func TestBlockCache_CompleteEntryFirstBlockGoneFallsThroughCleanly(t *testing.T)
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
 	memCache := cacheclient.NewMemoryCache()
 	cfg := config.NewDefault()
-	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.SetBlockCachingEnabled(true)
 	cfg.Cache.BlockSize = 4
 	cfg.Cache.SizeThreshold = 1 << 20
 	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
@@ -1523,7 +1523,7 @@ func TestBlockCache_CompleteEntryMidServeStaleSignalInvalidates(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
 	memCache := cacheclient.NewMemoryCache()
 	cfg := config.NewDefault()
-	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.SetBlockCachingEnabled(true)
 	cfg.Cache.BlockSize = 4
 	cfg.Cache.SizeThreshold = 1 << 20
 	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
@@ -1563,7 +1563,7 @@ func TestBlockCache_CompleteEntryFetchDeclineSalvagesViaRemainder(t *testing.T) 
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
 	memCache := cacheclient.NewMemoryCache()
 	cfg := config.NewDefault()
-	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.SetBlockCachingEnabled(true)
 	cfg.Cache.BlockSize = 4
 	cfg.Cache.SizeThreshold = 1 << 20
 	cfg.Cache.MaxPopulateMemoryBytes = 100
@@ -1610,7 +1610,7 @@ func TestBlockCache_CompleteEntryMassEvictionBoundsUpstreamFanout(t *testing.T) 
 	mock := newBlockMock(object, `"v1"`)
 	memCache := cacheclient.NewMemoryCache()
 	cfg := config.NewDefault()
-	cfg.Cache.BlockCachingEnabled = true
+	cfg.Cache.SetBlockCachingEnabled(true)
 	cfg.Cache.BlockSize = 2
 	cfg.Cache.SizeThreshold = 1 << 20
 	c := cache.NewCacheWithClient(memCache, &cfg.Cache)

@@ -39,13 +39,15 @@ const (
 	// DefaultCacheSizeThreshold is the max object size to cache (1GB).
 	DefaultCacheSizeThreshold = 1024 * 1024 * 1024
 
-	// DefaultCacheBlockSize (4 MiB) is the block granularity AND the read-side whole-vs-block
+	// DefaultCacheBlockSize (1 MiB) is the block granularity AND the read-side whole-vs-block
 	// boundary: a read miss for an object SMALLER than one block is cached as a whole blob
 	// (block-caching a sub-block object is identical to whole-caching it), while an object
-	// this size or LARGER is cached at block granularity. It must stay below ocache's 64 MB
-	// CompactThreshold so blocks pack into shared segments rather than each becoming a
-	// standalone file (see RFC 0001).
-	DefaultCacheBlockSize = 4 * 1024 * 1024
+	// this size or LARGER is cached at block granularity. Sized to typical analytics read
+	// granularity (Parquet footers/row-groups, SST blocks); tune it to your workload's read
+	// size, since an oversized block over-fetches on every miss and amplifies upstream. It must
+	// stay below ocache's 64 MB CompactThreshold so blocks pack into shared segments rather than
+	// each becoming a standalone file (see RFC 0001).
+	DefaultCacheBlockSize = 1 * 1024 * 1024
 
 	// DefaultCacheDiskPath is the default disk path for embedded cache storage.
 	DefaultCacheDiskPath = "/var/cache/tag"
@@ -229,12 +231,14 @@ type CacheConfig struct {
 	// BlockCachingEnabled turns on block-aligned caching for large objects (RFC 0001):
 	// objects at or above BlockSize are cached at BlockSize granularity on read, so a range
 	// read (e.g. a Parquet footer) populates and serves only the blocks it touches instead of
-	// the whole object. Defaults to false (opt-in rollout).
-	BlockCachingEnabled bool `yaml:"block_caching_enabled"`
+	// the whole object. Defaults to true when nil; set false to disable. Read via
+	// IsBlockCachingEnabled(). Size BlockSize to your workload's read granularity — an
+	// oversized block amplifies upstream traffic on every miss.
+	BlockCachingEnabled *bool `yaml:"block_caching_enabled"`
 	// BlockSize is the block granularity AND the read-side whole-vs-block boundary: a read
 	// miss for an object smaller than one block is whole-cached, an object this size or larger
 	// is block-cached. It must stay below ocache's 64 MB CompactThreshold so blocks pack into
-	// shared segments. 0 or unset uses DefaultCacheBlockSize (4 MiB). Only meaningful when
+	// shared segments. 0 or unset uses DefaultCacheBlockSize (1 MiB). Only meaningful when
 	// BlockCachingEnabled is true.
 	BlockSize int64 `yaml:"block_size"`
 	// WarmOnWriteReservedFraction caps the fraction of the populate memory budget
@@ -256,6 +260,19 @@ func (c *CacheConfig) IsEnabled() bool {
 		return true // Default to enabled
 	}
 	return *c.Enabled
+}
+
+// IsBlockCachingEnabled returns whether block-aligned caching is enabled (default: true when nil).
+func (c *CacheConfig) IsBlockCachingEnabled() bool {
+	if c.BlockCachingEnabled == nil {
+		return true // Default to enabled
+	}
+	return *c.BlockCachingEnabled
+}
+
+// SetBlockCachingEnabled sets the BlockCachingEnabled field to the given value.
+func (c *CacheConfig) SetBlockCachingEnabled(enabled bool) {
+	c.BlockCachingEnabled = &enabled
 }
 
 // SetEnabled sets the Enabled field to the given value.
@@ -569,7 +586,7 @@ func applyEnvOverrides(cfg *Config) {
 		}
 		// Override block-aligned caching from environment (accepts true/false/1/0).
 		if b, ok := envBool("TAG_CACHE_BLOCK_CACHING_ENABLED"); ok {
-			cfg.Cache.BlockCachingEnabled = b
+			cfg.Cache.SetBlockCachingEnabled(b)
 		}
 		// Override the block granularity from environment (0/unset keeps the default).
 		if n, ok := envInt64("TAG_CACHE_BLOCK_SIZE"); ok && n > 0 {

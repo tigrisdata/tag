@@ -7,11 +7,11 @@ on:
         description: "Cache mode to benchmark"
         type: choice
         options:
-          - default # whole-object caching (default path)
-          - blocks # block-aligned caching (RFC 0001)
-        default: default
+          - blocks # block-aligned caching (RFC 0001) — the product default
+          - whole # whole-object caching (block caching disabled) — baseline
+        default: blocks
       block_size:
-        description: "Block size in bytes for blocks mode (empty = 4 MiB default). e.g. 65536 to match the 64 KiB GET RANGE size."
+        description: "Block size in bytes for blocks mode (empty = 1 MiB default). e.g. 65536 to match the 64 KiB GET RANGE size."
         type: string
         default: ""
       duration:
@@ -23,7 +23,7 @@ on:
         type: string
         default: ""
       max_populate_memory:
-        description: "Populate memory budget in bytes (empty = 1GiB default). Diagnostic knob for budget-contention hypotheses."
+        description: "Populate memory budget in bytes (empty = 2GiB default). Diagnostic knob for budget-contention hypotheses."
         type: string
         default: ""
       range_objects:
@@ -37,11 +37,11 @@ on:
   workflow_call:
     inputs:
       cache_mode:
-        description: "Cache mode to benchmark: default | blocks"
+        description: "Cache mode to benchmark: blocks (default) | whole"
         type: string
-        default: default
+        default: blocks
       block_size:
-        description: "Block size in bytes for blocks mode (empty = 4 MiB default)"
+        description: "Block size in bytes for blocks mode (empty = 1 MiB default)"
         type: string
         default: ""
       duration:
@@ -53,7 +53,7 @@ on:
         type: string
         default: ""
       max_populate_memory:
-        description: "Populate memory budget in bytes (empty = 1GiB default)"
+        description: "Populate memory budget in bytes (empty = 2GiB default)"
         type: string
         default: ""
       range_objects:
@@ -65,7 +65,7 @@ on:
         type: string
         default: ""
   schedule:
-    # Nightly at 07:00 UTC (runs the default-mode benchmark)
+    # Nightly at 07:00 UTC (runs the product default: block-aligned caching)
     - cron: "0 7 * * *"
 
 # Each run benchmarks against its own bucket (tag-warp-ci-<run id>): warp clears its bucket
@@ -102,17 +102,17 @@ jobs:
       - name: Install system dependencies
         run: make install-deps
 
-      # cache_mode='blocks' enables block-aligned caching. block_size tunes the granularity: empty
-      # uses the 4 MiB production default, but warp GET RANGE reads 64 KiB ranges from 256 MiB
-      # objects (the SlateDB pattern), so at 4 MiB blocks each 64 KiB read pulls a full 4 MiB block
-      # (~64x read amplification). Pass block_size=65536 to size blocks to the range (1:1, no
-      # amplification) and measure where block caching actually wins. Anything else (default, or the
-      # empty cache_mode on scheduled/push runs) uses the whole-object path.
+      # Block-aligned caching is the product default (v1.16.0+), so the default run — and the
+      # scheduled/push nightly (empty cache_mode) — enables it, tracking what ships. cache_mode='whole'
+      # disables it to benchmark the whole-object baseline. block_size tunes the granularity: empty
+      # uses the 1 MiB default. warp GET RANGE reads 64 KiB ranges from 256 MiB objects (the SlateDB
+      # pattern), so at 1 MiB blocks each 64 KiB read pulls a 1 MiB block (~16x read amplification);
+      # pass block_size=65536 to size blocks to the range (1:1) and measure where block caching wins.
       - name: Start TAG (local mode)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          TAG_CACHE_BLOCK_CACHING_ENABLED: ${{ inputs.cache_mode == 'blocks' && 'true' || 'false' }}
+          TAG_CACHE_BLOCK_CACHING_ENABLED: ${{ inputs.cache_mode == 'whole' && 'false' || 'true' }}
           TAG_CACHE_BLOCK_SIZE: ${{ inputs.block_size }}
           TAG_CACHE_MAX_POPULATE_MEMORY: ${{ inputs.max_populate_memory }}
         run: make s3-test-local

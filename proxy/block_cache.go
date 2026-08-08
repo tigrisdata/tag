@@ -75,7 +75,7 @@ var errBlocksMostlyAbsent = fmt.Errorf("too many absent blocks: %w", errBlockStr
 // Config built directly, bypassing Load's normalization) from dividing by zero in block
 // arithmetic. A read miss for a block-eligible object populates blocks, not a whole blob.
 func (s *Service) isBlockEligibleSize(contentLength int64) bool {
-	return s.config.Cache.BlockCachingEnabled &&
+	return s.config.Cache.IsBlockCachingEnabled() &&
 		s.config.Cache.BlockSize > 0 &&
 		contentLength >= s.config.Cache.BlockSize
 }
