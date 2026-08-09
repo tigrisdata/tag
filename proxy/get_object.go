@@ -376,15 +376,13 @@ func (s *Service) streamFromUpstream(
 		!s.hasNoCacheHeaders(resp.Header) &&
 		s.isWithinSizeThreshold(resp)
 
-	// Set up cache listener if caching (streams directly to cache via pipe)
-	var cachePipeWriter *io.PipeWriter
+	// Set up cache listener if caching (streams directly to cache via pipe).
 	var cacheErrCh chan error
-
 	if shouldCache {
 		// Reserve against the memory budget by the object's actual size (capped at
 		// the buffer ceiling), so small objects don't each reserve the worst case.
 		weight := s.populateWeight(resp.ContentLength)
-		cachePipeWriter, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, writeStartTime)
+		_, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, writeStartTime)
 	}
 
 	// If an anonymous GET succeeded and Tigris didn't set an explicit per-object ACL,
@@ -429,23 +427,25 @@ func (s *Service) streamFromUpstream(
 		}
 	}
 
-	// Wait briefly for cache write to complete (the goroutine in setupCacheListener handles closing the pipe)
-	// We don't close cachePipeWriter here - the cache listener goroutine closes it when it finishes.
+	// A cache listener cannot report completion until broadcaster.Complete closes
+	// its chunk channel. fetchAndBroadcast calls Complete after this method returns,
+	// so waiting here delays completion without giving the cache writer a chance to
+	// finish. Observe an already-ready result, and otherwise log any late error
+	// without holding the broadcaster open.
 	if cacheErrCh != nil {
-		// Wait up to 100ms for cache write to complete, otherwise continue
 		select {
-		case cacheWriteErr := <-cacheErrCh:
-			if cacheWriteErr != nil {
+		case cacheWriteErr, ok := <-cacheErrCh:
+			if ok && cacheWriteErr != nil {
 				log.Warn().Err(cacheWriteErr).Str("bucket", bucket).Str("key", key).Msg("Cache write failed")
 			}
-		case <-time.After(100 * time.Millisecond):
-			// Don't block too long waiting for cache - it will complete in background
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache write still in progress, continuing")
+		default:
+			go func() {
+				if cacheWriteErr, ok := <-cacheErrCh; ok && cacheWriteErr != nil {
+					log.Warn().Err(cacheWriteErr).Str("bucket", bucket).Str("key", key).Msg("Cache write failed")
+				}
+			}()
 		}
 	}
-	// Ignore unused cachePipeWriter - it's managed by the cache listener goroutine
-	_ = cachePipeWriter
-
 	return nil
 }
 
