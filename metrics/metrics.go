@@ -264,6 +264,17 @@ var (
 		},
 	)
 
+	// CacheBlockPopulateFailed counts blocks that were fetched and validated but whose
+	// cache write failed (either the unary byte-write fast path or the streaming fallback).
+	// A flood-safe, alertable signal for populate-write failures; the per-block error is
+	// logged only at Debug to avoid log flooding under a sustained cache-backend outage.
+	CacheBlockPopulateFailed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_cache_block_populate_failed_total",
+			Help: "Number of validated object blocks whose cache write failed (block-aligned caching)",
+		},
+	)
+
 	// CacheBlockHits counts covering blocks already present in cache when serving a request
 	// from block mode; CacheBlockMisses counts covering blocks that had to be fetched.
 	CacheBlockHits = promauto.NewCounter(

@@ -983,6 +983,7 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 		}
 		ttl := int(s.config.Cache.TTL.Seconds())
 		if perr := s.cache.PutBlock(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, blockBuf, ttl); perr != nil {
+			metrics.CacheBlockPopulateFailed.Inc()
 			return nil, perr
 		}
 		metrics.CacheBlockPopulated.Inc()

@@ -577,9 +577,7 @@ func (c *Cache) PutBlock(ctx context.Context, bucket, key, etag string, blockSiz
 			handled, err := putter.PutBlockBytes(ctx, blockKey, data, int64(ttl))
 			if handled || err != nil {
 				if err != nil {
-					// Info during initial rollout: surface failures of the new unary
-					// byte-write path at the default log level so operators can observe it.
-					log.Info().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
+					log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
 				}
 				return err
 			}
