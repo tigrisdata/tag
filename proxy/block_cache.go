@@ -973,8 +973,8 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 		// which BlockExists can't distinguish from a complete one — so it would later serve
 		// truncated bytes. io.ReadFull errors on a short body, so a partial block is never stored.
 		// blockLen <= block_size, bounded by maxConcurrentBlockFetches concurrent fetches. The
-		// buffer is pooled and safely returned on exit: PutBlockStream consumes the reader
-		// fully before returning, so nothing references it afterwards.
+		// buffer is pooled and safely returned on exit: PutBlock consumes the fully validated
+		// slice before returning, so nothing references it afterwards.
 		bufp := getBlockBuf(blockLen)
 		defer putBlockBuf(bufp)
 		blockBuf := (*bufp)[:blockLen]
@@ -982,7 +982,7 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 			return nil, fmt.Errorf("block %d fetch: short body (%w), want %d bytes", blockIdx, rerr, blockLen)
 		}
 		ttl := int(s.config.Cache.TTL.Seconds())
-		if perr := s.cache.PutBlockStream(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, bytes.NewReader(blockBuf), ttl); perr != nil {
+		if perr := s.cache.PutBlock(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, blockBuf, ttl); perr != nil {
 			return nil, perr
 		}
 		metrics.CacheBlockPopulated.Inc()

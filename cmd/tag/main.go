@@ -273,8 +273,8 @@ func main() {
 		}
 		readyCancel()
 
-		// Wrap embedded cache with the cache.Cache interface
-		objectCache = cache.NewCacheWithClient(embeddedCache, &cfg.Cache)
+		// Wrap embedded cache with the cache.Cache interface.
+		objectCache = cache.NewCacheWithClient(newEmbeddedBlockCacheClient(embeddedCache), &cfg.Cache)
 
 		// Publish this node's local cache size as tag_cache_size_bytes. ocache keeps
 		// the total live (an atomic), so sampling it is cheap.
