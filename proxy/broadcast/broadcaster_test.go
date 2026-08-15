@@ -247,10 +247,36 @@ func TestBroadcasterContextCancellation(t *testing.T) {
 	// Cancel immediately
 	cancel()
 
-	// WaitForHeaders should return context error
+	// WaitForHeaders should return context error before headers arrive.
 	_, _, err := listener.WaitForHeaders(ctx)
 	if err != context.Canceled {
 		t.Errorf("Expected context.Canceled, got %v", err)
+	}
+}
+
+func TestBroadcasterHeadersWinOverConcurrentCancellation(t *testing.T) {
+	b := NewBroadcaster(DefaultChannelBuffer)
+	listener := b.Subscribe()
+	if listener == nil {
+		t.Fatal("Subscribe returned nil")
+	}
+
+	headers := make(http.Header)
+	headers.Set("ETag", `"ready"`)
+	b.SetHeaders(http.StatusOK, headers)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	status, gotHeaders, err := listener.WaitForHeaders(ctx)
+	if err != nil {
+		t.Fatalf("WaitForHeaders: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want %d", status, http.StatusOK)
+	}
+	if got := gotHeaders.Get("ETag"); got != `"ready"` {
+		t.Errorf("ETag = %q, want %q", got, `"ready"`)
 	}
 }
 

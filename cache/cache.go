@@ -12,6 +12,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	cacheclient "github.com/tigrisdata/ocache/client"
+	"github.com/tigrisdata/ocache/coordinator"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 )
@@ -23,6 +24,13 @@ import (
 // locality is left unrecorded.
 type localityChecker interface {
 	IsLocal(key string) bool
+}
+
+// blockBytePutter is an optional CacheClient capability for a fully staged block.
+// A client returns handled=false when its deployment-specific byte path cannot
+// safely accept the request; Cache then uses the normal CacheClient path.
+type blockBytePutter interface {
+	PutBlockBytes(ctx context.Context, key string, data []byte, ttlSeconds int64) (handled bool, err error)
 }
 
 // ErrNotFound indicates the key was not found in the cache.
@@ -511,6 +519,76 @@ func (c *Cache) BlockExistsErr(ctx context.Context, bucket, key, etag string, bl
 		return false, nil // genuinely absent
 	}
 	return false, e // transient failure — not proof of absence
+}
+
+// unaryPutRequestSize returns the encoded size of ocache's v1.9.0 PutRequest.
+// PutRequest has string key = 1, int64 ttl_seconds = 2, and bytes data = 3. Keeping
+// this check allocation-free matters on the staged-block path, while the exact size
+// keeps an oversized custom block_size on PutStream instead of exceeding gRPC's limit.
+func unaryPutRequestSize(key string, data []byte, ttlSeconds int64) int64 {
+	var size int64
+	if key != "" {
+		size += 1 + int64(protoVarintSize(uint64(len(key)))) + int64(len(key))
+	}
+	if ttlSeconds != 0 {
+		size += 1 + int64(protoVarintSize(uint64(ttlSeconds)))
+	}
+	if len(data) != 0 {
+		size += 1 + int64(protoVarintSize(uint64(len(data)))) + int64(len(data))
+	}
+	return size
+}
+
+func protoVarintSize(v uint64) int {
+	size := 1
+	for v >= 0x80 {
+		v >>= 7
+		size++
+	}
+	return size
+}
+
+func canPutBlockUnaryForLimit(key string, data []byte, ttlSeconds, limit int64) bool {
+	return unaryPutRequestSize(key, data, ttlSeconds) <= limit
+}
+
+func canPutBlockUnary(key string, data []byte, ttlSeconds int64) bool {
+	// TAG uses embedded's default coordinator router. Bound the unary request by
+	// both its send limit and ocache's client limit so either pinned setting can
+	// become the limiting side without changing this path.
+	limit := int64(min(cacheclient.MaxMessageSize, coordinator.MaxMessageSize))
+	return canPutBlockUnaryForLimit(key, data, ttlSeconds, limit)
+}
+
+// PutBlock writes a fully validated block to cache. Clients that explicitly
+// support a unary byte write receive it when the request fits ocache's configured
+// message limit; all other clients retain the streaming path.
+func (c *Cache) PutBlock(ctx context.Context, bucket, key, etag string, blockSize, blockIdx int64, data []byte, ttl int) error {
+	if !c.IsEnabled() || etag == "" {
+		return nil
+	}
+	if ttl == 0 {
+		ttl = int(c.defaultTTL)
+	}
+	blockKey := MakeBlockKey(bucket, key, etag, blockSize, blockIdx)
+
+	if canPutBlockUnary(blockKey, data, int64(ttl)) {
+		if putter, ok := c.client.(blockBytePutter); ok {
+			handled, err := putter.PutBlockBytes(ctx, blockKey, data, int64(ttl))
+			if handled || err != nil {
+				if err != nil {
+					log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
+				}
+				return err
+			}
+		}
+	}
+
+	if err := c.client.PutStream(ctx, blockKey, bytes.NewReader(data), int64(ttl)); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
+		return err
+	}
+	return nil
 }
 
 // PutBlockStream writes a single block of a block-mode object to cache. Blocks are

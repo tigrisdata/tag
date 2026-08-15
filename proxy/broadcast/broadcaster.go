@@ -94,13 +94,24 @@ type Listener struct {
 	disconnected bool          // True if disconnected due to slow consumption
 }
 
-// WaitForHeaders blocks until headers are available.
+// WaitForHeaders blocks until headers are available. If headers and context
+// cancellation become ready together, headers win. A cache listener can be
+// scheduled after its request handler returns, when both are already ready; it
+// must still consume the completed response and publish the cache entry.
 func (l *Listener) WaitForHeaders(ctx context.Context) (int, http.Header, error) {
 	select {
-	case <-ctx.Done():
-		return 0, nil, ctx.Err()
 	case <-l.headerCh:
 		return l.status, l.headers, nil
+	case <-ctx.Done():
+		// A select chooses randomly when both channels are ready. Re-check the
+		// headers so a completed response wins over concurrent cancellation, while
+		// still honoring cancellation when headers have not arrived.
+		select {
+		case <-l.headerCh:
+			return l.status, l.headers, nil
+		default:
+			return 0, nil, ctx.Err()
+		}
 	}
 }
 

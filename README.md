@@ -9,6 +9,7 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 - **Embedded Cache**: High-performance RocksDB-based cache with automatic cluster discovery
 - **Request Coalescing**: Streaming broadcast pattern reduces duplicate upstream requests under concurrent load
 - **Range Request Caching**: Background fetch of full objects on range cache miss for optimal ML training workloads
+- **Block-Aligned Caching** *(default)*: Caches large objects as fixed-size blocks (RFC 0001) so a small range read fetches and caches only the covering blocks instead of the whole object — ideal for sparse reads of large files (Parquet footers/row-groups, SST blocks). Enabled by default at 1 MiB blocks; size `block_size` to your read granularity, or set `block_caching_enabled: false` to cache whole objects.
 - **Conditional Requests**: Supports If-None-Match and If-Modified-Since for efficient cache validation
 - **AWS SigV4 Authentication**: Full AWS Signature Version 4 validation and re-signing
 - **Prometheus Metrics**: Comprehensive metrics for monitoring cache efficiency and performance
@@ -43,7 +44,7 @@ Each release publishes the install script, run script, and a matching `config.ya
 curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
 
 # A specific release
-curl -fsSL https://tag-releases.t3.storage.dev/v1.14.0/install.sh | bash
+curl -fsSL https://tag-releases.t3.storage.dev/v1.17.0/install.sh | bash
 ```
 
 The script installs the `tag` binary to `/usr/local/bin` and a default config to `/etc/tag/config.yaml`.
@@ -98,10 +99,11 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 
 - Objects larger than `size_threshold` are not cached
 - Objects with `Cache-Control: no-store` or `private` are not cached
-- Range requests trigger background fetch of full object (if within threshold)
+- Among cacheable objects (within `size_threshold`), those at or above `block_size` are cached as fixed-size blocks (block caching, on by default), so a range read fetches only the covering blocks; smaller objects are whole-cached
+- Set `block_caching_enabled: false` to cache whole objects instead — a range request then triggers a background fetch of the full object (if within threshold)
 - PUT/DELETE operations invalidate the cache entry
 
-See [docs/cache-control.md](docs/cache-control.md) for detailed cache control and revalidation documentation.
+See [docs/cache-control.md](docs/cache-control.md) for detailed cache control and revalidation documentation. For tuning and sizing block caching in production, see [docs/deploy.md](docs/deploy.md#block-aligned-caching).
 
 ## Configuration
 

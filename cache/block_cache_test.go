@@ -3,12 +3,17 @@ package cache
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
 	cacheclient "github.com/tigrisdata/ocache/client"
+	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/tag/config"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
 
 func newBlockTestCache(t *testing.T) *Cache {
@@ -16,6 +21,43 @@ func newBlockTestCache(t *testing.T) *Cache {
 	mem := cacheclient.NewMemoryCache()
 	cfg := config.NewDefault()
 	return NewCacheWithClient(mem, &cfg.Cache)
+}
+
+type recordingBlockClient struct {
+	cacheclient.CacheClient
+	putCalls       int
+	streamPutCalls int
+	bytePutCalls   int
+	lastTTL        int64
+	putErr         error
+	handleBytes    bool
+}
+
+func (c *recordingBlockClient) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
+	c.putCalls++
+	c.lastTTL = ttlSeconds
+	if c.putErr != nil {
+		return c.putErr
+	}
+	return c.CacheClient.Put(ctx, key, data, ttlSeconds)
+}
+
+func (c *recordingBlockClient) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
+	c.streamPutCalls++
+	c.lastTTL = ttlSeconds
+	return c.CacheClient.PutStream(ctx, key, r, ttlSeconds)
+}
+
+func (c *recordingBlockClient) PutBlockBytes(ctx context.Context, key string, data []byte, ttlSeconds int64) (bool, error) {
+	c.bytePutCalls++
+	if !c.handleBytes {
+		return false, nil
+	}
+	c.lastTTL = ttlSeconds
+	if c.putErr != nil {
+		return true, c.putErr
+	}
+	return true, c.CacheClient.Put(ctx, key, data, ttlSeconds)
 }
 
 // BlockExistsErr distinguishes a present block (true, nil) from a genuinely-absent one
@@ -124,6 +166,214 @@ func TestPutBlockStream_EmptyETagNotCached(t *testing.T) {
 	}
 	if c.BlockExists(ctx, "b", "k", "", 4, 0) {
 		t.Error("BlockExists(empty etag) = true, want false (empty etag not cached)")
+	}
+}
+
+func TestPutBlock_FallsBackToStreamAndPreservesBlockKeyAndTTL(t *testing.T) {
+	ctx := context.Background()
+	mem := cacheclient.NewMemoryCache()
+	client := &recordingBlockClient{CacheClient: mem}
+	cfg := config.NewDefault()
+	c := NewCacheWithClient(client, &cfg.Cache)
+
+	body := []byte("data")
+	if err := c.PutBlock(ctx, "b", "k", `"v1"`, 4, 2, body, 37); err != nil {
+		t.Fatalf("PutBlock: %v", err)
+	}
+	if client.putCalls != 0 || client.streamPutCalls != 1 {
+		t.Fatalf("write calls = Put:%d PutStream:%d, want Put:0 PutStream:1", client.putCalls, client.streamPutCalls)
+	}
+	if client.lastTTL != 37 {
+		t.Errorf("TTL = %d, want 37", client.lastTTL)
+	}
+
+	var got bytes.Buffer
+	if err := c.GetBlockRangeStream(ctx, "b", "k", `"v1"`, 4, 2, 0, int64(len(body)-1), &got); err != nil {
+		t.Fatalf("GetBlockRangeStream: %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), body) {
+		t.Errorf("stored body = %q, want %q", got.Bytes(), body)
+	}
+}
+
+func TestPutBlock_UsesSpecializedBytePath(t *testing.T) {
+	ctx := context.Background()
+	mem := cacheclient.NewMemoryCache()
+	client := &recordingBlockClient{CacheClient: mem, handleBytes: true}
+	cfg := config.NewDefault()
+	c := NewCacheWithClient(client, &cfg.Cache)
+	body := []byte("data")
+
+	if err := c.PutBlock(ctx, "b", "k", `"v1"`, 4, 0, body, 0); err != nil {
+		t.Fatalf("PutBlock: %v", err)
+	}
+	if client.bytePutCalls != 1 || client.putCalls != 0 || client.streamPutCalls != 0 {
+		t.Fatalf("write calls = PutBlockBytes:%d Put:%d PutStream:%d, want 1:0:0", client.bytePutCalls, client.putCalls, client.streamPutCalls)
+	}
+	if want := int64(cfg.Cache.TTL.Seconds()); client.lastTTL != want {
+		t.Errorf("TTL = %d, want default %d", client.lastTTL, want)
+	}
+
+	var got bytes.Buffer
+	if err := c.GetBlockRangeStream(ctx, "b", "k", `"v1"`, 4, 0, 0, int64(len(body)-1), &got); err != nil {
+		t.Fatalf("GetBlockRangeStream: %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), body) {
+		t.Errorf("stored body = %q, want %q", got.Bytes(), body)
+	}
+}
+
+func TestPutBlock_LargerBlocksUseSpecializedBytePath(t *testing.T) {
+	client := &recordingBlockClient{CacheClient: cacheclient.NewMemoryCache(), handleBytes: true}
+	cfg := config.NewDefault()
+	c := NewCacheWithClient(client, &cfg.Cache)
+	body := make([]byte, config.DefaultCacheBlockSize+1)
+
+	if err := c.PutBlock(context.Background(), "b", "k", `"v1"`, int64(len(body)), 0, body, 60); err != nil {
+		t.Fatalf("PutBlock: %v", err)
+	}
+	if client.bytePutCalls != 1 || client.streamPutCalls != 0 {
+		t.Fatalf("write calls = PutBlockBytes:%d PutStream:%d, want 1:0", client.bytePutCalls, client.streamPutCalls)
+	}
+}
+
+func TestPutBlock_PropagatesBytePathError(t *testing.T) {
+	want := errors.New("injected put failure")
+	client := &recordingBlockClient{CacheClient: cacheclient.NewMemoryCache(), putErr: want, handleBytes: true}
+	cfg := config.NewDefault()
+	c := NewCacheWithClient(client, &cfg.Cache)
+
+	if err := c.PutBlock(context.Background(), "b", "k", `"v1"`, 4, 0, []byte("data"), 60); !errors.Is(err, want) {
+		t.Fatalf("PutBlock error = %v, want %v", err, want)
+	}
+	if client.bytePutCalls != 1 || client.putCalls != 0 || client.streamPutCalls != 0 {
+		t.Fatalf("write calls = PutBlockBytes:%d Put:%d PutStream:%d, want 1:0:0", client.bytePutCalls, client.putCalls, client.streamPutCalls)
+	}
+}
+
+func TestPutBlock_EmptyETagAndDisabledCacheDoNothing(t *testing.T) {
+	client := &recordingBlockClient{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	c := NewCacheWithClient(client, &cfg.Cache)
+	if err := c.PutBlock(context.Background(), "b", "k", "", 4, 0, []byte("data"), 60); err != nil {
+		t.Fatalf("PutBlock(empty etag): %v", err)
+	}
+	if client.putCalls != 0 || client.streamPutCalls != 0 || client.bytePutCalls != 0 {
+		t.Fatalf("empty ETag wrote cache: PutBlockBytes:%d Put:%d PutStream:%d", client.bytePutCalls, client.putCalls, client.streamPutCalls)
+	}
+
+	disabled := NewDisabledCache()
+	if err := disabled.PutBlock(context.Background(), "b", "k", `"v1"`, 4, 0, []byte("data"), 60); err != nil {
+		t.Fatalf("PutBlock(disabled): %v", err)
+	}
+}
+
+func TestCanPutBlockUnaryUsesExactRequestLimit(t *testing.T) {
+	key := "blk|bucket|key|etag|4|0"
+	data := []byte("data")
+	ttl := int64(60)
+	size := unaryPutRequestSize(key, data, ttl)
+	if want := int64(proto.Size(&pb.PutRequest{Key: key, Data: data, TtlSeconds: ttl})); size != want {
+		t.Fatalf("unaryPutRequestSize = %d, want protobuf size %d", size, want)
+	}
+	if !canPutBlockUnaryForLimit(key, data, ttl, size) {
+		t.Errorf("request of size %d rejected at its exact limit", size)
+	}
+	if canPutBlockUnaryForLimit(key, data, ttl, size-1) {
+		t.Errorf("request of size %d accepted above limit %d", size, size-1)
+	}
+}
+
+func TestCanPutBlockUnaryAcceptsLargerConfiguredBlocks(t *testing.T) {
+	key := "blk|bucket|key|etag|4|0"
+	if !canPutBlockUnary(key, make([]byte, 2*config.DefaultCacheBlockSize), 60) {
+		t.Fatal("larger configured block did not use unary path")
+	}
+}
+
+type fakeRemoteBlockRouter struct {
+	local    bool
+	nodeID   string
+	client   pb.CacheServiceClient
+	routeErr error
+	routes   int
+}
+
+func (r *fakeRemoteBlockRouter) IsLocal(string) bool { return r.local }
+
+func (r *fakeRemoteBlockRouter) GetLocalNodeID() string { return r.nodeID }
+
+func (r *fakeRemoteBlockRouter) Route(string) (pb.CacheServiceClient, error) {
+	r.routes++
+	return r.client, r.routeErr
+}
+
+type recordingRemoteBlockRPCClient struct {
+	pb.CacheServiceClient
+	request  *pb.PutRequest
+	response *pb.PutResponse
+	err      error
+}
+
+func (c *recordingRemoteBlockRPCClient) PutObject(_ context.Context, req *pb.PutRequest, _ ...grpc.CallOption) (*pb.PutResponse, error) {
+	c.request = req
+	return c.response, c.err
+}
+
+func TestPutRemoteBlockBytesUsesUnaryRequest(t *testing.T) {
+	rpc := &recordingRemoteBlockRPCClient{response: &pb.PutResponse{Success: true}}
+	router := &fakeRemoteBlockRouter{nodeID: "node-a", client: rpc}
+	body := []byte("block data")
+
+	handled, err := PutRemoteBlockBytes(context.Background(), router, "block-key", body, 42)
+	if err != nil || !handled {
+		t.Fatalf("PutRemoteBlockBytes = (handled=%t, err=%v), want (true, nil)", handled, err)
+	}
+	if router.routes != 1 {
+		t.Fatalf("Route calls = %d, want 1", router.routes)
+	}
+	if rpc.request == nil {
+		t.Fatal("PutObject was not called")
+	}
+	if rpc.request.Key != "block-key" || rpc.request.TtlSeconds != 42 || !bytes.Equal(rpc.request.Data, body) {
+		t.Errorf("PutObject request = %+v, want key, TTL, and data preserved", rpc.request)
+	}
+}
+
+func TestPutRemoteBlockBytesLeavesLocalWriteOnExistingPath(t *testing.T) {
+	router := &fakeRemoteBlockRouter{local: true, nodeID: "node-a"}
+
+	handled, err := PutRemoteBlockBytes(context.Background(), router, "block-key", []byte("block data"), 42)
+	if err != nil || handled {
+		t.Fatalf("PutRemoteBlockBytes = (handled=%t, err=%v), want (false, nil)", handled, err)
+	}
+	if router.routes != 0 {
+		t.Errorf("Route calls = %d, want 0 for local key", router.routes)
+	}
+}
+
+func TestPutRemoteBlockBytesPropagatesRouteAndRemoteErrors(t *testing.T) {
+	routeErr := errors.New("route failed")
+	router := &fakeRemoteBlockRouter{nodeID: "node-a", routeErr: routeErr}
+	if handled, err := PutRemoteBlockBytes(context.Background(), router, "block-key", []byte("block data"), 42); !handled || !errors.Is(err, routeErr) {
+		t.Fatalf("route failure = (handled=%t, err=%v), want (true, %v)", handled, err, routeErr)
+	}
+
+	remoteErr := errors.New("remote failed")
+	rpc := &recordingRemoteBlockRPCClient{err: remoteErr}
+	router = &fakeRemoteBlockRouter{nodeID: "node-a", client: rpc}
+	if handled, err := PutRemoteBlockBytes(context.Background(), router, "block-key", []byte("block data"), 42); !handled || !errors.Is(err, remoteErr) {
+		t.Fatalf("remote failure = (handled=%t, err=%v), want (true, %v)", handled, err, remoteErr)
+	}
+}
+
+func TestPutRemoteBlockBytesPropagatesRejectedWrite(t *testing.T) {
+	rpc := &recordingRemoteBlockRPCClient{response: &pb.PutResponse{Success: false, Error: "write rejected"}}
+	router := &fakeRemoteBlockRouter{nodeID: "node-a", client: rpc}
+
+	handled, err := PutRemoteBlockBytes(context.Background(), router, "block-key", []byte("block data"), 42)
+	if !handled || err == nil || err.Error() != "put failed: write rejected" {
+		t.Fatalf("rejected write = (handled=%t, err=%v), want (true, put failed: write rejected)", handled, err)
 	}
 }
 
