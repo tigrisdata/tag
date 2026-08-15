@@ -14,7 +14,6 @@ import (
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy/broadcast"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -66,12 +65,13 @@ type Service struct {
 	forwarder               RequestForwarder
 	cache                   *cache.Cache
 	config                  *config.Config
-	cacheSemaphore          chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
-	populateBudget          *byteBudget        // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
-	perPopulateCap          int64              // Max bytes a single populate can buffer (reservation ceiling)
-	broadcastManager        *broadcast.Manager // For streaming request coalescing
-	activeBackgroundFetches sync.Map           // Dedup for background full-object fetches (range caching)
-	blockFetch              singleflight.Group // Coalesce concurrent fetches of the same block (RFC 0001)
+	cacheSemaphore          chan struct{}               // Count ceiling on concurrent cache-populate ops (nil = unlimited)
+	populateBudget          *byteBudget                 // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
+	perPopulateCap          int64                       // Max bytes a single populate can buffer (reservation ceiling)
+	broadcastManager        *broadcast.Manager          // For streaming request coalescing
+	activeBackgroundFetches sync.Map                    // Dedup for background full-object fetches (range caching)
+	blockFetchMu            sync.Mutex                  // Guards blockFetches
+	blockFetches            map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
 }
 
 // NewService creates a new proxy service.
@@ -146,6 +146,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		populateBudget:   populateBudget,
 		perPopulateCap:   perPopulateCap,
 		broadcastManager: broadcast.NewManager(channelBuf),
+		blockFetches:     make(map[string]*blockFetchState),
 	}
 }
 

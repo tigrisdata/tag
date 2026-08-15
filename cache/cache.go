@@ -382,6 +382,17 @@ func (c *Cache) recordServeLocality(bodyKey string) {
 	}
 }
 
+// IsBlockLocal reports whether the given block is owned by this node. known is
+// false when the underlying client cannot report ownership, in which case
+// callers must keep their existing synchronous write behavior.
+func (c *Cache) IsBlockLocal(bucket, key, etag string, blockSize, blockIdx int64) (local, known bool) {
+	lc, ok := c.client.(localityChecker)
+	if !ok {
+		return false, false
+	}
+	return lc.IsLocal(MakeBlockKey(bucket, key, etag, blockSize, blockIdx)), true
+}
+
 // ============================================================================
 // Range request support
 // ============================================================================

@@ -168,3 +168,27 @@ func TestServeLocality_NoCapabilityRecordsNothing(t *testing.T) {
 		t.Errorf("non-cluster client recorded locality (local %v, remote %v), want (0, 0)", ld, rd)
 	}
 }
+
+// IsBlockLocal exposes the ownership answer only when the embedded client can
+// report one. Callers use unknown ownership to preserve their synchronous path.
+func TestIsBlockLocal(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		client    cacheclient.CacheClient
+		wantLocal bool
+		wantKnown bool
+	}{
+		{"local owner", &localityMockClient{CacheClient: cacheclient.NewMemoryCache(), local: true}, true, true},
+		{"remote owner", &localityMockClient{CacheClient: cacheclient.NewMemoryCache(), local: false}, false, true},
+		{"unknown owner", cacheclient.NewMemoryCache(), false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.NewDefault()
+			c := NewCacheWithClient(tc.client, &cfg.Cache)
+			local, known := c.IsBlockLocal("b", "k", `"v1"`, 4, 2)
+			if local != tc.wantLocal || known != tc.wantKnown {
+				t.Fatalf("IsBlockLocal = (local=%t, known=%t), want (%t, %t)", local, known, tc.wantLocal, tc.wantKnown)
+			}
+		})
+	}
+}
