@@ -260,8 +260,9 @@ func putBlockBuf(bp *[]byte) {
 // assembling the requested bytes from the entry's blocks into a pooled buffer before
 // committing anything. Present blocks are read exactly once — the read itself is the
 // existence check, there is no separate probe pass — and blocks the read reports absent are
-// fetched (coalesced, bounded) and re-read, all BEFORE headers are written. It returns
-// served=true only once the 206 is committed; any assembly failure returns served=false with
+// fetched (coalesced, bounded) into retained validated buffers. A block another writer wins is
+// re-read; a block this request fetched is copied directly from memory, all BEFORE headers are
+// written. It returns served=true only once the 206 is committed; any assembly failure returns served=false with
 // the response untouched, so the caller falls through to upstream exactly as the probe-first
 // path would. Block hit/miss and range-served metrics are recorded only on a committed
 // serve, and a definitive stale signal invalidates the entry — both matching
@@ -305,17 +306,33 @@ func (s *Service) serveAssembledRange(
 
 	// Fetch whatever pass 1 found missing (coalesced across requests, bounded fan-out, stale
 	// signals prioritized over transient ones — a stale signal also invalidates the entry
-	// inside fetchBlocksToCache), then fill the gaps. Still pre-commit: a fetch or re-read
-	// failure falls through with the response untouched.
+	// inside fetchBlocksForAssembly). A validated buffer fetched by this request is copied
+	// straight into the response assembly, avoiding a remote post-put cache read. Only a
+	// block another writer made present while we waited is re-read. Still pre-commit: a fetch
+	// or re-read failure falls through with the response untouched.
 	if len(missing) > 0 {
-		if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, missing); ferr != nil {
+		fetched, ferr := s.fetchBlocksForAssembly(ctx, bucket, key, accessKey, secretKey, meta, missing)
+		if ferr != nil {
 			return false, ferr
 		}
+		defer func() {
+			for _, lease := range fetched {
+				lease.release()
+			}
+		}()
 		for _, i := range missing {
 			localStart, localEnd := blockLocalRange(i, rng.start, rng.end, meta.BlockSize, meta.ContentLength)
 			bStart, _ := blockBounds(i, meta.BlockSize, meta.ContentLength)
 			goff := bStart + localStart - rng.start
 			n := localEnd - localStart + 1
+			if lease := fetched[i]; lease != nil {
+				if copied := copy(buf[goff:goff+n], lease.data[localStart:localEnd+1]); int64(copied) != n {
+					return false, fmt.Errorf("block %d assembly: fetched buffer short read %d of %d bytes", i, copied, n)
+				}
+				lease.release()
+				delete(fetched, i)
+				continue
+			}
 			sw := &sliceWriter{dst: buf[goff : goff+n]}
 			rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, sw)
 			if rerr != nil || sw.off != n {
@@ -878,126 +895,355 @@ func recordBlockServeMetrics(total, missed int64) {
 	}
 }
 
-// fetchOneBlock fetches a single block from upstream (an aligned range GET) and writes it to
-// cache. Concurrent fetches of the same block (across requests) are coalesced via singleflight.
-// The populate budget is reserved by the block's actual size (read-miss priority, non-blocking);
-// on decline the block is not cached and errCachePopulateDeclined is returned. The fetched
-// block's ETag must match meta.ETag or it is rejected (a concurrent overwrite).
-// The shared fetch (the singleflight leader) runs under a DETACHED, timeout-bounded context,
-// not the caller's: binding it to one caller's context would let that caller's cancellation
-// fail the block for every waiter. But the caller does not block on it indefinitely — via
-// DoChan we select on the caller's ctx, so a caller that goes away (e.g. a disconnected
-// client on the synchronous serve path) stops waiting immediately and returns, while the
-// detached fetch keeps running to populate the cache for any other waiters.
-func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) error {
-	blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, blockIdx)
-	ch := s.blockFetch.DoChan(blockKey, func() (interface{}, error) {
-		fetchCtx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
-		defer cancel()
+// blockFetchState owns a validated staged block while callers either wait for its
+// cache write or copy it into a pre-commit assembled response. A state stays in
+// Service.blockFetches through a detached remote write, so late overlapping
+// callers join the same upstream fetch instead of re-fetching a block that has
+// not reached its owner yet.
+type blockFetchState struct {
+	mu sync.Mutex
 
-		// Re-check presence inside the singleflight leader: a prior fetch may have landed.
-		if s.cache.BlockExists(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx) {
+	serveDone chan struct{} // closed after validation makes data usable by an assembler
+	cacheDone chan struct{} // closed after the cache write (if any) has finished
+
+	consumers     int // callers that joined the state and have not released it
+	serveErr      error
+	cacheErr      error
+	cacheFinished bool
+
+	bufp *[]byte // returned to blockBufPool only after cache + every consumer finish
+	data []byte
+}
+
+// blockFetchLease grants an assembled-range serve read-only access to a staged
+// block. The lease must be released after the assembler has copied the relevant
+// slice; it keeps a pooled buffer out of reuse while a detached writer may still
+// marshal it to a remote cache owner.
+type blockFetchLease struct {
+	service *Service
+	state   *blockFetchState
+	data    []byte
+	once    sync.Once
+}
+
+func (l *blockFetchLease) release() {
+	if l == nil {
+		return
+	}
+	l.once.Do(func() { l.service.releaseBlockFetchConsumer(l.state) })
+}
+
+// beginBlockFetch joins or starts a detached block fetch. knownMissing is set
+// only by an assembled serve whose initial range read returned ErrNotFound, so
+// a new leader can avoid asking the same remote owner to prove that miss again.
+// Every caller reserves one consumer before the fetch can publish its buffer,
+// which makes ownership exact even when a fast remote write finishes before
+// waiters wake up.
+func (s *Service) beginBlockFetch(blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) *blockFetchState {
+	s.blockFetchMu.Lock()
+	if s.blockFetches == nil {
+		s.blockFetches = make(map[string]*blockFetchState)
+	}
+	if state := s.blockFetches[blockKey]; state != nil {
+		state.mu.Lock()
+		state.consumers++
+		state.mu.Unlock()
+		s.blockFetchMu.Unlock()
+		return state
+	}
+
+	state := &blockFetchState{
+		serveDone: make(chan struct{}),
+		cacheDone: make(chan struct{}),
+		consumers: 1,
+	}
+	s.blockFetches[blockKey] = state
+	s.blockFetchMu.Unlock()
+
+	go s.runBlockFetch(state, blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, knownMissing)
+	return state
+}
+
+func (state *blockFetchState) completeServe(bufp *[]byte, data []byte, err error) {
+	state.mu.Lock()
+	state.bufp = bufp
+	state.data = data
+	state.serveErr = err
+	close(state.serveDone)
+	state.mu.Unlock()
+}
+
+// finishBlockFetch removes the state only after its cache write no longer reads
+// data. Existing consumers can still hold leases; the last one returns the
+// buffer to the pool. A later caller therefore either joins an in-flight write
+// or probes a write that has already completed.
+func (s *Service) finishBlockFetch(blockKey string, state *blockFetchState, cacheErr error) {
+	s.blockFetchMu.Lock()
+	if s.blockFetches[blockKey] == state {
+		delete(s.blockFetches, blockKey)
+	}
+	s.blockFetchMu.Unlock()
+
+	var bufp *[]byte
+	state.mu.Lock()
+	state.cacheErr = cacheErr
+	state.cacheFinished = true
+	close(state.cacheDone)
+	if state.consumers == 0 {
+		bufp = state.bufp
+		state.bufp = nil
+		state.data = nil
+	}
+	state.mu.Unlock()
+	if bufp != nil {
+		putBlockBuf(bufp)
+	}
+}
+
+func (s *Service) releaseBlockFetchConsumer(state *blockFetchState) {
+	var bufp *[]byte
+	state.mu.Lock()
+	state.consumers--
+	if state.cacheFinished && state.consumers == 0 {
+		bufp = state.bufp
+		state.bufp = nil
+		state.data = nil
+	}
+	state.mu.Unlock()
+	if bufp != nil {
+		putBlockBuf(bufp)
+	}
+}
+
+// fetchOneBlockForAssembly returns a lease only when this fetch read validated
+// bytes from upstream. A nil lease means another writer won the race and the
+// caller must re-read the now-present block from cache.
+func (s *Service) fetchOneBlockForAssembly(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) (*blockFetchLease, error) {
+	blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, blockIdx)
+	// fetchBlocksForAssembly calls this only for a block its pre-commit range
+	// read already established as absent. The first leader can therefore skip
+	// the otherwise redundant remote presence recheck.
+	state := s.beginBlockFetch(blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, true)
+
+	select {
+	case <-state.serveDone:
+		state.mu.Lock()
+		err := state.serveErr
+		data := state.data
+		state.mu.Unlock()
+		if err != nil {
+			s.releaseBlockFetchConsumer(state)
+			return nil, err
+		}
+		if data == nil {
+			s.releaseBlockFetchConsumer(state)
 			return nil, nil
 		}
-		bStart, bEnd := blockBounds(blockIdx, meta.BlockSize, meta.ContentLength)
-		blockLen := bEnd - bStart + 1
+		return &blockFetchLease{service: s, state: state, data: data}, nil
+	case <-ctx.Done():
+		s.releaseBlockFetchConsumer(state)
+		return nil, ctx.Err()
+	}
+}
 
-		// Reserve populate budget by the block size, clamped via populateWeight so a block
-		// larger than the whole budget still acquires (one-at-a-time) instead of being shed
-		// forever. Non-blocking read-miss: on decline the block isn't cached and the caller
-		// falls through to a direct upstream range.
-		reserveWeight := s.populateWeight(blockLen)
-		if !s.acquireCacheSlot(fetchCtx, reserveWeight, priorityReadMiss) {
-			metrics.RecordCachePopulateSkipped(priorityReadMiss.metricSource())
-			return nil, errCachePopulateDeclined
-		}
-		defer s.releaseCacheSlot(reserveWeight)
+// fetchOneBlock waits for both validation and durability, preserving the
+// established behavior for probe-first and background populate callers. A
+// remote assembled serve can use fetchOneBlockForAssembly instead and return
+// after validation while this same state keeps the bounded writer alive.
+func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) error {
+	blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, blockIdx)
+	state := s.beginBlockFetch(blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, false)
 
-		resp, rerr := s.forwarder.DoConditionalGetRequest(fetchCtx, bucket, key, accessKey, secretKey, "", 0, fmt.Sprintf("bytes=%d-%d", bStart, bEnd))
-		if rerr != nil {
-			return nil, rerr
+	select {
+	case <-state.cacheDone:
+		state.mu.Lock()
+		err := state.cacheErr
+		state.mu.Unlock()
+		s.releaseBlockFetchConsumer(state)
+		return err
+	case <-ctx.Done():
+		s.releaseBlockFetchConsumer(state)
+		return ctx.Err()
+	}
+}
+
+// fetchBlocksForAssembly fetches the missing blocks needed by a pre-commit
+// assembled range and retains their validated bytes for direct assembly. It
+// preserves fetchBlocksToCache's stale-signal priority and invalidation rules.
+func (s *Service) fetchBlocksForAssembly(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdxs []int64) (map[int64]*blockFetchLease, error) {
+	var g errgroup.Group
+	g.SetLimit(maxConcurrentBlockFetches)
+	var mu sync.Mutex
+	leases := make(map[int64]*blockFetchLease, len(blockIdxs))
+	var stale, transient error
+	for _, idx := range blockIdxs {
+		g.Go(func() error {
+			lease, err := s.fetchOneBlockForAssembly(ctx, bucket, key, accessKey, secretKey, meta, idx)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if errors.Is(err, errBlockETagMismatch) || errors.Is(err, errBlockUpstreamGone) {
+					if stale == nil {
+						stale = err
+					}
+				} else if transient == nil {
+					transient = err
+				}
+				return nil
+			}
+			if lease != nil {
+				leases[idx] = lease
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	if stale != nil {
+		for _, lease := range leases {
+			lease.release()
 		}
-		defer resp.Body.Close()
-		// A 404 is an object-level "gone" — the cached entry is stale, so signal it for
-		// invalidation. A 403 is NOT: it is principal/permission-level (these credentials can't
-		// read the object right now), not proof the object is gone, so it must not invalidate the
-		// block-mode entry shared across all principals — otherwise one caller's denial would wipe
-		// a valid entry for everyone. A 403 falls through to the generic non-206 failure below
-		// (fail this fetch, no invalidation); the caller then forwards the request upstream.
-		if resp.StatusCode == http.StatusNotFound {
-			return nil, errBlockUpstreamGone
+		log.Debug().Err(stale).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
+		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		return nil, stale
+	}
+	if transient != nil {
+		for _, lease := range leases {
+			lease.release()
 		}
-		// A block fetch must be a 206 whose body is exactly the requested block bytes. A 200
-		// means upstream ignored the Range and returned the whole object (whose byte 0 is the
-		// object start, not this block's offset), and a length that differs from the requested
-		// block means the 206 bounds don't match — storing either would corrupt block offsets.
-		// Reject both; the caller falls through to a direct upstream range.
-		if resp.StatusCode != http.StatusPartialContent {
-			return nil, fmt.Errorf("block %d fetch: unexpected status %d (want 206)", blockIdx, resp.StatusCode)
-		}
-		// ETag guard FIRST: the block must belong to the exact version meta describes. Checking
-		// this before the length/bounds guards ensures an out-of-band overwrite (which changes
-		// the ETag, and may also change the touched block's length) is reported as
-		// errBlockETagMismatch — so ensureBlocksCached invalidates the stale entry — rather than
-		// masked by a plain length/bounds error that leaves the stale meta to retry until TTL.
-		// A block-mode entry is only established from a range response that carried an ETag, so
-		// meta.ETag is always set. If a per-block fetch OMITS its ETag we cannot confirm the
-		// version: a same-size overwrite would otherwise be stored under the old meta.ETag,
-		// mixing versions across blocks. Treat missing-ETag as a transient failure (don't cache,
-		// don't invalidate — it's unconfirmed, not a definitive mismatch); the caller falls
-		// through to a direct upstream range that serves the current bytes.
-		respETag := resp.Header.Get("ETag")
-		if respETag == "" {
-			return nil, fmt.Errorf("block %d fetch: response missing ETag, cannot verify version", blockIdx)
-		}
-		if respETag != meta.ETag {
-			return nil, errBlockETagMismatch
-		}
-		// Same version (ETag matches): the response length must be exactly the requested block.
-		// This rejects a 200 (whole object) and any 206 whose length differs — including an
-		// unknown/chunked length (ContentLength < 0), which we can't validate and so must not
-		// store (a short/long body would be served at fixed block-local offsets, corrupting
-		// reads). S3/Tigris always set Content-Length on a 206, so a well-formed fetch passes.
-		if resp.ContentLength != blockLen {
-			return nil, fmt.Errorf("block %d fetch: content-length %d, want %d", blockIdx, resp.ContentLength, blockLen)
-		}
-		// Validate the 206's Content-Range bounds match the block we asked for. A same-length
-		// response at a different offset (a non-conformant upstream) would otherwise be stored
-		// under this block index and served at the wrong object offset.
-		if rs, re, _, ok := parseContentRange(resp.Header.Get("Content-Range")); !ok || rs != bStart || re != bEnd {
-			return nil, fmt.Errorf("block %d fetch: content-range bounds %d-%d (ok=%t), want %d-%d", blockIdx, rs, re, ok, bStart, bEnd)
-		}
-		// Read the full block into memory before storing: the guards above validate the 206's
-		// headers, not that the body actually delivered blockLen bytes. A body that ends short
-		// (truncated response) streamed straight into PutBlockStream could persist a short block,
-		// which BlockExists can't distinguish from a complete one — so it would later serve
-		// truncated bytes. io.ReadFull errors on a short body, so a partial block is never stored.
-		// blockLen <= block_size, bounded by maxConcurrentBlockFetches concurrent fetches. The
-		// buffer is pooled and safely returned on exit: PutBlock consumes the fully validated
-		// slice before returning, so nothing references it afterwards.
-		bufp := getBlockBuf(blockLen)
-		defer putBlockBuf(bufp)
-		blockBuf := (*bufp)[:blockLen]
-		if _, rerr := io.ReadFull(resp.Body, blockBuf); rerr != nil {
-			return nil, fmt.Errorf("block %d fetch: short body (%w), want %d bytes", blockIdx, rerr, blockLen)
-		}
-		ttl := int(s.config.Cache.TTL.Seconds())
-		if perr := s.cache.PutBlock(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, blockBuf, ttl); perr != nil {
+		return nil, transient
+	}
+	return leases, nil
+}
+
+// runBlockFetch fetches and validates one aligned block under a detached,
+// timeout-bounded context. It transfers the acquired populate slot and staged
+// buffer to a remote writer only after io.ReadFull has completed. Local owners
+// (and clients that cannot report ownership) retain the prior synchronous write
+// behavior; remote owners publish the immutable bytes to assemblers first.
+func (s *Service) runBlockFetch(state *blockFetchState, blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) {
+	fetchCtx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+	fail := func(err error) {
+		state.completeServe(nil, nil, err)
+		cancel()
+		s.finishBlockFetch(blockKey, state, err)
+	}
+
+	// A generic coalesced fetch may have been preceded by an unrelated writer,
+	// so it retains the presence recheck. The assembled path reaches here only
+	// after its own range read returned ErrNotFound; repeating that remote probe
+	// adds a serial RPC without making the staged bytes safer. A writer that
+	// races after that observed miss can at most receive an idempotent put of the
+	// same ETag-versioned block.
+	if !knownMissing && s.cache.BlockExists(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx) {
+		state.completeServe(nil, nil, nil)
+		cancel()
+		s.finishBlockFetch(blockKey, state, nil)
+		return
+	}
+	bStart, bEnd := blockBounds(blockIdx, meta.BlockSize, meta.ContentLength)
+	blockLen := bEnd - bStart + 1
+
+	// Reserve populate budget by the block size, clamped via populateWeight so a block
+	// larger than the whole budget still acquires (one-at-a-time) instead of being shed
+	// forever. The reservation stays held by a detached remote writer, bounding both
+	// the number of writers and the staged bytes after the client response is sent.
+	reserveWeight := s.populateWeight(blockLen)
+	if !s.acquireCacheSlot(fetchCtx, reserveWeight, priorityReadMiss) {
+		metrics.RecordCachePopulateSkipped(priorityReadMiss.metricSource())
+		fail(errCachePopulateDeclined)
+		return
+	}
+
+	abort := func(err error) {
+		s.releaseCacheSlot(reserveWeight)
+		fail(err)
+	}
+	resp, rerr := s.forwarder.DoConditionalGetRequest(fetchCtx, bucket, key, accessKey, secretKey, "", 0, fmt.Sprintf("bytes=%d-%d", bStart, bEnd))
+	if rerr != nil {
+		abort(rerr)
+		return
+	}
+	defer resp.Body.Close()
+	// A 404 is an object-level "gone" — the cached entry is stale, so signal it for
+	// invalidation. A 403 is principal-level and must not invalidate shared metadata.
+	if resp.StatusCode == http.StatusNotFound {
+		abort(errBlockUpstreamGone)
+		return
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		abort(fmt.Errorf("block %d fetch: unexpected status %d (want 206)", blockIdx, resp.StatusCode))
+		return
+	}
+	// ETag validation precedes shape validation so an overwrite is reported as stale
+	// even when it also changed the touched block's length.
+	respETag := resp.Header.Get("ETag")
+	if respETag == "" {
+		abort(fmt.Errorf("block %d fetch: response missing ETag, cannot verify version", blockIdx))
+		return
+	}
+	if respETag != meta.ETag {
+		abort(errBlockETagMismatch)
+		return
+	}
+	if resp.ContentLength != blockLen {
+		abort(fmt.Errorf("block %d fetch: content-length %d, want %d", blockIdx, resp.ContentLength, blockLen))
+		return
+	}
+	if rs, re, _, ok := parseContentRange(resp.Header.Get("Content-Range")); !ok || rs != bStart || re != bEnd {
+		abort(fmt.Errorf("block %d fetch: content-range bounds %d-%d (ok=%t), want %d-%d", blockIdx, rs, re, ok, bStart, bEnd))
+		return
+	}
+
+	// A block becomes usable only after its body is exact. The same immutable slice
+	// is then safe for concurrent read-only assembly and remote gRPC marshaling.
+	bufp := getBlockBuf(blockLen)
+	blockBuf := (*bufp)[:blockLen]
+	if _, rerr := io.ReadFull(resp.Body, blockBuf); rerr != nil {
+		putBlockBuf(bufp)
+		abort(fmt.Errorf("block %d fetch: short body (%w), want %d bytes", blockIdx, rerr, blockLen))
+		return
+	}
+	ttl := int(s.config.Cache.TTL.Seconds())
+
+	// Only a client that positively reports a remote owner takes the detached path.
+	// Unknown clients retain the old synchronous semantics, as do local embedded owners.
+	local, known := s.cache.IsBlockLocal(bucket, key, meta.ETag, meta.BlockSize, blockIdx)
+	if !known || local {
+		perr := s.cache.PutBlock(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, blockBuf, ttl)
+		s.releaseCacheSlot(reserveWeight)
+		cancel()
+		if perr != nil {
+			putBlockBuf(bufp)
 			metrics.CacheBlockPopulateFailed.Inc()
-			return nil, perr
+			state.completeServe(nil, nil, perr)
+			s.finishBlockFetch(blockKey, state, perr)
+			return
 		}
 		metrics.CacheBlockPopulated.Inc()
 		metrics.CacheBlockBytesPopulated.Add(float64(blockLen))
-		return nil, nil
-	})
-	select {
-	case res := <-ch:
-		return res.Err
-	case <-ctx.Done():
-		// The caller gave up (e.g. client disconnected). Stop waiting and return promptly; the
-		// detached fetch above keeps running to populate the cache for any remaining waiters.
-		return ctx.Err()
+		state.completeServe(bufp, blockBuf, nil)
+		s.finishBlockFetch(blockKey, state, nil)
+		return
 	}
+
+	// Remote persistence is intentionally detached from the assembled response.
+	// The state retains both the slot and buffer until PutBlock has consumed the
+	// bytes, so this cannot create unbounded writers or recycle a live pool buffer.
+	state.completeServe(bufp, blockBuf, nil)
+	go func() {
+		perr := s.cache.PutBlock(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, blockBuf, ttl)
+		if perr != nil {
+			metrics.CacheBlockPopulateFailed.Inc()
+			log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Detached remote block cache write failed")
+		} else {
+			metrics.CacheBlockPopulated.Inc()
+			metrics.CacheBlockBytesPopulated.Add(float64(blockLen))
+		}
+		s.releaseCacheSlot(reserveWeight)
+		cancel()
+		s.finishBlockFetch(blockKey, state, perr)
+	}()
 }
 
 // invalidateStaleBlockMeta deletes the object's cache entry only if the stored meta still carries
