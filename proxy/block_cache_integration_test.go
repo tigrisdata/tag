@@ -1681,7 +1681,8 @@ func TestRemainingMetaTTL(t *testing.T) {
 // A warm multi-block serve whose pipeline buffer reservation the budget declines degrades to
 // the direct sequential stream and still serves byte-exact from cache — budget pressure slows
 // a warm serve down, it never surrenders it to upstream. Budget of 5: the complete path's
-// first-block reservation (2) leaves 3, so the pipeline's two-buffer reservation (4) declines.
+// first-block reservation (2) leaves 3, so the smallest two-buffer pipeline reservation (4)
+// declines.
 func TestBlockCache_PipelineBudgetDeclineDegradesToSequential(t *testing.T) {
 	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes → 20 2-byte blocks
 	mock := newBlockMock(object, `"v1"`)
@@ -1770,9 +1771,9 @@ func (f *failAfterWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// A client write failure mid-pipeline must unwind the prefetching reader promptly (returning
-// its in-flight buffer) instead of leaving it blocked on the handoff forever. The serve returns
-// without hanging; -race would flag an unsynchronized unwind.
+// A client write failure mid-pipeline must cancel outstanding cache-read workers promptly and
+// return their buffers instead of leaving them blocked. The serve returns without hanging; -race
+// would flag an unsynchronized unwind.
 func TestBlockCache_PipelineClientWriteFailureUnwindsCleanly(t *testing.T) {
 	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes → 20 2-byte blocks
 	mock := newBlockMock(object, `"v1"`)
@@ -1795,7 +1796,7 @@ func TestBlockCache_PipelineClientWriteFailureUnwindsCleanly(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("serve did not return after a mid-body client write failure (pipeline reader stuck?)")
+		t.Fatal("serve did not return after a mid-body client write failure (prefetch workers stuck?)")
 	}
 }
 
@@ -1806,8 +1807,8 @@ func TestBlockCache_PipelineClientWriteFailureUnwindsCleanly(t *testing.T) {
 func TestBlockCache_SequentialClientWriteFailureDoesNotFetchRemainder(t *testing.T) {
 	object := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$") // 40 bytes → 20 2-byte blocks
 	mock := newBlockMock(object, `"v1"`)
-	// Budget 5: the complete path's first-block reservation (2) leaves 3, so the pipeline's
-	// two-buffer reservation (4) declines and the stream takes the sequential path.
+	// Budget 5: the complete path's first-block reservation (2) leaves 3, so the smallest
+	// two-buffer pipeline reservation (4) declines and the stream takes the sequential path.
 	svc, c := newBlockServiceWithBudget(t, mock, 2, 5)
 
 	w := httptest.NewRecorder()

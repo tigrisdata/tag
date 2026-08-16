@@ -110,7 +110,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		}
 		populateBudget = newByteBudget(total, reserveFraction, perPopulateCap)
 		// Block-serve staging buffers (pre-commit range/first-block assembly, the streaming
-		// pipeline's double buffers) draw from this SAME budget — so max_populate_memory_bytes is
+		// pipeline's bounded prefetch window) draw from this SAME budget — so max_populate_memory_bytes is
 		// an honest total, not a hidden 2x — but are capped at HALF of it. A warm multi-block
 		// serve holds its staging bytes for the whole (possibly multi-second) response, and at
 		// high concurrency those long holds would crowd cold-miss populates out of a shared,
@@ -198,7 +198,7 @@ func (s *Service) populateWeight(contentLength int64) int64 {
 // Unlike populateWeight it is NOT capped at perPopulateCap — that ceiling models the
 // broadcast pipeline's buffering, which has no relationship to raw block-sized staging
 // buffers; clamping to it would let the budget admit more bytes than are actually allocated
-// (e.g. two 64 MiB pipeline buffers reserved as one 80 MiB cap), silently breaking the very
+// (e.g. 32 64 MiB pipeline buffers reserved as one 80 MiB cap), silently breaking the very
 // bound the budget exists to enforce.
 func (s *Service) stagingWeight(n int64) int64 {
 	if n < 1 {

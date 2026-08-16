@@ -54,6 +54,12 @@ var errBlockAssemblyWouldAmplify = errors.New("block assembly would amplify")
 // remainder stream and the degenerate entry is invalidated.
 const maxInlineFetchesPerServe = 2
 
+// maxBlockServePrefetch bounds warm block-cache reads that can be staged for one committed
+// response. Matching the range miss fan-out cap prevents a complete warm range from staging more
+// buffers than a cold range may fetch, while the staging reservation imposes the tighter limit
+// when memory is scarce.
+const maxBlockServePrefetch = maxRangeBlockFanout
+
 // errBlockStreamDegraded marks a committed block serve that hit a block the cache can no longer
 // produce and an inline fetch could not (or should not) recover — but whose remaining bytes
 // upstream can still supply. streamBlockRange salvages the response with one uncached upstream
@@ -379,13 +385,13 @@ type streamOutcome struct {
 // re-split. Only stale signals (a different object version — never mixable into a committed
 // body), client write failures, and a failed remainder still truncate.
 //
-// Multi-block serves are PIPELINED: a reader goroutine prefetches block i+1 into a pooled
-// buffer while block i's bytes are being written to the client, so the cache read latency and
-// the client write latency overlap instead of adding up — the structural stall that made warm
-// multi-block GETs trail whole-object serves (whose single contiguous body never waits
-// per-block). The pipeline holds at most two block buffers (one draining to the client, one
-// filling), reserved against the serve-staging byte budget (never the populate budget — see
-// NewService); on decline — and for single-block serves, where there is nothing to overlap —
+// Multi-block serves use a bounded ordered prefetch window. Each cache read lands in its own
+// pooled buffer, so independently routed remote block keys can be in flight together while the
+// write loop still commits their bytes in order. The window admits at most maxRangeBlockFanout
+// buffers and is
+// reserved against the serve-staging byte budget (never the populate budget — see NewService).
+// Under budget pressure it selects the largest window of at least two buffers that fits; when
+// even two buffers do not fit — and for single-block serves, where there is nothing to overlap —
 // it degrades to the direct sequential path.
 func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (out streamOutcome, err error) {
 	cw := &countingWriter{w: w}
@@ -397,14 +403,25 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 	b0, bK := coveringBlocks(start, end, meta.BlockSize)
 	if b0 == bK {
 		out, err = s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
-	} else if weight := s.stagingWeight(2 * meta.BlockSize); s.populateBudget == nil || s.populateBudget.tryAcquireStaging(weight) {
-		if s.populateBudget != nil {
-			defer s.populateBudget.releaseStaging(weight)
-		}
-		out, err = s.streamBlockRangePipelined(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
 	} else {
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Pipeline buffer budget declined - streaming blocks sequentially")
-		out, err = s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
+		window := min(bK-b0+1, int64(maxBlockServePrefetch))
+		pipelined := false
+		for ; window >= 2; window-- {
+			weight := s.stagingWeight(window * meta.BlockSize)
+			if s.populateBudget != nil && !s.populateBudget.tryAcquireStaging(weight) {
+				continue
+			}
+			out, err = s.streamBlockRangePipelined(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end, int(window))
+			if s.populateBudget != nil {
+				s.populateBudget.releaseStaging(weight)
+			}
+			pipelined = true
+			break
+		}
+		if !pipelined {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Pipeline buffer budget declined - streaming blocks sequentially")
+			out, err = s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
+		}
 	}
 	if err == nil {
 		return out, nil
@@ -437,50 +454,69 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 	return out, err
 }
 
-// streamBlockRangePipelined is streamBlockRange's overlapped core: an unbuffered channel
-// hands each prefetched block from the reader goroutine to the write loop, so exactly one
-// block is filling while one is draining (double buffering — two pooled buffers alive at
-// peak, which is what streamBlockRange reserved). Absent blocks are recovered by the reader
-// via readBlockSlice (bounded by the shared per-serve fetch cap) before the handoff; the
-// first reader error ends the stream in order, exactly where the sequential path would have
-// failed. The stop channel unwinds the reader (and returns its in-flight buffer) when the
-// write loop exits early on a client write error.
-func (s *Service) streamBlockRangePipelined(ctx context.Context, cw *countingWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64) (out streamOutcome, err error) {
+// streamBlockRangePipelined is streamBlockRange's bounded ordered prefetch core. Cache reads
+// begin concurrently, each in its own pooled buffer, but the write loop waits for and commits
+// block i before i+1. Workers only perform the cache read; a cache miss is recovered by the
+// ordered write loop, so fetchesLeft remains a sequential per-serve cap and a later miss or
+// error cannot overtake an earlier block. Every started worker owns one buffer until the write
+// loop consumes it or cancellation returns it to the pool.
+func (s *Service) streamBlockRangePipelined(ctx context.Context, cw *countingWriter, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, start, end int64, prefetchWindow int) (out streamOutcome, err error) {
 	b0, bK := coveringBlocks(start, end, meta.BlockSize)
 	type blockRead struct {
-		bufp      *[]byte
-		n         int64
-		fetchedIt bool
-		err       error
+		bufp       *[]byte
+		n          int64
+		localStart int64
+		localEnd   int64
+		done       chan struct{}
+		err        error
+		fetchedIt  bool
 	}
-	results := make(chan blockRead)
-	stop := make(chan struct{})
-	go func() {
-		defer close(results)
-		fetchesLeft := int64(maxInlineFetchesPerServe)
-		for i := b0; i <= bK; i++ {
-			localStart, localEnd := blockLocalRange(i, start, end, meta.BlockSize, meta.ContentLength)
-			br := blockRead{n: localEnd - localStart + 1}
-			br.bufp = getBlockBuf(br.n)
-			br.fetchedIt, br.err = s.readBlockSlice(ctx, bucket, key, accessKey, secretKey, meta, i, localStart, localEnd, (*br.bufp)[:br.n], &fetchesLeft)
-			select {
-			case results <- br:
-			case <-stop:
-				putBlockBuf(br.bufp)
-				return
-			}
-			if br.err != nil {
-				return
-			}
+
+	readCtx, cancel := context.WithCancel(ctx)
+	pending := make(map[int64]*blockRead, prefetchWindow)
+	defer func() {
+		cancel()
+		for _, br := range pending {
+			<-br.done
+			putBlockBuf(br.bufp)
 		}
 	}()
-	defer close(stop)
-	for br := range results {
+
+	next := b0
+	startRead := func(i int64) {
+		localStart, localEnd := blockLocalRange(i, start, end, meta.BlockSize, meta.ContentLength)
+		br := &blockRead{
+			bufp:       getBlockBuf(localEnd - localStart + 1),
+			n:          localEnd - localStart + 1,
+			localStart: localStart,
+			localEnd:   localEnd,
+			done:       make(chan struct{}),
+		}
+		pending[i] = br
+		go func() {
+			br.err = s.readCachedBlockSlice(readCtx, bucket, key, meta, i, br.localStart, br.localEnd, (*br.bufp)[:br.n])
+			close(br.done)
+		}()
+	}
+	for ; next <= bK && len(pending) < prefetchWindow; next++ {
+		startRead(next)
+	}
+
+	fetchesLeft := int64(maxInlineFetchesPerServe)
+	for i := b0; i <= bK; i++ {
+		br := pending[i]
+		<-br.done // close publishes the completed cache read and its buffer contents
+		if errors.Is(br.err, cache.ErrNotFound) {
+			br.fetchedIt, br.err = s.recoverMissingBlockSlice(ctx, bucket, key, accessKey, secretKey, meta, i, br.localStart, br.localEnd, (*br.bufp)[:br.n], &fetchesLeft)
+		} else if br.err != nil {
+			br.err = blockReadSliceError(i, br.err)
+		}
 		if br.fetchedIt {
 			out.fetched++ // counted even when the post-fetch re-read failed: the miss happened
 		}
 		if br.err != nil {
 			putBlockBuf(br.bufp)
+			delete(pending, i)
 			return out, br.err
 		}
 		if !br.fetchedIt {
@@ -488,8 +524,13 @@ func (s *Service) streamBlockRangePipelined(ctx context.Context, cw *countingWri
 		}
 		_, werr := cw.Write((*br.bufp)[:br.n])
 		putBlockBuf(br.bufp)
+		delete(pending, i)
 		if werr != nil {
 			return out, werr
+		}
+		if next <= bK {
+			startRead(next)
+			next++
 		}
 	}
 	return out, nil
@@ -510,38 +551,64 @@ func (s *Service) streamBlockRangePipelined(ctx context.Context, cw *countingWri
 // signals pass through unwrapped: a different version must never be mixed into a committed
 // body (fetchBlocksToCache has already invalidated the entry).
 func (s *Service) readBlockSlice(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, idx, localStart, localEnd int64, dst []byte, fetchesLeft *int64) (fetched bool, err error) {
-	read := func() error {
-		sw := &sliceWriter{dst: dst}
-		rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, idx, localStart, localEnd, sw)
-		if rerr == nil && sw.off != int64(len(dst)) {
-			return fmt.Errorf("block %d stream: short read %d of %d bytes", idx, sw.off, len(dst))
-		}
-		return rerr
-	}
-	rerr := read()
+	rerr := s.readCachedBlockSlice(ctx, bucket, key, meta, idx, localStart, localEnd, dst)
 	switch {
 	case rerr == nil:
 		return false, nil
 	case errors.Is(rerr, cache.ErrNotFound):
-		if fetchesLeft != nil {
-			if *fetchesLeft <= 0 {
-				return false, errBlocksMostlyAbsent
-			}
-			*fetchesLeft--
-		}
-		if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{idx}); ferr != nil {
-			if errors.Is(ferr, errBlockETagMismatch) || errors.Is(ferr, errBlockUpstreamGone) {
-				return false, ferr
-			}
-			return false, fmt.Errorf("block %d inline fetch failed (%w): %w", idx, ferr, errBlockStreamDegraded)
-		}
-		if rerr = read(); rerr != nil {
-			return true, fmt.Errorf("block %d unreadable after fetch (%w): %w", idx, rerr, errBlockStreamDegraded)
-		}
-		return true, nil
+		return s.recoverMissingBlockSlice(ctx, bucket, key, accessKey, secretKey, meta, idx, localStart, localEnd, dst, fetchesLeft)
 	default:
-		return false, fmt.Errorf("block %d read failed (%w): %w", idx, rerr, errBlockStreamDegraded)
+		return false, blockReadSliceError(idx, rerr)
 	}
+}
+
+// readCachedBlockSlice does only the cache read half of readBlockSlice. The prefetch workers
+// call it concurrently for immutable block ranges; miss recovery stays with the ordered consumer
+// so it cannot race the shared inline-fetch cap or report a later failure before an earlier block.
+func (s *Service) readCachedBlockSlice(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, idx, localStart, localEnd int64, dst []byte) error {
+	sw := &sliceWriter{dst: dst}
+	rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, idx, localStart, localEnd, sw)
+	if rerr == nil && sw.off != int64(len(dst)) {
+		return fmt.Errorf("block %d stream: short read %d of %d bytes", idx, sw.off, len(dst))
+	}
+	return rerr
+}
+
+// recoverMissingBlockSlice performs the mutable half of readBlockSlice after an ordered cache
+// miss. Only one caller in a serve reaches this method at a time, preserving the inline-fetch
+// cap and the original first-error order while cache-hit reads ahead may run concurrently. A
+// prefetched ErrNotFound is only a snapshot: another writer can make that block visible before
+// this ordered consumer reaches it. Re-read before charging the inline-fetch allowance, so
+// speculative misses that have already become hits cannot exhaust the recovery cap or make a
+// later genuine miss degrade the entry.
+func (s *Service) recoverMissingBlockSlice(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, idx, localStart, localEnd int64, dst []byte, fetchesLeft *int64) (fetched bool, err error) {
+	rerr := s.readCachedBlockSlice(ctx, bucket, key, meta, idx, localStart, localEnd, dst)
+	switch {
+	case rerr == nil:
+		return false, nil
+	case !errors.Is(rerr, cache.ErrNotFound):
+		return false, blockReadSliceError(idx, rerr)
+	}
+	if fetchesLeft != nil {
+		if *fetchesLeft <= 0 {
+			return false, errBlocksMostlyAbsent
+		}
+		*fetchesLeft--
+	}
+	if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{idx}); ferr != nil {
+		if errors.Is(ferr, errBlockETagMismatch) || errors.Is(ferr, errBlockUpstreamGone) {
+			return false, ferr
+		}
+		return false, fmt.Errorf("block %d inline fetch failed (%w): %w", idx, ferr, errBlockStreamDegraded)
+	}
+	if rerr := s.readCachedBlockSlice(ctx, bucket, key, meta, idx, localStart, localEnd, dst); rerr != nil {
+		return true, fmt.Errorf("block %d unreadable after fetch (%w): %w", idx, rerr, errBlockStreamDegraded)
+	}
+	return true, nil
+}
+
+func blockReadSliceError(idx int64, err error) error {
+	return fmt.Errorf("block %d read failed (%w): %w", idx, err, errBlockStreamDegraded)
 }
 
 // clientWriteTracker distinguishes write-side failures from cache-read failures on the
