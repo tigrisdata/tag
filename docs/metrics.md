@@ -324,11 +324,20 @@ staging budget (half of `cache.max_populate_memory_bytes`):
 | `shrunk`     | A smaller window than requested was granted                           |
 | `sequential` | Every window size was declined — the serve degraded to the unbuffered sequential path |
 
-A rising `shrunk`/`sequential` share under load means the staging budget is saturating and
-tail latency is being served by the slow path — the signal to raise
-`cache.max_populate_memory_bytes`:
+The two non-`full` outcomes have different costs: `shrunk` serves are still pipelined,
+just with less read concurrency (a mild, roughly proportional latency impact), while
+`sequential` serves alone take the unbuffered slow path (one cache read in flight — the
+pre-pipelining latency profile). Track them separately:
 
 ```promql
+# Sequential fallback share — the true slow-path traffic. Any sustained non-zero
+# rate under load means tail latency is being served by the sequential path:
+# the signal to raise cache.max_populate_memory_bytes.
+sum(rate(tag_cache_block_prefetch_windows_total{outcome="sequential"}[5m])) /
+sum(rate(tag_cache_block_prefetch_windows_total[5m]))
+
+# Budget-pressure share — serves that could not get their full window (shrunk +
+# sequential). A leading indicator: rising pressure precedes sequential fallback.
 sum(rate(tag_cache_block_prefetch_windows_total{outcome!="full"}[5m])) /
 sum(rate(tag_cache_block_prefetch_windows_total[5m]))
 ```
