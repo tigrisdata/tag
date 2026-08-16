@@ -52,7 +52,7 @@ Request duration in seconds.
 | ----------- | ------------ |
 | `operation` | S3 operation |
 
-**Buckets:** Default Prometheus buckets (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)
+**Buckets:** 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10 (the default Prometheus buckets plus extra tail resolution at 1.5, 2, 3, 4 and 7.5 seconds)
 
 **Example queries:**
 
@@ -301,6 +301,46 @@ read (e.g. a Parquet footer) populates and serves only the blocks it touches.
 `tag_cache_block_populated_total` counts blocks fetched from upstream and written to cache;
 `tag_cache_block_bytes_populated_total` is the bytes those fetches pulled. Compare the bytes
 against `tag_bytes_transferred_total{direction="out"}` to gauge populate-vs-served amplification.
+
+#### tag_cache_block_populate_failed_total
+
+**Type:** Counter
+
+Blocks that were fetched from upstream and validated but whose cache write failed (either
+the unary byte-write fast path or the streaming fallback). Flood-safe, alertable signal for
+populate-write failures; the per-block error is logged only at Debug. Healthy value is 0 —
+alert on any sustained rate.
+
+#### tag_cache_block_prefetch_windows_total
+
+**Type:** Counter (labeled by `outcome`)
+
+Multi-block serves classified by the prefetch window they were granted from the shared
+staging budget (half of `cache.max_populate_memory_bytes`):
+
+| `outcome`    | Meaning                                                               |
+| ------------ | --------------------------------------------------------------------- |
+| `full`       | The requested window was granted — the fast pipelined path            |
+| `shrunk`     | A smaller window than requested was granted                           |
+| `sequential` | Every window size was declined — the serve degraded to the unbuffered sequential path |
+
+The two non-`full` outcomes have different costs: `shrunk` serves are still pipelined,
+just with less read concurrency (a mild, roughly proportional latency impact), while
+`sequential` serves alone take the unbuffered slow path (one cache read in flight — the
+pre-pipelining latency profile). Track them separately:
+
+```promql
+# Sequential fallback share — the true slow-path traffic. Any sustained non-zero
+# rate under load means tail latency is being served by the sequential path:
+# the signal to raise cache.max_populate_memory_bytes.
+sum(rate(tag_cache_block_prefetch_windows_total{outcome="sequential"}[5m])) /
+sum(rate(tag_cache_block_prefetch_windows_total[5m]))
+
+# Budget-pressure share — serves that could not get their full window (shrunk +
+# sequential). A leading indicator: rising pressure precedes sequential fallback.
+sum(rate(tag_cache_block_prefetch_windows_total{outcome!="full"}[5m])) /
+sum(rate(tag_cache_block_prefetch_windows_total[5m]))
+```
 
 #### tag_cache_block_hits_total / tag_cache_block_misses_total
 

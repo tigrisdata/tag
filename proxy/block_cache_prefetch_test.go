@@ -13,10 +13,12 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
+	"github.com/tigrisdata/tag/metrics"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -752,5 +754,53 @@ func TestBlockCache_PipelineClientWriteFailureCancelsPrefetches(t *testing.T) {
 	service.populateBudget.mu.Unlock()
 	if remaining != total || inUse != 0 {
 		t.Fatalf("staging budget after cancelled prefetch = (remaining=%d, in_use=%d), want (%d, 0)", remaining, inUse, total)
+	}
+}
+
+// prefetchWindowOutcome reads the current value of the prefetch-window outcome counter.
+func prefetchWindowOutcome(t *testing.T, outcome string) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := metrics.CacheBlockPrefetchWindows.WithLabelValues(outcome).Write(&m); err != nil {
+		t.Fatalf("read counter %q: %v", outcome, err)
+	}
+	return m.GetCounter().GetValue()
+}
+
+// Every multi-block serve classifies the prefetch window it was granted: a budget
+// covering the full request counts "full", a budget granting a smaller window counts
+// "shrunk", and a budget that declines every window size counts "sequential". The
+// counter is the operator-facing signal that tail latency is coming from staging
+// saturation rather than the fast pipelined path.
+func TestBlockCache_PrefetchWindowOutcomeCounter(t *testing.T) {
+	blockSize := int64(prefetchTestBlockSize)
+	cases := []struct {
+		name    string
+		blocks  int
+		total   int64 // MaxPopulateMemoryBytes; staging cap is half
+		outcome string
+	}{
+		// 4 blocks requested, staging cap 4 blocks -> full window granted.
+		{"full", 4, 8 * blockSize, "full"},
+		// 4 blocks requested, staging cap 2 blocks -> window shrinks to 2.
+		{"shrunk", 4, 4 * blockSize, "shrunk"},
+		// 4 blocks requested, staging cap under 2 blocks -> sequential fallback.
+		{"sequential", 4, 3 * blockSize, "sequential"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newBlockPrefetchFixture(t, false, tc.blocks)
+			fixture.service.config.Cache.MaxPopulateMemoryBytes = tc.total
+			fixture.service.populateBudget = newByteBudget(tc.total, 0, fixture.service.perPopulateCap)
+			fixture.service.populateBudget.stagingCap = tc.total / 2
+
+			before := prefetchWindowOutcome(t, tc.outcome)
+			if _, err := fixture.serve(fixture.newWriter()); err != nil {
+				t.Fatalf("serve: %v", err)
+			}
+			if got := prefetchWindowOutcome(t, tc.outcome) - before; got != 1 {
+				t.Fatalf("outcome %q counted %v times, want 1", tc.outcome, got)
+			}
+		})
 	}
 }

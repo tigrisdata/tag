@@ -404,12 +404,17 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 	if b0 == bK {
 		out, err = s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
 	} else {
-		window := min(bK-b0+1, int64(maxBlockServePrefetch))
+		requested := min(bK-b0+1, int64(maxBlockServePrefetch))
 		pipelined := false
-		for ; window >= 2; window-- {
+		for window := requested; window >= 2; window-- {
 			weight := s.stagingWeight(window * meta.BlockSize)
 			if s.populateBudget != nil && !s.populateBudget.tryAcquireStaging(weight) {
 				continue
+			}
+			if window == requested {
+				metrics.CacheBlockPrefetchWindows.WithLabelValues("full").Inc()
+			} else {
+				metrics.CacheBlockPrefetchWindows.WithLabelValues("shrunk").Inc()
 			}
 			out, err = s.streamBlockRangePipelined(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end, int(window))
 			if s.populateBudget != nil {
@@ -419,6 +424,7 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 			break
 		}
 		if !pipelined {
+			metrics.CacheBlockPrefetchWindows.WithLabelValues("sequential").Inc()
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Pipeline buffer budget declined - streaming blocks sequentially")
 			out, err = s.streamBlockRangeSequential(ctx, cw, bucket, key, accessKey, secretKey, meta, start, end)
 		}
