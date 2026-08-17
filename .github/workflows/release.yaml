@@ -54,6 +54,15 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Use reachable apt mirror
+        # The runner image points apt at azure.archive.ubuntu.com, which is a
+        # single point of failure (and unreliable outside Azure). Repoint to
+        # the main Ubuntu archive before installing packages. Linux-only: the
+        # darwin matrix entry has no /etc/apt and installs via Homebrew.
+        if: runner.os == 'Linux'
+        run: |
+          sudo grep -rl azure.archive.ubuntu.com /etc/apt/ | xargs -r sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g'
+
       - name: Install system dependencies
         run: make install-deps
 
