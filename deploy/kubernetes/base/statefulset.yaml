@@ -22,7 +22,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: tag
-          image: tigrisdata/tag:v1.17.0
+          image: tigrisdata/tag:v1.17.6
           imagePullPolicy: Always
           env:
             - name: POD_NAME
@@ -59,6 +59,10 @@ spec:
               value: "tag-headless:7000"
             - name: TAG_CACHE_MAX_DISK_USAGE
               value: "429496729600"
+            # On throughput-capped volumes, bound background compaction I/O so it
+            # cannot starve serving reads (see docs/deploy.md). 0/unset = unthrottled.
+            # - name: TAG_CACHE_COMPACTION_BPS
+            #   value: "33554432" # 32 MiB/s
             - name: TAG_LOG_LEVEL
               value: "info"
           ports:
