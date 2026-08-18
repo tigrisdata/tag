@@ -53,15 +53,29 @@ func ParseHTTPDate(dateStr string) (time.Time, error) {
 
 // RequestSigner signs HTTP requests using AWS SigV4.
 type RequestSigner struct {
-	endpoint string
-	region   string
+	endpoint    string
+	endpointURL *url.URL
+	endpointErr error
+	region      string
 }
 
 // NewRequestSigner creates a new request signer.
 func NewRequestSigner(endpoint, region string) *RequestSigner {
+	endpoint = strings.TrimSuffix(endpoint, "/")
+
+	// Build the template once with the same URL parsing and host normalization
+	// that SignRequest previously received from http.NewRequestWithContext.
+	templateRequest, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	var endpointURL *url.URL
+	if err == nil {
+		endpointURL = templateRequest.URL
+	}
+
 	return &RequestSigner{
-		endpoint: strings.TrimSuffix(endpoint, "/"),
-		region:   region,
+		endpoint:    endpoint,
+		endpointURL: endpointURL,
+		endpointErr: err,
+		region:      region,
 	}
 }
 
@@ -79,12 +93,12 @@ func (s *RequestSigner) Endpoint() string {
 func (s *RequestSigner) SignRequest(ctx context.Context, method, path string,
 	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header) (*http.Request, error) {
 
-	// Build the full URL using url.URL to properly handle encoding
-	// This ensures special characters like % are properly encoded
-	baseURL, err := url.Parse(s.endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse endpoint: %w", err)
+	if s.endpointErr != nil {
+		return nil, fmt.Errorf("failed to parse endpoint: %w", s.endpointErr)
 	}
+
+	// Copy the immutable endpoint template before applying request-specific fields.
+	baseURL := *s.endpointURL
 
 	// Split path and query string
 	pathPart := path
@@ -97,11 +111,45 @@ func (s *RequestSigner) SignRequest(ctx context.Context, method, path string,
 	// Set path (Go will properly encode special characters like % when converting to string)
 	baseURL.Path = pathPart
 	baseURL.RawQuery = queryPart
+	if baseURL.Opaque != "" {
+		// URL.String ignores Path for opaque URLs, so the old stringify-and-parse
+		// path returned an empty Path as well.
+		baseURL.Path = ""
+		baseURL.RawPath = ""
+	} else {
+		if baseURL.RawPath != "" {
+			unescapedPath, err := url.PathUnescape(baseURL.RawPath)
+			if err != nil || unescapedPath != baseURL.Path {
+				baseURL.RawPath = ""
+			}
+		}
+		// URL.String inserts this slash before a relative path when a host is
+		// present; preserve the URL fields the old parse produced.
+		if baseURL.Host != "" && baseURL.Path != "" && baseURL.Path[0] != '/' {
+			baseURL.Path = "/" + baseURL.Path
+			baseURL.RawPath = ""
+		}
+	}
+	baseURL.ForceQuery = baseURL.ForceQuery && baseURL.RawQuery == ""
 
-	fullURL := baseURL.String()
-
-	// Create the new request with streaming body
-	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
+	// A raw '#' in a query becomes a fragment when the old URL string was
+	// reparsed. Keep that unusual, accepted request-target behavior while the
+	// ordinary path attaches its completed URL directly.
+	var (
+		req *http.Request
+		err error
+	)
+	if strings.Contains(baseURL.RawQuery, "#") {
+		req, err = http.NewRequestWithContext(ctx, method, baseURL.String(), body)
+	} else {
+		// Use NewRequestWithContext for its method, context, and body setup, then
+		// attach the completed URL directly rather than serializing and reparsing it.
+		req, err = http.NewRequestWithContext(ctx, method, "", body)
+		if err == nil {
+			req.URL = &baseURL
+			req.Host = baseURL.Host
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
