@@ -132,7 +132,7 @@ Sizing guidance:
 - **Ceiling:** total compaction I/O ≈ 2× the budget (each byte is read then written); keep that well under half the volume cap so serving always has headroom. `32 MiB/s` on a 240 MB/s volume consumes ~27%.
 - **Floor:** the budget must outpace sustained cache churn or raw-file backlog accumulates. One pod at 32 MiB/s drains ~2.7 TB/day.
 - Populate writes (the serving path filling the cache) are **never** throttled — only compaction's own source reads (its writes follow implicitly).
-- The throttle deliberately trades slower backlog drain for stable serving latency; watch `ocache_compaction_bytes_compacted_total` (should plateau at the budget during drain) and serving p95 during post-load consolidation.
+- The throttle deliberately trades slower backlog drain for stable serving latency; watch `rate(ocache_compaction_bytes_compacted_total[5m])` (should plateau near the budget during drain — use a multi-minute window, as the counter advances at batch-commit granularity and short windows read spiky) and serving p95 during post-load consolidation.
 
 ### Health Checks
 
