@@ -236,9 +236,10 @@ func main() {
 		// the top-level embedded.Config fields (DiskPath, TTL, etc.) still take
 		// precedence over anything set here.
 		embeddedCfg.Storage = &ocachestorage.StorageConfig{
-			DeleteBatchSize: cfg.Cache.DeleteBatchSize,
-			RecoveryWorkers: cfg.Cache.RecoveryWorkers,
-			EvictionPolicy:  cfg.Cache.EvictionPolicy,
+			DeleteBatchSize:          cfg.Cache.DeleteBatchSize,
+			RecoveryWorkers:          cfg.Cache.RecoveryWorkers,
+			EvictionPolicy:           cfg.Cache.EvictionPolicy,
+			CompactionBytesPerSecond: cfg.Cache.CompactionBytesPerSecond,
 		}
 
 		// Configure gRPC auth for cache cluster communication

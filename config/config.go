@@ -199,6 +199,14 @@ type CacheConfig struct {
 	// "lru" (default) or "fifo" (oldest-written first). Only takes effect when
 	// MaxDiskUsageBytes > 0 — with no disk cap nothing is evicted regardless.
 	EvictionPolicy string `yaml:"eviction_policy"`
+	// CompactionBytesPerSecond bounds the shared source-read budget for ocache's
+	// background file compaction and segment recompaction (bytes/second). It
+	// protects serving reads on throughput-capped volumes: unthrottled
+	// compaction bursts saturate the disk and stall foreground GETs. 0 or unset
+	// leaves compaction unthrottled (ocache's library default); set it to a
+	// small fraction of the volume's throughput cap (e.g. 16-32 MiB/s on a
+	// 240 MB/s volume).
+	CompactionBytesPerSecond int64 `yaml:"compaction_bytes_per_second"`
 	// MaxConcurrentWrites bounds concurrent cache-populate operations (upstream
 	// fetch + streaming write). When saturated, the object is still served from
 	// upstream but not cached, so the memory/I/O-heavy write path can't grow
@@ -565,6 +573,13 @@ func applyEnvOverrides(cfg *Config) {
 		// Override startup recovery worker count from environment
 		if workers, ok := envInt("TAG_CACHE_RECOVERY_WORKERS"); ok && workers > 0 {
 			cfg.Cache.RecoveryWorkers = workers
+		}
+		// Override the compaction source-read budget from environment
+		// (bytes/second). An explicit 0 disables the throttle even when YAML
+		// enabled it (ocache 0-disables convention); a negative value is
+		// ignored so it cannot wipe a valid YAML setting.
+		if bps, ok := envInt64("TAG_CACHE_COMPACTION_BPS"); ok && bps >= 0 {
+			cfg.Cache.CompactionBytesPerSecond = bps
 		}
 		// Override eviction policy from environment ("lru" or "fifo").
 		// Ignore a blank/whitespace-only value so it can't wipe a valid YAML or

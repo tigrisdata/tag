@@ -1210,3 +1210,33 @@ func TestLoad_MaxPopulateMemoryNegativeDisables(t *testing.T) {
 		t.Errorf("MaxPopulateMemoryBytes = %d, want -1 (negative disables, even whitespace-padded)", cfg.Cache.MaxPopulateMemoryBytes)
 	}
 }
+
+// TestCompactionBPS_OverrideByEnv verifies TAG_CACHE_COMPACTION_BPS plumbs the
+// compaction source-read budget into the cache config, and that non-positive or
+// garbage values leave it unset (unthrottled, matching ocache's 0-disables
+// convention).
+func TestCompactionBPS_OverrideByEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml int64 // value already set (as if from YAML) before the env override
+		env  string
+		want int64
+	}{
+		{"positive value enables throttle", 0, "16777216", 16777216},
+		{"positive value overrides yaml", 1000, "16777216", 16777216},
+		{"explicit zero disables a yaml throttle", 1000, "0", 0},
+		{"whitespace-padded value accepted", 0, " 16777216 ", 16777216},
+		{"negative ignored, yaml kept", 1000, "-1", 1000},
+		{"garbage ignored, yaml kept", 1000, "fast", 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TAG_CACHE_COMPACTION_BPS", tc.env)
+			cfg := NewDefault()
+			cfg.Cache.CompactionBytesPerSecond = tc.yaml
+			applyEnvOverrides(cfg)
+			if cfg.Cache.CompactionBytesPerSecond != tc.want {
+				t.Errorf("Cache.CompactionBytesPerSecond = %d, want %d", cfg.Cache.CompactionBytesPerSecond, tc.want)
+			}
+		})
+	}
+}
