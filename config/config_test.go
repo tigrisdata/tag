@@ -1210,3 +1210,29 @@ func TestLoad_MaxPopulateMemoryNegativeDisables(t *testing.T) {
 		t.Errorf("MaxPopulateMemoryBytes = %d, want -1 (negative disables, even whitespace-padded)", cfg.Cache.MaxPopulateMemoryBytes)
 	}
 }
+
+// TestCompactionBPS_OverrideByEnv verifies TAG_CACHE_COMPACTION_BPS plumbs the
+// compaction source-read budget into the cache config, and that non-positive or
+// garbage values leave it unset (unthrottled, matching ocache's 0-disables
+// convention).
+func TestCompactionBPS_OverrideByEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		want int64
+	}{
+		{"positive value enables throttle", "16777216", 16777216},
+		{"zero stays unthrottled", "0", 0},
+		{"negative stays unthrottled", "-1", 0},
+		{"garbage stays unthrottled", "fast", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TAG_CACHE_COMPACTION_BPS", tc.env)
+			cfg := NewDefault()
+			applyEnvOverrides(cfg)
+			if cfg.Cache.CompactionBytesPerSecond != tc.want {
+				t.Errorf("Cache.CompactionBytesPerSecond = %d, want %d", cfg.Cache.CompactionBytesPerSecond, tc.want)
+			}
+		})
+	}
+}
