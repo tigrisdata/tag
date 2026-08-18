@@ -575,12 +575,11 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Cache.RecoveryWorkers = workers
 		}
 		// Override the compaction source-read budget from environment
-		// (bytes/second). Only a positive value enables the throttle,
-		// matching the ocache 0-disables convention.
-		if val := os.Getenv("TAG_CACHE_COMPACTION_BPS"); val != "" {
-			if bps, err := strconv.ParseInt(val, 10, 64); err == nil && bps > 0 {
-				cfg.Cache.CompactionBytesPerSecond = bps
-			}
+		// (bytes/second). An explicit 0 disables the throttle even when YAML
+		// enabled it (ocache 0-disables convention); a negative value is
+		// ignored so it cannot wipe a valid YAML setting.
+		if bps, ok := envInt64("TAG_CACHE_COMPACTION_BPS"); ok && bps >= 0 {
+			cfg.Cache.CompactionBytesPerSecond = bps
 		}
 		// Override eviction policy from environment ("lru" or "fifo").
 		// Ignore a blank/whitespace-only value so it can't wipe a valid YAML or
