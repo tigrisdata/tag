@@ -16,7 +16,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_DISK_PATH`             | Path to cache data directory                                                    | `/var/cache/tag`         |
 | `TAG_CACHE_MAX_DISK_USAGE`        | Max disk usage in bytes (0 = unlimited)                                         | `0`                      |
 | `TAG_CACHE_EVICTION_POLICY`       | Eviction order when the disk cap is hit: `lru` or `fifo` (oldest-written first)  | `lru`                    |
-| `TAG_CACHE_COMPACTION_BPS`        | Shared source-read budget (bytes/second) for ocache background compaction + recompaction; protects serving reads on throughput-capped volumes. `0` disables (also via env override); unset keeps YAML/default; set to a small fraction of the volume cap (e.g. `16777216` = 16 MiB/s on a 240 MB/s volume) | unthrottled              |
+| `TAG_CACHE_COMPACTION_BPS`        | Shared read budget (bytes/second) for ocache background compaction, recompaction, and the liveness walks that gate reclaim; protects serving reads on throughput-capped volumes. `0` disables (also via env override); unset keeps YAML/default; set to a small fraction of the volume cap (e.g. `33554432` = 32 MiB/s on a 240 MB/s volume) | unthrottled              |
 | `TAG_CACHE_WARM_ON_WRITE`         | Warm the cache after a successful write via a background fetch (`true`/`false`)  | `false`                  |
 | `TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION` | Fraction of the populate memory budget reserved (elastically) for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; negative disables) | `0.5` |
 | `TAG_CACHE_BLOCK_CACHING_ENABLED`  | Enable block-aligned caching for large objects (RFC 0001): a read miss for an object at/above `block_size` is cached at block granularity (`true`/`false`) | `true`                   |
@@ -134,10 +134,10 @@ cache:
   # Override with TAG_CACHE_EVICTION_POLICY env var
   eviction_policy: lru
 
-  # Shared source-read budget (bytes/second) for ocache's background file
-  # compaction and segment recompaction. Protects serving reads on
-  # throughput-capped volumes: unthrottled compaction bursts can saturate the
-  # disk and stall foreground GETs. 0/unset = unthrottled (the ocache library
+  # Shared read budget (bytes/second) for ocache's background file compaction,
+  # segment recompaction, and the liveness walks that gate reclaim. Protects
+  # serving reads on throughput-capped volumes: unthrottled compaction bursts
+  # can saturate the disk and stall foreground GETs. 0/unset = unthrottled (the ocache library
   # default); size it to a small fraction of the volume's throughput cap
   # (e.g. 33554432 = 32 MiB/s on a 240 MB/s volume). Populate writes are
   # never throttled — only compaction's own reads (writes follow implicitly).

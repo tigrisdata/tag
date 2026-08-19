@@ -69,7 +69,7 @@ resources:
   - ../../base
 images:
   - name: tigrisdata/tag
-    newTag: v1.17.6
+    newTag: v1.17.7
 ```
 
 ## Production Considerations
@@ -132,7 +132,22 @@ Sizing guidance:
 - **Ceiling:** total compaction I/O ≈ 2× the budget (each byte is read then written); keep that well under half the volume cap so serving always has headroom. `32 MiB/s` on a 240 MB/s volume consumes ~27%.
 - **Floor:** the budget must outpace sustained cache churn or raw-file backlog accumulates. One pod at 32 MiB/s drains ~2.7 TB/day.
 - Populate writes (the serving path filling the cache) are **never** throttled — only compaction's own source reads (its writes follow implicitly).
+- The budget also covers the **liveness walks that gate recompaction** (one ~4 KiB page charged per entry examined), so enabling it bounds reclaim's read load too rather than leaving it unaccounted.
 - The throttle deliberately trades slower backlog drain for stable serving latency; watch `rate(ocache_compaction_bytes_compacted_total[5m])` (should plateau near the budget during drain — use a multi-minute window, as the counter advances at batch-commit granularity and short windows read spiky) and serving p95 during post-load consolidation.
+
+### Reclaiming dead space
+
+Objects that are overwritten, deleted, or expired leave dead bytes inside segment files. Those bytes have no metadata pointing at them, so TTL, eviction, and the deletion queue cannot reach them — only segment recompaction frees them, by copying the live entries out and deleting the old segment.
+
+Recompaction decides what to reclaim by **deriving** each cold segment's dead bytes from the segment's own entries checked against metadata ([ocache RFC-009](https://github.com/tigrisdata/ocache/blob/main/docs/rfcs/RFC-009-walk-gated-recompaction.md)), so reclaim does not depend on bookkeeping counters staying perfect. There is nothing to configure; the relevant knobs are ocache defaults (2 h minimum segment age, 0.5 fragmentation threshold).
+
+What to watch:
+
+- `rate(ocache_segment_walks_total[10m])` — segments examined. Should be non-zero on any node with cold segments; flat zero means recompaction is disabled or every segment is younger than the age gate.
+- `increase(ocache_recompaction_segments_total[1h])` and `increase(ocache_recompaction_bytes_freed_total[1h])` — reclaim actually happening.
+- **Physical vs logical divergence is the real health signal**: compare `kubelet_volume_stats_used_bytes` for the cache PVC against `ocache_disk_usage_bytes` (live bytes). A gap that grows and never shrinks means dead space is accumulating faster than it is reclaimed; a gap that stays small means reclaim is keeping up. Expect the gap to spike during heavy population and while a recompaction holds both the old and new segment on disk.
+
+Because segments must pass the age gate first, reclaim begins roughly two hours after a pod restart, not immediately.
 
 ### Health Checks
 
