@@ -134,6 +134,17 @@ cache:
   # Override with TAG_CACHE_EVICTION_POLICY env var
   eviction_policy: lru
 
+  # Shared source-read budget (bytes/second) for ocache's background file
+  # compaction and segment recompaction. Protects serving reads on
+  # throughput-capped volumes: unthrottled compaction bursts can saturate the
+  # disk and stall foreground GETs. 0/unset = unthrottled (the ocache library
+  # default); size it to a small fraction of the volume's throughput cap
+  # (e.g. 33554432 = 32 MiB/s on a 240 MB/s volume). Populate writes are
+  # never throttled — only compaction's own reads (writes follow implicitly).
+  # Override with TAG_CACHE_COMPACTION_BPS env var (explicit 0 disables a
+  # YAML-set value).
+  compaction_bytes_per_second: 0
+
   # Warm the cache after a successful write (PutObject / CompleteMultipartUpload /
   # CopyObject) by triggering a background full-object fetch, so a read soon after a
   # write hits cache. This is cache-warm-on-write (write-around plus async warming),
@@ -345,6 +356,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |
 | `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |
 | `eviction_policy`       | string   | `lru`            | Eviction order when the disk cap is hit: `lru` or `fifo` (only applies when `max_disk_usage_bytes` > 0) |
+| `compaction_bytes_per_second` | int64 | `0`          | Shared source-read budget (bytes/s) for background compaction + recompaction; `0` = unthrottled. Size to a small fraction of the volume's throughput cap |
 | `warm_on_write`         | bool     | `false`          | Warm the cache after a successful write via a background fetch (one extra upstream GET per write) |
 | `warm_on_write_reserved_fraction` | float | `0.5`     | Elastic share of the populate budget reserved for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; `0`/unset = default, negative = disabled) |
 | `node_id`               | string   | `""`             | Unique node identifier for cluster mode                                             |

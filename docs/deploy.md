@@ -69,7 +69,7 @@ resources:
   - ../../base
 images:
   - name: tigrisdata/tag
-    newTag: v1.17.0
+    newTag: v1.17.6
 ```
 
 ## Production Considerations
@@ -114,6 +114,25 @@ Start near your median read size; the `1048576` (1 MiB) default suits typical an
 - **Serve latency** — `histogram_quantile(0.95, sum(rate(tag_request_duration_seconds_bucket[5m])) by (le))`.
 
 Cache buffering memory (populate + block-serve staging) is bounded by `TAG_CACHE_MAX_POPULATE_MEMORY` — one honest total (default 2 GiB). See the [Configuration Reference](configuration.md).
+
+### Compaction I/O throttling on throughput-capped volumes
+
+Cloud block volumes are usually throughput-capped (e.g. OCI Balanced at 240 MB/s, gp3 baseline at 125 MB/s). ocache's background compaction (raw-file → segment consolidation and segment recompaction) is unthrottled by default and, after heavy cache population, can burst well past such caps — starving foreground serving reads and causing multi-second p95 stalls until the backlog drains.
+
+On capped volumes, set a shared compaction budget:
+
+```yaml
+env:
+  - name: TAG_CACHE_COMPACTION_BPS
+    value: "33554432" # 32 MiB/s
+```
+
+Sizing guidance:
+
+- **Ceiling:** total compaction I/O ≈ 2× the budget (each byte is read then written); keep that well under half the volume cap so serving always has headroom. `32 MiB/s` on a 240 MB/s volume consumes ~27%.
+- **Floor:** the budget must outpace sustained cache churn or raw-file backlog accumulates. One pod at 32 MiB/s drains ~2.7 TB/day.
+- Populate writes (the serving path filling the cache) are **never** throttled — only compaction's own source reads (its writes follow implicitly).
+- The throttle deliberately trades slower backlog drain for stable serving latency; watch `rate(ocache_compaction_bytes_compacted_total[5m])` (should plateau near the budget during drain — use a multi-minute window, as the counter advances at batch-commit granularity and short windows read spiky) and serving p95 during post-load consolidation.
 
 ### Health Checks
 
