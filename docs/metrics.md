@@ -342,6 +342,45 @@ sum(rate(tag_cache_block_prefetch_windows_total{outcome!="full"}[5m])) /
 sum(rate(tag_cache_block_prefetch_windows_total[5m]))
 ```
 
+#### tag_cache_block_prefetched_total / tag_cache_block_prefetch_used_total
+
+**Type:** Counter (`prefetched` labeled by `trigger`)
+
+Speculative block fetches, and how many of them were later served from cache. Together they
+give prefetch precision — the fraction of speculative work that paid for itself:
+
+```promql
+# Prefetch precision. A low ratio means the speculation is evicting more than it
+# earns: turn the trigger off rather than tuning it.
+sum(rate(tag_cache_block_prefetch_used_total[30m])) /
+sum(rate(tag_cache_block_prefetched_total[30m]))
+```
+
+Attribution counts blocks, not reads: a prefetched block served many times counts once, so
+precision cannot exceed 1. It is also deliberately an undercount — attribution is tracked in a
+bounded, TTL-expiring set, so a block served long after it was prefetched goes unattributed.
+Read the ratio as a floor.
+
+The only `trigger` today is `parquet_footer`, from `cache.parquet_optimization`.
+
+#### tag_cache_parquet_footer_bytes
+
+**Type:** Histogram
+
+Size of the parquet metadata region, read from the trailer of objects served while
+`cache.parquet_optimization` is on. This is the measurement that decides whether the
+optimization is worth running at all: metadata smaller than `cache.block_size` is already
+covered by the tail block that the triggering read cached, and prefetching does nothing.
+
+```promql
+# Share of parquet objects whose metadata spans more than one 1 MiB block —
+# the only population the prefetch can help. Near zero means turn it off.
+1 - (
+  sum(rate(tag_cache_parquet_footer_bytes_bucket{le="1.048576e+06"}[1h])) /
+  sum(rate(tag_cache_parquet_footer_bytes_count[1h]))
+)
+```
+
 #### tag_cache_block_hits_total / tag_cache_block_misses_total
 
 **Type:** Counter

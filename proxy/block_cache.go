@@ -430,6 +430,9 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 		}
 	}
 	if err == nil {
+		// A completed range that reached the object's tail is a parquet reader
+		// opening the file (when the optimization is on and the key says so).
+		s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, start, end)
 		return out, nil
 	}
 	if errors.Is(err, errBlockStreamDegraded) && ctx.Err() == nil && start+cw.written <= end {
@@ -527,6 +530,7 @@ func (s *Service) streamBlockRangePipelined(ctx context.Context, cw *countingWri
 		}
 		if !br.fetchedIt {
 			out.fromCache++
+			s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, i)
 		}
 		_, werr := cw.Write((*br.bufp)[:br.n])
 		putBlockBuf(br.bufp)
@@ -676,6 +680,7 @@ func (s *Service) streamBlockRangeSequential(ctx context.Context, cw *countingWr
 		}
 		if !wasFetched {
 			out.fromCache++
+			s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, i)
 		}
 	}
 	return out, nil
@@ -873,6 +878,7 @@ func (s *Service) serveCompleteFromBlocks(
 		out.fetched++
 	} else {
 		out.fromCache++
+		s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, 0)
 	}
 	n, werr := w.Write(buf)
 	if n > 0 {

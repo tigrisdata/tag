@@ -199,6 +199,17 @@ type CacheConfig struct {
 	// "lru" (default) or "fifo" (oldest-written first). Only takes effect when
 	// MaxDiskUsageBytes > 0 — with no disk cap nothing is evicted regardless.
 	EvictionPolicy string `yaml:"eviction_policy"`
+	// ParquetOptimization enables format-aware prefetching for objects whose key
+	// ends in ".parquet". A parquet reader always reads the file footer before any
+	// data, and the footer is at the end of the object, so a read that touches the
+	// object's tail is a reliable signal that the whole metadata region is about to
+	// be read. When the metadata spans more than the tail block, TAG fetches the
+	// remaining metadata blocks in the background instead of letting the reader
+	// discover them as serial misses. Off by default: it reads 8 bytes of object
+	// content to size the footer, which is format-specific behavior an operator
+	// should opt into.
+	ParquetOptimization bool `yaml:"parquet_optimization"`
+
 	// CompactionBytesPerSecond bounds the shared source-read budget for ocache's
 	// background file compaction and segment recompaction (bytes/second). It
 	// protects serving reads on throughput-capped volumes: unthrottled
@@ -573,6 +584,10 @@ func applyEnvOverrides(cfg *Config) {
 		// Override startup recovery worker count from environment
 		if workers, ok := envInt("TAG_CACHE_RECOVERY_WORKERS"); ok && workers > 0 {
 			cfg.Cache.RecoveryWorkers = workers
+		}
+		// Enable parquet-aware footer prefetching from environment.
+		if val := strings.ToLower(strings.TrimSpace(os.Getenv("TAG_CACHE_PARQUET_OPTIMIZATION"))); val != "" {
+			cfg.Cache.ParquetOptimization = val == "true" || val == "1"
 		}
 		// Override the compaction source-read budget from environment
 		// (bytes/second). An explicit 0 disables the throttle even when YAML
