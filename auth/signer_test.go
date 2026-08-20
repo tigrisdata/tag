@@ -6,9 +6,19 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
+
+func newReservedCanonicalQueryValues() url.Values {
+	return url.Values{
+		"prefix/with space": {"one/two", "a b", "100%"},
+		"x+y":               {"日本", ""},
+	}
+}
+
+const reservedCanonicalQueryString = "prefix%2Fwith%20space=100%25&prefix%2Fwith%20space=a%20b&prefix%2Fwith%20space=one%2Ftwo&x%2By=&x%2By=%E6%97%A5%E6%9C%AC"
 
 func TestRequestSigner_SignRequest(t *testing.T) {
 	signer := NewRequestSigner("https://s3.amazonaws.com", "us-east-1")
@@ -174,6 +184,27 @@ func TestBuildCanonicalQueryString(t *testing.T) {
 
 			if result != tt.expected {
 				t.Errorf("buildCanonicalQueryString() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCanonicalQueryStringReservedBytes(t *testing.T) {
+	signer := NewRequestSigner("https://s3.amazonaws.com", "us-east-1")
+	validator := NewRequestValidator(NewCredentialStore())
+
+	tests := []struct {
+		name  string
+		build func(url.Values) string
+	}{
+		{name: "signer", build: signer.buildCanonicalQueryString},
+		{name: "validator", build: validator.buildCanonicalQueryString},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.build(newReservedCanonicalQueryValues()); got != reservedCanonicalQueryString {
+				t.Errorf("buildCanonicalQueryString() = %q, want %q", got, reservedCanonicalQueryString)
 			}
 		})
 	}

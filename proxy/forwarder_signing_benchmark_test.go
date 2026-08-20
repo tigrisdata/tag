@@ -31,6 +31,13 @@ const (
 		"?tagging&versionId=one%2Ftwo%20with%25marker-" +
 		"000000000000000000000000000000000000000000000000000000000000"
 
+	// This is a GetObjectTagging request with query keys and values that need
+	// SigV4 percent encoding. It exercises validation and re-signing through
+	// Service.HandlePassthrough without an upstream network round trip.
+	signingForwarderBenchmarkEscapedQueryPath = "/benchmark-bucket/object%2Fwith space+and%25" +
+		"?tagging&prefix%2Fwith%20space=one%2Ftwo&prefix%2Fwith%20space=a%20b" +
+		"&prefix%2Fwith%20space=100%25&x%2By=&x%2By=%E6%97%A5%E6%9C%AC"
+
 	// This is an UploadPart request, which is also routed to
 	// Service.HandlePassthrough through handleObjectWithQuery. Its escaped key
 	// and opaque upload ID are deliberately longer than the tagging request.
@@ -204,6 +211,27 @@ func BenchmarkServiceHandlePassthroughSigning(b *testing.B) {
 		b,
 		http.MethodGet,
 		signingForwarderBenchmarkGetPath,
+		"",
+		http.Header{"X-Amz-Expected-Bucket-Owner": {"123456789012"}},
+	)
+	req := incomingRequest.Clone(context.Background())
+	writer := signingForwarderBenchmarkResponseWriter{header: make(http.Header)}
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if err := service.HandlePassthrough(&writer, req); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkServiceHandlePassthroughSigningEscapedQuery measures a signed
+// passthrough request whose canonical query has reserved keys and values.
+func BenchmarkServiceHandlePassthroughSigningEscapedQuery(b *testing.B) {
+	service, incomingRequest := newSigningPassthroughBenchmark(
+		b,
+		http.MethodGet,
+		signingForwarderBenchmarkEscapedQueryPath,
 		"",
 		http.Header{"X-Amz-Expected-Bucket-Owner": {"123456789012"}},
 	)

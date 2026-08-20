@@ -17,6 +17,19 @@ func newSignerBenchmark() *RequestSigner {
 	return NewRequestSigner("https://upstream.example.com", "us-east-1")
 }
 
+func BenchmarkRequestValidatorBuildCanonicalQueryStringReservedBytes(b *testing.B) {
+	validator := NewRequestValidator(NewCredentialStore())
+	query := newReservedCanonicalQueryValues()
+	if got := validator.buildCanonicalQueryString(newReservedCanonicalQueryValues()); got != reservedCanonicalQueryString {
+		b.Fatalf("buildCanonicalQueryString() = %q, want %q", got, reservedCanonicalQueryString)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		validator.buildCanonicalQueryString(query)
+	}
+}
+
 func BenchmarkRequestSignerSignRequest(b *testing.B) {
 	signer := newSignerBenchmark()
 	ctx := context.Background()
