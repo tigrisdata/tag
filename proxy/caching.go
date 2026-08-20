@@ -562,6 +562,55 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 	}()
 }
 
+// hasNoCacheDirectives reports whether any Cache-Control field has a directive that
+// forbids shared caching. It matches directive names rather than substrings, so extension
+// directives and parameter values such as no-storex or foo="no-store" retain normal caching.
+func hasNoCacheDirectives(cacheControls []string) bool {
+	for _, cacheControl := range cacheControls {
+		for i := 0; i < len(cacheControl); {
+			// A field can contain a comma-separated list of directives. Skip optional
+			// whitespace and any empty directives before reading the next name.
+			for i < len(cacheControl) && (cacheControl[i] == ',' || cacheControl[i] == ' ' || cacheControl[i] == '\t') {
+				i++
+			}
+			start := i
+			for i < len(cacheControl) && cacheControl[i] != '=' && cacheControl[i] != ',' && cacheControl[i] != ' ' && cacheControl[i] != '\t' {
+				i++
+			}
+			if strings.EqualFold(cacheControl[start:i], "no-store") || strings.EqualFold(cacheControl[start:i], "private") {
+				return true
+			}
+
+			// Consume the rest of this directive. Commas in quoted extension values do
+			// not start another directive, and an escaped quote stays in that value.
+			quoted, escaped := false, false
+		scanDirective:
+			for i < len(cacheControl) {
+				switch cacheControl[i] {
+				case '\\':
+					if quoted {
+						escaped = !escaped
+					}
+				case '"':
+					if !escaped {
+						quoted = !quoted
+					}
+					escaped = false
+				case ',':
+					if !quoted {
+						i++
+						break scanDirective
+					}
+				default:
+					escaped = false
+				}
+				i++
+			}
+		}
+	}
+	return false
+}
+
 // hasNoCacheHeaders checks if response has no-cache directives.
 func (s *Service) hasNoCacheHeaders(headers http.Header) bool {
 	cc := headers.Get("Cache-Control")

@@ -490,8 +490,10 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// Forward to Tigris, recording the upstream status. When eligible, forwardPutMaybeTee
 	// tees the decoded body so we can populate the cache directly (write-through) instead of
 	// a read-back warm-on-write GET; teed is non-nil only when a tee was attempted.
+	// requestRejectsCache marks a no-store/private PUT that was plain-forwarded before tee
+	// admission and must not start a read-back warm after a successful write.
 	rec := &statusRecorder{ResponseWriter: w}
-	teed, err := s.forwardPutMaybeTee(r.Context(), rec, r, bucket, key)
+	teed, requestRejectsCache, err := s.forwardPutMaybeTee(r.Context(), rec, r, bucket, key)
 
 	// Re-invalidate AFTER upstream confirms the write. A GET that raced the
 	// in-flight PUT may have fetched the pre-PUT object and begun re-caching it;
@@ -504,13 +506,13 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
 		s.invalidateObject(context.Background(), bucket, key)
-		cached := false
+		teeHandled := requestRejectsCache
 		if teed != nil {
 			// writeThroughCache takes ownership of the reserved populate budget.
-			cached = s.writeThroughCache(bucket, key, teed)
+			teeHandled = s.writeThroughCache(bucket, key, teed)
 			teed = nil
 		}
-		if !cached {
+		if !teeHandled {
 			s.warmOnWrite(r, bucket, key)
 		}
 	}
