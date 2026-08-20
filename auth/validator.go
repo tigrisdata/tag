@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -266,29 +265,8 @@ func (v *RequestValidator) buildCanonicalRequestPresigned(r *http.Request, signe
 }
 
 // buildCanonicalQueryString builds the canonical query string.
-func (v *RequestValidator) buildCanonicalQueryString(query url.Values) string {
-	if len(query) == 0 {
-		return ""
-	}
-
-	// Get sorted keys
-	keys := make([]string, 0, len(query))
-	for k := range query {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	// Build sorted key=value pairs using AWS SigV4 encoding
-	pairs := make([]string, 0, len(query))
-	for _, k := range keys {
-		values := query[k]
-		sort.Strings(values)
-		for _, val := range values {
-			pairs = append(pairs, awsURIEncode(k, true)+"="+awsURIEncode(val, true))
-		}
-	}
-
-	return strings.Join(pairs, "&")
+func (*RequestValidator) buildCanonicalQueryString(query url.Values) string {
+	return canonicalQueryString(query)
 }
 
 // buildCanonicalHeadersFromList builds canonical headers from a list of header names.

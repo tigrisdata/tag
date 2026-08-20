@@ -78,9 +78,19 @@ func teeObjectSize(r *http.Request) int64 {
 // threshold, and the populate budget admits it without blocking — it tees the decoded body
 // so the caller can populate the cache without a read-back warm GET. It returns a non-nil
 // *teeState only when a tee was attempted; the caller must then route it through
-// writeThroughCache (which releases the reserved budget). Otherwise it performs a plain
-// forward and returns nil, and the caller falls back to warm-on-write.
-func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string) (*teeState, error) {
+// writeThroughCache (which releases the reserved budget). A PUT request policy that
+// conclusively rejects shared caching takes the plain-forward path before tee admission and
+// returns requestRejectsCache=true so the caller also skips the read-back warm. Other plain
+// forwards return nil, false and fall back to warm-on-write.
+func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string) (teed *teeState, requestRejectsCache bool, err error) {
+	if s.config.Cache.WarmOnWrite && s.cache.IsEnabled() {
+		// net/http canonicalizes incoming header keys. Avoid parsing a policy on the
+		// common cacheable path, which has no Cache-Control field at all.
+		if cacheControls := r.Header["Cache-Control"]; len(cacheControls) > 0 && hasNoCacheDirectives(cacheControls) {
+			return nil, true, s.forwarder.Forward(ctx, w, r)
+		}
+	}
+
 	tf, ok := s.forwarder.(bodyTeeingForwarder)
 	size := teeObjectSize(r)
 	eligible := ok &&
@@ -110,7 +120,7 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 		size <= s.config.Cache.SizeThreshold
 
 	if !eligible {
-		return nil, s.forwarder.Forward(ctx, w, r)
+		return nil, false, s.forwarder.Forward(ctx, w, r)
 	}
 
 	// Non-blocking admission: the tee runs on the client PUT path, so it must never block
@@ -118,18 +128,21 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 	// without blocking; on denial we fall back to a plain forward + (async, blocking)
 	// warm-on-write, so the object still gets cached under budget pressure.
 	if !s.acquireCacheSlot(ctx, size, priorityReadMiss) {
-		return nil, s.forwarder.Forward(ctx, w, r)
+		return nil, false, s.forwarder.Forward(ctx, w, r)
 	}
 
 	// Preallocate to the exact known size to avoid repeated append reallocations on the
 	// write hot path.
-	ts := &teeState{buf: &cappedBuffer{buf: make([]byte, 0, int(size)), cap: int(size)}, weight: size}
+	ts := &teeState{
+		buf:    &cappedBuffer{buf: make([]byte, 0, int(size)), cap: int(size)},
+		weight: size,
+	}
 	status, headers, accessKey, secretKey, err := tf.ForwardTeeingBody(ctx, w, r, ts.buf)
 	ts.statusCode = status
 	ts.respHeaders = headers
 	ts.accessKey = accessKey
 	ts.secretKey = secretKey
-	return ts, err
+	return ts, false, err
 }
 
 // writeThroughCache populates the cache from a teed PutObject body without a full-object
@@ -137,9 +150,10 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 // headers a GET would, minus the body), so the cached entry can never diverge from an origin
 // GET, then writes that meta with the bytes already teed.
 //
-// Returns true when the write was handed off to the async path (which caches the object or,
-// if the HEAD can't confirm it, falls back to a read-back warm), false when it declined
-// synchronously (over-cap body, missing ETag, or no usable credentials) so the caller warms.
+// Returns true when the tee was handed off to the async path (which caches the object or,
+// if the HEAD can't confirm it, falls back to a read-back warm). It returns false only when
+// it declined synchronously (over-cap body, missing ETag, or no usable credentials) so the
+// caller warms.
 // The reserved populate budget is always released: synchronously on decline, or when the
 // async work completes.
 func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {

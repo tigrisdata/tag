@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
@@ -72,6 +73,10 @@ type Service struct {
 	activeBackgroundFetches sync.Map                    // Dedup for background full-object fetches (range caching)
 	blockFetchMu            sync.Mutex                  // Guards blockFetches
 	blockFetches            map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
+	// prefetchedBlocks remembers recently prefetched block keys so a later serve
+	// of one can be attributed, giving prefetch precision. Bounded and
+	// TTL-expiring: this is measurement, and must not become a memory term.
+	prefetchedBlocks *expirable.LRU[string, struct{}]
 }
 
 // NewService creates a new proxy service.
@@ -147,6 +152,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		perPopulateCap:   perPopulateCap,
 		broadcastManager: broadcast.NewManager(channelBuf),
 		blockFetches:     make(map[string]*blockFetchState),
+		prefetchedBlocks: expirable.NewLRU[string, struct{}](maxPrefetchedBlockTracking, nil, prefetchTrackingTTL),
 	}
 }
 
@@ -192,6 +198,18 @@ func (s *Service) populateWeight(contentLength int64) int64 {
 	return w
 }
 
+const (
+	// maxPrefetchedBlockTracking bounds the prefetch attribution set. Sized well
+	// above the blocks one node prefetches within the TTL, so precision is not
+	// understated by eviction from this set.
+	maxPrefetchedBlockTracking = 65536
+
+	// prefetchTrackingTTL is how long a prefetched block stays attributable. A
+	// prefetch that is not used within this window was not useful in the sense
+	// that motivates prefetching — hiding latency from the read that follows it.
+	prefetchTrackingTTL = 30 * time.Minute
+)
+
 // stagingWeight is the byte weight a block-serve staging buffer reserves against the
 // serve-staging budget: the buffer's ACTUAL size, clamped only by the total budget (so a
 // buffer larger than the whole budget still serves one-at-a-time, mirroring populateWeight).
@@ -214,6 +232,7 @@ func (s *Service) stagingWeight(n int64) int64 {
 // budget. warmWrite populates (cache-warm-on-write, which pre-cache data about to
 // be read) get a reserved, prioritized slice of the budget so the read-miss
 // full-object warm flood can't starve them; readMiss populates use the rest.
+
 type populatePriority int
 
 const (
@@ -490,8 +509,10 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// Forward to Tigris, recording the upstream status. When eligible, forwardPutMaybeTee
 	// tees the decoded body so we can populate the cache directly (write-through) instead of
 	// a read-back warm-on-write GET; teed is non-nil only when a tee was attempted.
+	// requestRejectsCache marks a no-store/private PUT that was plain-forwarded before tee
+	// admission and must not start a read-back warm after a successful write.
 	rec := &statusRecorder{ResponseWriter: w}
-	teed, err := s.forwardPutMaybeTee(r.Context(), rec, r, bucket, key)
+	teed, requestRejectsCache, err := s.forwardPutMaybeTee(r.Context(), rec, r, bucket, key)
 
 	// Re-invalidate AFTER upstream confirms the write. A GET that raced the
 	// in-flight PUT may have fetched the pre-PUT object and begun re-caching it;
@@ -504,13 +525,13 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
 		s.invalidateObject(context.Background(), bucket, key)
-		cached := false
+		teeHandled := requestRejectsCache
 		if teed != nil {
 			// writeThroughCache takes ownership of the reserved populate budget.
-			cached = s.writeThroughCache(bucket, key, teed)
+			teeHandled = s.writeThroughCache(bucket, key, teed)
 			teed = nil
 		}
-		if !cached {
+		if !teeHandled {
 			s.warmOnWrite(r, bucket, key)
 		}
 	}

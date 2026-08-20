@@ -16,11 +16,12 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_DISK_PATH`             | Path to cache data directory                                                    | `/var/cache/tag`         |
 | `TAG_CACHE_MAX_DISK_USAGE`        | Max disk usage in bytes (0 = unlimited)                                         | `0`                      |
 | `TAG_CACHE_EVICTION_POLICY`       | Eviction order when the disk cap is hit: `lru` or `fifo` (oldest-written first)  | `lru`                    |
-| `TAG_CACHE_COMPACTION_BPS`        | Shared source-read budget (bytes/second) for ocache background compaction + recompaction; protects serving reads on throughput-capped volumes. `0` disables (also via env override); unset keeps YAML/default; set to a small fraction of the volume cap (e.g. `16777216` = 16 MiB/s on a 240 MB/s volume) | unthrottled              |
+| `TAG_CACHE_COMPACTION_BPS`        | Shared read budget (bytes/second) for ocache background compaction, recompaction, and the liveness walks that gate reclaim; protects serving reads on throughput-capped volumes. `0` disables (also via env override); unset keeps YAML/default; set to a small fraction of the volume cap (e.g. `33554432` = 32 MiB/s on a 240 MB/s volume) | unthrottled              |
 | `TAG_CACHE_WARM_ON_WRITE`         | Warm the cache after a successful write via a background fetch (`true`/`false`)  | `false`                  |
 | `TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION` | Fraction of the populate memory budget reserved (elastically) for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; negative disables) | `0.5` |
 | `TAG_CACHE_BLOCK_CACHING_ENABLED`  | Enable block-aligned caching for large objects (RFC 0001): a read miss for an object at/above `block_size` is cached at block granularity (`true`/`false`) | `true`                   |
 | `TAG_CACHE_BLOCK_SIZE`             | Block granularity **and** the read-side whole-vs-block boundary (bytes): a read miss below this is whole-cached, at/above it is block-cached; must stay below ocache's 64 MB compaction threshold | `1048576` (1 MiB)        |
+| `TAG_CACHE_PARQUET_OPTIMIZATION`   | Prefetch a parquet object's metadata blocks when a read reaches its tail, so a reader opening the file does not discover the rest of the metadata as serial misses. Only fires when the metadata spans more than the tail block (`true`/`1`; any other value leaves it off) | `false`                  |
 | `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
 | `TAG_CACHE_CLUSTER_ADDR`          | Address for memberlist gossip                                                   | `:7000`                  |
 | `TAG_CACHE_GRPC_ADDR`             | Address for gRPC server                                                         | `:9000`                  |
@@ -134,10 +135,10 @@ cache:
   # Override with TAG_CACHE_EVICTION_POLICY env var
   eviction_policy: lru
 
-  # Shared source-read budget (bytes/second) for ocache's background file
-  # compaction and segment recompaction. Protects serving reads on
-  # throughput-capped volumes: unthrottled compaction bursts can saturate the
-  # disk and stall foreground GETs. 0/unset = unthrottled (the ocache library
+  # Shared read budget (bytes/second) for ocache's background file compaction,
+  # segment recompaction, and the liveness walks that gate reclaim. Protects
+  # serving reads on throughput-capped volumes: unthrottled compaction bursts
+  # can saturate the disk and stall foreground GETs. 0/unset = unthrottled (the ocache library
   # default); size it to a small fraction of the volume's throughput cap
   # (e.g. 33554432 = 32 MiB/s on a 240 MB/s volume). Populate writes are
   # never throttled — only compaction's own reads (writes follow implicitly).
@@ -179,6 +180,17 @@ cache:
   # below ocache's 64 MB compaction threshold so blocks pack into shared segments. 0/unset =
   # default (1 MiB). Override with TAG_CACHE_BLOCK_SIZE env var.
   block_size: 1048576
+
+  # Parquet-aware footer prefetching (opt-in). A parquet reader must read the file's metadata
+  # before any data, and that metadata sits at the end of the object. Block caching already
+  # covers metadata that fits in the tail block; this fetches the earlier blocks when it does
+  # not, using the length the file itself declares rather than a guess. Costs one speculative
+  # fetch per spanned block, shed under populate pressure like any other prefetch. Watch
+  # tag_cache_parquet_footer_bytes to confirm it still applies to your data:
+  # measured on production parseable data, footers run ~1.25% of object size, so a
+  # 300 MB object carries ~3.5 MB of metadata -- several blocks at a 1 MiB block_size.
+  # Override with TAG_CACHE_PARQUET_OPTIMIZATION env var.
+  parquet_optimization: false
 
   # Unique node identifier for cluster mode
   # Required for multi-node deployments
@@ -353,6 +365,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
 | `block_caching_enabled` | bool     | `true`           | Enable block-aligned caching for large objects (RFC 0001)                           |
 | `block_size`            | int64    | `1048576`        | Block granularity **and** the read-side whole-vs-block boundary (must stay below ocache's 64 MB compaction threshold) |
+| `parquet_optimization`  | bool     | `false`          | Prefetch a parquet object's metadata blocks on a tail read (only when the metadata spans more than the tail block) |
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |
 | `max_disk_usage_bytes`  | int64    | `0`              | Max disk usage (0 = unlimited)                                                      |
 | `eviction_policy`       | string   | `lru`            | Eviction order when the disk cap is hit: `lru` or `fifo` (only applies when `max_disk_usage_bytes` > 0) |

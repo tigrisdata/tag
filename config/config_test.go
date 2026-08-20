@@ -1240,3 +1240,34 @@ func TestCompactionBPS_OverrideByEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestParquetOptimization_OverrideByEnv verifies TAG_CACHE_PARQUET_OPTIMIZATION
+// plumbs the parquet footer prefetch into the cache config. The optimization is
+// speculative work, so an unrecognized value must leave it off rather than
+// guessing the operator meant to enable it.
+func TestParquetOptimization_OverrideByEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml bool // value already set (as if from YAML) before the env override
+		env  string
+		want bool
+	}{
+		{"true enables", false, "true", true},
+		{"one enables", false, "1", true},
+		{"mixed case accepted", false, "True", true},
+		{"whitespace-padded value accepted", false, " true ", true},
+		{"false disables a yaml enable", true, "false", false},
+		{"garbage disables rather than guessing", true, "yes-please", false},
+		{"unset leaves yaml alone", true, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TAG_CACHE_PARQUET_OPTIMIZATION", tc.env)
+			cfg := NewDefault()
+			cfg.Cache.ParquetOptimization = tc.yaml
+			applyEnvOverrides(cfg)
+			if cfg.Cache.ParquetOptimization != tc.want {
+				t.Errorf("Cache.ParquetOptimization = %v, want %v", cfg.Cache.ParquetOptimization, tc.want)
+			}
+		})
+	}
+}

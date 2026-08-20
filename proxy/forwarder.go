@@ -190,7 +190,7 @@ func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) ba
 // originalReq is the original client request, passed to the response interceptor
 // for parsing auth info. It can be nil if no interceptor is set.
 func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) error {
-	_, _, err := b.executeAndStreamReturningMeta(w, fwdReq, inContentLength, originalReq)
+	_, _, err := b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, false)
 	return err
 }
 
@@ -199,6 +199,12 @@ func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Req
 // tee path, which needs the response ETag to build cache metadata for the just-written
 // object without a read-back GET. On a transport error it returns (0, nil, err).
 func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (int, http.Header, error) {
+	return b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, true)
+}
+
+// executeAndStreamWithMeta streams an upstream response and optionally retains an
+// owned copy of its headers for a caller that needs metadata after streaming.
+func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request, captureMeta bool) (int, http.Header, error) {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
 	}
@@ -217,9 +223,12 @@ func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwd
 		b.responseInterceptor(resp, originalReq)
 	}
 
-	// Clone response headers before streaming so callers can read the upstream ETag
-	// after the body is consumed.
-	respHeaders := resp.Header.Clone()
+	var respHeaders http.Header
+	if captureMeta {
+		// The write-through tee reads the ETag after the body is consumed, so it
+		// needs independent header ownership.
+		respHeaders = resp.Header.Clone()
+	}
 
 	// Stream response back to client
 	copyHeaders(w.Header(), resp.Header)

@@ -5,6 +5,30 @@ import (
 	"time"
 )
 
+func TestHasNoCacheDirectives(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		cacheControls []string
+		want          bool
+	}{
+		{name: "no directives", want: false},
+		{name: "no-store", cacheControls: []string{"no-store"}, want: true},
+		{name: "private with field list", cacheControls: []string{`private="Set-Cookie"`}, want: true},
+		{name: "later repeated directive", cacheControls: []string{"max-age=60", "No-Store"}, want: true},
+		{name: "after quoted extension", cacheControls: []string{`foo="value, still", private`}, want: true},
+		{name: "extension names", cacheControls: []string{"no-storex, privatex"}, want: false},
+		{name: "extension value", cacheControls: []string{"foo=no-store"}, want: false},
+		{name: "quoted extension value", cacheControls: []string{`foo="no-store, private"`}, want: false},
+		{name: "escaped quote in extension value", cacheControls: []string{`foo="a\", no-store", max-age=60`}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasNoCacheDirectives(tc.cacheControls); got != tc.want {
+				t.Errorf("hasNoCacheDirectives(%q) = %t, want %t", tc.cacheControls, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCacheWriteTimeoutForSize(t *testing.T) {
 	tests := []struct {
 		name          string

@@ -350,6 +350,7 @@ func (s *Service) serveAssembledRange(
 	// Committed serve: record hit/miss + serve metrics (only here, never on a fall-through),
 	// then write the response.
 	recordBlockServeMetrics(bK-b0+1, int64(len(missing)))
+	s.noteAssembledPrefetchHits(bucket, key, meta, b0, bK, missing)
 	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(http.StatusPartialContent)
@@ -362,6 +363,10 @@ func (s *Service) serveAssembledRange(
 	}
 	metrics.RecordRangeFromCacheHit()
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	// A parquet reader's trailer probe is a few bytes, so it is served here rather
+	// than by streamBlockRange — this, not the streaming path, is where the footer
+	// signal actually arrives for a reader opening a file.
+	s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, rng.start, rng.end, buf)
 	return true, nil
 }
 
@@ -430,6 +435,11 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 		}
 	}
 	if err == nil {
+		// A completed range that reached the object's tail is a parquet reader
+		// opening the file (when the optimization is on and the key says so).
+		// The streaming path has already handed its bytes to the client, so the
+		// trailer has to come from cache here.
+		s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, start, end, nil)
 		return out, nil
 	}
 	if errors.Is(err, errBlockStreamDegraded) && ctx.Err() == nil && start+cw.written <= end {
@@ -527,6 +537,7 @@ func (s *Service) streamBlockRangePipelined(ctx context.Context, cw *countingWri
 		}
 		if !br.fetchedIt {
 			out.fromCache++
+			s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, i)
 		}
 		_, werr := cw.Write((*br.bufp)[:br.n])
 		putBlockBuf(br.bufp)
@@ -676,6 +687,7 @@ func (s *Service) streamBlockRangeSequential(ctx context.Context, cw *countingWr
 		}
 		if !wasFetched {
 			out.fromCache++
+			s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, i)
 		}
 	}
 	return out, nil
@@ -873,6 +885,7 @@ func (s *Service) serveCompleteFromBlocks(
 		out.fetched++
 	} else {
 		out.fromCache++
+		s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, 0)
 	}
 	n, werr := w.Write(buf)
 	if n > 0 {

@@ -292,6 +292,39 @@ var (
 		[]string{"outcome"},
 	)
 
+	// CacheBlockPrefetched counts blocks fetched speculatively rather than to
+	// satisfy a request in flight. CacheBlockPrefetchUsed counts those that were
+	// later served before eviction. Their ratio is prefetch precision, which is
+	// what decides whether speculation pays for itself: an imprecise prefetcher
+	// spends upstream bandwidth and, under FIFO eviction, displaces blocks that
+	// would have been hit.
+	CacheBlockPrefetched = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_cache_block_prefetched_total",
+			Help: "Blocks fetched speculatively, by trigger",
+		},
+		[]string{"trigger"},
+	)
+
+	CacheBlockPrefetchUsed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_cache_block_prefetch_used_total",
+			Help: "Speculatively fetched blocks that were later served from cache",
+		},
+	)
+
+	// CacheParquetFooterBytes records observed parquet metadata sizes. The
+	// distribution answers whether footer prefetching can help at all: metadata
+	// that fits inside the object's tail block is already cached by the read that
+	// triggered this measurement, so only the tail of this distribution matters.
+	CacheParquetFooterBytes = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "tag_cache_parquet_footer_bytes",
+			Help:    "Size of the parquet metadata region, in bytes",
+			Buckets: prometheus.ExponentialBuckets(64*1024, 2, 10),
+		},
+	)
+
 	// CacheBlockHits counts covering blocks already present in cache when serving a request
 	// from block mode; CacheBlockMisses counts covering blocks that had to be fetched.
 	CacheBlockHits = promauto.NewCounter(

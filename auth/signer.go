@@ -233,29 +233,48 @@ func (s *RequestSigner) buildCanonicalRequest(req *http.Request, bodyHash string
 }
 
 // buildCanonicalQueryString builds the canonical query string from URL parameters.
-func (s *RequestSigner) buildCanonicalQueryString(query url.Values) string {
+func (*RequestSigner) buildCanonicalQueryString(query url.Values) string {
+	return canonicalQueryString(query)
+}
+
+// canonicalQueryString builds sorted key=value pairs using AWS SigV4 encoding.
+func canonicalQueryString(query url.Values) string {
 	if len(query) == 0 {
 		return ""
 	}
 
-	// Get sorted keys
 	keys := make([]string, 0, len(query))
-	for k := range query {
-		keys = append(keys, k)
+	for key := range query {
+		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 
-	// Build sorted key=value pairs using AWS SigV4 encoding
-	pairs := make([]string, 0, len(query))
-	for _, k := range keys {
-		values := query[k]
+	// Every byte can become a three-byte escape, plus the pair separators.
+	size := 0
+	for _, key := range keys {
+		values := query[key]
 		sort.Strings(values)
-		for _, v := range values {
-			pairs = append(pairs, awsURIEncode(k, true)+"="+awsURIEncode(v, true))
+		for _, value := range values {
+			size += 3*len(key) + 3*len(value) + 2
 		}
 	}
 
-	return strings.Join(pairs, "&")
+	var result strings.Builder
+	result.Grow(size)
+	pairs := 0
+	for _, key := range keys {
+		for _, value := range query[key] {
+			if pairs > 0 {
+				result.WriteByte('&')
+			}
+			writeAWSURIEncoded(&result, key, true)
+			result.WriteByte('=')
+			writeAWSURIEncoded(&result, value, true)
+			pairs++
+		}
+	}
+
+	return result.String()
 }
 
 // buildCanonicalHeaders builds canonical headers and signed headers string.
@@ -373,15 +392,24 @@ func hashSHA256(data []byte) string {
 func awsURIEncode(s string, encodeSlash bool) string {
 	var result strings.Builder
 	result.Grow(len(s) * 3) // Worst case: all chars need encoding
-	for _, c := range []byte(s) {
-		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-			(c >= '0' && c <= '9') || c == '_' || c == '-' || c == '~' || c == '.' {
-			result.WriteByte(c)
-		} else if c == '/' && !encodeSlash {
-			result.WriteByte(c)
-		} else {
-			result.WriteString(fmt.Sprintf("%%%02X", c))
-		}
-	}
+	writeAWSURIEncoded(&result, s, encodeSlash)
 	return result.String()
+}
+
+const awsURIHex = "0123456789ABCDEF"
+
+func writeAWSURIEncoded(result *strings.Builder, s string, encodeSlash bool) {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-' || c == '~' || c == '.' ||
+			(c == '/' && !encodeSlash) {
+			result.WriteByte(c)
+			continue
+		}
+
+		result.WriteByte('%')
+		result.WriteByte(awsURIHex[c>>4])
+		result.WriteByte(awsURIHex[c&0x0F])
+	}
 }

@@ -342,6 +342,54 @@ sum(rate(tag_cache_block_prefetch_windows_total{outcome!="full"}[5m])) /
 sum(rate(tag_cache_block_prefetch_windows_total[5m]))
 ```
 
+#### tag_cache_block_prefetched_total / tag_cache_block_prefetch_used_total
+
+**Type:** Counter (`prefetched` labeled by `trigger`)
+
+Speculative block fetches, and how many of them were later served from cache. Together they
+give prefetch precision — the fraction of speculative work that paid for itself:
+
+```promql
+# Prefetch precision. A low ratio means the speculation is evicting more than it
+# earns: turn the trigger off rather than tuning it.
+sum(rate(tag_cache_block_prefetch_used_total[30m])) /
+sum(rate(tag_cache_block_prefetched_total[30m]))
+```
+
+Attribution counts blocks, not reads: a prefetched block served many times counts once, so
+precision cannot exceed 1. It is also deliberately an undercount — attribution is tracked in a
+bounded, TTL-expiring set, so a block served long after it was prefetched goes unattributed.
+Read the ratio as a floor.
+
+The only `trigger` today is `parquet_footer`, from `cache.parquet_optimization`.
+
+#### tag_cache_parquet_footer_bytes
+
+**Type:** Histogram
+
+Size of the parquet metadata region, read from the trailer of objects served while
+`cache.parquet_optimization` is on. Recorded for **every** parquet object whose trailer is
+read, including ones that are not prefetched, so the distribution describes the whole
+population rather than just the prefetched tail of it.
+
+The prefetch does work whenever `footer + 8` exceeds the **remainder** block
+(`ContentLength mod block_size`, averaging half a block) — not merely when the footer exceeds
+`block_size`.
+
+Measured baseline on production parseable data (26 objects): footers run **~1.25% of object
+size** — 3.0 MB at 244 MB, 4.7 MB at 394 MB — so at a 1 MiB `block_size` the metadata spans
+3–5 blocks and the prefetch fires on ~69% of objects. Only small (<2 MB) files, with 20–50 KB
+footers, fit inside the remainder.
+
+Use the histogram to confirm that ratio still holds for your data: a schema change alters
+footer size, and a distribution that collapses below the remainder-block size means the
+optimization has stopped earning its keep.
+
+```promql
+# Median footer size — compare against cache.block_size.
+histogram_quantile(0.5, sum(rate(tag_cache_parquet_footer_bytes_bucket[1h])) by (le))
+```
+
 #### tag_cache_block_hits_total / tag_cache_block_misses_total
 
 **Type:** Counter
