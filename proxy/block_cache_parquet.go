@@ -52,12 +52,25 @@ func isParquetKey(key string) bool {
 // blocks preceding the object's tail block, when the just-served range touched
 // that tail block. It returns immediately; the fetch runs detached.
 //
-// Callers pass the range that was served, not the range that was requested: a
-// serve that failed before reaching the tail proves nothing about what the
-// reader will do next.
-func (s *Service) maybePrefetchParquetFooter(bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, servedStart, servedEnd int64) {
+// Callers pass the range that was SERVED, not the range requested: a serve that
+// failed before reaching the tail proves nothing about what the reader does next.
+//
+// served, when non-nil, is exactly those bytes. It matters on a cold open: the
+// assembled path serves a freshly fetched tail from an in-memory lease while its
+// cache write is still detached, so reading the trailer back from cache would
+// miss and silently skip the prefetch on a reader's FIRST open -- the case this
+// exists for. Callers that no longer hold the bytes pass nil.
+func (s *Service) maybePrefetchParquetFooter(bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, servedStart, servedEnd int64, served []byte) {
 	if !s.parquetFooterPrefetchWanted(key, meta, servedStart, servedEnd) {
 		return
+	}
+
+	// Copy the trailer out before returning: served is a pooled buffer the caller
+	// releases as soon as we return, and the fetch below runs detached.
+	var trailer []byte
+	if int64(len(served)) == servedEnd-servedStart+1 {
+		off := meta.ContentLength - parquetTrailerSize - servedStart
+		trailer = append([]byte(nil), served[off:off+parquetTrailerSize]...)
 	}
 
 	// Every tail read of a hot object hits this path, so coalesce: one prefetch
@@ -70,7 +83,7 @@ func (s *Service) maybePrefetchParquetFooter(bucket, key, accessKey, secretKey s
 	}
 	go func() {
 		defer s.activeBackgroundFetches.Delete(dedupKey)
-		s.prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey, meta)
+		s.prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey, meta, trailer)
 	}()
 }
 
@@ -93,11 +106,11 @@ func (s *Service) parquetFooterPrefetchWanted(key string, meta *cache.CachedObje
 
 // prefetchParquetFooterBlocks reads the metadata length the object declares,
 // then fetches the metadata blocks that are not already cached.
-func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta) {
+func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, trailer []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 	defer cancel()
 
-	footerLen, ok := s.readParquetFooterLength(ctx, bucket, key, meta)
+	footerLen, ok := s.parquetFooterLength(ctx, bucket, key, meta, trailer)
 	if !ok {
 		return
 	}
@@ -140,10 +153,31 @@ func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey 
 	}
 }
 
-// readParquetFooterLength reads the object's 8-byte trailer from cache and
-// returns the declared metadata length. It reports false when the trailer is
-// unreadable or does not describe a parquet file, which also covers a key that
-// merely ends in ".parquet".
+// parquetFooterLength returns the declared metadata length, preferring a trailer
+// the caller already holds over a cache read that can race a detached write.
+func (s *Service) parquetFooterLength(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, trailer []byte) (int64, bool) {
+	if len(trailer) == parquetTrailerSize {
+		return parseParquetTrailer(trailer, meta.ContentLength)
+	}
+	return s.readParquetFooterLength(ctx, bucket, key, meta)
+}
+
+// parseParquetTrailer validates the 8-byte trailer and returns the metadata
+// length it declares, rejecting anything that cannot describe this object.
+func parseParquetTrailer(buf []byte, contentLength int64) (int64, bool) {
+	if string(buf[4:]) != parquetMagic {
+		return 0, false
+	}
+	footerLen := int64(binary.LittleEndian.Uint32(buf[:4]))
+	if footerLen <= 0 || footerLen > contentLength-parquetTrailerSize {
+		return 0, false
+	}
+	return footerLen, true
+}
+
+// readParquetFooterLength reads the object's 8-byte trailer from cache. It
+// reports false when the trailer is unreadable or does not describe a parquet
+// file, which also covers a key that merely ends in ".parquet".
 func (s *Service) readParquetFooterLength(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) (int64, bool) {
 	tailBlock := (meta.ContentLength - 1) / meta.BlockSize
 	blockStart := tailBlock * meta.BlockSize
@@ -161,15 +195,7 @@ func (s *Service) readParquetFooterLength(ctx context.Context, bucket, key strin
 		// evicted or the node lost it: no reason to speculate further.
 		return 0, false
 	}
-	if string(buf[4:]) != parquetMagic {
-		return 0, false
-	}
-
-	footerLen := int64(binary.LittleEndian.Uint32(buf[:4]))
-	if footerLen <= 0 || footerLen > meta.ContentLength-parquetTrailerSize {
-		return 0, false
-	}
-	return footerLen, true
+	return parseParquetTrailer(buf, meta.ContentLength)
 }
 
 // notePrefetchedBlock records a speculatively fetched block so that a later

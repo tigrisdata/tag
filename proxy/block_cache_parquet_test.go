@@ -232,7 +232,7 @@ func TestPrefetchParquetFooterBlocks_FetchesTheSpannedBlocks(t *testing.T) {
 		t.Fatalf("seeding tail block: %v", err)
 	}
 
-	s.prefetchParquetFooterBlocks(bucket, key, "access", "secret", meta)
+	s.prefetchParquetFooterBlocks(bucket, key, "access", "secret", meta, nil)
 
 	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
 	if got := fwd.requestedRanges(); !slices.Equal(got, want) {
@@ -258,7 +258,7 @@ func TestPrefetchParquetFooterBlocks_NoFetchWhenFooterFitsTailBlock(t *testing.T
 	s.forwarder = fwd
 
 	meta := &cache.CachedObjectMeta{ETag: `"v1"`, BlockSize: blockSize, ContentLength: contentLength}
-	s.prefetchParquetFooterBlocks("b", "a.parquet", "access", "secret", meta)
+	s.prefetchParquetFooterBlocks("b", "a.parquet", "access", "secret", meta, nil)
 
 	if got := fwd.requestedRanges(); len(got) != 0 {
 		t.Fatalf("prefetched %v for metadata that fits the tail block", got)
@@ -277,7 +277,7 @@ func TestMaybePrefetchParquetFooter_CoalescesConcurrentTriggers(t *testing.T) {
 	dedupKey := "pq:b/a.parquet/" + meta.ETag
 	s.activeBackgroundFetches.Store(dedupKey, struct{}{})
 
-	s.maybePrefetchParquetFooter("b", "a.parquet", "access", "secret", meta, contentLength-parquetTrailerSize, contentLength-1)
+	s.maybePrefetchParquetFooter("b", "a.parquet", "access", "secret", meta, contentLength-parquetTrailerSize, contentLength-1, nil)
 
 	// A coalesced trigger must leave the in-flight marker for its owner to clear.
 	if _, ok := s.activeBackgroundFetches.Load(dedupKey); !ok {
@@ -346,6 +346,70 @@ func TestServeRangeFromBlockCache_TrailerProbeTriggersFooterPrefetch(t *testing.
 	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
 	if got := fwd.requestedRanges(); !slices.Equal(got, want) {
 		t.Fatalf("prefetched ranges = %v, want %v", got, want)
+	}
+}
+
+// Regression test for the cold-open race. The assembled serve path returns a
+// freshly fetched tail block from an in-memory lease while its cache write is
+// still detached, so the trailer is NOT yet readable from cache when the
+// prefetch fires. Reading it back from cache would skip the prefetch on a
+// reader's first open, which is precisely what this feature targets -- and it
+// would also bias tag_cache_parquet_footer_bytes toward warm re-opens only.
+func TestPrefetchParquetFooterBlocks_UsesServedTrailerWhenTailNotYetCached(t *testing.T) {
+	const (
+		blockSize = 1024
+		blocks    = 6
+		bucket    = "bucket"
+		key       = "a.parquet"
+		etag      = `"v1"`
+	)
+	contentLength := int64(blockSize * blocks)
+	metaStart := int64(3500)
+	footerLen := contentLength - parquetTrailerSize - metaStart
+
+	body := make([]byte, contentLength)
+	binary.LittleEndian.PutUint32(body[contentLength-parquetTrailerSize:], uint32(footerLen))
+	copy(body[contentLength-4:], parquetMagic)
+
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = blockSize
+	cfg.Cache.ParquetOptimization = true
+	store := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	fwd := &parquetFooterForwarder{body: body, etag: etag}
+	s := NewService(fwd, store, cfg)
+
+	meta := &cache.CachedObjectMeta{ETag: etag, BlockSize: blockSize, ContentLength: contentLength}
+
+	// Deliberately seed NOTHING: this is the cold open, with the tail block's
+	// cache write still in flight.
+	trailer := body[contentLength-parquetTrailerSize:]
+	s.prefetchParquetFooterBlocks(bucket, key, "access", "secret", meta, trailer)
+
+	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
+	if got := fwd.requestedRanges(); !slices.Equal(got, want) {
+		t.Fatalf("prefetched ranges = %v, want %v (served trailer was ignored)", got, want)
+	}
+}
+
+// Without the served bytes and without a cached tail, there is nothing to read
+// the length from, so the prefetch must skip rather than guess.
+func TestPrefetchParquetFooterBlocks_SkipsWhenTrailerUnavailable(t *testing.T) {
+	const blockSize = 1024
+	content, contentLength := parquetTailBlock(t, blockSize, 300)
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = blockSize
+	cfg.Cache.ParquetOptimization = true
+	store := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	fwd := &parquetFooterForwarder{body: content, etag: `"v1"`}
+	s := NewService(fwd, store, cfg)
+
+	meta := &cache.CachedObjectMeta{ETag: `"v1"`, BlockSize: blockSize, ContentLength: contentLength}
+	s.prefetchParquetFooterBlocks("b", "a.parquet", "access", "secret", meta, nil)
+
+	if got := fwd.requestedRanges(); len(got) != 0 {
+		t.Fatalf("prefetched %v with no readable trailer", got)
 	}
 }
 

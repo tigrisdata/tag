@@ -366,7 +366,7 @@ func (s *Service) serveAssembledRange(
 	// A parquet reader's trailer probe is a few bytes, so it is served here rather
 	// than by streamBlockRange — this, not the streaming path, is where the footer
 	// signal actually arrives for a reader opening a file.
-	s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, rng.start, rng.end)
+	s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, rng.start, rng.end, buf)
 	return true, nil
 }
 
@@ -437,7 +437,9 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 	if err == nil {
 		// A completed range that reached the object's tail is a parquet reader
 		// opening the file (when the optimization is on and the key says so).
-		s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, start, end)
+		// The streaming path has already handed its bytes to the client, so the
+		// trailer has to come from cache here.
+		s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, start, end, nil)
 		return out, nil
 	}
 	if errors.Is(err, errBlockStreamDegraded) && ctx.Err() == nil && start+cw.written <= end {
