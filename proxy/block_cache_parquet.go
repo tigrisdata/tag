@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/binary"
+	"slices"
 	"strings"
 
 	"github.com/rs/zerolog/log"
@@ -189,9 +190,26 @@ func (s *Service) notePrefetchHit(bucket, key, etag string, blockSize, idx int64
 	if s.prefetchedBlocks == nil {
 		return
 	}
-	k := cache.MakeBlockKey(bucket, key, etag, blockSize, idx)
-	if _, ok := s.prefetchedBlocks.Get(k); ok {
-		s.prefetchedBlocks.Remove(k)
+	// Remove reports whether the key was present and clears it under one lock, so
+	// two serves racing on the same block cannot both attribute it. A Get-then-
+	// Remove pair would let precision exceed 1.
+	if s.prefetchedBlocks.Remove(cache.MakeBlockKey(bucket, key, etag, blockSize, idx)) {
 		metrics.CacheBlockPrefetchUsed.Inc()
+	}
+}
+
+// noteAssembledPrefetchHits attributes the covering blocks that an assembled serve
+// read straight from cache. missing lists the blocks it had to fetch, which by
+// definition were not prefetch hits. The slice holds at most two entries, so the
+// linear scan is cheaper than building a set.
+func (s *Service) noteAssembledPrefetchHits(bucket, key string, meta *cache.CachedObjectMeta, b0, bK int64, missing []int64) {
+	if s.prefetchedBlocks == nil {
+		return
+	}
+	for i := b0; i <= bK; i++ {
+		if slices.Contains(missing, i) {
+			continue
+		}
+		s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, i)
 	}
 }

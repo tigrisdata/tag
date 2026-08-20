@@ -368,9 +368,17 @@ The only `trigger` today is `parquet_footer`, from `cache.parquet_optimization`.
 **Type:** Histogram
 
 Size of the parquet metadata region, read from the trailer of objects served while
-`cache.parquet_optimization` is on. This is the measurement that decides whether the
-optimization is worth running at all: metadata smaller than `cache.block_size` is already
-covered by the tail block that the triggering read cached, and prefetching does nothing.
+`cache.parquet_optimization` is on. It is recorded for **every** parquet object whose trailer
+is read, including the ones whose metadata fits the tail block and are therefore not
+prefetched — so the distribution describes the whole population, not just the prefetched tail
+of it.
+
+This is the measurement that decides whether the optimization has anything to do: metadata
+smaller than `cache.block_size` is already covered by the tail block that the triggering read
+cached, and prefetching it would fetch nothing. Note the ordering — the metric is only
+recorded while the flag is on, so the flow is to canary-enable on one node, read the
+distribution, and then decide for the fleet. Prefetching during that canary is bounded (capped
+block count, shed under populate pressure), which is what makes enabling-to-measure safe.
 
 ```promql
 # Share of parquet objects whose metadata spans more than one 1 MiB block —

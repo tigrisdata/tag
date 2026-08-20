@@ -350,6 +350,7 @@ func (s *Service) serveAssembledRange(
 	// Committed serve: record hit/miss + serve metrics (only here, never on a fall-through),
 	// then write the response.
 	recordBlockServeMetrics(bK-b0+1, int64(len(missing)))
+	s.noteAssembledPrefetchHits(bucket, key, meta, b0, bK, missing)
 	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(http.StatusPartialContent)
@@ -362,6 +363,10 @@ func (s *Service) serveAssembledRange(
 	}
 	metrics.RecordRangeFromCacheHit()
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	// A parquet reader's trailer probe is a few bytes, so it is served here rather
+	// than by streamBlockRange — this, not the streaming path, is where the footer
+	// signal actually arrives for a reader opening a file.
+	s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, rng.start, rng.end)
 	return true, nil
 }
 

@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
@@ -158,6 +160,7 @@ type parquetFooterForwarder struct {
 
 	mu     sync.Mutex
 	ranges []string
+	served chan struct{}
 }
 
 func (f *parquetFooterForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _, _ string, _ int64, rangeHeader string) (*http.Response, error) {
@@ -168,6 +171,9 @@ func (f *parquetFooterForwarder) DoConditionalGetRequest(_ context.Context, _, _
 	f.mu.Lock()
 	f.ranges = append(f.ranges, rangeHeader)
 	f.mu.Unlock()
+	if f.served != nil {
+		f.served <- struct{}{}
+	}
 
 	header := make(http.Header)
 	header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(f.body)))
@@ -276,6 +282,70 @@ func TestMaybePrefetchParquetFooter_CoalescesConcurrentTriggers(t *testing.T) {
 	// A coalesced trigger must leave the in-flight marker for its owner to clear.
 	if _, ok := s.activeBackgroundFetches.Load(dedupKey); !ok {
 		t.Fatal("coalesced trigger deleted the in-flight marker owned by another prefetch")
+	}
+}
+
+// Regression test for the wiring, not the mechanism. A parquet reader's trailer
+// probe is a few bytes, so it is served by the assembled-range path and never
+// reaches streamBlockRange. Triggering the prefetch only from the streaming path
+// meant the signal that matters most never fired in production shapes.
+func TestServeRangeFromBlockCache_TrailerProbeTriggersFooterPrefetch(t *testing.T) {
+	const (
+		blockSize = 1024
+		blocks    = 6
+		bucket    = "bucket"
+		key       = "a.parquet"
+		etag      = `"v1"`
+	)
+	contentLength := int64(blockSize * blocks)
+	metaStart := int64(3500) // inside block 3, so blocks 3 and 4 must be prefetched
+	footerLen := contentLength - parquetTrailerSize - metaStart
+
+	body := make([]byte, contentLength)
+	binary.LittleEndian.PutUint32(body[contentLength-parquetTrailerSize:], uint32(footerLen))
+	copy(body[contentLength-4:], parquetMagic)
+
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = blockSize
+	cfg.Cache.ParquetOptimization = true
+	store := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	served := make(chan struct{}, blocks)
+	fwd := &parquetFooterForwarder{body: body, etag: etag, served: served}
+	s := NewService(fwd, store, cfg)
+
+	meta := &cache.CachedObjectMeta{ETag: etag, BlockSize: blockSize, ContentLength: contentLength}
+	tail := int64(blocks - 1)
+	if err := store.PutBlock(context.Background(), bucket, key, etag, blockSize, tail, body[tail*blockSize:], 3600); err != nil {
+		t.Fatalf("seeding tail block: %v", err)
+	}
+
+	// The read a parquet reader actually issues first: the 8-byte trailer.
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", contentLength-parquetTrailerSize, contentLength-1)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
+	req.Header.Set("Range", rangeHeader)
+
+	ok, err := s.serveRangeFromBlockCache(context.Background(), rec, req, bucket, key, "access", "secret", meta, rangeHeader, time.Now())
+	if err != nil || !ok {
+		t.Fatalf("serveRangeFromBlockCache(trailer) = (%v, %v), want (true, nil)", ok, err)
+	}
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", rec.Code)
+	}
+
+	// The prefetch is detached; wait for the two blocks it must fetch.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-served:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("trailer probe did not trigger the footer prefetch (ranges so far: %v)", fwd.requestedRanges())
+		}
+	}
+
+	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
+	if got := fwd.requestedRanges(); !slices.Equal(got, want) {
+		t.Fatalf("prefetched ranges = %v, want %v", got, want)
 	}
 }
 
