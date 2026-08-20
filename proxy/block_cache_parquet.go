@@ -21,15 +21,17 @@ import (
 // touches an object's tail block is a reliable signal that the reader is
 // opening the file and is about to read the whole metadata region.
 //
-// Block caching already covers the common case: the tail read caches the tail
-// block, so metadata that fits inside it is served from cache. Metadata larger
-// than one block is not — a file with many row groups and columns can carry
-// several MiB of it — and the reader discovers those blocks as serial misses,
-// each costing an upstream round trip before the first row is read.
+// The triggering read caches only the TAIL block, and that is a partial block:
+// ContentLength mod block_size, averaging half a block. So the prefetch is needed
+// whenever footer+8 exceeds that remainder, not merely when it exceeds block_size.
 //
-// This prefetch closes that gap and nothing else. It fetches only blocks the
-// metadata provably spans, computed from the length the file itself declares,
-// so speculation is bounded by the object rather than by a guess.
+// Measured on the ORD parseable bucket (26 objects, two days): footers run ~1.25%
+// of object size -- 3.0 MB at 244 MB, 4.7 MB at 394 MB -- so against 1 MiB blocks
+// the metadata spans 3-5 blocks and this fires on ~69% of objects. Only the small
+// (<2 MB) files, whose footers are 20-50 KB, fit in the remainder.
+//
+// It fetches only blocks the metadata provably spans, computed from the length the
+// file itself declares, so speculation is bounded by the object, not by a guess.
 const (
 	parquetMagic = "PAR1"
 
@@ -122,9 +124,8 @@ func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey 
 	tailBlock := (meta.ContentLength - 1) / meta.BlockSize
 	firstBlock := metaStart / meta.BlockSize
 	if firstBlock >= tailBlock {
-		// Metadata fits in the tail block, which the triggering read already
-		// cached. This is the common case and the reason the histogram above
-		// is worth more than the prefetch itself.
+		// Metadata fits the remainder block the triggering read already cached.
+		// Measured: only the small (<2 MB) objects land here.
 		return
 	}
 	if tailBlock-firstBlock > maxParquetFooterPrefetchBlocks {

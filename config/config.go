@@ -203,11 +203,13 @@ type CacheConfig struct {
 	// ends in ".parquet". A parquet reader always reads the file footer before any
 	// data, and the footer is at the end of the object, so a read that touches the
 	// object's tail is a reliable signal that the whole metadata region is about to
-	// be read. When the metadata spans more than the tail block, TAG fetches the
-	// remaining metadata blocks in the background instead of letting the reader
-	// discover them as serial misses. Off by default: it reads 8 bytes of object
-	// content to size the footer, which is format-specific behavior an operator
-	// should opt into.
+	// be read. When the metadata spans more than the (partial) tail block, TAG
+	// fetches the remaining metadata blocks in the background instead of letting the
+	// reader discover them as misses. Measured on production parseable data, footers
+	// run ~1.25% of object size, so a 300 MB object carries ~3.5 MB of metadata --
+	// several blocks at a 1 MiB block_size. Off by default: it reads 8 bytes of
+	// object content to size the footer, which is format-specific behavior an
+	// operator should opt into.
 	ParquetOptimization bool `yaml:"parquet_optimization"`
 
 	// CompactionBytesPerSecond bounds the shared source-read budget for ocache's

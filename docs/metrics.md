@@ -368,25 +368,26 @@ The only `trigger` today is `parquet_footer`, from `cache.parquet_optimization`.
 **Type:** Histogram
 
 Size of the parquet metadata region, read from the trailer of objects served while
-`cache.parquet_optimization` is on. It is recorded for **every** parquet object whose trailer
-is read, including the ones whose metadata fits the tail block and are therefore not
-prefetched — so the distribution describes the whole population, not just the prefetched tail
-of it.
+`cache.parquet_optimization` is on. Recorded for **every** parquet object whose trailer is
+read, including ones that are not prefetched, so the distribution describes the whole
+population rather than just the prefetched tail of it.
 
-This is the measurement that decides whether the optimization has anything to do: metadata
-smaller than `cache.block_size` is already covered by the tail block that the triggering read
-cached, and prefetching it would fetch nothing. Note the ordering — the metric is only
-recorded while the flag is on, so the flow is to canary-enable on one node, read the
-distribution, and then decide for the fleet. Prefetching during that canary is bounded (capped
-block count, shed under populate pressure), which is what makes enabling-to-measure safe.
+The prefetch does work whenever `footer + 8` exceeds the **remainder** block
+(`ContentLength mod block_size`, averaging half a block) — not merely when the footer exceeds
+`block_size`.
+
+Measured baseline on production parseable data (26 objects): footers run **~1.25% of object
+size** — 3.0 MB at 244 MB, 4.7 MB at 394 MB — so at a 1 MiB `block_size` the metadata spans
+3–5 blocks and the prefetch fires on ~69% of objects. Only small (<2 MB) files, with 20–50 KB
+footers, fit inside the remainder.
+
+Use the histogram to confirm that ratio still holds for your data: a schema change alters
+footer size, and a distribution that collapses below the remainder-block size means the
+optimization has stopped earning its keep.
 
 ```promql
-# Share of parquet objects whose metadata spans more than one 1 MiB block —
-# the only population the prefetch can help. Near zero means turn it off.
-1 - (
-  sum(rate(tag_cache_parquet_footer_bytes_bucket{le="1.048576e+06"}[1h])) /
-  sum(rate(tag_cache_parquet_footer_bytes_count[1h]))
-)
+# Median footer size — compare against cache.block_size.
+histogram_quantile(0.5, sum(rate(tag_cache_parquet_footer_bytes_bucket[1h])) by (le))
 ```
 
 #### tag_cache_block_hits_total / tag_cache_block_misses_total
