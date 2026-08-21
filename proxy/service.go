@@ -534,6 +534,9 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 		if !teeHandled {
 			s.warmOnWrite(r, bucket, key)
 		}
+		// Independent of warmOnWrite: that caches whole objects and is off here,
+		// while this caches only the metadata region (RFC 0002).
+		s.warmParquetFooterOnWrite(r, bucket, key)
 	}
 	// Forward errored or upstream rejected the write: nothing cached, so release any budget
 	// reserved for the tee.
@@ -683,6 +686,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
 		s.invalidateObject(context.Background(), bucket, key)
 		s.warmOnWrite(r, bucket, key)
+		s.warmParquetFooterOnWrite(r, bucket, key)
 	}
 
 	return err
@@ -835,6 +839,9 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		// Warm-on-write is the only way to make a multipart-completed object hot:
 		// TAG never sees its assembled body, so a write-through tee is impossible.
 		s.warmOnWrite(r, bucket, key)
+		// The path that matters for parquet: ingestors write via multipart, so this
+		// is where a freshly written file's metadata gets warmed (RFC 0002).
+		s.warmParquetFooterOnWrite(r, bucket, key)
 	}
 
 	// Cache successful completions in ocache for idempotent replays. Only cache a

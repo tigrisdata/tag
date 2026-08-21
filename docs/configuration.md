@@ -181,14 +181,18 @@ cache:
   # default (1 MiB). Override with TAG_CACHE_BLOCK_SIZE env var.
   block_size: 1048576
 
-  # Parquet-aware footer prefetching (opt-in). A parquet reader must read the file's metadata
+  # Parquet-aware footer caching (opt-in). Drives two triggers: a read that reaches an
+  # object's trailer prefetches the rest of its metadata, and a parquet object written
+  # through TAG has its metadata warmed before the first read (RFC 0002).
+  # A parquet reader must read the file's metadata
   # before any data, and that metadata sits at the end of the object. Block caching already
   # covers metadata that fits in the tail block; this fetches the earlier blocks when it does
   # not, using the length the file itself declares rather than a guess. Costs one speculative
   # fetch per spanned block, shed under populate pressure like any other prefetch. Watch
-  # tag_cache_parquet_footer_bytes to confirm it still applies to your data:
-  # measured on production parseable data, footers run ~1.25% of object size, so a
-  # 300 MB object carries ~3.5 MB of metadata -- several blocks at a 1 MiB block_size.
+  # tag_cache_parquet_footer_bytes to see whether it applies to your data: footer
+  # size scales with row groups and columns, so a wide schema can put several MB of
+  # metadata on a few-hundred-MB object -- several blocks at a 1 MiB block_size --
+  # while a narrow schema keeps it inside the tail block and this does nothing.
   # Override with TAG_CACHE_PARQUET_OPTIMIZATION env var.
   parquet_optimization: false
 

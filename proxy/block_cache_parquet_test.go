@@ -433,3 +433,204 @@ func newParquetTestService(t *testing.T, content []byte, blockSize int64) *Servi
 	}
 	return s
 }
+
+// The block set must cover the whole metadata region through the tail, and stay
+// bounded when a declared footer length is pathological.
+func TestParquetFooterBlocks(t *testing.T) {
+	const blockSize = 1024
+	t.Run("spans metadata through the tail", func(t *testing.T) {
+		meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 6 * blockSize}
+		// metadata starts at 6144-8-2644 = 3492, inside block 3; tail is block 5.
+		got := parquetFooterBlocks(meta, 2644)
+		if !slices.Equal(got, []int64{3, 4, 5}) {
+			t.Fatalf("blocks = %v, want [3 4 5]", got)
+		}
+	})
+
+	t.Run("footer inside the tail block is just that block", func(t *testing.T) {
+		meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 6 * blockSize}
+		if got := parquetFooterBlocks(meta, 100); !slices.Equal(got, []int64{5}) {
+			t.Fatalf("blocks = %v, want [5]", got)
+		}
+	})
+
+	t.Run("stays bounded for a pathological footer", func(t *testing.T) {
+		meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 5000 * blockSize}
+		got := parquetFooterBlocks(meta, 4000*blockSize)
+		if len(got) != maxParquetFooterPrefetchBlocks {
+			t.Fatalf("blocks = %d, want the %d cap", len(got), maxParquetFooterPrefetchBlocks)
+		}
+		if got[len(got)-1] != 4999 {
+			t.Fatalf("last block = %d, want the tail block 4999", got[len(got)-1])
+		}
+	})
+}
+
+// suffixRangeForwarder answers a bytes=-8 suffix range the way S3 does: 206 with
+// Content-Range reporting the total size, which is what lets the warm path run for
+// an object TAG has never seen.
+type suffixRangeForwarder struct {
+	mockForwarder
+	body   []byte
+	etag   string
+	status int
+
+	mu     sync.Mutex
+	ranges []string
+}
+
+func (f *suffixRangeForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _, _ string, _ int64, rangeHeader string) (*http.Response, error) {
+	f.mu.Lock()
+	f.ranges = append(f.ranges, rangeHeader)
+	f.mu.Unlock()
+
+	total := int64(len(f.body))
+	var n int64 = parquetTrailerSize
+	if _, err := fmt.Sscanf(rangeHeader, "bytes=-%d", &n); err != nil {
+		return nil, fmt.Errorf("unexpected range %q", rangeHeader)
+	}
+	chunk := f.body[total-n:]
+	header := make(http.Header)
+	header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", total-n, total-1, total))
+	if f.etag != "" {
+		header.Set("ETag", f.etag)
+	}
+	status := f.status
+	if status == 0 {
+		status = http.StatusPartialContent
+	}
+	return &http.Response{
+		StatusCode:    status,
+		ContentLength: int64(len(chunk)),
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(chunk)),
+	}, nil
+}
+
+func newWarmTestService(t *testing.T, body []byte, etag string, status int) (*Service, *suffixRangeForwarder) {
+	t.Helper()
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 1024
+	cfg.Cache.ParquetOptimization = true
+	store := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	fwd := &suffixRangeForwarder{body: body, etag: etag, status: status}
+	return NewService(fwd, store, cfg), fwd
+}
+
+func warmTestObject(footerLen int64) []byte {
+	const blockSize, blocks = 1024, 6
+	body := make([]byte, blockSize*blocks)
+	binary.LittleEndian.PutUint32(body[len(body)-parquetTrailerSize:], uint32(footerLen))
+	copy(body[len(body)-4:], parquetMagic)
+	return body
+}
+
+// The whole point: an object TAG has never seen resolves its size, ETag and footer
+// length from ONE suffix-range read -- no HEAD, no manifest, no cached metadata.
+func TestReadParquetTrailerFromUpstream(t *testing.T) {
+	t.Run("resolves size, etag and footer length", func(t *testing.T) {
+		body := warmTestObject(2644)
+		s, fwd := newWarmTestService(t, body, `"v1"`, 0)
+
+		meta, footerLen, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk")
+		if !ok {
+			t.Fatal("trailer read failed")
+		}
+		if meta.ContentLength != int64(len(body)) || meta.ETag != `"v1"` || footerLen != 2644 {
+			t.Fatalf("meta = %+v footerLen=%d, want len=%d etag=\"v1\" footer=2644", meta, footerLen, len(body))
+		}
+		if got := fwd.ranges; !slices.Equal(got, []string{"bytes=-8"}) {
+			t.Fatalf("upstream ranges = %v, want one suffix range", got)
+		}
+	})
+
+	t.Run("rejects a 200 rather than draining a whole object", func(t *testing.T) {
+		s, _ := newWarmTestService(t, warmTestObject(2644), `"v1"`, http.StatusOK)
+		if _, _, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk"); ok {
+			t.Fatal("accepted a 200 - the range was ignored and the body is the whole object")
+		}
+	})
+
+	t.Run("rejects a missing ETag", func(t *testing.T) {
+		s, _ := newWarmTestService(t, warmTestObject(2644), "", 0)
+		if _, _, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk"); ok {
+			t.Fatal("accepted an object with no ETag - nothing could be keyed")
+		}
+	})
+
+	t.Run("rejects an interval that is not the object tail", func(t *testing.T) {
+		s, _ := newWarmTestService(t, warmTestObject(2644), `"v1"`, 0)
+		s.forwarder = &wrongIntervalForwarder{body: warmTestObject(2644), etag: `"v1"`}
+		if _, _, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk"); ok {
+			t.Fatal("accepted bytes from an interval other than the object's last 8")
+		}
+	})
+
+	t.Run("rejects a non-parquet trailer", func(t *testing.T) {
+		body := warmTestObject(2644)
+		copy(body[len(body)-4:], "XXXX")
+		s, _ := newWarmTestService(t, body, `"v1"`, 0)
+		if _, _, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk"); ok {
+			t.Fatal("accepted a key that merely ends in .parquet")
+		}
+	})
+}
+
+// The trigger must stay off unless the optimization is on and the key is parquet,
+// and must not fire twice for a retried write.
+func TestWarmParquetFooterOnWrite_Gating(t *testing.T) {
+	body := warmTestObject(2644)
+
+	t.Run("disabled does nothing", func(t *testing.T) {
+		s, fwd := newWarmTestService(t, body, `"v1"`, 0)
+		s.config.Cache.ParquetOptimization = false
+		s.warmParquetFooterOnWrite(httptest.NewRequest(http.MethodPut, "/b/a.parquet", nil), "b", "a.parquet")
+		if len(fwd.ranges) != 0 {
+			t.Fatalf("warmed %v with the optimization off", fwd.ranges)
+		}
+	})
+
+	t.Run("non-parquet key does nothing", func(t *testing.T) {
+		s, fwd := newWarmTestService(t, body, `"v1"`, 0)
+		s.warmParquetFooterOnWrite(httptest.NewRequest(http.MethodPut, "/b/a.json", nil), "b", "a.json")
+		if len(fwd.ranges) != 0 {
+			t.Fatalf("warmed %v for a non-parquet key", fwd.ranges)
+		}
+	})
+
+	t.Run("a retried write coalesces", func(t *testing.T) {
+		s, fwd := newWarmTestService(t, body, `"v1"`, 0)
+		s.activeBackgroundFetches.Store("pqw:b/a.parquet", struct{}{})
+		s.warmParquetFooterOnWrite(httptest.NewRequest(http.MethodPut, "/b/a.parquet", nil), "b", "a.parquet")
+		if len(fwd.ranges) != 0 {
+			t.Fatalf("warmed %v while another warm was in flight", fwd.ranges)
+		}
+		if _, ok := s.activeBackgroundFetches.Load("pqw:b/a.parquet"); !ok {
+			t.Fatal("coalesced trigger cleared the marker owned by the in-flight warm")
+		}
+	})
+}
+
+// wrongIntervalForwarder answers the suffix range with trailer-shaped bytes taken
+// from the WRONG interval, and reports that interval honestly in Content-Range.
+// Block indices are derived from these bounds, so they must be checked.
+type wrongIntervalForwarder struct {
+	mockForwarder
+	body []byte
+	etag string
+}
+
+func (f *wrongIntervalForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _, _ string, _ int64, _ string) (*http.Response, error) {
+	total := int64(len(f.body))
+	header := make(http.Header)
+	// Valid trailer bytes, but from the middle of the object rather than its tail.
+	header.Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", parquetTrailerSize-1, total))
+	header.Set("ETag", f.etag)
+	return &http.Response{
+		StatusCode:    http.StatusPartialContent,
+		ContentLength: parquetTrailerSize,
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(f.body[total-parquetTrailerSize:])),
+	}, nil
+}

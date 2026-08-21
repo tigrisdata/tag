@@ -361,7 +361,15 @@ precision cannot exceed 1. It is also deliberately an undercount — attribution
 bounded, TTL-expiring set, so a block served long after it was prefetched goes unattributed.
 Read the ratio as a floor.
 
-The only `trigger` today is `parquet_footer`, from `cache.parquet_optimization`.
+Both triggers come from `cache.parquet_optimization`:
+
+| `trigger` | Fires when |
+| --- | --- |
+| `parquet_footer` | A read reached a parquet object's trailer — reactive, helps the second and later reads |
+| `write_warm` | A parquet object was written through TAG — proactive, removes the first read's miss (RFC 0002) |
+
+Compare the two directly. `write_warm` precision materially below `parquet_footer` precision
+means the readers are not following writes closely, and that trigger is not paying for itself.
 
 #### tag_cache_parquet_footer_bytes
 
@@ -376,14 +384,15 @@ The prefetch does work whenever `footer + 8` exceeds the **remainder** block
 (`ContentLength mod block_size`, averaging half a block) — not merely when the footer exceeds
 `block_size`.
 
-Measured baseline on production parseable data (26 objects): footers run **~1.25% of object
-size** — 3.0 MB at 244 MB, 4.7 MB at 394 MB — so at a 1 MiB `block_size` the metadata spans
-3–5 blocks and the prefetch fires on ~69% of objects. Only small (<2 MB) files, with 20–50 KB
-footers, fit inside the remainder.
+Footer size scales with row groups and columns, since the footer carries per-column
+statistics. On a production deployment with a wide schema, footers ran **~1.25% of object
+size** — several MB on a few-hundred-MB object — so at a 1 MiB `block_size` the metadata spans
+several blocks and the prefetch does real work on most objects. A narrow schema keeps the
+footer inside the tail block, where there is nothing to prefetch.
 
-Use the histogram to confirm that ratio still holds for your data: a schema change alters
-footer size, and a distribution that collapses below the remainder-block size means the
-optimization has stopped earning its keep.
+Use the histogram to establish that ratio for your own data, and to detect drift: a schema
+change alters footer size, and a distribution that collapses below the remainder-block size
+means the optimization has stopped earning its keep.
 
 ```promql
 # Median footer size — compare against cache.block_size.

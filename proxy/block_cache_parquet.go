@@ -3,6 +3,9 @@ package proxy
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
+	"io"
+	"net/http"
 	"slices"
 	"strings"
 
@@ -25,10 +28,12 @@ import (
 // ContentLength mod block_size, averaging half a block. So the prefetch is needed
 // whenever footer+8 exceeds that remainder, not merely when it exceeds block_size.
 //
-// Measured on the ORD parseable bucket (26 objects, two days): footers run ~1.25%
-// of object size -- 3.0 MB at 244 MB, 4.7 MB at 394 MB -- so against 1 MiB blocks
-// the metadata spans 3-5 blocks and this fires on ~69% of objects. Only the small
-// (<2 MB) files, whose footers are 20-50 KB, fit in the remainder.
+// Footer size scales with row groups and columns, since it carries per-column
+// statistics. Measured on a production deployment with a wide schema, footers ran
+// ~1.25% of object size -- several MB on a few-hundred-MB object -- so at a 1 MiB
+// block_size the metadata spans several blocks and this fires on most objects.
+// Narrow schemas produce much smaller footers; tag_cache_parquet_footer_bytes is
+// how a deployment tells which case it is in.
 //
 // It fetches only blocks the metadata provably spans, computed from the length the
 // file itself declares, so speculation is bounded by the object, not by a guess.
@@ -239,4 +244,161 @@ func (s *Service) noteAssembledPrefetchHits(bucket, key string, meta *cache.Cach
 		}
 		s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, i)
 	}
+}
+
+// Write-time footer warming (RFC 0002).
+//
+// The read-triggered prefetch above can only help a file's SECOND read: the first
+// one is what fires it. Under a sliding-window reader -- a dashboard querying
+// [now-1h, now] on a refresh timer -- that is the only read that ever misses,
+// because every later refresh finds the window already warm. So the remaining
+// cold reads are exactly the files written since the last refresh.
+//
+// TAG proxies those writes, so it can warm them before the first query rather than
+// during it. A just-written file is inside the window by definition; this schedules
+// a fetch rather than guessing at one.
+
+// warmParquetFooterOnWrite caches a freshly written parquet object's metadata blocks.
+// It returns immediately; the work runs detached, after the client's write response
+// has already been committed.
+func (s *Service) warmParquetFooterOnWrite(r *http.Request, bucket, key string) {
+	if s.config == nil || !s.config.Cache.ParquetOptimization || !s.cache.IsEnabled() {
+		return
+	}
+	if !s.config.Cache.IsBlockCachingEnabled() || s.config.Cache.BlockSize <= 0 {
+		return
+	}
+	if !isParquetKey(key) {
+		return
+	}
+	// Warming reads the object back, so it needs credentials that can read it. An
+	// anonymous write tells us nothing about read access, so skip rather than guess.
+	_, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
+	if err != nil || accessKey == "" || secretKey == "" {
+		return
+	}
+
+	// One warm per object version in flight, reusing the read-path coalescer: a
+	// retried CompleteMultipartUpload must not warm twice.
+	dedupKey := "pqw:" + bucket + "/" + key
+	if _, loaded := s.activeBackgroundFetches.LoadOrStore(dedupKey, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		defer s.activeBackgroundFetches.Delete(dedupKey)
+		s.warmParquetFooterBlocks(bucket, key, accessKey, secretKey)
+	}()
+}
+
+// warmParquetFooterBlocks resolves the object's size, ETag and metadata length with a
+// single suffix-range read, then populates the blocks the metadata spans.
+func (s *Service) warmParquetFooterBlocks(bucket, key, accessKey, secretKey string) {
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+	defer cancel()
+
+	meta, footerLen, ok := s.readParquetTrailerFromUpstream(ctx, bucket, key, accessKey, secretKey)
+	if !ok {
+		return
+	}
+	metrics.CacheParquetFooterBytes.Observe(float64(footerLen))
+
+	blocks := parquetFooterBlocks(meta, footerLen)
+	if len(blocks) == 0 {
+		return
+	}
+	// Counted as requested rather than as landed: triggerBlockModePopulate reports
+	// asynchronously, and over-counting the denominator understates precision, which
+	// is the safe direction for a number used to decide whether to keep this on.
+	for _, idx := range blocks {
+		metrics.CacheBlockPrefetched.WithLabelValues("write_warm").Inc()
+		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, idx)
+	}
+	// Fetches the blocks and writes the block-mode meta LAST, tombstone-aware -- the
+	// visibility gate from RFC 0001. Nothing here bypasses that ordering.
+	s.triggerBlockModePopulate(bucket, key, accessKey, secretKey, meta, blocks)
+}
+
+// readParquetTrailerFromUpstream fetches the object's last 8 bytes. A suffix range is
+// used deliberately: it needs no prior knowledge of the object's size, and the 206's
+// Content-Range reports that size back -- which is what lets this run for an object
+// TAG has never seen, without a HEAD and without consulting a manifest.
+func (s *Service) readParquetTrailerFromUpstream(ctx context.Context, bucket, key, accessKey, secretKey string) (*cache.CachedObjectMeta, int64, bool) {
+	resp, err := s.forwarder.DoConditionalGetRequest(ctx, bucket, key, accessKey, secretKey, "", 0,
+		fmt.Sprintf("bytes=-%d", parquetTrailerSize))
+	if err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Parquet footer warm - trailer read failed")
+		return nil, 0, false
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		// The range was ignored and the whole object is coming. Close WITHOUT
+		// draining: draining for connection reuse would pull hundreds of MB through
+		// the warm path, which is the exact cost the suffix range exists to avoid.
+		_ = resp.Body.Close()
+		return nil, 0, false
+	}
+	defer func() {
+		// A valid 206 here is 8 bytes and is fully consumed below, so this drains
+		// nothing in the normal case. Bounded anyway: an over-long body must not be
+		// read to EOF just to make the connection reusable.
+		_, _ = io.CopyN(io.Discard, resp.Body, parquetTrailerSize)
+		_ = resp.Body.Close()
+	}()
+
+	// Trust the interval, not just the total: derive block indices only from a range
+	// that really is the object's last parquetTrailerSize bytes. A server that
+	// answered a different interval would otherwise have its bytes parsed as a
+	// trailer.
+	first, last, contentLength, hasBounds := parseContentRange(resp.Header.Get("Content-Range"))
+	if !hasBounds || contentLength <= parquetTrailerSize {
+		return nil, 0, false
+	}
+	if first != contentLength-parquetTrailerSize || last != contentLength-1 {
+		log.Debug().Str("bucket", bucket).Str("key", key).
+			Str("content_range", resp.Header.Get("Content-Range")).
+			Msg("Parquet footer warm - upstream answered a different interval than the suffix range")
+		return nil, 0, false
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		// The ETag keys every block and the meta entry; without it nothing can be stored.
+		return nil, 0, false
+	}
+	if !s.isBlockEligibleSize(contentLength) {
+		// Sub-block objects are whole-cached, and their footer is the whole object.
+		return nil, 0, false
+	}
+
+	buf := make([]byte, parquetTrailerSize)
+	if _, err := io.ReadFull(resp.Body, buf); err != nil {
+		return nil, 0, false
+	}
+	footerLen, valid := parseParquetTrailer(buf, contentLength)
+	if !valid {
+		// A ".parquet" suffix is a hint, not a guarantee.
+		return nil, 0, false
+	}
+
+	return &cache.CachedObjectMeta{
+		ETag:          etag,
+		BlockSize:     s.config.Cache.BlockSize,
+		ContentLength: contentLength,
+	}, footerLen, true
+}
+
+// parquetFooterBlocks returns the block indices the metadata region spans, including
+// the tail block. Empty when the object is degenerate.
+func parquetFooterBlocks(meta *cache.CachedObjectMeta, footerLen int64) []int64 {
+	tailBlock := (meta.ContentLength - 1) / meta.BlockSize
+	firstBlock := (meta.ContentLength - parquetTrailerSize - footerLen) / meta.BlockSize
+	if firstBlock < 0 {
+		firstBlock = 0
+	}
+	if tailBlock-firstBlock+1 > maxParquetFooterPrefetchBlocks {
+		firstBlock = tailBlock - maxParquetFooterPrefetchBlocks + 1
+	}
+	blocks := make([]int64, 0, tailBlock-firstBlock+1)
+	for i := firstBlock; i <= tailBlock; i++ {
+		blocks = append(blocks, i)
+	}
+	return blocks
 }
