@@ -133,10 +133,12 @@ func TestReadParquetFooterLength(t *testing.T) {
 // Precision accounting must count blocks, not reads: a prefetched block served
 // repeatedly is one useful prefetch, not many.
 func TestPrefetchAttribution_CountsEachBlockOnce(t *testing.T) {
-	s := NewService(nil, nil, config.NewDefault())
+	cfg := config.NewDefault()
+	cfg.Cache.ParquetOptimization = true
+	s := NewService(nil, nil, cfg)
 	const blockSize = 1024
 
-	s.notePrefetchedBlock("b", "a.parquet", `"v1"`, blockSize, 7)
+	s.notePrefetchedBlock("b", "a.parquet", `"v1"`, blockSize, 7, triggerWriteWarm)
 	key := cache.MakeBlockKey("b", "a.parquet", `"v1"`, blockSize, 7)
 	if _, ok := s.prefetchedBlocks.Get(key); !ok {
 		t.Fatal("prefetched block was not recorded")

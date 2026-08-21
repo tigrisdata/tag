@@ -46,14 +46,13 @@ var errBlockUpstreamGone = errors.New("block upstream gone")
 // as "fall through to the miss path", not a real error.
 var errBlockAssemblyWouldAmplify = errors.New("block assembly would amplify")
 
-// errBlockEntryHasNoBlocks is the amplify bail for an entry holding NO cached blocks
-// at all — a metadata-only entry, established on write or by a footer warm before any
-// read populated it. It wraps errBlockAssemblyWouldAmplify, so callers that only care
-// about "fall through" match it unchanged, while the full-object path can tell the two
-// apart: an entry with cached blocks may be serving stale bytes and must be
-// invalidated on bail, whereas an entry with none has no such hazard and wiping it
-// would discard the metadata later range reads are meant to reuse.
-var errBlockEntryHasNoBlocks = fmt.Errorf("%w: entry has no cached blocks", errBlockAssemblyWouldAmplify)
+// errNoRequestedBlocksCached is the amplify bail for a request whose covering blocks
+// are ALL absent. The predicate is per-request, not per-entry: only a full-object
+// serve spans every block, so only there does it mean the entry itself holds nothing.
+// It wraps errBlockAssemblyWouldAmplify, so callers that only care about "fall
+// through" match it unchanged, while the full-object path uses the distinction to skip
+// an invalidation that would protect nothing (see serveCompleteFromBlocks).
+var errNoRequestedBlocksCached = fmt.Errorf("%w: none of the requested blocks are cached", errBlockAssemblyWouldAmplify)
 
 // maxInlineFetchesPerServe bounds how many absent blocks one COMMITTED block serve recovers via
 // individual aligned upstream fetches. BlocksComplete is a hint: blocks and meta evict/expire
@@ -803,9 +802,11 @@ func (s *Service) serveFullObjectFromBlockCache(
 			//
 			// An entry holding NO blocks is exempt: there are no cached bytes to serve stale, so
 			// the invalidation protects nothing, and wiping it would discard a metadata-only entry
-			// (meta-on-write, or a footer warm before its first read) that later range reads are
-			// meant to reuse — making this full GET destructive rather than merely slow.
-			if !errors.Is(ferr, errBlockEntryHasNoBlocks) {
+			// (meta-on-write) that later range reads are meant to reuse — making this full GET
+			// destructive rather than merely slow. Note a footer-warmed entry holds blocks and is
+			// NOT exempt: it still takes the invalidating branch, since those cached blocks are
+			// exactly the stale-serve hazard this guards.
+			if !errors.Is(ferr, errNoRequestedBlocksCached) {
 				s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
 			}
 			return false, nil
@@ -1398,7 +1399,7 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 	if (bailIfMostlyMissing && int64(len(missing))*2 > total) ||
 		(maxFetchFanout > 0 && int64(len(missing)) > maxFetchFanout) {
 		if int64(len(missing)) == total {
-			return errBlockEntryHasNoBlocks
+			return errNoRequestedBlocksCached
 		}
 		return errBlockAssemblyWouldAmplify
 	}

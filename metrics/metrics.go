@@ -306,11 +306,12 @@ var (
 		[]string{"trigger"},
 	)
 
-	CacheBlockPrefetchUsed = promauto.NewCounter(
+	CacheBlockPrefetchUsed = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "tag_cache_block_prefetch_used_total",
-			Help: "Speculatively fetched blocks that were later served from cache",
+			Help: "Speculatively fetched blocks that were later served from cache, by trigger",
 		},
+		[]string{"trigger"},
 	)
 
 	// CacheParquetFooterBytes records observed parquet metadata sizes. The

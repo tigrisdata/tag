@@ -344,16 +344,17 @@ sum(rate(tag_cache_block_prefetch_windows_total[5m]))
 
 #### tag_cache_block_prefetched_total / tag_cache_block_prefetch_used_total
 
-**Type:** Counter (`prefetched` labeled by `trigger`)
+**Type:** Counter (both labeled by `trigger`)
 
 Speculative block fetches, and how many of them were later served from cache. Together they
 give prefetch precision — the fraction of speculative work that paid for itself:
 
 ```promql
-# Prefetch precision. A low ratio means the speculation is evicting more than it
-# earns: turn the trigger off rather than tuning it.
-sum(rate(tag_cache_block_prefetch_used_total[30m])) /
-sum(rate(tag_cache_block_prefetched_total[30m]))
+# Prefetch precision, per trigger. A low ratio means that trigger is evicting more
+# than it earns: turn it off rather than tuning it. Both counters carry the label,
+# so the triggers are compared directly rather than pooled.
+sum by (trigger) (rate(tag_cache_block_prefetch_used_total[30m])) /
+sum by (trigger) (rate(tag_cache_block_prefetched_total[30m]))
 ```
 
 Attribution counts blocks, not reads: a prefetched block served many times counts once, so

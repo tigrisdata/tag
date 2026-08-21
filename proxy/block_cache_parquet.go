@@ -48,6 +48,11 @@ const (
 	// larger than this is pathological (or a corrupt length that passed the
 	// sanity checks), and prefetching it would evict more than it can repay.
 	maxParquetFooterPrefetchBlocks = 32
+
+	// Trigger labels for the prefetch counters. Precision is compared BETWEEN these,
+	// so both the prefetched and the used counter must carry them.
+	triggerReadPrefetch = "parquet_footer"
+	triggerWriteWarm    = "write_warm"
 )
 
 // isParquetKey reports whether the key names a parquet object. Matching on the
@@ -81,16 +86,27 @@ func (s *Service) maybePrefetchParquetFooter(bucket, key, accessKey, secretKey s
 		trailer = append([]byte(nil), served[off:off+parquetTrailerSize]...)
 	}
 
-	// Every tail read of a hot object hits this path, so coalesce: one prefetch
-	// per object version at a time. Without this a repeatedly-read object would
-	// spawn a goroutine and a cache read per request to reach the same
-	// already-satisfied conclusion.
-	dedupKey := "pq:" + bucket + "/" + key + "/" + meta.ETag
+	// Two separate guards, because in-flight coalescing alone does not stop the
+	// repeat work. The dedup key is released as soon as the goroutine returns, and
+	// for an already-warm object it returns almost immediately -- so every tail read
+	// would still spawn a goroutine that re-probes the metadata blocks, which are
+	// mostly remote in a cluster. The cooldown suppresses the scan itself for a
+	// while after one completes.
+	versionKey := bucket + "/" + key + "/" + meta.ETag
+	if s.recentFooterWork != nil {
+		if _, recent := s.recentFooterWork.Get(versionKey); recent {
+			return
+		}
+	}
+	dedupKey := "pq:" + versionKey
 	if _, loaded := s.activeBackgroundFetches.LoadOrStore(dedupKey, struct{}{}); loaded {
 		return
 	}
 	go func() {
 		defer s.activeBackgroundFetches.Delete(dedupKey)
+		if s.recentFooterWork != nil {
+			defer s.recentFooterWork.Add(versionKey, struct{}{})
+		}
 		s.prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey, meta, trailer)
 	}()
 }
@@ -155,8 +171,8 @@ func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey 
 				Msg("Parquet footer prefetch failed")
 			return
 		}
-		metrics.CacheBlockPrefetched.WithLabelValues("parquet_footer").Inc()
-		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, i)
+		metrics.CacheBlockPrefetched.WithLabelValues(triggerReadPrefetch).Inc()
+		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, i, triggerReadPrefetch)
 	}
 }
 
@@ -209,11 +225,13 @@ func (s *Service) readParquetFooterLength(ctx context.Context, bucket, key strin
 // serve of it can be attributed. The set is bounded and TTL-expiring: an entry
 // that ages out simply stops being attributable, which understates precision
 // rather than overstating it.
-func (s *Service) notePrefetchedBlock(bucket, key, etag string, blockSize, idx int64) {
+func (s *Service) notePrefetchedBlock(bucket, key, etag string, blockSize, idx int64, trigger string) {
 	if s.prefetchedBlocks == nil {
 		return
 	}
-	s.prefetchedBlocks.Add(cache.MakeBlockKey(bucket, key, etag, blockSize, idx), struct{}{})
+	// The trigger is stored, not just counted: precision is only meaningful per
+	// trigger, and it cannot be recovered at hit time otherwise.
+	s.prefetchedBlocks.Add(cache.MakeBlockKey(bucket, key, etag, blockSize, idx), trigger)
 }
 
 // notePrefetchHit attributes a cache hit to an earlier prefetch, once. Removing
@@ -226,8 +244,10 @@ func (s *Service) notePrefetchHit(bucket, key, etag string, blockSize, idx int64
 	// Remove reports whether the key was present and clears it under one lock, so
 	// two serves racing on the same block cannot both attribute it. A Get-then-
 	// Remove pair would let precision exceed 1.
-	if s.prefetchedBlocks.Remove(cache.MakeBlockKey(bucket, key, etag, blockSize, idx)) {
-		metrics.CacheBlockPrefetchUsed.Inc()
+	k := cache.MakeBlockKey(bucket, key, etag, blockSize, idx)
+	if trigger, ok := s.prefetchedBlocks.Get(k); ok {
+		s.prefetchedBlocks.Remove(k)
+		metrics.CacheBlockPrefetchUsed.WithLabelValues(trigger).Inc()
 	}
 }
 
@@ -301,6 +321,16 @@ func (s *Service) warmParquetFooterBlocks(bucket, key, accessKey, secretKey stri
 	ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 	defer cancel()
 
+	// Stamp BEFORE the upstream trailer read, not after: an invalidation landing
+	// during that round trip must be newer than this timestamp or it will not block
+	// the meta write below. That is not theoretical -- blocks are ETag-keyed and
+	// survive the meta delete, and runBlockFetch short-circuits on BlockExists
+	// without contacting upstream, so a warm whose footer blocks are all still
+	// cached performs NO upstream validation and would happily re-publish meta for
+	// a deleted object. meta_on_write.go and write_through.go both stamp before
+	// their HEAD for the same reason.
+	writeStartTime := time.Now().UnixNano()
+
 	meta, footerLen, ok := s.readParquetTrailerFromUpstream(ctx, bucket, key, accessKey, secretKey)
 	if !ok {
 		return
@@ -320,22 +350,27 @@ func (s *Service) warmParquetFooterBlocks(bucket, key, accessKey, secretKey stri
 		return
 	}
 
-	// Stamp before fetching so an invalidation landing mid-warm is newer and blocks
-	// the meta write below.
-	writeStartTime := time.Now().UnixNano()
+	// Which blocks this warm will actually fetch. fetchBlocksToCache silently skips
+	// ones already cached -- by a prior warm, a read-triggered prefetch, or a retried
+	// write -- and crediting those would report work that never happened and score
+	// them as hits on the next read, inflating the very ratio the rollout decision
+	// rests on. The read-triggered path tests presence before counting; match it.
+	absent := make([]int64, 0, len(blocks))
+	for _, idx := range blocks {
+		if !s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, idx) {
+			absent = append(absent, idx)
+		}
+	}
+
 	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, blocks); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Parquet footer warm - block fetch failed")
 		return
 	}
 
-	// Counted only once the blocks are actually cached. Counting at schedule time
-	// would credit a warm that never landed: the blocks would still be recorded for
-	// attribution, so a later read that fetched them itself would be scored as a
-	// prefetch hit and INFLATE precision -- in a metric whose whole job is to decide
-	// whether this trigger earns its keep.
-	for _, idx := range blocks {
-		metrics.CacheBlockPrefetched.WithLabelValues("write_warm").Inc()
-		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, idx)
+	// Counted only once the blocks are cached, and only those this warm fetched.
+	for _, idx := range absent {
+		metrics.CacheBlockPrefetched.WithLabelValues(triggerWriteWarm).Inc()
+		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, idx, triggerWriteWarm)
 	}
 
 	// Meta last, tombstone-aware -- the RFC 0001 visibility gate. Blocks stay useful

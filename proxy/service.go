@@ -76,7 +76,11 @@ type Service struct {
 	// prefetchedBlocks remembers recently prefetched block keys so a later serve
 	// of one can be attributed, giving prefetch precision. Bounded and
 	// TTL-expiring: this is measurement, and must not become a memory term.
-	prefetchedBlocks *expirable.LRU[string, struct{}]
+	prefetchedBlocks *expirable.LRU[string, string]
+	// recentFooterWork suppresses repeat footer scans for an object version that was
+	// already examined. Without it every tail read of a fully-warmed object re-probes
+	// its metadata blocks, which in cluster mode are mostly remote.
+	recentFooterWork *expirable.LRU[string, struct{}]
 }
 
 // NewService creates a new proxy service.
@@ -143,7 +147,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		Int64("serve_staging_cap_bytes", stagingCap).
 		Msg("Cache-populate limits configured")
 
-	return &Service{
+	svc := &Service{
 		forwarder:        forwarder,
 		cache:            cache,
 		config:           cfg,
@@ -152,8 +156,16 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		perPopulateCap:   perPopulateCap,
 		broadcastManager: broadcast.NewManager(channelBuf),
 		blockFetches:     make(map[string]*blockFetchState),
-		prefetchedBlocks: expirable.NewLRU[string, struct{}](maxPrefetchedBlockTracking, nil, prefetchTrackingTTL),
 	}
+	// Left nil unless the feature that populates it is on. The serve path attributes
+	// every cached block through notePrefetchHit, and that costs a block-key build plus
+	// a locked LRU op per block -- hundreds per full-object serve. A default-off feature
+	// must not charge the hot path for bookkeeping nobody reads.
+	if cfg.Cache.ParquetOptimization {
+		svc.prefetchedBlocks = expirable.NewLRU[string, string](maxPrefetchedBlockTracking, nil, prefetchTrackingTTL)
+		svc.recentFooterWork = expirable.NewLRU[string, struct{}](maxPrefetchedBlockTracking, nil, footerWorkCooldown)
+	}
+	return svc
 }
 
 // perPopulateBufferBytes returns the maximum bytes a single cache-populate can
@@ -208,6 +220,11 @@ const (
 	// prefetch that is not used within this window was not useful in the sense
 	// that motivates prefetching — hiding latency from the read that follows it.
 	prefetchTrackingTTL = 30 * time.Minute
+
+	// footerWorkCooldown is how long a footer scan is suppressed for one object
+	// version after it completes. Short enough that an evicted footer is re-warmed
+	// promptly, long enough that a hot object is not re-scanned per read.
+	footerWorkCooldown = 5 * time.Minute
 )
 
 // stagingWeight is the byte weight a block-serve staging buffer reserves against the
