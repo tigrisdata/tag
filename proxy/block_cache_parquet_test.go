@@ -775,3 +775,45 @@ func TestParquetFooterBlocks_BlockAlignedObjectHasFullTail(t *testing.T) {
 		t.Fatal("aligned object with a footer larger than one block should need a prefetch")
 	}
 }
+
+// The two triggers use different work keys, so a read prefetch and a write warm can
+// overlap on one object, both await the SAME coalesced block fetch, and both find
+// the block present afterwards. That is ONE physical transfer. Counting it under
+// both triggers would inflate the prefetched total against a numerator that can only
+// ever be claimed once, deflating precision for work that was done correctly.
+func TestPrefetchAttribution_OverlappingTriggersCountOneTransfer(t *testing.T) {
+	cfg := config.NewDefault()
+	cfg.Cache.ParquetOptimization = true
+	s := NewService(nil, nil, cfg)
+	const blockSize = 1024
+
+	readCounter := metrics.CacheBlockPrefetched.WithLabelValues(triggerReadPrefetch)
+	writeCounter := metrics.CacheBlockPrefetched.WithLabelValues(triggerWriteWarm)
+	usedRead := metrics.CacheBlockPrefetchUsed.WithLabelValues(triggerReadPrefetch)
+	usedWrite := metrics.CacheBlockPrefetchUsed.WithLabelValues(triggerWriteWarm)
+	before := testutil.ToFloat64(readCounter) + testutil.ToFloat64(writeCounter)
+	usedBefore := testutil.ToFloat64(usedRead) + testutil.ToFloat64(usedWrite)
+
+	const objects = 100
+	for i := 0; i < objects; i++ {
+		key := fmt.Sprintf("o-%d.parquet", i)
+		// Both triggers observe the same coalesced fetch of the same block.
+		s.notePrefetchedBlock("b", key, `"v1"`, blockSize, 3, triggerReadPrefetch)
+		s.notePrefetchedBlock("b", key, `"v1"`, blockSize, 3, triggerWriteWarm)
+		// The block is then served once.
+		s.notePrefetchHit("b", key, `"v1"`, blockSize, 3)
+	}
+
+	prefetched := testutil.ToFloat64(readCounter) + testutil.ToFloat64(writeCounter) - before
+	used := testutil.ToFloat64(usedRead) + testutil.ToFloat64(usedWrite) - usedBefore
+
+	if prefetched != objects {
+		t.Errorf("counted %v prefetched blocks for %d transfers - one coalesced fetch credited to both triggers", prefetched, objects)
+	}
+	if used != objects {
+		t.Errorf("counted %v used blocks for %d serves", used, objects)
+	}
+	if prefetched != used {
+		t.Errorf("precision = %v/%v; a transfer counted twice cannot be claimed twice, so this reads below 1 for work that succeeded", used, prefetched)
+	}
+}

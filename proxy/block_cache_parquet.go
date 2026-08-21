@@ -195,7 +195,6 @@ func (s *Service) ensureParquetFooterBlocks(ctx context.Context, bucket, key, ac
 		if !s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, idx) {
 			continue
 		}
-		metrics.CacheBlockPrefetched.WithLabelValues(trigger).Inc()
 		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, idx, trigger)
 	}
 
@@ -254,17 +253,39 @@ func (s *Service) readParquetFooterLength(ctx context.Context, bucket, key strin
 	return parseParquetTrailer(buf, meta.ContentLength)
 }
 
-// notePrefetchedBlock records a speculatively fetched block so that a later
-// serve of it can be attributed. The set is bounded and TTL-expiring: an entry
-// that ages out simply stops being attributable, which understates precision
-// rather than overstating it.
+// notePrefetchedBlock records a speculatively fetched block so that a later serve
+// of it can be attributed. The set is bounded and TTL-expiring: an entry that ages
+// out simply stops being attributable, which understates precision rather than
+// overstating it.
+// It also increments the prefetched counter, and does so ONLY when this call is the
+// one that claimed the block. The two triggers do not coalesce with each other --
+// they use different work keys -- so a read prefetch and a write warm can overlap on
+// one object, both await the SAME coalesced block fetch, and both see the block
+// present afterwards. That is one physical transfer, and counting it under both
+// triggers would inflate the prefetched total and deflate precision against a
+// numerator that can only be claimed once.
+//
+// Counting here rather than at the call site is deliberate: the counter and the
+// attribution set are the numerator and denominator of the same ratio, and keeping
+// them in one place means they cannot drift apart.
 func (s *Service) notePrefetchedBlock(bucket, key, etag string, blockSize, idx int64, trigger string) {
 	if s.prefetchedBlocks == nil {
 		return
 	}
+	k := cache.MakeBlockKey(bucket, key, etag, blockSize, idx)
+
 	// The trigger is stored, not just counted: precision is only meaningful per
 	// trigger, and it cannot be recovered at hit time otherwise.
-	s.prefetchedBlocks.Add(cache.MakeBlockKey(bucket, key, etag, blockSize, idx), trigger)
+	s.prefetchAttributionMu.Lock()
+	_, alreadyClaimed := s.prefetchedBlocks.Get(k)
+	if !alreadyClaimed {
+		s.prefetchedBlocks.Add(k, trigger)
+	}
+	s.prefetchAttributionMu.Unlock()
+
+	if !alreadyClaimed {
+		metrics.CacheBlockPrefetched.WithLabelValues(trigger).Inc()
+	}
 }
 
 // notePrefetchHit attributes a cache hit to an earlier prefetch, exactly once.
