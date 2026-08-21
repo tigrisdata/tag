@@ -10,15 +10,12 @@ import (
 	"net/http/httptest"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
-	"github.com/tigrisdata/tag/metrics"
 )
 
 // parquetTailBlock builds an object tail that a parquet reader would recognise:
@@ -133,29 +130,6 @@ func TestReadParquetFooterLength(t *testing.T) {
 	})
 }
 
-// Precision accounting must count blocks, not reads: a prefetched block served
-// repeatedly is one useful prefetch, not many.
-func TestPrefetchAttribution_CountsEachBlockOnce(t *testing.T) {
-	cfg := config.NewDefault()
-	cfg.Cache.ParquetOptimization = true
-	s := NewService(nil, nil, cfg)
-	const blockSize = 1024
-
-	s.notePrefetchedBlock("b", "a.parquet", `"v1"`, blockSize, 7, triggerWriteWarm)
-	key := cache.MakeBlockKey("b", "a.parquet", `"v1"`, blockSize, 7)
-	if _, ok := s.prefetchedBlocks.Get(key); !ok {
-		t.Fatal("prefetched block was not recorded")
-	}
-
-	s.notePrefetchHit("b", "a.parquet", `"v1"`, blockSize, 7)
-	if _, ok := s.prefetchedBlocks.Get(key); ok {
-		t.Fatal("attribution left the block recorded, so a re-read would count twice")
-	}
-	// A second hit on the same block must be a no-op rather than a panic or a
-	// second attribution.
-	s.notePrefetchHit("b", "a.parquet", `"v1"`, blockSize, 7)
-}
-
 // parquetFooterForwarder serves ranged reads out of a full object body and
 // records what was asked for, which is what the prefetch is judged on.
 type parquetFooterForwarder struct {
@@ -250,10 +224,8 @@ func TestPrefetchParquetFooterBlocks_FetchesTheSpannedBlocks(t *testing.T) {
 		if !store.BlockExists(context.Background(), bucket, key, etag, blockSize, idx) {
 			t.Errorf("block %d was not cached by the prefetch", idx)
 		}
-		if _, ok := s.prefetchedBlocks.Get(cache.MakeBlockKey(bucket, key, etag, blockSize, idx)); !ok {
-			t.Errorf("block %d was not recorded for attribution", idx)
-		}
 	}
+	_ = s
 }
 
 // Metadata that fits inside the tail block is already cached by the read that
@@ -698,47 +670,6 @@ func (f *noStoreForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _
 	}, nil
 }
 
-// Attribution must survive concurrent serves of the same prefetched block. This
-// regressed once already: recovering the trigger label requires reading the LRU
-// value, which turned an atomic Remove into a Get-then-Remove pair, and two racing
-// serves could both observe the entry and both count it -- pushing precision above
-// 1 in the metric that decides whether these triggers stay on.
-//
-// It drives notePrefetchHit itself and asserts on the counter that ships. An
-// earlier version of this test reimplemented the lock-and-clear inline, which
-// exercised a copy of the logic rather than the function, and so would have stayed
-// green if the production path lost its mutex -- the exact regression it exists to
-// catch.
-func TestPrefetchAttribution_ConcurrentServesCountOnce(t *testing.T) {
-	cfg := config.NewDefault()
-	cfg.Cache.ParquetOptimization = true
-	s := NewService(nil, nil, cfg)
-	const blockSize = 1024
-
-	counter := metrics.CacheBlockPrefetchUsed.WithLabelValues(triggerWriteWarm)
-	before := testutil.ToFloat64(counter)
-
-	const rounds = 200
-	for round := 0; round < rounds; round++ {
-		key := fmt.Sprintf("a-%d.parquet", round)
-		s.notePrefetchedBlock("b", key, `"v1"`, blockSize, 7, triggerWriteWarm)
-
-		var wg sync.WaitGroup
-		for racer := 0; racer < 8; racer++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				s.notePrefetchHit("b", key, `"v1"`, blockSize, 7)
-			}()
-		}
-		wg.Wait()
-	}
-
-	if got := testutil.ToFloat64(counter) - before; got != rounds {
-		t.Fatalf("attributed %v blocks across %d races, want exactly %d - a block counted more than once inflates precision above 1", got, rounds, rounds)
-	}
-}
-
 // The cap must bound the blocks a caller actually fetches. Applying it to a span
 // that still contains the tail, then dropping the tail, silently gives the read
 // trigger one block less than the write trigger from the same configured limit.
@@ -774,83 +705,5 @@ func TestParquetFooterBlocks_BlockAlignedObjectHasFullTail(t *testing.T) {
 	// Footer larger than the tail block does spill into the previous one.
 	if got := parquetFooterBlocks(meta, blockSize+10, true); len(got) == 0 {
 		t.Fatal("aligned object with a footer larger than one block should need a prefetch")
-	}
-}
-
-// gatedBlockForwarder holds the first upstream block fetch open until released, so
-// two callers provably overlap on the same block rather than racing by luck.
-type gatedBlockForwarder struct {
-	*blockMockForwarder
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (f *gatedBlockForwarder) DoConditionalGetRequest(ctx context.Context, bucket, key, ak, sk, etag string, ms int64, rangeHeader string) (*http.Response, error) {
-	f.once.Do(func() {
-		close(f.started)
-		<-f.release
-	})
-	return f.blockMockForwarder.DoConditionalGetRequest(ctx, bucket, key, ak, sk, etag, ms, rangeHeader)
-}
-
-// Two triggers can want the same absent block at the same time. They coalesce onto
-// ONE upstream transfer, and only the caller that owns that transfer may count it —
-// otherwise the prefetched total exceeds the number of transfers, while the numerator
-// can only ever be claimed once, and precision reads low for work that succeeded.
-//
-// This drives the real fetch path rather than the bookkeeping convention: it asserts
-// that one physical fetch produces exactly one owner.
-func TestFetchBlocksToCache_CoalescedFetchHasOneOwner(t *testing.T) {
-	const (
-		blockSize = 4
-		bucket    = "bucket"
-		key       = "o.bin"
-		etag      = `"v1"`
-	)
-	object := make([]byte, blockSize*4)
-	base := newBlockMock(object, etag)
-	fwd := &gatedBlockForwarder{
-		blockMockForwarder: base,
-		started:            make(chan struct{}),
-		release:            make(chan struct{}),
-	}
-	svc, _ := newBlockService(t, base)
-	svc.forwarder = fwd
-
-	meta := &cache.CachedObjectMeta{ETag: etag, BlockSize: blockSize, ContentLength: int64(len(object))}
-
-	var owners atomic.Int32
-	var wg sync.WaitGroup
-	for caller := 0; caller < 2; caller++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			owned, err := svc.fetchBlocksToCache(context.Background(), bucket, key, "ak", "sk", meta, []int64{2})
-			if err != nil {
-				return
-			}
-			owners.Add(int32(len(owned)))
-		}()
-	}
-	<-fwd.started // the first fetch is in flight
-	// Give the second caller time to join it rather than start its own.
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		svc.blockFetchMu.Lock()
-		joined := len(svc.blockFetches) > 0
-		svc.blockFetchMu.Unlock()
-		if joined {
-			break
-		}
-	}
-	close(fwd.release)
-	wg.Wait()
-
-	if got := base.blockGets.Load(); got != 1 {
-		t.Fatalf("upstream fetched the block %d times, want 1 - the callers did not coalesce", got)
-	}
-	if got := owners.Load(); got != 1 {
-		t.Fatalf("%d callers claimed ownership of 1 transfer - counting both inflates prefetched against a numerator that can only be claimed once", got)
 	}
 }

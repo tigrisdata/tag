@@ -112,15 +112,19 @@ Where the query window slides, objects older than the window stop being read. A 
 
 ## Metrics
 
-No new metric families. The counters from #174 are already labeled by trigger:
+- `tag_cache_block_prefetched_total{trigger="write_warm"}` — how much speculative work this trigger does
+- `tag_cache_parquet_footer_bytes` — the footer-size distribution, which tells a deployment whether its schema makes this worthwhile at all
+- `tag_cache_block_hits_total` / `tag_cache_block_misses_total` — the outcome
 
-- `tag_cache_block_prefetched_total{trigger="write_warm"}` — blocks warmed at write time
-- `tag_cache_block_prefetch_used_total` — those later served from cache
-- `tag_cache_parquet_footer_bytes` — the footer-size distribution, which is how a deployment tells whether its schema makes this worthwhile at all
+Judge it on the **hit ratio**, not on a prefetch-precision ratio. An earlier revision of
+this RFC proposed a per-block "was it used" counter and a rule comparing precision between
+triggers. That was dropped: attributing each serve back to a prefetch put a lookup on the
+serve path, running thousands of times a second, to re-derive a number that is ~98% by
+construction — a reader that has read a parquet trailer cannot do anything except read the
+metadata region next. The hit ratio measures the outcome directly and costs nothing extra.
 
-Precision is `used / prefetched`, counted per **block** rather than per read, cleared atomically, and expiring — so the ratio is a **floor**, never an inflated claim.
-
-The decision rule is explicit: **compare `write_warm` precision against `parquet_footer` precision.** If it is materially lower, readers are not following writers in this deployment and the trigger should be turned off. The metric decides, not the argument in this document.
+The decision rule is therefore: **prefetch volume rising without the block hit ratio
+rising means the trigger is not landing where reads go, and should be turned off.**
 
 ## Rollout
 

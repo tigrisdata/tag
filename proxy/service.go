@@ -73,14 +73,6 @@ type Service struct {
 	activeBackgroundFetches sync.Map                    // Dedup for background full-object fetches (range caching)
 	blockFetchMu            sync.Mutex                  // Guards blockFetches
 	blockFetches            map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
-	// prefetchedBlocks remembers recently prefetched block keys so a later serve
-	// of one can be attributed, giving prefetch precision. Bounded and
-	// TTL-expiring: this is measurement, and must not become a memory term.
-	prefetchedBlocks *expirable.LRU[string, string]
-	// prefetchAttributionMu makes the lookup-and-clear in notePrefetchHit atomic.
-	// The LRU's own ops are atomic individually, but recovering the trigger requires
-	// reading the value before removing it, and that pair must not interleave.
-	prefetchAttributionMu sync.Mutex
 	// recentFooterWork suppresses repeat footer scans for an object version that was
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
@@ -161,13 +153,9 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		broadcastManager: broadcast.NewManager(channelBuf),
 		blockFetches:     make(map[string]*blockFetchState),
 	}
-	// Left nil unless the feature that populates it is on. The serve path attributes
-	// every cached block through notePrefetchHit, and that costs a block-key build plus
-	// a locked LRU op per block -- hundreds per full-object serve. A default-off feature
-	// must not charge the hot path for bookkeeping nobody reads.
+	// Allocated only when the feature that uses it is on.
 	if cfg.Cache.ParquetOptimization {
-		svc.prefetchedBlocks = expirable.NewLRU[string, string](maxPrefetchedBlockTracking, nil, prefetchTrackingTTL)
-		svc.recentFooterWork = expirable.NewLRU[string, struct{}](maxPrefetchedBlockTracking, nil, footerWorkCooldown)
+		svc.recentFooterWork = expirable.NewLRU[string, struct{}](maxFooterWorkTracking, nil, footerWorkCooldown)
 	}
 	return svc
 }
@@ -215,15 +203,8 @@ func (s *Service) populateWeight(contentLength int64) int64 {
 }
 
 const (
-	// maxPrefetchedBlockTracking bounds the prefetch attribution set. Sized well
-	// above the blocks one node prefetches within the TTL, so precision is not
-	// understated by eviction from this set.
-	maxPrefetchedBlockTracking = 65536
-
-	// prefetchTrackingTTL is how long a prefetched block stays attributable. A
-	// prefetch that is not used within this window was not useful in the sense
-	// that motivates prefetching — hiding latency from the read that follows it.
-	prefetchTrackingTTL = 30 * time.Minute
+	// maxFooterWorkTracking bounds the set of recently scanned object versions.
+	maxFooterWorkTracking = 65536
 
 	// footerWorkCooldown is how long a footer scan is suppressed for one object
 	// version after it completes. Short enough that an evicted footer is re-warmed

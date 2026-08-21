@@ -105,27 +105,38 @@ Applies to keys ending in `.parquet` (case-insensitive). The suffix is a hint, n
 
 ## Checking whether it worked
 
-Two counters, both labelled by `trigger`:
+Measure the **outcome**, not the speculation. The block hit ratio is what actually
+matters and it already exists:
 
 ```promql
-# Precision: the share of speculatively fetched blocks later served from cache.
-sum by (trigger) (rate(tag_cache_block_prefetch_used_total[30m]))
+# Block cache hit ratio. Footer caching should raise it, most visibly on first opens.
+sum(rate(tag_cache_block_hits_total[30m]))
 /
+(sum(rate(tag_cache_block_hits_total[30m])) + sum(rate(tag_cache_block_misses_total[30m])))
+```
+
+Alongside it, the cost side:
+
+```promql
+# How much speculative fetching each trigger is doing.
 sum by (trigger) (rate(tag_cache_block_prefetched_total[30m]))
 ```
 
-Read this as a **floor**, not an exact figure. Attribution counts blocks rather than reads (a block served many times counts once), clears atomically, and expires — all of which make the ratio understate rather than flatter.
+Rising hit ratio with modest prefetch volume is the shape you want. Prefetch volume
+with no movement in hit ratio means the speculation is not landing where reads go, and
+the trigger should be turned off.
 
-**What good looks like.** This is not really speculation: a reader that has read a trailer *will* read the metadata region moments later, because it cannot do anything else. So precision should be high — a production deployment runs at ~98%. A materially lower number means the guess is not paying off for that trigger, and the honest response is to turn it off rather than tune it.
-
-**Comparing the two triggers is the point.** If `write_warm` precision is much lower than `parquet_footer`, readers in your deployment are not following writers closely, and the write trigger is doing work nobody consumes.
+There is deliberately **no per-block "was this prefetch used" counter**. Attributing
+each later serve back to a prefetch costs a lookup on the serve path — hundreds of
+times per full-object serve, thousands per second — to re-derive a number that is
+~98% by construction, because a reader that has read a parquet trailer cannot do
+anything except read the metadata region next. That is not a good trade for a hot
+path, and the hit ratio answers the real question more directly.
 
 Also worth watching:
 
-- `tag_cache_block_hits_total` / `tag_cache_block_misses_total` — the block hit ratio should rise, most visibly on first opens.
-- `tag_cache_parquet_footer_bytes` — the footer distribution. A shift here means a schema change, and it is worth re-checking that the optimization still applies.
-
----
+- `tag_cache_parquet_footer_bytes` — the footer distribution. A shift here means a
+  schema change, and it is worth re-checking that the optimization still applies.
 
 ## What it costs, and what bounds it
 
@@ -134,7 +145,7 @@ Fetching metadata is roughly 1% of the bytes that caching whole objects would mo
 - **Bounded by the object.** The block range comes from the declared metadata length, validated against the object size. A corrupt or impossible length prefetches nothing.
 - **Capped.** At most 32 blocks per object, so a pathological file cannot evict a working set.
 - **Shed, not queued.** Fetches take the populate budget non-blocking, so under load prefetching is dropped rather than competing with reads that clients are waiting on.
-- **Skips what is cached.** Blocks already present are never re-fetched, and never counted.
+- **Skips what is cached.** Blocks already present are never re-fetched.
 - **Coalesced.** One scan per object version at a time, with a short cooldown afterwards, so a hot object is not re-examined on every read.
 - **Off the request path.** Both triggers fire after the response is committed, so neither adds latency to the request that fired it.
 

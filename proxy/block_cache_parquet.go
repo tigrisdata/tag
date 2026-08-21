@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
@@ -183,20 +182,13 @@ func (s *Service) ensureParquetFooterBlocks(ctx context.Context, bucket, key, ac
 	// centralises the stale-meta invalidation that a per-block loop here used to
 	// miss: an ETag mismatch means the entry describes a version upstream no longer
 	// serves, and leaving it would fail every later read until TTL.
-	owned, err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, absent)
+	// Volume, not precision: how much speculative fetching this trigger is doing.
+	// Counted before the fetch because that is what was asked for; a block another
+	// caller happened to transfer first is close enough for a cost signal, and
+	// pinning it exactly cost more than it was worth (see the metric's doc comment).
+	metrics.CacheBlockPrefetched.WithLabelValues(trigger).Add(float64(len(absent)))
 
-	// Count the transfers this call OWNED, not the blocks that ended up present.
-	// Presence proves the block arrived, never who brought it -- a concurrent demand
-	// read, or the other trigger, may have been the one to fetch it, and crediting
-	// ourselves for their transfer inflates precision for work we did not do. Owned
-	// blocks are also counted when the batch as a whole failed: a partial fetch is
-	// still real work, and leaving it uncounted would hide it permanently, since a
-	// later attempt would not find those blocks absent.
-	for _, idx := range owned {
-		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, idx, trigger)
-	}
-
-	if err != nil {
+	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, absent); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Str("trigger", trigger).
 			Msg("Parquet footer blocks not fully cached")
 		// Retryable: a shed happens under load, which is when a later read most wants
@@ -249,79 +241,6 @@ func (s *Service) readParquetFooterLength(ctx context.Context, bucket, key strin
 		return 0, false
 	}
 	return parseParquetTrailer(buf, meta.ContentLength)
-}
-
-// notePrefetchedBlock records a speculatively fetched block so that a later serve
-// of it can be attributed. The set is bounded and TTL-expiring: an entry that ages
-// out simply stops being attributable, which understates precision rather than
-// overstating it.
-// It also increments the prefetched counter. Callers must invoke it once per
-// transfer they OWNED -- fetchBlocksToCache reports which those were -- so a block
-// fetched once is counted once even when several callers awaited it. Deriving that
-// from cache presence instead cannot work: presence proves the block arrived, not
-// who fetched it.
-//
-// Counting here rather than at the call site is deliberate: the counter and the
-// attribution set are the denominator and numerator of the same ratio, and keeping
-// them in one place means they cannot drift apart.
-func (s *Service) notePrefetchedBlock(bucket, key, etag string, blockSize, idx int64, trigger string) {
-	if s.prefetchedBlocks == nil {
-		return
-	}
-	k := cache.MakeBlockKey(bucket, key, etag, blockSize, idx)
-
-	// The trigger is stored, not just counted: precision is only meaningful per
-	// trigger, and it cannot be recovered at hit time otherwise.
-	s.prefetchAttributionMu.Lock()
-	s.prefetchedBlocks.Add(k, trigger)
-	s.prefetchAttributionMu.Unlock()
-
-	metrics.CacheBlockPrefetched.WithLabelValues(trigger).Inc()
-}
-
-// notePrefetchHit attributes a cache hit to an earlier prefetch, exactly once.
-// Clearing the entry keeps the ratio a count of blocks rather than of reads, so a
-// block read many times cannot inflate precision.
-//
-// The lookup and the removal must be ONE atomic step. expirable.LRU.Remove is
-// atomic but discards the value, and the trigger label is only recoverable from
-// that value — so a Get-then-Remove pair is the obvious shape and is wrong: two
-// serves racing on the same block both observe it and both increment, letting
-// precision exceed 1. The mutex buys back the atomicity that reading the value
-// costs. It is only taken when the feature is on, since prefetchedBlocks is nil
-// otherwise.
-func (s *Service) notePrefetchHit(bucket, key, etag string, blockSize, idx int64) {
-	if s.prefetchedBlocks == nil {
-		return
-	}
-	k := cache.MakeBlockKey(bucket, key, etag, blockSize, idx)
-
-	s.prefetchAttributionMu.Lock()
-	trigger, ok := s.prefetchedBlocks.Get(k)
-	if ok {
-		s.prefetchedBlocks.Remove(k)
-	}
-	s.prefetchAttributionMu.Unlock()
-
-	if ok {
-		metrics.CacheBlockPrefetchUsed.WithLabelValues(trigger).Inc()
-	}
-}
-
-// noteAssembledPrefetchHits attributes the covering blocks that an assembled serve
-// read straight from cache. missing lists the blocks it had to fetch, which by
-// definition were not prefetch hits. The slice holds at most two entries, so the
-// linear scan is cheaper than building a set.
-func (s *Service) noteAssembledPrefetchHits(bucket, key string, meta *cache.CachedObjectMeta, b0, bK int64, missing []int64) {
-	if s.prefetchedBlocks == nil {
-		return
-	}
-	for i := b0; i <= bK; i++ {
-		if slices.Contains(missing, i) {
-			continue
-		}
-		s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, i)
-	}
 }
 
 // Write-time footer warming (RFC 0002).

@@ -230,7 +230,7 @@ func benchmarkFetchOneBlockRemoteCacheWrite(b *testing.B, blockLen int) {
 	}
 
 	// Establish the gRPC connections and warm the block-buffer pool before timing.
-	if _, err := svc.fetchOneBlock(context.Background(), "benchmark", "block", "access", "secret", meta, 0); err != nil {
+	if err := svc.fetchOneBlock(context.Background(), "benchmark", "block", "access", "secret", meta, 0); err != nil {
 		b.Fatalf("warm fetchOneBlock: %v", err)
 	}
 
@@ -238,7 +238,7 @@ func benchmarkFetchOneBlockRemoteCacheWrite(b *testing.B, blockLen int) {
 	b.SetBytes(int64(blockLen))
 	b.ResetTimer()
 	for b.Loop() {
-		if _, err := svc.fetchOneBlock(context.Background(), "benchmark", "block", "access", "secret", meta, 0); err != nil {
+		if err := svc.fetchOneBlock(context.Background(), "benchmark", "block", "access", "secret", meta, 0); err != nil {
 			b.Fatal(err)
 		}
 	}

@@ -292,24 +292,22 @@ var (
 		[]string{"outcome"},
 	)
 
-	// CacheBlockPrefetched counts blocks fetched speculatively rather than to
-	// satisfy a request in flight. CacheBlockPrefetchUsed counts those that were
-	// later served before eviction. Their ratio is prefetch precision, which is
-	// what decides whether speculation pays for itself: an imprecise prefetcher
-	// spends upstream bandwidth and, under FIFO eviction, displaces blocks that
-	// would have been hit.
+	// CacheBlockPrefetched counts blocks fetched speculatively rather than to satisfy
+	// a request in flight, by trigger. It is a VOLUME signal — how much speculative
+	// work a trigger is doing — not a precision signal.
+	//
+	// There is deliberately no matching "used" counter. Attributing each later serve
+	// back to a prefetch required a per-block lookup on the serve path, which runs
+	// hundreds of times per full-object serve and thousands of times per second, to
+	// re-derive a ratio that is ~98% by construction: a reader that has read a parquet
+	// trailer cannot do anything except read the metadata region next. Whether the
+	// prefetch pays off is better read from tag_cache_block_hits_total /
+	// tag_cache_block_misses_total, which measures the outcome rather than a proxy for
+	// it and costs nothing extra.
 	CacheBlockPrefetched = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "tag_cache_block_prefetched_total",
 			Help: "Blocks fetched speculatively, by trigger",
-		},
-		[]string{"trigger"},
-	)
-
-	CacheBlockPrefetchUsed = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "tag_cache_block_prefetch_used_total",
-			Help: "Speculatively fetched blocks that were later served from cache, by trigger",
 		},
 		[]string{"trigger"},
 	)

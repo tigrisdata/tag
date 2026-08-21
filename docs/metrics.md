@@ -342,36 +342,27 @@ sum(rate(tag_cache_block_prefetch_windows_total{outcome!="full"}[5m])) /
 sum(rate(tag_cache_block_prefetch_windows_total[5m]))
 ```
 
-#### tag_cache_block_prefetched_total / tag_cache_block_prefetch_used_total
+#### tag_cache_block_prefetched_total
 
-**Type:** Counter (both labeled by `trigger`)
+**Type:** Counter (labeled by `trigger`)
 
-Speculative block fetches, and how many of them were later served from cache. Together they
-give prefetch precision — the fraction of speculative work that paid for itself:
+Blocks fetched speculatively rather than to satisfy a request in flight. This is a
+**volume** signal — how much speculative work each trigger is doing — not a precision
+signal.
 
-```promql
-# Prefetch precision, per trigger. A low ratio means that trigger is evicting more
-# than it earns: turn it off rather than tuning it. Both counters carry the label,
-# so the triggers are compared directly rather than pooled.
-sum by (trigger) (rate(tag_cache_block_prefetch_used_total[30m])) /
-sum by (trigger) (rate(tag_cache_block_prefetched_total[30m]))
-```
+Judge the benefit from the block hit ratio (`tag_cache_block_hits_total` /
+`tag_cache_block_misses_total`), which measures the outcome directly. Rising hit ratio
+with modest prefetch volume is what you want; volume with no movement in hit ratio
+means the speculation is not landing where reads go.
 
-Attribution counts blocks, not reads: a prefetched block served many times counts once, so
-precision cannot exceed 1. It is also deliberately an undercount — attribution is tracked in a
-bounded, TTL-expiring set, so a block served long after it was prefetched goes unattributed.
-Read the ratio as a floor.
+There is deliberately no matching `_used_total`. Attributing each serve back to a
+prefetch required a per-block lookup on the serve path, which runs thousands of times
+per second, to re-derive a ratio that is ~98% by construction — a reader that has read
+a parquet trailer cannot do anything except read the metadata region next.
 
-Both triggers come from `cache.parquet_optimization` (see
-[docs/parquet-optimization.md](parquet-optimization.md) for the full guide):
-
-| `trigger` | Fires when |
-| --- | --- |
-| `parquet_footer` | A read reached a parquet object's trailer — reactive, helps the second and later reads |
-| `write_warm` | A parquet object was written through TAG — proactive, removes the first read's miss (RFC 0002) |
-
-Compare the two directly. `write_warm` precision materially below `parquet_footer` precision
-means the readers are not following writes closely, and that trigger is not paying for itself.
+Triggers today: `parquet_footer` (a read reached an object's trailer) and `write_warm`
+(a parquet object was written through TAG), both from `cache.parquet_optimization` —
+see [docs/parquet-optimization.md](parquet-optimization.md).
 
 #### tag_cache_parquet_footer_bytes
 
