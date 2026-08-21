@@ -1348,7 +1348,17 @@ func (s *Service) invalidateStaleBlockMeta(bucket, key, staleETag string) {
 	if m, found, err := s.cache.GetMeta(ctx, bucket, key); err != nil || !found || m == nil || m.ETag != staleETag {
 		return // already gone, or replaced by a newer version — leave it
 	}
-	s.cache.Delete(ctx, bucket, key)
+	if err := s.cache.Delete(ctx, bucket, key); err != nil {
+		// Record the failure rather than discarding it. This delete is what stops a
+		// stale entry answering later reads, so a silent failure leaves exactly the
+		// hazard it exists to prevent — and a delete metric that only ever reports
+		// success would hide it. invalidateObject treats its own failures the same way.
+		metrics.RecordCacheOperation("delete", "error")
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).
+			Msg("Stale block-mode meta not invalidated - entry may serve stale metadata until TTL")
+		return
+	}
+	metrics.RecordCacheOperation("delete", "success")
 }
 
 // ensureBlocksCached makes covering blocks [b0,bK] present in cache: it probes the range once,

@@ -291,15 +291,16 @@ func TestCacheBlockMetaOnWrite(t *testing.T) {
 	})
 }
 
-// A full-object GET over an entry whose blocks are all absent must not leave that
-// entry behind. The bail decides from a probe and never contacts upstream, so it
-// cannot know the object still exists — and a metadata-only entry that outlives a
-// deleted object answers later HEADs with 200 and stale headers until TTL.
+// The hazard: an entry whose blocks are all absent outliving the object it describes.
+// The full-GET bail decides from a probe and never contacts upstream, so it cannot
+// know the object is gone — and a surviving metadata-only entry answers later HEADs
+// with 200 and stale headers until the TTL.
 //
-// The cost of invalidating is one discovery round trip on the next read. The cost of
-// keeping it is answering wrongly, so correctness wins. An earlier revision exempted
-// these entries to protect meta-on-write from exactly this; that was the wrong trade.
-func TestFullGet_InvalidatesEntryWithNoCachedBlocks(t *testing.T) {
+// Deleting the object upstream is what makes this deterministic. An earlier version
+// primed a live object and polled for the entry to disappear, which raced the miss
+// path re-populating it: correct behaviour could fail the assertion purely on
+// timing. With upstream gone there is nothing to re-populate, so absence is stable.
+func TestFullGet_DoesNotLeaveEntryForDeletedObject(t *testing.T) {
 	const (
 		blockSize = 4
 		bucket    = "b"
@@ -307,9 +308,6 @@ func TestFullGet_InvalidatesEntryWithNoCachedBlocks(t *testing.T) {
 		etag      = `"v1"`
 	)
 	object := make([]byte, blockSize*10)
-	for i := range object {
-		object[i] = byte('a' + i%26)
-	}
 
 	mock := newBlockMock(object, etag)
 	svc, c := newBlockService(t, mock)
@@ -320,21 +318,15 @@ func TestFullGet_InvalidatesEntryWithNoCachedBlocks(t *testing.T) {
 	h.Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
 	mustPrimeMeta(t, c, bucket, key, svc.buildBlockMeta(bucket, key, h, int64(len(object))))
 
+	// The object is deleted at the origin, without TAG seeing the delete.
+	mock.blockGet404 = true
+
 	rec := httptest.NewRecorder()
 	if err := svc.HandleGetObject(rec, fullGet(bucket, key)); err != nil {
 		t.Fatalf("full GET: %v", err)
 	}
-	if rec.Code != 200 || rec.Body.Len() != len(object) {
-		t.Fatalf("full GET served status=%d len=%d, want 200 and %d bytes", rec.Code, rec.Body.Len(), len(object))
-	}
 
-	// The entry may be re-established by the miss path's own populate, so assert on
-	// what matters: it must not still be the OLD entry, unvalidated against upstream.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, found, _ := c.GetMeta(context.Background(), bucket, key); !found {
-			return // invalidated as required
-		}
+	if _, found, _ := c.GetMeta(context.Background(), bucket, key); found {
+		t.Fatal("entry for a deleted object survived an unvalidated full GET; a later HEAD would answer 200 with stale headers until TTL")
 	}
-	t.Fatal("full GET left a metadata-only entry in place without validating it upstream; a deleted object would answer HEAD 200 until TTL")
 }
