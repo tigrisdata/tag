@@ -161,14 +161,7 @@ func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey 
 func (s *Service) ensureParquetFooterBlocks(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, footerLen int64, tailServedByCaller bool, trigger string) bool {
 	metrics.CacheParquetFooterBytes.Observe(float64(footerLen))
 
-	blocks := parquetFooterBlocks(meta, footerLen)
-	if tailServedByCaller && len(blocks) > 0 {
-		// The read that fired this produced the tail block and is caching it, possibly
-		// still in flight. Re-fetching it would duplicate that upstream transfer on
-		// every cold open, and presence alone cannot tell "absent" from "being written
-		// right now" — so the caller states it instead of the cache guessing.
-		blocks = blocks[:len(blocks)-1]
-	}
+	blocks := parquetFooterBlocks(meta, footerLen, tailServedByCaller)
 	if len(blocks) == 0 {
 		return true
 	}
@@ -190,20 +183,28 @@ func (s *Service) ensureParquetFooterBlocks(ctx context.Context, bucket, key, ac
 	// centralises the stale-meta invalidation that a per-block loop here used to
 	// miss: an ETag mismatch means the entry describes a version upstream no longer
 	// serves, and leaving it would fail every later read until TTL.
-	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, absent); err != nil {
+	err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, absent)
+
+	// Count what actually landed, not whether the batch as a whole succeeded.
+	// fetchBlocksToCache can cache some blocks and shed or fail on others, and those
+	// cached blocks are real work: skipping them because a sibling failed would leave
+	// the work invisible to the ratio this feature is judged on, and a later attempt
+	// could not credit them either, since they no longer look absent. Re-probing is
+	// the honest way to ask what happened -- the batch does not report per block.
+	for _, idx := range absent {
+		if !s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, idx) {
+			continue
+		}
+		metrics.CacheBlockPrefetched.WithLabelValues(trigger).Inc()
+		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, idx, trigger)
+	}
+
+	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Str("trigger", trigger).
-			Msg("Parquet footer blocks not cached")
+			Msg("Parquet footer blocks not fully cached")
 		// Retryable: a shed happens under load, which is when a later read most wants
 		// another attempt. Never start a cooldown on this.
 		return false
-	}
-
-	// Counted only once cached, and only what this call fetched. Crediting blocks
-	// that were already present would report work that never happened and score them
-	// as hits on the next read, inflating the precision the rollout rests on.
-	for _, idx := range absent {
-		metrics.CacheBlockPrefetched.WithLabelValues(trigger).Inc()
-		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, idx, trigger)
 	}
 	return true
 }
@@ -464,19 +465,33 @@ func (s *Service) readParquetTrailerFromUpstream(ctx context.Context, bucket, ke
 	return s.buildBlockMeta(bucket, key, resp.Header, contentLength), footerLen, true
 }
 
-// parquetFooterBlocks returns the block indices the metadata region spans, including
-// the tail block. Empty when the object is degenerate.
-func parquetFooterBlocks(meta *cache.CachedObjectMeta, footerLen int64) []int64 {
+// parquetFooterBlocks returns the block indices this caller should fetch for the
+// metadata region. Empty when there is nothing to do.
+//
+// tailServedByCaller drops the tail block: the read that fired the prefetch already
+// produced it and may still be writing it, so re-fetching would duplicate that
+// transfer on every cold open. The cap is applied AFTER that, so it bounds the
+// blocks actually fetched rather than a span one of them is about to be removed
+// from — otherwise the read trigger would silently prefetch one block fewer than
+// the write trigger from the same limit.
+func parquetFooterBlocks(meta *cache.CachedObjectMeta, footerLen int64, tailServedByCaller bool) []int64 {
 	tailBlock := (meta.ContentLength - 1) / meta.BlockSize
+	lastWanted := tailBlock
+	if tailServedByCaller {
+		lastWanted--
+	}
 	firstBlock := (meta.ContentLength - parquetTrailerSize - footerLen) / meta.BlockSize
 	if firstBlock < 0 {
 		firstBlock = 0
 	}
-	if tailBlock-firstBlock+1 > maxParquetFooterPrefetchBlocks {
-		firstBlock = tailBlock - maxParquetFooterPrefetchBlocks + 1
+	if lastWanted < firstBlock {
+		return nil
 	}
-	blocks := make([]int64, 0, tailBlock-firstBlock+1)
-	for i := firstBlock; i <= tailBlock; i++ {
+	if lastWanted-firstBlock+1 > maxParquetFooterPrefetchBlocks {
+		firstBlock = lastWanted - maxParquetFooterPrefetchBlocks + 1
+	}
+	blocks := make([]int64, 0, lastWanted-firstBlock+1)
+	for i := firstBlock; i <= lastWanted; i++ {
 		blocks = append(blocks, i)
 	}
 	return blocks

@@ -453,7 +453,7 @@ func TestParquetFooterBlocks(t *testing.T) {
 	t.Run("spans metadata through the tail", func(t *testing.T) {
 		meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 6 * blockSize}
 		// metadata starts at 6144-8-2644 = 3492, inside block 3; tail is block 5.
-		got := parquetFooterBlocks(meta, 2644)
+		got := parquetFooterBlocks(meta, 2644, false)
 		if !slices.Equal(got, []int64{3, 4, 5}) {
 			t.Fatalf("blocks = %v, want [3 4 5]", got)
 		}
@@ -461,14 +461,14 @@ func TestParquetFooterBlocks(t *testing.T) {
 
 	t.Run("footer inside the tail block is just that block", func(t *testing.T) {
 		meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 6 * blockSize}
-		if got := parquetFooterBlocks(meta, 100); !slices.Equal(got, []int64{5}) {
+		if got := parquetFooterBlocks(meta, 100, false); !slices.Equal(got, []int64{5}) {
 			t.Fatalf("blocks = %v, want [5]", got)
 		}
 	})
 
 	t.Run("stays bounded for a pathological footer", func(t *testing.T) {
 		meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 5000 * blockSize}
-		got := parquetFooterBlocks(meta, 4000*blockSize)
+		got := parquetFooterBlocks(meta, 4000*blockSize, false)
 		if len(got) != maxParquetFooterPrefetchBlocks {
 			t.Fatalf("blocks = %d, want the %d cap", len(got), maxParquetFooterPrefetchBlocks)
 		}
@@ -735,5 +735,43 @@ func TestPrefetchAttribution_ConcurrentServesCountOnce(t *testing.T) {
 
 	if got := testutil.ToFloat64(counter) - before; got != rounds {
 		t.Fatalf("attributed %v blocks across %d races, want exactly %d - a block counted more than once inflates precision above 1", got, rounds, rounds)
+	}
+}
+
+// The cap must bound the blocks a caller actually fetches. Applying it to a span
+// that still contains the tail, then dropping the tail, silently gives the read
+// trigger one block less than the write trigger from the same configured limit.
+func TestParquetFooterBlocks_CapAppliesAfterTailIsDropped(t *testing.T) {
+	const blockSize = 1024
+	meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 5000 * blockSize}
+	huge := int64(4000 * blockSize)
+
+	write := parquetFooterBlocks(meta, huge, false)
+	read := parquetFooterBlocks(meta, huge, true)
+
+	if len(write) != maxParquetFooterPrefetchBlocks {
+		t.Fatalf("write trigger got %d blocks, want the %d cap", len(write), maxParquetFooterPrefetchBlocks)
+	}
+	if len(read) != maxParquetFooterPrefetchBlocks {
+		t.Fatalf("read trigger got %d blocks, want the %d cap — the tail was dropped after capping", len(read), maxParquetFooterPrefetchBlocks)
+	}
+	if read[len(read)-1] != write[len(write)-1]-1 {
+		t.Fatalf("read range should end one block before the tail: read ends %d, write ends %d", read[len(read)-1], write[len(write)-1])
+	}
+}
+
+// A block-aligned object has a FULL tail block, not a zero-length remainder, so its
+// metadata has to exceed a whole block before anything needs prefetching.
+func TestParquetFooterBlocks_BlockAlignedObjectHasFullTail(t *testing.T) {
+	const blockSize = 1024
+	meta := &cache.CachedObjectMeta{BlockSize: blockSize, ContentLength: 4 * blockSize}
+
+	// Footer smaller than a full block fits the tail; nothing to fetch beyond it.
+	if got := parquetFooterBlocks(meta, blockSize-parquetTrailerSize-1, true); len(got) != 0 {
+		t.Fatalf("aligned object with a sub-block footer wanted %v, want nothing", got)
+	}
+	// Footer larger than the tail block does spill into the previous one.
+	if got := parquetFooterBlocks(meta, blockSize+10, true); len(got) == 0 {
+		t.Fatal("aligned object with a footer larger than one block should need a prefetch")
 	}
 }

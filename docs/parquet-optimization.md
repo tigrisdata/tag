@@ -52,13 +52,19 @@ It depends on one thing: **is the metadata bigger than the block that already ge
 
 Footer size scales with row groups and columns, because the footer carries per-column statistics for every row group. A wide schema can put several MB of metadata on a few-hundred-MB object; a narrow one keeps it under a hundred KB.
 
-The comparison is *not* footer size against `block_size`. It is footer size against the **remainder block** — `ContentLength mod block_size` — because the tail block is a partial block, anywhere from 1 byte to a full block. So the prefetch does work whenever:
+The comparison is *not* footer size against `block_size`. It is footer size against the **tail block**, which is usually a partial block:
 
 ```
-footer_bytes + 8  >  ContentLength mod block_size
+tail_bytes = ContentLength - floor((ContentLength - 1) / block_size) * block_size
 ```
 
-For randomly sized objects the remainder averages half a block, so a footer of a few hundred KB against 1 MiB blocks still fires on a meaningful fraction of objects.
+That is `ContentLength mod block_size` for most objects — anywhere from 1 byte to a full block — and exactly `block_size` for an object whose length happens to be a multiple of it. The prefetch does work whenever:
+
+```
+footer_bytes + 8  >  tail_bytes
+```
+
+For arbitrarily sized objects the tail averages half a block, so a footer of a few hundred KB against 1 MiB blocks still fires on a meaningful fraction of them. Objects that are exact multiples of `block_size` get a full block of coverage and fire least often.
 
 **To find out for your data**, enable the flag on one node and read the histogram:
 
@@ -67,7 +73,7 @@ For randomly sized objects the remainder averages half a block, so a footer of a
 histogram_quantile(0.5, sum(rate(tag_cache_parquet_footer_bytes_bucket[1h])) by (le))
 ```
 
-`tag_cache_parquet_footer_bytes` is recorded for **every** parquet object whose trailer is read — including ones that are not prefetched — so it describes the whole population, not just the part that was acted on. If the distribution sits well below your remainder-block size, this optimization has nothing to do and should stay off.
+`tag_cache_parquet_footer_bytes` is recorded for **every** parquet object whose trailer is read — including ones that are not prefetched — so it describes the whole population, not just the part that was acted on. If the distribution sits well below your typical tail-block size, this optimization has nothing to do and should stay off.
 
 ---
 

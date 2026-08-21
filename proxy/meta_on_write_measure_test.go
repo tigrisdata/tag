@@ -95,7 +95,7 @@ func TestMeasure_FirstOpenUpstreamRoundTrips(t *testing.T) {
 
 	// (c) Meta-on-write + footer warm: metadata present and the footer blocks cached.
 	metaAndFooter := run(t, "meta+footer", func(svc *Service, c *cache.Cache, meta *cache.CachedObjectMeta) {
-		for _, idx := range parquetFooterBlocks(meta, footerLen) {
+		for _, idx := range parquetFooterBlocks(meta, footerLen, false) {
 			start, end := blockBounds(idx, blockSize, total)
 			if err := c.PutBlock(context.Background(), bucket, key, etag, blockSize, idx, object[start:end+1], 3600); err != nil {
 				t.Fatalf("prime block %d: %v", idx, err)
