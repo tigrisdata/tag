@@ -46,14 +46,6 @@ var errBlockUpstreamGone = errors.New("block upstream gone")
 // as "fall through to the miss path", not a real error.
 var errBlockAssemblyWouldAmplify = errors.New("block assembly would amplify")
 
-// errNoRequestedBlocksCached is the amplify bail for a request whose covering blocks
-// are ALL absent. The predicate is per-request, not per-entry: only a full-object
-// serve spans every block, so only there does it mean the entry itself holds nothing.
-// It wraps errBlockAssemblyWouldAmplify, so callers that only care about "fall
-// through" match it unchanged, while the full-object path uses the distinction to skip
-// an invalidation that would protect nothing (see serveCompleteFromBlocks).
-var errNoRequestedBlocksCached = fmt.Errorf("%w: none of the requested blocks are cached", errBlockAssemblyWouldAmplify)
-
 // maxInlineFetchesPerServe bounds how many absent blocks one COMMITTED block serve recovers via
 // individual aligned upstream fetches. BlocksComplete is a hint: blocks and meta evict/expire
 // independently, so a surviving meta over mass-evicted blocks would otherwise turn one full GET
@@ -791,21 +783,21 @@ func (s *Service) serveFullObjectFromBlockCache(
 	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, 0, lastBlock, true, 0); ferr != nil {
 		if errors.Is(ferr, errBlockAssemblyWouldAmplify) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Int64("blocks", lastBlock+1).Msg("Full-object block assembly would amplify - falling through to single upstream GET")
-			// Don't leave a mostly-missing entry in place: the bail skips the per-block staleness
-			// check, so if the object was deleted/overwritten out of band its already-cached blocks
-			// would keep serving stale bytes on later range reads until TTL. Invalidate it (only if
-			// still this version, so a concurrently re-established entry isn't wiped) and let the
-			// miss path re-establish the current version via a single streaming re-split.
+			// Don't leave a mostly-missing entry in place: the bail decides from a probe and
+			// never contacts upstream, so it cannot know whether the object still exists. If it
+			// was deleted or overwritten out of band, keeping the entry would serve stale bytes
+			// from its cached blocks, and stale HEADERS from its metadata, until TTL. Invalidate
+			// (only if still this version, so a concurrently re-established entry isn't wiped)
+			// and let the miss path re-establish the current version.
 			//
-			// An entry holding NO blocks is exempt: there are no cached bytes to serve stale, so
-			// the invalidation protects nothing, and wiping it would discard a metadata-only entry
-			// (meta-on-write) that later range reads are meant to reuse — making this full GET
-			// destructive rather than merely slow. Note a footer-warmed entry holds blocks and is
-			// NOT exempt: it still takes the invalidating branch, since those cached blocks are
-			// exactly the stale-serve hazard this guards.
-			if !errors.Is(ferr, errNoRequestedBlocksCached) {
-				s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
-			}
+			// This applies to an entry holding NO blocks too, even though it has no cached bytes
+			// to serve stale. Its METADATA can still be stale, and a later HEAD would answer 200
+			// from it for an object that no longer exists. An earlier revision exempted such
+			// entries so a full GET could not discard a metadata-only entry (meta-on-write) that
+			// later reads would reuse — but that traded a correctness property for a performance
+			// one. Losing the entry costs one discovery round trip on the next read; keeping a
+			// stale one answers wrongly for up to the TTL.
+			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
 			return false, nil
 		}
 		log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Full-object block assembly failed - falling through to upstream")
@@ -1394,9 +1386,6 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 	// avoiding a hit-ratio skew (failed fetches correlate with more-missing requests).
 	if (bailIfMostlyMissing && int64(len(missing))*2 > total) ||
 		(maxFetchFanout > 0 && int64(len(missing)) > maxFetchFanout) {
-		if int64(len(missing)) == total {
-			return errNoRequestedBlocksCached
-		}
 		return errBlockAssemblyWouldAmplify
 	}
 	if len(missing) == 0 {

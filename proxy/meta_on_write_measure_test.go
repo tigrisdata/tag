@@ -291,12 +291,15 @@ func TestCacheBlockMetaOnWrite(t *testing.T) {
 	})
 }
 
-// A metadata-only entry must survive a full-object GET. The full-GET path bails when
-// most blocks are absent and invalidates the entry, which is right when it holds
-// cached blocks that could serve stale bytes — but an entry with NO blocks has no
-// such hazard, and wiping it would make the full GET destroy exactly what
-// meta-on-write (and a footer warm before its first read) just established.
-func TestFullGet_PreservesMetadataOnlyEntry(t *testing.T) {
+// A full-object GET over an entry whose blocks are all absent must not leave that
+// entry behind. The bail decides from a probe and never contacts upstream, so it
+// cannot know the object still exists — and a metadata-only entry that outlives a
+// deleted object answers later HEADs with 200 and stale headers until TTL.
+//
+// The cost of invalidating is one discovery round trip on the next read. The cost of
+// keeping it is answering wrongly, so correctness wins. An earlier revision exempted
+// these entries to protect meta-on-write from exactly this; that was the wrong trade.
+func TestFullGet_InvalidatesEntryWithNoCachedBlocks(t *testing.T) {
 	const (
 		blockSize = 4
 		bucket    = "b"
@@ -325,7 +328,13 @@ func TestFullGet_PreservesMetadataOnlyEntry(t *testing.T) {
 		t.Fatalf("full GET served status=%d len=%d, want 200 and %d bytes", rec.Code, rec.Body.Len(), len(object))
 	}
 
-	if _, found, _ := c.GetMeta(context.Background(), bucket, key); !found {
-		t.Fatal("full GET destroyed the metadata-only entry that later range reads were meant to reuse")
+	// The entry may be re-established by the miss path's own populate, so assert on
+	// what matters: it must not still be the OLD entry, unvalidated against upstream.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, found, _ := c.GetMeta(context.Background(), bucket, key); !found {
+			return // invalidated as required
+		}
 	}
+	t.Fatal("full GET left a metadata-only entry in place without validating it upstream; a deleted object would answer HEAD 200 until TTL")
 }
