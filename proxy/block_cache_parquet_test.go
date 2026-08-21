@@ -586,6 +586,15 @@ func TestReadParquetTrailerFromUpstream(t *testing.T) {
 		}
 	})
 
+	// Every other populate path refuses these; this one must too.
+	t.Run("rejects an object the client marked uncacheable", func(t *testing.T) {
+		s, _ := newWarmTestService(t, warmTestObject(2644), `"v1"`, 0)
+		s.forwarder = &noStoreForwarder{body: warmTestObject(2644), etag: `"v1"`}
+		if _, _, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk"); ok {
+			t.Fatal("warmed an object marked Cache-Control: no-store")
+		}
+	})
+
 	t.Run("rejects a non-parquet trailer", func(t *testing.T) {
 		body := warmTestObject(2644)
 		copy(body[len(body)-4:], "XXXX")
@@ -646,6 +655,28 @@ func (f *wrongIntervalForwarder) DoConditionalGetRequest(_ context.Context, _, _
 	// Valid trailer bytes, but from the middle of the object rather than its tail.
 	header.Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", parquetTrailerSize-1, total))
 	header.Set("ETag", f.etag)
+	return &http.Response{
+		StatusCode:    http.StatusPartialContent,
+		ContentLength: parquetTrailerSize,
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(f.body[total-parquetTrailerSize:])),
+	}, nil
+}
+
+// noStoreForwarder answers the suffix range for an object the client marked
+// uncacheable, which every populate path is required to refuse.
+type noStoreForwarder struct {
+	mockForwarder
+	body []byte
+	etag string
+}
+
+func (f *noStoreForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _, _ string, _ int64, _ string) (*http.Response, error) {
+	total := int64(len(f.body))
+	header := make(http.Header)
+	header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", total-parquetTrailerSize, total-1, total))
+	header.Set("ETag", f.etag)
+	header.Set("Cache-Control", "no-store")
 	return &http.Response{
 		StatusCode:    http.StatusPartialContent,
 		ContentLength: parquetTrailerSize,

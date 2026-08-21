@@ -392,6 +392,13 @@ func (s *Service) readParquetTrailerFromUpstream(ctx context.Context, bucket, ke
 		// Sub-block objects are whole-cached, and their footer is the whole object.
 		return nil, 0, false
 	}
+	// Same gate every other populate path applies: an object the client marked
+	// no-store/private, or one over the size threshold, must not be cached here
+	// either. Built from the response headers so Cache-Control is actually seen.
+	if probe := s.buildBlockMeta(bucket, key, resp.Header, contentLength); !probe.IsCacheable(s.config.Cache.SizeThreshold) {
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Parquet footer warm skipped - object is not cacheable")
+		return nil, 0, false
+	}
 
 	buf := make([]byte, parquetTrailerSize)
 	if _, err := io.ReadFull(resp.Body, buf); err != nil {
