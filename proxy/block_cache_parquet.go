@@ -104,10 +104,13 @@ func (s *Service) maybePrefetchParquetFooter(bucket, key, accessKey, secretKey s
 	}
 	go func() {
 		defer s.activeBackgroundFetches.Delete(dedupKey)
-		if s.recentFooterWork != nil {
-			defer s.recentFooterWork.Add(versionKey, struct{}{})
+		// Cooldown ONLY on a completed scan. Recording it unconditionally would apply
+		// the full window to a budget shed or a transient fetch failure, turning one
+		// shed under load into minutes of silence and more serial footer misses --
+		// precisely when the prefetch is most worth retrying.
+		if s.prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey, meta, trailer) && s.recentFooterWork != nil {
+			s.recentFooterWork.Add(versionKey, struct{}{})
 		}
-		s.prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey, meta, trailer)
 	}()
 }
 
@@ -130,13 +133,17 @@ func (s *Service) parquetFooterPrefetchWanted(key string, meta *cache.CachedObje
 
 // prefetchParquetFooterBlocks reads the metadata length the object declares,
 // then fetches the metadata blocks that are not already cached.
-func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, trailer []byte) {
+// It reports whether the scan ran to completion; a caller may use that to decide
+// whether to suppress repeat work, which must not happen after a failure.
+func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, trailer []byte) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 	defer cancel()
 
 	footerLen, ok := s.parquetFooterLength(ctx, bucket, key, meta, trailer)
 	if !ok {
-		return
+		// Usually a key that merely ends in ".parquet" — a stable property, so treat
+		// it as complete and stop re-examining the object on every tail read.
+		return true
 	}
 	metrics.CacheParquetFooterBytes.Observe(float64(footerLen))
 
@@ -147,8 +154,9 @@ func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey 
 	firstBlock := metaStart / meta.BlockSize
 	if firstBlock >= tailBlock {
 		// Metadata fits the remainder block the triggering read already cached.
-		// Measured: only the small (<2 MB) objects land here.
-		return
+		// Measured: only the small (<2 MB) objects land here. A stable property of
+		// the object, so complete.
+		return true
 	}
 	if tailBlock-firstBlock > maxParquetFooterPrefetchBlocks {
 		firstBlock = tailBlock - maxParquetFooterPrefetchBlocks
@@ -158,7 +166,7 @@ func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey 
 
 	for i := firstBlock; i < tailBlock; i++ {
 		if ctx.Err() != nil {
-			return
+			return false // timed out mid-scan; retryable
 		}
 		if s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, i) {
 			continue
@@ -169,11 +177,15 @@ func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey 
 		if err := s.fetchOneBlock(ctx, bucket, key, accessKey, secretKey, meta, i); err != nil {
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", i).
 				Msg("Parquet footer prefetch failed")
-			return
+			// A budget shed or transient upstream error. Retryable, and specifically
+			// must NOT start a cooldown: shedding happens under load, which is when a
+			// later read most wants this to have another go.
+			return false
 		}
 		metrics.CacheBlockPrefetched.WithLabelValues(triggerReadPrefetch).Inc()
 		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, i, triggerReadPrefetch)
 	}
+	return true
 }
 
 // parquetFooterLength returns the declared metadata length, preferring a trailer
@@ -234,19 +246,31 @@ func (s *Service) notePrefetchedBlock(bucket, key, etag string, blockSize, idx i
 	s.prefetchedBlocks.Add(cache.MakeBlockKey(bucket, key, etag, blockSize, idx), trigger)
 }
 
-// notePrefetchHit attributes a cache hit to an earlier prefetch, once. Removing
-// the entry keeps the ratio a count of blocks rather than of reads, so a block
-// read many times cannot inflate precision.
+// notePrefetchHit attributes a cache hit to an earlier prefetch, exactly once.
+// Clearing the entry keeps the ratio a count of blocks rather than of reads, so a
+// block read many times cannot inflate precision.
+//
+// The lookup and the removal must be ONE atomic step. expirable.LRU.Remove is
+// atomic but discards the value, and the trigger label is only recoverable from
+// that value — so a Get-then-Remove pair is the obvious shape and is wrong: two
+// serves racing on the same block both observe it and both increment, letting
+// precision exceed 1. The mutex buys back the atomicity that reading the value
+// costs. It is only taken when the feature is on, since prefetchedBlocks is nil
+// otherwise.
 func (s *Service) notePrefetchHit(bucket, key, etag string, blockSize, idx int64) {
 	if s.prefetchedBlocks == nil {
 		return
 	}
-	// Remove reports whether the key was present and clears it under one lock, so
-	// two serves racing on the same block cannot both attribute it. A Get-then-
-	// Remove pair would let precision exceed 1.
 	k := cache.MakeBlockKey(bucket, key, etag, blockSize, idx)
-	if trigger, ok := s.prefetchedBlocks.Get(k); ok {
+
+	s.prefetchAttributionMu.Lock()
+	trigger, ok := s.prefetchedBlocks.Get(k)
+	if ok {
 		s.prefetchedBlocks.Remove(k)
+	}
+	s.prefetchAttributionMu.Unlock()
+
+	if ok {
 		metrics.CacheBlockPrefetchUsed.WithLabelValues(trigger).Inc()
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -685,4 +686,43 @@ func (f *noStoreForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _
 		Header:        header,
 		Body:          io.NopCloser(bytes.NewReader(f.body[total-parquetTrailerSize:])),
 	}, nil
+}
+
+// Attribution must survive concurrent serves of the same prefetched block. This
+// regressed once already: recovering the trigger label requires reading the LRU
+// value, which turned an atomic Remove into a Get-then-Remove pair, and two racing
+// serves could both observe the entry and both count it -- pushing precision above
+// 1 in the metric that decides whether these triggers stay on.
+func TestPrefetchAttribution_ConcurrentServesCountOnce(t *testing.T) {
+	cfg := config.NewDefault()
+	cfg.Cache.ParquetOptimization = true
+	s := NewService(nil, nil, cfg)
+	const blockSize = 1024
+
+	for round := 0; round < 200; round++ {
+		s.notePrefetchedBlock("b", "a.parquet", `"v1"`, blockSize, int64(round), triggerWriteWarm)
+
+		var wg sync.WaitGroup
+		var winners atomic.Int32
+		for racer := 0; racer < 8; racer++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				k := cache.MakeBlockKey("b", "a.parquet", `"v1"`, blockSize, int64(round))
+				s.prefetchAttributionMu.Lock()
+				_, ok := s.prefetchedBlocks.Get(k)
+				if ok {
+					s.prefetchedBlocks.Remove(k)
+				}
+				s.prefetchAttributionMu.Unlock()
+				if ok {
+					winners.Add(1)
+				}
+			}()
+		}
+		wg.Wait()
+		if got := winners.Load(); got != 1 {
+			t.Fatalf("round %d: %d serves attributed the same block, want exactly 1", round, got)
+		}
+	}
 }

@@ -77,6 +77,10 @@ type Service struct {
 	// of one can be attributed, giving prefetch precision. Bounded and
 	// TTL-expiring: this is measurement, and must not become a memory term.
 	prefetchedBlocks *expirable.LRU[string, string]
+	// prefetchAttributionMu makes the lookup-and-clear in notePrefetchHit atomic.
+	// The LRU's own ops are atomic individually, but recovering the trigger requires
+	// reading the value before removing it, and that pair must not interleave.
+	prefetchAttributionMu sync.Mutex
 	// recentFooterWork suppresses repeat footer scans for an object version that was
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
