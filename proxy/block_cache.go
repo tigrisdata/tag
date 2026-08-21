@@ -1493,21 +1493,32 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block-mode populate skipped - block fetch failed")
 			return
 		}
-		// Re-check that no entry was established concurrently before stamping block-mode meta.
-		// The schedule-time !found gate can go stale during the block fetch above: a racing
-		// full-GET miss may have whole-cached the object. Overwriting that with block-mode meta
-		// would demote a complete whole-mode entry to a partial one, so back off and let it win
-		// (the touched blocks we fetched are harmless orphans that age out).
-		if _, found, _ := s.cache.GetMeta(ctx, bucket, key); found {
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Block-mode meta write skipped - entry established concurrently")
-			return
-		}
-		ttl := int(s.config.Cache.TTL.Seconds())
-		wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime)
-		if err != nil || !wrote {
-			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (tombstone or error)")
-			return
-		}
-		log.Debug().Str("bucket", bucket).Str("key", key).Int("blocks", len(touched)).Int64("block_size", meta.BlockSize).Msg("Block-mode entry populated")
+		s.finalizeBlockModeMeta(ctx, bucket, key, meta, len(touched), writeStartTime)
 	}()
+}
+
+// finalizeBlockModeMeta stamps the block-mode meta once its blocks have landed — the
+// "blocks first, meta last" visibility gate from RFC 0001. Split out so callers that
+// need to act between the two steps (write-time footer warming records per-block
+// attribution there) share this logic instead of re-deriving its race handling.
+//
+// writeStartTime must be stamped BEFORE the blocks were fetched, so an invalidation
+// landing mid-populate is newer and blocks the meta write.
+func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, blockCount int, writeStartTime int64) {
+	// Re-check that no entry was established concurrently before stamping block-mode meta.
+	// The schedule-time !found gate can go stale during the block fetch: a racing
+	// full-GET miss may have whole-cached the object. Overwriting that with block-mode meta
+	// would demote a complete whole-mode entry to a partial one, so back off and let it win
+	// (the blocks we fetched are keyed by ETag, so a matching entry still resolves them).
+	if _, found, _ := s.cache.GetMeta(ctx, bucket, key); found {
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Block-mode meta write skipped - entry established concurrently")
+		return
+	}
+	ttl := int(s.config.Cache.TTL.Seconds())
+	wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime)
+	if err != nil || !wrote {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (tombstone or error)")
+		return
+	}
+	log.Debug().Str("bucket", bucket).Str("key", key).Int("blocks", blockCount).Int64("block_size", meta.BlockSize).Msg("Block-mode entry populated")
 }

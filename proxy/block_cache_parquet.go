@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog/log"
 
@@ -310,16 +311,36 @@ func (s *Service) warmParquetFooterBlocks(bucket, key, accessKey, secretKey stri
 	if len(blocks) == 0 {
 		return
 	}
-	// Counted as requested rather than as landed: triggerBlockModePopulate reports
-	// asynchronously, and over-counting the denominator understates precision, which
-	// is the safe direction for a number used to decide whether to keep this on.
+	// The shared populate path refuses a fan-out above this, and a silent refusal
+	// after the counters had already moved would report warms that never happened.
+	// Check it here so the skip is explicit and unmeasured.
+	if int64(len(blocks)) > maxRangeBlockFanout {
+		log.Debug().Str("bucket", bucket).Str("key", key).Int("blocks", len(blocks)).
+			Msg("Parquet footer warm skipped - metadata spans more blocks than the populate fan-out allows")
+		return
+	}
+
+	// Stamp before fetching so an invalidation landing mid-warm is newer and blocks
+	// the meta write below.
+	writeStartTime := time.Now().UnixNano()
+	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, blocks); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Parquet footer warm - block fetch failed")
+		return
+	}
+
+	// Counted only once the blocks are actually cached. Counting at schedule time
+	// would credit a warm that never landed: the blocks would still be recorded for
+	// attribution, so a later read that fetched them itself would be scored as a
+	// prefetch hit and INFLATE precision -- in a metric whose whole job is to decide
+	// whether this trigger earns its keep.
 	for _, idx := range blocks {
 		metrics.CacheBlockPrefetched.WithLabelValues("write_warm").Inc()
 		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, idx)
 	}
-	// Fetches the blocks and writes the block-mode meta LAST, tombstone-aware -- the
-	// visibility gate from RFC 0001. Nothing here bypasses that ordering.
-	s.triggerBlockModePopulate(bucket, key, accessKey, secretKey, meta, blocks)
+
+	// Meta last, tombstone-aware -- the RFC 0001 visibility gate. Blocks stay useful
+	// even if this backs off, since they are keyed by ETag.
+	s.finalizeBlockModeMeta(ctx, bucket, key, meta, len(blocks), writeStartTime)
 }
 
 // readParquetTrailerFromUpstream fetches the object's last 8 bytes. A suffix range is

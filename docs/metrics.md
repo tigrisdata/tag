@@ -375,10 +375,17 @@ means the readers are not following writes closely, and that trigger is not payi
 
 **Type:** Histogram
 
-Size of the parquet metadata region, read from the trailer of objects served while
+Size of the parquet metadata region, read from the trailer of objects while
 `cache.parquet_optimization` is on. Recorded for **every** parquet object whose trailer is
 read, including ones that are not prefetched, so the distribution describes the whole
 population rather than just the prefetched tail of it.
+
+Note the population depends on which triggers are active. The read trigger observes objects
+as they are read; the write trigger observes them as they are written. With both on, an object
+written and later read through the same node is observed twice, and write-heavy deployments
+will weight the distribution toward recently written objects. Read it as a distribution of
+*observations*, not of distinct objects — that is what makes it useful for drift detection and
+what to keep in mind before comparing across deployments.
 
 The prefetch does work whenever `footer + 8` exceeds the **remainder** block
 (`ContentLength mod block_size`, averaging half a block) — not merely when the footer exceeds
