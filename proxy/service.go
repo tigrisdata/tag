@@ -842,6 +842,10 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		// The path that matters for parquet: ingestors write via multipart, so this
 		// is where a freshly written file's metadata gets warmed (RFC 0002).
 		s.warmParquetFooterOnWrite(r, bucket, key)
+		// Prototype: establish the metadata entry so the first read does not pay an
+		// upstream round trip to discover it. Multipart is the gap — write-through
+		// cannot tee a body TAG never sees.
+		s.cacheBlockMetaOnWrite(r, bucket, key, completedMultipartETag(capture))
 	}
 
 	// Cache successful completions in ocache for idempotent replays. Only cache a

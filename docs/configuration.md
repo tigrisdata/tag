@@ -21,6 +21,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION` | Fraction of the populate memory budget reserved (elastically) for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; negative disables) | `0.5` |
 | `TAG_CACHE_BLOCK_CACHING_ENABLED`  | Enable block-aligned caching for large objects (RFC 0001): a read miss for an object at/above `block_size` is cached at block granularity (`true`/`false`) | `true`                   |
 | `TAG_CACHE_BLOCK_SIZE`             | Block granularity **and** the read-side whole-vs-block boundary (bytes): a read miss below this is whole-cached, at/above it is block-cached; must stay below ocache's 64 MB compaction threshold | `1048576` (1 MiB)        |
+| `TAG_CACHE_META_ON_WRITE`          | Cache an object's metadata (not its body) when TAG proxies its write, so the first read resolves it from cache instead of a round trip. Closes the multipart gap, where write-through cannot tee a body TAG never sees (`true`/`1`; any other value leaves it off) | `false`                  |
 | `TAG_CACHE_PARQUET_OPTIMIZATION`   | Prefetch a parquet object's metadata blocks when a read reaches its tail, so a reader opening the file does not discover the rest of the metadata as serial misses. Only fires when the metadata spans more than the tail block (`true`/`1`; any other value leaves it off) | `false`                  |
 | `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
 | `TAG_CACHE_CLUSTER_ADDR`          | Address for memberlist gossip                                                   | `:7000`                  |
@@ -180,6 +181,15 @@ cache:
   # below ocache's 64 MB compaction threshold so blocks pack into shared segments. 0/unset =
   # default (1 MiB). Override with TAG_CACHE_BLOCK_SIZE env var.
   block_size: 1048576
+
+  # Cache object METADATA on write (opt-in, prototype). TAG invalidates on write and
+  # caches nothing, so the first read of a freshly written object pays an upstream
+  # round trip purely to establish metadata before block mode can engage. Write-through
+  # already caches meta+body for a teed PutObject; this closes the multipart gap, where
+  # TAG never sees the assembled body. Metadata only -- the body stays uncached and
+  # blocks are fetched on demand, exactly as block mode already does for evicted blocks.
+  # Override with TAG_CACHE_META_ON_WRITE env var.
+  meta_on_write: false
 
   # Parquet-aware footer caching (opt-in). Drives two triggers: a read that reaches an
   # object's trailer prefetches the rest of its metadata, and a parquet object written
