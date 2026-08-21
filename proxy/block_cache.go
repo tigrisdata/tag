@@ -46,6 +46,15 @@ var errBlockUpstreamGone = errors.New("block upstream gone")
 // as "fall through to the miss path", not a real error.
 var errBlockAssemblyWouldAmplify = errors.New("block assembly would amplify")
 
+// errBlockEntryHasNoBlocks is the amplify bail for an entry holding NO cached blocks
+// at all — a metadata-only entry, established on write or by a footer warm before any
+// read populated it. It wraps errBlockAssemblyWouldAmplify, so callers that only care
+// about "fall through" match it unchanged, while the full-object path can tell the two
+// apart: an entry with cached blocks may be serving stale bytes and must be
+// invalidated on bail, whereas an entry with none has no such hazard and wiping it
+// would discard the metadata later range reads are meant to reuse.
+var errBlockEntryHasNoBlocks = fmt.Errorf("%w: entry has no cached blocks", errBlockAssemblyWouldAmplify)
+
 // maxInlineFetchesPerServe bounds how many absent blocks one COMMITTED block serve recovers via
 // individual aligned upstream fetches. BlocksComplete is a hint: blocks and meta evict/expire
 // independently, so a surviving meta over mass-evicted blocks would otherwise turn one full GET
@@ -786,12 +795,19 @@ func (s *Service) serveFullObjectFromBlockCache(
 	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, 0, lastBlock, true, 0); ferr != nil {
 		if errors.Is(ferr, errBlockAssemblyWouldAmplify) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Int64("blocks", lastBlock+1).Msg("Full-object block assembly would amplify - falling through to single upstream GET")
-			// Don't leave the mostly-missing entry in place: the bail skips the per-block staleness
+			// Don't leave a mostly-missing entry in place: the bail skips the per-block staleness
 			// check, so if the object was deleted/overwritten out of band its already-cached blocks
 			// would keep serving stale bytes on later range reads until TTL. Invalidate it (only if
 			// still this version, so a concurrently re-established entry isn't wiped) and let the
 			// miss path re-establish the current version via a single streaming re-split.
-			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+			//
+			// An entry holding NO blocks is exempt: there are no cached bytes to serve stale, so
+			// the invalidation protects nothing, and wiping it would discard a metadata-only entry
+			// (meta-on-write, or a footer warm before its first read) that later range reads are
+			// meant to reuse — making this full GET destructive rather than merely slow.
+			if !errors.Is(ferr, errBlockEntryHasNoBlocks) {
+				s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+			}
 			return false, nil
 		}
 		log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Full-object block assembly failed - falling through to upstream")
@@ -1381,6 +1397,9 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 	// avoiding a hit-ratio skew (failed fetches correlate with more-missing requests).
 	if (bailIfMostlyMissing && int64(len(missing))*2 > total) ||
 		(maxFetchFanout > 0 && int64(len(missing)) > maxFetchFanout) {
+		if int64(len(missing)) == total {
+			return errBlockEntryHasNoBlocks
+		}
 		return errBlockAssemblyWouldAmplify
 	}
 	if len(missing) == 0 {

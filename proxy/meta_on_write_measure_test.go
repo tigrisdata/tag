@@ -290,3 +290,42 @@ func TestCacheBlockMetaOnWrite(t *testing.T) {
 		}
 	})
 }
+
+// A metadata-only entry must survive a full-object GET. The full-GET path bails when
+// most blocks are absent and invalidates the entry, which is right when it holds
+// cached blocks that could serve stale bytes — but an entry with NO blocks has no
+// such hazard, and wiping it would make the full GET destroy exactly what
+// meta-on-write (and a footer warm before its first read) just established.
+func TestFullGet_PreservesMetadataOnlyEntry(t *testing.T) {
+	const (
+		blockSize = 4
+		bucket    = "b"
+		key       = "o.bin"
+		etag      = `"v1"`
+	)
+	object := make([]byte, blockSize*10)
+	for i := range object {
+		object[i] = byte('a' + i%26)
+	}
+
+	mock := newBlockMock(object, etag)
+	svc, c := newBlockService(t, mock)
+
+	h := http.Header{}
+	h.Set("ETag", etag)
+	h.Set("Content-Type", "application/octet-stream")
+	h.Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+	mustPrimeMeta(t, c, bucket, key, svc.buildBlockMeta(bucket, key, h, int64(len(object))))
+
+	rec := httptest.NewRecorder()
+	if err := svc.HandleGetObject(rec, fullGet(bucket, key)); err != nil {
+		t.Fatalf("full GET: %v", err)
+	}
+	if rec.Code != 200 || rec.Body.Len() != len(object) {
+		t.Fatalf("full GET served status=%d len=%d, want 200 and %d bytes", rec.Code, rec.Body.Len(), len(object))
+	}
+
+	if _, found, _ := c.GetMeta(context.Background(), bucket, key); !found {
+		t.Fatal("full GET destroyed the metadata-only entry that later range reads were meant to reuse")
+	}
+}
