@@ -278,8 +278,12 @@ func (s *Service) warmParquetFooterOnWrite(r *http.Request, bucket, key string) 
 		return
 	}
 
-	// One warm per object version in flight, reusing the read-path coalescer: a
-	// retried CompleteMultipartUpload must not warm twice.
+	// One warm per object in flight, reusing the read-path coalescer, so a retried
+	// CompleteMultipartUpload does not warm twice. Deliberately NOT keyed by version:
+	// the ETag is only learned from the trailer read below, so it cannot be in the
+	// key. A second write landing mid-warm is therefore skipped, and that version is
+	// warmed by the read-triggered path on its first read instead -- one cold read,
+	// not a permanent gap.
 	dedupKey := "pqw:" + bucket + "/" + key
 	if _, loaded := s.activeBackgroundFetches.LoadOrStore(dedupKey, struct{}{}); loaded {
 		return
@@ -378,11 +382,11 @@ func (s *Service) readParquetTrailerFromUpstream(ctx context.Context, bucket, ke
 		return nil, 0, false
 	}
 
-	return &cache.CachedObjectMeta{
-		ETag:          etag,
-		BlockSize:     s.config.Cache.BlockSize,
-		ContentLength: contentLength,
-	}, footerLen, true
+	// Build the entry the same way the range path does, from the 206's headers.
+	// A hand-rolled struct would omit StatusCode -- and this meta is the visibility
+	// gate, so a later HEAD hit would call WriteHeader(0) and panic net/http -- as
+	// well as Content-Type, Last-Modified and user metadata that clients expect.
+	return s.buildBlockMeta(bucket, key, resp.Header, contentLength), footerLen, true
 }
 
 // parquetFooterBlocks returns the block indices the metadata region spans, including

@@ -559,6 +559,25 @@ func TestReadParquetTrailerFromUpstream(t *testing.T) {
 		}
 	})
 
+	// The warm meta is the visibility gate for the entry, so it must be a complete
+	// object meta -- not just the three fields the block maths needs. A zero
+	// StatusCode reaches WriteHeader on a later HEAD hit and panics net/http.
+	t.Run("builds a complete object meta", func(t *testing.T) {
+		body := warmTestObject(2644)
+		s, _ := newWarmTestService(t, body, `"v1"`, 0)
+
+		meta, _, ok := s.readParquetTrailerFromUpstream(context.Background(), "b", "a.parquet", "ak", "sk")
+		if !ok {
+			t.Fatal("trailer read failed")
+		}
+		if meta.StatusCode < 100 || meta.StatusCode > 999 {
+			t.Fatalf("StatusCode = %d, which panics net/http at WriteHeader", meta.StatusCode)
+		}
+		if meta.Bucket != "b" || meta.Key != "a.parquet" {
+			t.Fatalf("meta identity = %q/%q, want b/a.parquet", meta.Bucket, meta.Key)
+		}
+	})
+
 	t.Run("rejects an interval that is not the object tail", func(t *testing.T) {
 		s, _ := newWarmTestService(t, warmTestObject(2644), `"v1"`, 0)
 		s.forwarder = &wrongIntervalForwarder{body: warmTestObject(2644), etag: `"v1"`}
