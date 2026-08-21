@@ -191,7 +191,7 @@ cache:
   # Override with TAG_CACHE_META_ON_WRITE env var.
   meta_on_write: false
 
-  # Parquet-aware footer caching (opt-in). Drives two triggers: a read that reaches an
+  # Parquet-aware footer caching (opt-in). Full guide: docs/parquet-optimization.md Drives two triggers: a read that reaches an
   # object's trailer prefetches the rest of its metadata, and a parquet object written
   # through TAG has its metadata warmed before the first read (RFC 0002).
   # A parquet reader must read the file's metadata

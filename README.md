@@ -123,6 +123,7 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 - **Kubernetes** — StatefulSet, HPA, and services in [`deploy/kubernetes/`](deploy/kubernetes/); high availability, scaling, and probes in [docs/deploy.md](docs/deploy.md).
 - **Docker** — single-node and cluster Compose in [`deploy/docker/`](deploy/docker/); see [docs/docker.md](docs/docker.md).
 - **TLS/HTTPS** — see [docs/tls.md](docs/tls.md).
+- **Parquet workloads** — caching parquet metadata ahead of the reader that needs it; see [docs/parquet-optimization.md](docs/parquet-optimization.md).
 - **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Architecture

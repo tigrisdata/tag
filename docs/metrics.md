@@ -362,7 +362,8 @@ precision cannot exceed 1. It is also deliberately an undercount — attribution
 bounded, TTL-expiring set, so a block served long after it was prefetched goes unattributed.
 Read the ratio as a floor.
 
-Both triggers come from `cache.parquet_optimization`:
+Both triggers come from `cache.parquet_optimization` (see
+[docs/parquet-optimization.md](parquet-optimization.md) for the full guide):
 
 | `trigger` | Fires when |
 | --- | --- |

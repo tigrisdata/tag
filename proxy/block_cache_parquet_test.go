@@ -238,8 +238,11 @@ func TestPrefetchParquetFooterBlocks_FetchesTheSpannedBlocks(t *testing.T) {
 
 	s.prefetchParquetFooterBlocks(bucket, key, "access", "secret", meta, nil)
 
+	// Fetched concurrently, so compare as a set: ordering is not part of the contract.
 	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
-	if got := fwd.requestedRanges(); !slices.Equal(got, want) {
+	got := fwd.requestedRanges()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
 		t.Fatalf("upstream ranges = %v, want %v", got, want)
 	}
 	for _, idx := range []int64{3, 4} {
@@ -347,8 +350,11 @@ func TestServeRangeFromBlockCache_TrailerProbeTriggersFooterPrefetch(t *testing.
 		}
 	}
 
+	// Concurrent fetches, so compare as a set.
 	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
-	if got := fwd.requestedRanges(); !slices.Equal(got, want) {
+	got := fwd.requestedRanges()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
 		t.Fatalf("prefetched ranges = %v, want %v", got, want)
 	}
 }
@@ -391,7 +397,9 @@ func TestPrefetchParquetFooterBlocks_UsesServedTrailerWhenTailNotYetCached(t *te
 	s.prefetchParquetFooterBlocks(bucket, key, "access", "secret", meta, trailer)
 
 	want := []string{"bytes=3072-4095", "bytes=4096-5119"}
-	if got := fwd.requestedRanges(); !slices.Equal(got, want) {
+	got := fwd.requestedRanges()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
 		t.Fatalf("prefetched ranges = %v, want %v (served trailer was ignored)", got, want)
 	}
 }
