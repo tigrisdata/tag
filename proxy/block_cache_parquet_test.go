@@ -10,13 +10,14 @@ import (
 	"net/http/httptest"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
+	"github.com/tigrisdata/tag/metrics"
 )
 
 // parquetTailBlock builds an object tail that a parquet reader would recognise:
@@ -693,36 +694,38 @@ func (f *noStoreForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _
 // value, which turned an atomic Remove into a Get-then-Remove pair, and two racing
 // serves could both observe the entry and both count it -- pushing precision above
 // 1 in the metric that decides whether these triggers stay on.
+//
+// It drives notePrefetchHit itself and asserts on the counter that ships. An
+// earlier version of this test reimplemented the lock-and-clear inline, which
+// exercised a copy of the logic rather than the function, and so would have stayed
+// green if the production path lost its mutex -- the exact regression it exists to
+// catch.
 func TestPrefetchAttribution_ConcurrentServesCountOnce(t *testing.T) {
 	cfg := config.NewDefault()
 	cfg.Cache.ParquetOptimization = true
 	s := NewService(nil, nil, cfg)
 	const blockSize = 1024
 
-	for round := 0; round < 200; round++ {
-		s.notePrefetchedBlock("b", "a.parquet", `"v1"`, blockSize, int64(round), triggerWriteWarm)
+	counter := metrics.CacheBlockPrefetchUsed.WithLabelValues(triggerWriteWarm)
+	before := testutil.ToFloat64(counter)
+
+	const rounds = 200
+	for round := 0; round < rounds; round++ {
+		key := fmt.Sprintf("a-%d.parquet", round)
+		s.notePrefetchedBlock("b", key, `"v1"`, blockSize, 7, triggerWriteWarm)
 
 		var wg sync.WaitGroup
-		var winners atomic.Int32
 		for racer := 0; racer < 8; racer++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				k := cache.MakeBlockKey("b", "a.parquet", `"v1"`, blockSize, int64(round))
-				s.prefetchAttributionMu.Lock()
-				_, ok := s.prefetchedBlocks.Get(k)
-				if ok {
-					s.prefetchedBlocks.Remove(k)
-				}
-				s.prefetchAttributionMu.Unlock()
-				if ok {
-					winners.Add(1)
-				}
+				s.notePrefetchHit("b", key, `"v1"`, blockSize, 7)
 			}()
 		}
 		wg.Wait()
-		if got := winners.Load(); got != 1 {
-			t.Fatalf("round %d: %d serves attributed the same block, want exactly 1", round, got)
-		}
+	}
+
+	if got := testutil.ToFloat64(counter) - before; got != rounds {
+		t.Fatalf("attributed %v blocks across %d races, want exactly %d - a block counted more than once inflates precision above 1", got, rounds, rounds)
 	}
 }
