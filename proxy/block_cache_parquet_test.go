@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -776,44 +777,80 @@ func TestParquetFooterBlocks_BlockAlignedObjectHasFullTail(t *testing.T) {
 	}
 }
 
-// The two triggers use different work keys, so a read prefetch and a write warm can
-// overlap on one object, both await the SAME coalesced block fetch, and both find
-// the block present afterwards. That is ONE physical transfer. Counting it under
-// both triggers would inflate the prefetched total against a numerator that can only
-// ever be claimed once, deflating precision for work that was done correctly.
-func TestPrefetchAttribution_OverlappingTriggersCountOneTransfer(t *testing.T) {
-	cfg := config.NewDefault()
-	cfg.Cache.ParquetOptimization = true
-	s := NewService(nil, nil, cfg)
-	const blockSize = 1024
+// gatedBlockForwarder holds the first upstream block fetch open until released, so
+// two callers provably overlap on the same block rather than racing by luck.
+type gatedBlockForwarder struct {
+	*blockMockForwarder
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
 
-	readCounter := metrics.CacheBlockPrefetched.WithLabelValues(triggerReadPrefetch)
-	writeCounter := metrics.CacheBlockPrefetched.WithLabelValues(triggerWriteWarm)
-	usedRead := metrics.CacheBlockPrefetchUsed.WithLabelValues(triggerReadPrefetch)
-	usedWrite := metrics.CacheBlockPrefetchUsed.WithLabelValues(triggerWriteWarm)
-	before := testutil.ToFloat64(readCounter) + testutil.ToFloat64(writeCounter)
-	usedBefore := testutil.ToFloat64(usedRead) + testutil.ToFloat64(usedWrite)
+func (f *gatedBlockForwarder) DoConditionalGetRequest(ctx context.Context, bucket, key, ak, sk, etag string, ms int64, rangeHeader string) (*http.Response, error) {
+	f.once.Do(func() {
+		close(f.started)
+		<-f.release
+	})
+	return f.blockMockForwarder.DoConditionalGetRequest(ctx, bucket, key, ak, sk, etag, ms, rangeHeader)
+}
 
-	const objects = 100
-	for i := 0; i < objects; i++ {
-		key := fmt.Sprintf("o-%d.parquet", i)
-		// Both triggers observe the same coalesced fetch of the same block.
-		s.notePrefetchedBlock("b", key, `"v1"`, blockSize, 3, triggerReadPrefetch)
-		s.notePrefetchedBlock("b", key, `"v1"`, blockSize, 3, triggerWriteWarm)
-		// The block is then served once.
-		s.notePrefetchHit("b", key, `"v1"`, blockSize, 3)
+// Two triggers can want the same absent block at the same time. They coalesce onto
+// ONE upstream transfer, and only the caller that owns that transfer may count it —
+// otherwise the prefetched total exceeds the number of transfers, while the numerator
+// can only ever be claimed once, and precision reads low for work that succeeded.
+//
+// This drives the real fetch path rather than the bookkeeping convention: it asserts
+// that one physical fetch produces exactly one owner.
+func TestFetchBlocksToCache_CoalescedFetchHasOneOwner(t *testing.T) {
+	const (
+		blockSize = 4
+		bucket    = "bucket"
+		key       = "o.bin"
+		etag      = `"v1"`
+	)
+	object := make([]byte, blockSize*4)
+	base := newBlockMock(object, etag)
+	fwd := &gatedBlockForwarder{
+		blockMockForwarder: base,
+		started:            make(chan struct{}),
+		release:            make(chan struct{}),
 	}
+	svc, _ := newBlockService(t, base)
+	svc.forwarder = fwd
 
-	prefetched := testutil.ToFloat64(readCounter) + testutil.ToFloat64(writeCounter) - before
-	used := testutil.ToFloat64(usedRead) + testutil.ToFloat64(usedWrite) - usedBefore
+	meta := &cache.CachedObjectMeta{ETag: etag, BlockSize: blockSize, ContentLength: int64(len(object))}
 
-	if prefetched != objects {
-		t.Errorf("counted %v prefetched blocks for %d transfers - one coalesced fetch credited to both triggers", prefetched, objects)
+	var owners atomic.Int32
+	var wg sync.WaitGroup
+	for caller := 0; caller < 2; caller++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			owned, err := svc.fetchBlocksToCache(context.Background(), bucket, key, "ak", "sk", meta, []int64{2})
+			if err != nil {
+				return
+			}
+			owners.Add(int32(len(owned)))
+		}()
 	}
-	if used != objects {
-		t.Errorf("counted %v used blocks for %d serves", used, objects)
+	<-fwd.started // the first fetch is in flight
+	// Give the second caller time to join it rather than start its own.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		svc.blockFetchMu.Lock()
+		joined := len(svc.blockFetches) > 0
+		svc.blockFetchMu.Unlock()
+		if joined {
+			break
+		}
 	}
-	if prefetched != used {
-		t.Errorf("precision = %v/%v; a transfer counted twice cannot be claimed twice, so this reads below 1 for work that succeeded", used, prefetched)
+	close(fwd.release)
+	wg.Wait()
+
+	if got := base.blockGets.Load(); got != 1 {
+		t.Fatalf("upstream fetched the block %d times, want 1 - the callers did not coalesce", got)
+	}
+	if got := owners.Load(); got != 1 {
+		t.Fatalf("%d callers claimed ownership of 1 transfer - counting both inflates prefetched against a numerator that can only be claimed once", got)
 	}
 }

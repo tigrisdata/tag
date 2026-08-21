@@ -620,7 +620,7 @@ func (s *Service) recoverMissingBlockSlice(ctx context.Context, bucket, key, acc
 		}
 		*fetchesLeft--
 	}
-	if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{idx}); ferr != nil {
+	if _, ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{idx}); ferr != nil {
 		if errors.Is(ferr, errBlockETagMismatch) || errors.Is(ferr, errBlockUpstreamGone) {
 			return false, ferr
 		}
@@ -675,7 +675,7 @@ func (s *Service) streamBlockRangeSequential(ctx context.Context, cw *countingWr
 				return out, errBlocksMostlyAbsent
 			}
 			fetchesLeft--
-			if ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{i}); ferr != nil {
+			if _, ferr := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, []int64{i}); ferr != nil {
 				if errors.Is(ferr, errBlockETagMismatch) || errors.Is(ferr, errBlockUpstreamGone) {
 					return out, ferr
 				}
@@ -947,14 +947,23 @@ func (s *Service) serveCompleteFromBlocks(
 // must not mask a slower stale signal from another (which would leave the stale meta to retry
 // until TTL). Blocks are therefore not canceled on a sibling's error — each runs to completion
 // so its signal is observed — but the caller's ctx still aborts them (e.g. client disconnect).
-func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdxs []int64) error {
+// It returns the block indices whose fetch THIS call owned. A caller that joined a
+// fetch already in flight did not cause that transfer, so a prefetch must not count
+// it: the block would have arrived regardless.
+func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdxs []int64) ([]int64, error) {
 	var g errgroup.Group
 	g.SetLimit(maxConcurrentBlockFetches)
 	var mu sync.Mutex
 	var stale, transient error
+	owned := make([]int64, 0, len(blockIdxs))
 	for _, idx := range blockIdxs {
 		g.Go(func() error {
-			err := s.fetchOneBlock(ctx, bucket, key, accessKey, secretKey, meta, idx)
+			mine, err := s.fetchOneBlock(ctx, bucket, key, accessKey, secretKey, meta, idx)
+			if mine {
+				mu.Lock()
+				owned = append(owned, idx)
+				mu.Unlock()
+			}
 			if err == nil {
 				return nil
 			}
@@ -981,9 +990,9 @@ func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey
 		// safe for every caller.
 		log.Debug().Err(stale).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
 		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
-		return stale
+		return owned, stale
 	}
-	return transient
+	return owned, transient
 }
 
 // recordBlockServeMetrics records per-block hit/miss counts and the full/partial serve
@@ -1042,7 +1051,11 @@ func (l *blockFetchLease) release() {
 // Every caller reserves one consumer before the fetch can publish its buffer,
 // which makes ownership exact even when a fast remote write finishes before
 // waiters wake up.
-func (s *Service) beginBlockFetch(blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) *blockFetchState {
+// It also reports whether this call OWNS the fetch (true) or joined one already in
+// flight (false). Only the owner performs the upstream transfer, which is what lets
+// a prefetch count the work it actually caused rather than inferring it from cache
+// presence -- presence proves the block arrived, not who brought it.
+func (s *Service) beginBlockFetch(blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) (*blockFetchState, bool) {
 	s.blockFetchMu.Lock()
 	if s.blockFetches == nil {
 		s.blockFetches = make(map[string]*blockFetchState)
@@ -1052,7 +1065,7 @@ func (s *Service) beginBlockFetch(blockKey, bucket, key, accessKey, secretKey st
 		state.consumers++
 		state.mu.Unlock()
 		s.blockFetchMu.Unlock()
-		return state
+		return state, false
 	}
 
 	state := &blockFetchState{
@@ -1064,7 +1077,7 @@ func (s *Service) beginBlockFetch(blockKey, bucket, key, accessKey, secretKey st
 	s.blockFetchMu.Unlock()
 
 	go s.runBlockFetch(state, blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, knownMissing)
-	return state
+	return state, true
 }
 
 func (state *blockFetchState) completeServe(bufp *[]byte, data []byte, err error) {
@@ -1126,7 +1139,7 @@ func (s *Service) fetchOneBlockForAssembly(ctx context.Context, bucket, key, acc
 	// fetchBlocksForAssembly calls this only for a block its pre-commit range
 	// read already established as absent. The first leader can therefore skip
 	// the otherwise redundant remote presence recheck.
-	state := s.beginBlockFetch(blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, true)
+	state, _ := s.beginBlockFetch(blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, true)
 
 	select {
 	case <-state.serveDone:
@@ -1153,20 +1166,20 @@ func (s *Service) fetchOneBlockForAssembly(ctx context.Context, bucket, key, acc
 // established behavior for probe-first and background populate callers. A
 // remote assembled serve can use fetchOneBlockForAssembly instead and return
 // after validation while this same state keeps the bounded writer alive.
-func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) error {
+func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) (owned bool, err error) {
 	blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, blockIdx)
-	state := s.beginBlockFetch(blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, false)
+	state, owned := s.beginBlockFetch(blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, false)
 
 	select {
 	case <-state.cacheDone:
 		state.mu.Lock()
-		err := state.cacheErr
+		cerr := state.cacheErr
 		state.mu.Unlock()
 		s.releaseBlockFetchConsumer(state)
-		return err
+		return owned, cerr
 	case <-ctx.Done():
 		s.releaseBlockFetchConsumer(state)
-		return ctx.Err()
+		return owned, ctx.Err()
 	}
 }
 
@@ -1407,7 +1420,7 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 		recordBlockServeMetrics(total, 0)
 		return nil
 	}
-	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, missing); err != nil {
+	if _, err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, missing); err != nil {
 		// A definitive stale signal has already invalidated the entry inside
 		// fetchBlocksToCache, so the caller's fall-through re-establishes the current state.
 		// Transient failures (budget shed, 5xx, upstream blip) leave the still-valid meta in
@@ -1509,7 +1522,7 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 		// newer than our timestamp and blocks the meta write (mirrors the whole-object paths).
 		writeStartTime := time.Now().UnixNano()
 
-		if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, touched); err != nil {
+		if _, err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, touched); err != nil {
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block-mode populate skipped - block fetch failed")
 			return
 		}

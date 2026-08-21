@@ -311,7 +311,7 @@ func TestServeAssembledRange_RemoteWriterHoldsPopulateSlot(t *testing.T) {
 	results := startGatedAssembledRange(svc, meta, client.trace)
 
 	waitBlockSignal(t, client.putStarted, "remote cache put start")
-	if err := svc.fetchOneBlock(context.Background(), meta.Bucket, meta.Key, "access", "secret", meta, 1); !errors.Is(err, errCachePopulateDeclined) {
+	if _, err := svc.fetchOneBlock(context.Background(), meta.Bucket, meta.Key, "access", "secret", meta, 1); !errors.Is(err, errCachePopulateDeclined) {
 		t.Fatalf("second block fetch while remote writer is stalled = %v, want %v", err, errCachePopulateDeclined)
 	}
 	if got := mock.blockGets.Load(); got != 1 {

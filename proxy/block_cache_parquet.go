@@ -183,18 +183,16 @@ func (s *Service) ensureParquetFooterBlocks(ctx context.Context, bucket, key, ac
 	// centralises the stale-meta invalidation that a per-block loop here used to
 	// miss: an ETag mismatch means the entry describes a version upstream no longer
 	// serves, and leaving it would fail every later read until TTL.
-	err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, absent)
+	owned, err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, absent)
 
-	// Count what actually landed, not whether the batch as a whole succeeded.
-	// fetchBlocksToCache can cache some blocks and shed or fail on others, and those
-	// cached blocks are real work: skipping them because a sibling failed would leave
-	// the work invisible to the ratio this feature is judged on, and a later attempt
-	// could not credit them either, since they no longer look absent. Re-probing is
-	// the honest way to ask what happened -- the batch does not report per block.
-	for _, idx := range absent {
-		if !s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, idx) {
-			continue
-		}
+	// Count the transfers this call OWNED, not the blocks that ended up present.
+	// Presence proves the block arrived, never who brought it -- a concurrent demand
+	// read, or the other trigger, may have been the one to fetch it, and crediting
+	// ourselves for their transfer inflates precision for work we did not do. Owned
+	// blocks are also counted when the batch as a whole failed: a partial fetch is
+	// still real work, and leaving it uncounted would hide it permanently, since a
+	// later attempt would not find those blocks absent.
+	for _, idx := range owned {
 		s.notePrefetchedBlock(bucket, key, meta.ETag, meta.BlockSize, idx, trigger)
 	}
 
@@ -257,16 +255,14 @@ func (s *Service) readParquetFooterLength(ctx context.Context, bucket, key strin
 // of it can be attributed. The set is bounded and TTL-expiring: an entry that ages
 // out simply stops being attributable, which understates precision rather than
 // overstating it.
-// It also increments the prefetched counter, and does so ONLY when this call is the
-// one that claimed the block. The two triggers do not coalesce with each other --
-// they use different work keys -- so a read prefetch and a write warm can overlap on
-// one object, both await the SAME coalesced block fetch, and both see the block
-// present afterwards. That is one physical transfer, and counting it under both
-// triggers would inflate the prefetched total and deflate precision against a
-// numerator that can only be claimed once.
+// It also increments the prefetched counter. Callers must invoke it once per
+// transfer they OWNED -- fetchBlocksToCache reports which those were -- so a block
+// fetched once is counted once even when several callers awaited it. Deriving that
+// from cache presence instead cannot work: presence proves the block arrived, not
+// who fetched it.
 //
 // Counting here rather than at the call site is deliberate: the counter and the
-// attribution set are the numerator and denominator of the same ratio, and keeping
+// attribution set are the denominator and numerator of the same ratio, and keeping
 // them in one place means they cannot drift apart.
 func (s *Service) notePrefetchedBlock(bucket, key, etag string, blockSize, idx int64, trigger string) {
 	if s.prefetchedBlocks == nil {
@@ -277,15 +273,10 @@ func (s *Service) notePrefetchedBlock(bucket, key, etag string, blockSize, idx i
 	// The trigger is stored, not just counted: precision is only meaningful per
 	// trigger, and it cannot be recovered at hit time otherwise.
 	s.prefetchAttributionMu.Lock()
-	_, alreadyClaimed := s.prefetchedBlocks.Get(k)
-	if !alreadyClaimed {
-		s.prefetchedBlocks.Add(k, trigger)
-	}
+	s.prefetchedBlocks.Add(k, trigger)
 	s.prefetchAttributionMu.Unlock()
 
-	if !alreadyClaimed {
-		metrics.CacheBlockPrefetched.WithLabelValues(trigger).Inc()
-	}
+	metrics.CacheBlockPrefetched.WithLabelValues(trigger).Inc()
 }
 
 // notePrefetchHit attributes a cache hit to an earlier prefetch, exactly once.
