@@ -212,6 +212,14 @@ type CacheConfig struct {
 	// operator should opt into.
 	ParquetOptimization bool `yaml:"parquet_optimization"`
 
+	// MetaOnWrite caches an object's METADATA when TAG proxies its write, without
+	// caching the body. TAG otherwise invalidates on write and caches nothing, so
+	// the first read of a freshly written object pays an upstream round trip just to
+	// establish metadata before block mode can engage. Multipart uploads are the gap
+	// this closes: write-through already caches meta+body for a teed PutObject, but
+	// TAG never sees a multipart body and so caches nothing at all. Prototype.
+	MetaOnWrite bool `yaml:"meta_on_write"`
+
 	// CompactionBytesPerSecond bounds the shared source-read budget for ocache's
 	// background file compaction and segment recompaction (bytes/second). It
 	// protects serving reads on throughput-capped volumes: unthrottled
@@ -590,6 +598,10 @@ func applyEnvOverrides(cfg *Config) {
 		// Enable parquet-aware footer prefetching from environment.
 		if val := strings.ToLower(strings.TrimSpace(os.Getenv("TAG_CACHE_PARQUET_OPTIMIZATION"))); val != "" {
 			cfg.Cache.ParquetOptimization = val == "true" || val == "1"
+		}
+		// Enable metadata caching on write from environment.
+		if val := strings.ToLower(strings.TrimSpace(os.Getenv("TAG_CACHE_META_ON_WRITE"))); val != "" {
+			cfg.Cache.MetaOnWrite = val == "true" || val == "1"
 		}
 		// Override the compaction source-read budget from environment
 		// (bytes/second). An explicit 0 disables the throttle even when YAML

@@ -33,6 +33,7 @@ type blockMockForwarder struct {
 	blockGetNoETag      bool         // if set, per-block 206 fetches omit the ETag header
 	blockGetShortBody   bool         // if set, per-block 206 body is shorter than its Content-Length
 	blockGets           atomic.Int32 // count of per-block DoConditionalGetRequest calls
+	forwards            atomic.Int32 // count of client-range forwards (DoRequestWithCreds)
 }
 
 func newBlockMock(object []byte, etag string) *blockMockForwarder {
@@ -40,6 +41,7 @@ func newBlockMock(object []byte, etag string) *blockMockForwarder {
 	// The client forward serves the requested range, or the whole object for a full GET. A
 	// deleted object (blockGet404) 404s the forward too, not only per-block fetches.
 	m.mockForwarder.doRequestFunc = func(_ context.Context, r *http.Request, _, _ string) (*http.Response, error) {
+		m.forwards.Add(1)
 		if m.blockGet404 {
 			return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
 		}
@@ -1826,3 +1828,6 @@ func TestBlockCache_SequentialClientWriteFailureDoesNotFetchRemainder(t *testing
 		t.Errorf("client write failure triggered %d upstream requests, want 0 (no remainder salvage)", got)
 	}
 }
+
+// clientForwards reports how many client-range forwards have hit upstream.
+func (m *blockMockForwarder) clientForwards() int32 { return m.forwards.Load() }

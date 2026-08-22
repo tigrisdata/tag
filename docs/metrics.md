@@ -342,48 +342,57 @@ sum(rate(tag_cache_block_prefetch_windows_total{outcome!="full"}[5m])) /
 sum(rate(tag_cache_block_prefetch_windows_total[5m]))
 ```
 
-#### tag_cache_block_prefetched_total / tag_cache_block_prefetch_used_total
+#### tag_cache_block_prefetched_total
 
-**Type:** Counter (`prefetched` labeled by `trigger`)
+**Type:** Counter (labeled by `trigger`)
 
-Speculative block fetches, and how many of them were later served from cache. Together they
-give prefetch precision — the fraction of speculative work that paid for itself:
+Blocks fetched speculatively rather than to satisfy a request in flight. This is a
+**volume** signal — how much speculative work each trigger is doing — not a precision
+signal.
 
-```promql
-# Prefetch precision. A low ratio means the speculation is evicting more than it
-# earns: turn the trigger off rather than tuning it.
-sum(rate(tag_cache_block_prefetch_used_total[30m])) /
-sum(rate(tag_cache_block_prefetched_total[30m]))
-```
+Judge the benefit from the block hit ratio (`tag_cache_block_hits_total` /
+`tag_cache_block_misses_total`), which measures the outcome directly. Rising hit ratio
+with modest prefetch volume is what you want; volume with no movement in hit ratio
+means the speculation is not landing where reads go.
 
-Attribution counts blocks, not reads: a prefetched block served many times counts once, so
-precision cannot exceed 1. It is also deliberately an undercount — attribution is tracked in a
-bounded, TTL-expiring set, so a block served long after it was prefetched goes unattributed.
-Read the ratio as a floor.
+There is deliberately no matching `_used_total`. Attributing each serve back to a
+prefetch required a per-block lookup on the serve path, which runs thousands of times
+per second, to re-derive a ratio that is ~98% by construction — a reader that has read
+a parquet trailer cannot do anything except read the metadata region next.
 
-The only `trigger` today is `parquet_footer`, from `cache.parquet_optimization`.
+Triggers today: `parquet_footer` (a read reached an object's trailer) and `write_warm`
+(a parquet object was written through TAG), both from `cache.parquet_optimization` —
+see [docs/parquet-optimization.md](parquet-optimization.md).
 
 #### tag_cache_parquet_footer_bytes
 
 **Type:** Histogram
 
-Size of the parquet metadata region, read from the trailer of objects served while
+Size of the parquet metadata region, read from the trailer of objects while
 `cache.parquet_optimization` is on. Recorded for **every** parquet object whose trailer is
 read, including ones that are not prefetched, so the distribution describes the whole
 population rather than just the prefetched tail of it.
+
+Note the population depends on which triggers are active. The read trigger observes objects
+as they are read; the write trigger observes them as they are written. With both on, an object
+written and later read through the same node is observed twice, and write-heavy deployments
+will weight the distribution toward recently written objects. Read it as a distribution of
+*observations*, not of distinct objects — that is what makes it useful for drift detection and
+what to keep in mind before comparing across deployments.
 
 The prefetch does work whenever `footer + 8` exceeds the **remainder** block
 (`ContentLength mod block_size`, averaging half a block) — not merely when the footer exceeds
 `block_size`.
 
-Measured baseline on production parseable data (26 objects): footers run **~1.25% of object
-size** — 3.0 MB at 244 MB, 4.7 MB at 394 MB — so at a 1 MiB `block_size` the metadata spans
-3–5 blocks and the prefetch fires on ~69% of objects. Only small (<2 MB) files, with 20–50 KB
-footers, fit inside the remainder.
+Footer size scales with row groups and columns, since the footer carries per-column
+statistics. On a production deployment with a wide schema, footers ran **~1.25% of object
+size** — several MB on a few-hundred-MB object — so at a 1 MiB `block_size` the metadata spans
+several blocks and the prefetch does real work on most objects. A narrow schema keeps the
+footer inside the tail block, where there is nothing to prefetch.
 
-Use the histogram to confirm that ratio still holds for your data: a schema change alters
-footer size, and a distribution that collapses below the remainder-block size means the
-optimization has stopped earning its keep.
+Use the histogram to establish that ratio for your own data, and to detect drift: a schema
+change alters footer size, and a distribution that collapses below the remainder-block size
+means the optimization has stopped earning its keep.
 
 ```promql
 # Median footer size — compare against cache.block_size.

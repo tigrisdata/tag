@@ -1271,3 +1271,32 @@ func TestParquetOptimization_OverrideByEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestMetaOnWrite_OverrideByEnv verifies TAG_CACHE_META_ON_WRITE plumbs metadata
+// caching on write into the cache config. It changes what a read-after-write sees,
+// so an unrecognized value must leave it off rather than guessing.
+func TestMetaOnWrite_OverrideByEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml bool
+		env  string
+		want bool
+	}{
+		{"true enables", false, "true", true},
+		{"one enables", false, "1", true},
+		{"mixed case accepted", false, "True", true},
+		{"false disables a yaml enable", true, "false", false},
+		{"garbage disables rather than guessing", true, "maybe", false},
+		{"unset leaves yaml alone", true, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TAG_CACHE_META_ON_WRITE", tc.env)
+			cfg := NewDefault()
+			cfg.Cache.MetaOnWrite = tc.yaml
+			applyEnvOverrides(cfg)
+			if cfg.Cache.MetaOnWrite != tc.want {
+				t.Errorf("Cache.MetaOnWrite = %v, want %v", cfg.Cache.MetaOnWrite, tc.want)
+			}
+		})
+	}
+}

@@ -350,7 +350,6 @@ func (s *Service) serveAssembledRange(
 	// Committed serve: record hit/miss + serve metrics (only here, never on a fall-through),
 	// then write the response.
 	recordBlockServeMetrics(bK-b0+1, int64(len(missing)))
-	s.noteAssembledPrefetchHits(bucket, key, meta, b0, bK, missing)
 	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(http.StatusPartialContent)
@@ -537,7 +536,6 @@ func (s *Service) streamBlockRangePipelined(ctx context.Context, cw *countingWri
 		}
 		if !br.fetchedIt {
 			out.fromCache++
-			s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, i)
 		}
 		_, werr := cw.Write((*br.bufp)[:br.n])
 		putBlockBuf(br.bufp)
@@ -687,7 +685,6 @@ func (s *Service) streamBlockRangeSequential(ctx context.Context, cw *countingWr
 		}
 		if !wasFetched {
 			out.fromCache++
-			s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, i)
 		}
 	}
 	return out, nil
@@ -786,11 +783,20 @@ func (s *Service) serveFullObjectFromBlockCache(
 	if ferr := s.ensureBlocksCached(ctx, bucket, key, accessKey, secretKey, meta, 0, lastBlock, true, 0); ferr != nil {
 		if errors.Is(ferr, errBlockAssemblyWouldAmplify) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Int64("blocks", lastBlock+1).Msg("Full-object block assembly would amplify - falling through to single upstream GET")
-			// Don't leave the mostly-missing entry in place: the bail skips the per-block staleness
-			// check, so if the object was deleted/overwritten out of band its already-cached blocks
-			// would keep serving stale bytes on later range reads until TTL. Invalidate it (only if
-			// still this version, so a concurrently re-established entry isn't wiped) and let the
-			// miss path re-establish the current version via a single streaming re-split.
+			// Don't leave a mostly-missing entry in place: the bail decides from a probe and
+			// never contacts upstream, so it cannot know whether the object still exists. If it
+			// was deleted or overwritten out of band, keeping the entry would serve stale bytes
+			// from its cached blocks, and stale HEADERS from its metadata, until TTL. Invalidate
+			// (only if still this version, so a concurrently re-established entry isn't wiped)
+			// and let the miss path re-establish the current version.
+			//
+			// This applies to an entry holding NO blocks too, even though it has no cached bytes
+			// to serve stale. Its METADATA can still be stale, and a later HEAD would answer 200
+			// from it for an object that no longer exists. An earlier revision exempted such
+			// entries so a full GET could not discard a metadata-only entry (meta-on-write) that
+			// later reads would reuse — but that traded a correctness property for a performance
+			// one. Losing the entry costs one discovery round trip on the next read; keeping a
+			// stale one answers wrongly for up to the TTL.
 			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
 			return false, nil
 		}
@@ -885,7 +891,6 @@ func (s *Service) serveCompleteFromBlocks(
 		out.fetched++
 	} else {
 		out.fromCache++
-		s.notePrefetchHit(bucket, key, meta.ETag, meta.BlockSize, 0)
 	}
 	n, werr := w.Write(buf)
 	if n > 0 {
@@ -1343,7 +1348,17 @@ func (s *Service) invalidateStaleBlockMeta(bucket, key, staleETag string) {
 	if m, found, err := s.cache.GetMeta(ctx, bucket, key); err != nil || !found || m == nil || m.ETag != staleETag {
 		return // already gone, or replaced by a newer version — leave it
 	}
-	s.cache.Delete(ctx, bucket, key)
+	if err := s.cache.Delete(ctx, bucket, key); err != nil {
+		// Record the failure rather than discarding it. This delete is what stops a
+		// stale entry answering later reads, so a silent failure leaves exactly the
+		// hazard it exists to prevent — and a delete metric that only ever reports
+		// success would hide it. invalidateObject treats its own failures the same way.
+		metrics.RecordCacheOperation("delete", "error")
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).
+			Msg("Stale block-mode meta not invalidated - entry may serve stale metadata until TTL")
+		return
+	}
+	metrics.RecordCacheOperation("delete", "success")
 }
 
 // ensureBlocksCached makes covering blocks [b0,bK] present in cache: it probes the range once,
@@ -1493,21 +1508,32 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block-mode populate skipped - block fetch failed")
 			return
 		}
-		// Re-check that no entry was established concurrently before stamping block-mode meta.
-		// The schedule-time !found gate can go stale during the block fetch above: a racing
-		// full-GET miss may have whole-cached the object. Overwriting that with block-mode meta
-		// would demote a complete whole-mode entry to a partial one, so back off and let it win
-		// (the touched blocks we fetched are harmless orphans that age out).
-		if _, found, _ := s.cache.GetMeta(ctx, bucket, key); found {
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Block-mode meta write skipped - entry established concurrently")
-			return
-		}
-		ttl := int(s.config.Cache.TTL.Seconds())
-		wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime)
-		if err != nil || !wrote {
-			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (tombstone or error)")
-			return
-		}
-		log.Debug().Str("bucket", bucket).Str("key", key).Int("blocks", len(touched)).Int64("block_size", meta.BlockSize).Msg("Block-mode entry populated")
+		s.finalizeBlockModeMeta(ctx, bucket, key, meta, len(touched), writeStartTime)
 	}()
+}
+
+// finalizeBlockModeMeta stamps the block-mode meta once its blocks have landed — the
+// "blocks first, meta last" visibility gate from RFC 0001. Split out so callers that
+// need to act between the two steps (write-time footer warming records per-block
+// attribution there) share this logic instead of re-deriving its race handling.
+//
+// writeStartTime must be stamped BEFORE the blocks were fetched, so an invalidation
+// landing mid-populate is newer and blocks the meta write.
+func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, blockCount int, writeStartTime int64) {
+	// Re-check that no entry was established concurrently before stamping block-mode meta.
+	// The schedule-time !found gate can go stale during the block fetch: a racing
+	// full-GET miss may have whole-cached the object. Overwriting that with block-mode meta
+	// would demote a complete whole-mode entry to a partial one, so back off and let it win
+	// (the blocks we fetched are keyed by ETag, so a matching entry still resolves them).
+	if _, found, _ := s.cache.GetMeta(ctx, bucket, key); found {
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Block-mode meta write skipped - entry established concurrently")
+		return
+	}
+	ttl := int(s.config.Cache.TTL.Seconds())
+	wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime)
+	if err != nil || !wrote {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (tombstone or error)")
+		return
+	}
+	log.Debug().Str("bucket", bucket).Str("key", key).Int("blocks", blockCount).Int64("block_size", meta.BlockSize).Msg("Block-mode entry populated")
 }
