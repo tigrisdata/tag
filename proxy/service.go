@@ -94,6 +94,18 @@ func (s *Service) revalidationRequested(r *http.Request) bool {
 	return shouldForceRevalidate(r) && s.originPolicy().CanRevalidate()
 }
 
+// cacheBypassRequested reports whether the client asked to skip the cache AND this
+// deployment can serve the request some other way.
+//
+// Cache-Control: no-store asks for a response that did not come from cache. With
+// no upstream there is no other source, so honoring it turns a cached object into
+// a 404 — the same failure revalidationRequested prevents, arriving by a different
+// header. Nothing is being served stale by ignoring it: with no origin, the cached
+// copy is the only copy.
+func (s *Service) cacheBypassRequested(r *http.Request) bool {
+	return shouldBypassCache(r) && s.originPolicy().CanFill()
+}
+
 // originPolicy returns the configured Origin, falling back to proxy behaviour when
 // unset. NewService always sets it; the fallback covers Services built as literals
 // (tests do this in a dozen places), where defaulting to "there is an upstream"
@@ -627,7 +639,7 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
 	forceRevalidate := s.revalidationRequested(r)
-	bypassCache := shouldBypassCache(r)
+	bypassCache := s.cacheBypassRequested(r)
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleHeadObject")
 

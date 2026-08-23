@@ -1354,15 +1354,32 @@ func TestUpstreamDisabled_SkipsEndpointValidation(t *testing.T) {
 	}
 }
 
-func TestUpstreamDisabled_EnvDropsTheDefaultedEndpoint(t *testing.T) {
+// The mode is read before defaults are applied, so no endpoint is ever invented.
+func TestUpstreamDisabled_EnvYieldsNoEndpoint(t *testing.T) {
 	t.Setenv("TAG_UPSTREAM_DISABLED", "true")
 
 	cfg := &Config{}
-	applyDefaults(cfg) // endpoint gets the default here; env override runs after
+	applyUpstreamModeEnv(cfg)
+	applyDefaults(cfg)
 	applyEnvOverrides(cfg)
 
 	if cfg.Upstream.Endpoint != "" {
-		t.Fatalf("endpoint = %q, want the invented default dropped", cfg.Upstream.Endpoint)
+		t.Fatalf("endpoint = %q, want none in origin-less mode", cfg.Upstream.Endpoint)
+	}
+}
+
+// An explicit false must be able to override a YAML upstream.disabled: true,
+// matching how TAG_TRANSPARENT_PROXY behaves.
+func TestUpstreamDisabled_EnvFalseRestoresTheOrigin(t *testing.T) {
+	t.Setenv("TAG_UPSTREAM_DISABLED", "false")
+
+	cfg := &Config{}
+	cfg.Upstream.Disabled = true // as if set in YAML
+	applyUpstreamModeEnv(cfg)
+	applyDefaults(cfg)
+
+	if !cfg.Upstream.HasOrigin() {
+		t.Fatal("an explicit false must restore the default upstream")
 	}
 }
 
@@ -1373,6 +1390,7 @@ func TestUpstreamDisabled_EnvKeepsExplicitEndpointForValidation(t *testing.T) {
 	t.Setenv("TAG_UPSTREAM_ENDPOINT", "https://t3.storage.dev")
 
 	cfg := &Config{}
+	applyUpstreamModeEnv(cfg)
 	applyDefaults(cfg)
 	applyEnvOverrides(cfg)
 
@@ -1385,6 +1403,7 @@ func TestUpstreamDisabled_UnrecognizedEnvValueLeavesOriginIntact(t *testing.T) {
 	t.Setenv("TAG_UPSTREAM_DISABLED", "yes")
 
 	cfg := &Config{}
+	applyUpstreamModeEnv(cfg)
 	applyDefaults(cfg)
 	applyEnvOverrides(cfg)
 

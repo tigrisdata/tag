@@ -196,7 +196,7 @@ func main() {
 	if !cfg.Upstream.HasOrigin() {
 		log.Info().
 			Bool("cache_grpc_auth", cfg.Cache.IsGRPCAuthEnabled()).
-			Msg("Origin-less mode: no upstream configured. Cache misses are served as NoSuchKey, writes are stored locally, and the deployment's trust boundary is the network")
+			Msg("Origin-less mode: no upstream configured. Cache misses are served as NoSuchKey and the deployment's trust boundary is the network. Writes and unauthenticated reads of non-public objects are NOT yet supported in this mode")
 	}
 	if cfg.Upstream.HasOrigin() && cfg.Upstream.IsTransparentProxy() {
 		accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
@@ -206,7 +206,7 @@ func main() {
 		}
 		proxySigner = auth.NewProxySigner(accessKey, secretKey)
 		log.Info().Msg("Transparent proxy mode enabled")
-	} else {
+	} else if cfg.Upstream.HasOrigin() {
 		log.Info().Str("endpoint", cfg.Upstream.Endpoint).Msg("Signing mode enabled")
 		if !config.IsTigrisEndpoint(cfg.Upstream.Endpoint) {
 			log.Warn().Str("endpoint", cfg.Upstream.Endpoint).

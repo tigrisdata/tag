@@ -364,6 +364,9 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Read the deployment mode first: it decides whether an endpoint default applies.
+	applyUpstreamModeEnv(&cfg)
+
 	// Apply defaults
 	applyDefaults(&cfg)
 
@@ -385,6 +388,7 @@ func Load(path string) (*Config, error) {
 // Panics if the resulting configuration is invalid (e.g., disallowed upstream endpoint).
 func NewDefault() *Config {
 	cfg := &Config{}
+	applyUpstreamModeEnv(cfg)
 	applyDefaults(cfg)
 	applyEnvOverrides(cfg)
 	resolveClusterAuthDefault(cfg)
@@ -392,6 +396,26 @@ func NewDefault() *Config {
 		panic(fmt.Sprintf("invalid default configuration: %v", err))
 	}
 	return cfg
+}
+
+// applyUpstreamModeEnv reads the origin-less switch. It runs before applyDefaults
+// so that no endpoint is ever invented in this mode — which means any non-empty
+// Endpoint later on is one the operator supplied, and validate() can reject the
+// combination without having to guess whether a value was defaulted.
+//
+// Honors an explicit false so the environment can override a YAML
+// upstream.disabled: true, matching TAG_TRANSPARENT_PROXY. Unrecognized values
+// leave the setting untouched rather than silently flipping the deployment mode.
+func applyUpstreamModeEnv(cfg *Config) {
+	val := strings.ToLower(strings.TrimSpace(os.Getenv("TAG_UPSTREAM_DISABLED")))
+	switch val {
+	case "":
+		return
+	case "true", "1":
+		cfg.Upstream.Disabled = true
+	case "false", "0":
+		cfg.Upstream.Disabled = false
+	}
 }
 
 // applyDefaults sets default values for unset configuration fields.
@@ -551,20 +575,6 @@ func envBool(key string) (bool, bool) {
 
 // applyEnvOverrides applies environment variable overrides to configuration.
 func applyEnvOverrides(cfg *Config) {
-	// Origin-less mode, handled before the endpoint override below so that setting
-	// both is caught by validate() as a contradiction rather than silently resolved.
-	// applyDefaults has already run, so a default endpoint may be present; drop it,
-	// since it was invented rather than asked for. An endpoint the operator actually
-	// configured survives and trips validation.
-	if val := strings.ToLower(strings.TrimSpace(os.Getenv("TAG_UPSTREAM_DISABLED"))); val != "" {
-		if val == "true" || val == "1" {
-			cfg.Upstream.Disabled = true
-			if cfg.Upstream.Endpoint == DefaultUpstreamEndpoint {
-				cfg.Upstream.Endpoint = ""
-			}
-		}
-	}
-
 	// Override upstream endpoint from environment
 	if endpoint := os.Getenv("TAG_UPSTREAM_ENDPOINT"); endpoint != "" {
 		cfg.Upstream.Endpoint = endpoint

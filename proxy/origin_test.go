@@ -168,3 +168,49 @@ func TestOriginless_MissReturnsNoSuchKeyWithoutHanging(t *testing.T) {
 		t.Fatalf("body must carry NoSuchKey, got %q", w.Body.String())
 	}
 }
+
+// NoSuchKey describes a missing object. Answering it for a bucket listing or a
+// write tells the client the wrong thing about the wrong noun.
+func TestOriginlessForwarder_NonObjectReadsAreNotImplemented(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		target string
+		want   int
+	}{
+		{"object GET", http.MethodGet, "/bucket/key.txt", http.StatusNotFound},
+		{"object HEAD", http.MethodHead, "/bucket/key.txt", http.StatusNotFound},
+		{"bucket list", http.MethodGet, "/bucket?list-type=2", http.StatusNotImplemented},
+		{"list buckets", http.MethodGet, "/", http.StatusNotImplemented},
+		{"multipart list", http.MethodGet, "/bucket?uploads", http.StatusNotImplemented},
+		{"put object", http.MethodPut, "/bucket/key.txt", http.StatusNotImplemented},
+		{"delete object", http.MethodDelete, "/bucket/key.txt", http.StatusNotImplemented},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(tc.method, tc.target, nil)
+			if err := (originlessForwarder{}).Forward(context.Background(), w, r); err != nil {
+				t.Fatalf("Forward: %v", err)
+			}
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d", w.Code, tc.want)
+			}
+		})
+	}
+}
+
+// Cache-Control: no-store asks for a response that did not come from cache. With
+// no upstream there is no other source, so honoring it would 404 an object TAG is
+// holding — the same failure as the revalidation case, via a different header.
+func TestCacheBypassRequested_IgnoredWithoutOrigin(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/b/k", nil)
+	r.Header.Set("Cache-Control", "no-store")
+
+	if (&Service{origin: proxyOrigin{}}).cacheBypassRequested(r) != true {
+		t.Error("with an origin, no-store must still bypass the cache")
+	}
+	if (&Service{origin: noOrigin{}}).cacheBypassRequested(r) != false {
+		t.Error("without an origin, no-store must be ignored rather than 404 a cached object")
+	}
+}
