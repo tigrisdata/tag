@@ -108,7 +108,9 @@ RSS scales with configuration, not just cache size:
 | Per-request buffers | `TAG_MAX_INFLIGHT_REQUESTS` — budget roughly **10 MiB per in-flight request** |
 | Go heap + RocksDB cgo | Grows with load, not directly configurable |
 
-So a rough floor is `MAX_POPULATE_MEMORY + (MAX_INFLIGHT_REQUESTS × 10 MiB) + headroom`. The per-request figure is measured from one production workload and is a starting point, not a constant — confirm it against your own RSS before relying on it.
+`MAX_POPULATE_MEMORY + (MAX_INFLIGHT_REQUESTS × 10 MiB)` is the **worst case**, not a floor — it assumes every admission slot is simultaneously occupied by a request streaming a full buffer. Real deployments sit far below it: the cap is a ceiling that a healthy workload rarely approaches, which is why the shipped 8 GiB default is fine against defaults of a 2 GiB budget and a 1024 cap.
+
+Size against your own measured RSS, and use the worst case to understand how much room a configuration change can consume. The 10 MiB figure comes from one saturated production workload — treat it as an order of magnitude, not a constant.
 
 > **Raising the inflight cap raises the memory floor.** These two settings are sized together. Increasing `TAG_MAX_INFLIGHT_REQUESTS` without matching memory converts reclaimable page cache into non-reclaimable per-request buffers and will OOM the pod — the working set barely moves while RSS climbs, so the change looks safe right up until the kill.
 
@@ -144,6 +146,8 @@ env:
 ```
 
 It changes what a read-after-write observes (metadata is served from cache rather than fetched), and is ETag-guarded against concurrent overwrites. Off by default.
+
+> Both this and parquet optimization **require block caching** (on by default). With `TAG_CACHE_BLOCK_CACHING_ENABLED=false`, or a non-positive `block_size`, they are silently inert — the setting reads as enabled and does nothing.
 
 ### Parquet optimization
 
