@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/proxy/broadcast"
@@ -212,5 +213,92 @@ func TestCacheBypassRequested_IgnoredWithoutOrigin(t *testing.T) {
 	}
 	if (&Service{origin: noOrigin{}}).cacheBypassRequested(r) != false {
 		t.Error("without an origin, no-store must be ignored rather than 404 a cached object")
+	}
+}
+
+// The property that matters most for phase 1: cached data must SURVIVE a rejected
+// mutation. The mutation handlers invalidate before forwarding, so without the
+// AcceptsMutations gate a client receiving nothing but errors could still wipe the
+// tier one PUT — or one 1000-key DeleteObjects — at a time.
+func TestOriginless_RejectedMutationsDoNotInvalidate(t *testing.T) {
+	mem := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	c := cache.NewCacheWithClient(mem, &cfg.Cache)
+
+	seed := func(key string) {
+		meta := &cache.CachedObjectMeta{
+			Bucket: "b", Key: key, StatusCode: http.StatusOK,
+			ETag: `"abc"`, ContentLength: 5, CachedAt: time.Now().Unix(),
+		}
+		if err := c.PutWithMeta(context.Background(), "b", key, meta, []byte("hello"), 60); err != nil {
+			t.Fatalf("seed %s: %v", key, err)
+		}
+	}
+	assertCached := func(key, after string) {
+		t.Helper()
+		if _, found, err := c.GetMeta(context.Background(), "b", key); err != nil || !found {
+			t.Fatalf("after %s: cached entry for %q was destroyed (found=%v err=%v)", after, key, found, err)
+		}
+	}
+
+	svc := &Service{origin: noOrigin{}, cache: c, config: cfg, forwarder: originlessForwarder{}}
+
+	seed("k1")
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, httptest.NewRequest(http.MethodPut, "/b/k1", strings.NewReader("x"))); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("put status = %d, want 501", w.Code)
+	}
+	assertCached("k1", "rejected PUT")
+
+	w = httptest.NewRecorder()
+	if err := svc.HandleDeleteObject(w, httptest.NewRequest(http.MethodDelete, "/b/k1", nil)); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("delete status = %d, want 501", w.Code)
+	}
+	assertCached("k1", "rejected DELETE")
+
+	seed("k2")
+	body := `<Delete><Object><Key>k1</Key></Object><Object><Key>k2</Key></Object></Delete>`
+	w = httptest.NewRecorder()
+	if err := svc.HandleDeleteObjects(w, httptest.NewRequest(http.MethodPost, "/b?delete", strings.NewReader(body))); err != nil {
+		t.Fatalf("bulk delete: %v", err)
+	}
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("bulk delete status = %d, want 501", w.Code)
+	}
+	assertCached("k1", "rejected DeleteObjects")
+	assertCached("k2", "rejected DeleteObjects")
+
+	w = httptest.NewRecorder()
+	copyReq := httptest.NewRequest(http.MethodPut, "/b/k1", nil)
+	copyReq.Header.Set("X-Amz-Copy-Source", "/b/k2")
+	if err := svc.HandleCopyObject(w, copyReq); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("copy status = %d, want 501", w.Code)
+	}
+	assertCached("k1", "rejected CopyObject")
+
+	w = httptest.NewRecorder()
+	if err := svc.HandleCompleteMultipartUpload(w, httptest.NewRequest(http.MethodPost, "/b/k1?uploadId=u1", strings.NewReader("<CompleteMultipartUpload/>"))); err != nil {
+		t.Fatalf("cmu: %v", err)
+	}
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("cmu status = %d, want 501", w.Code)
+	}
+	assertCached("k1", "rejected CompleteMultipartUpload")
+}
+
+// The proxying mode must be untouched by the gate: literals with no origin default
+// to proxy behaviour, where mutations still invalidate and forward.
+func TestProxyMode_MutationsStillInvalidate(t *testing.T) {
+	if !(&Service{}).originPolicy().AcceptsMutations() {
+		t.Fatal("proxy mode must keep accepting mutations")
 	}
 }

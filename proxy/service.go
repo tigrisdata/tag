@@ -15,6 +15,7 @@ import (
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy/broadcast"
+	"github.com/tigrisdata/tag/s3err"
 )
 
 const (
@@ -104,6 +105,21 @@ func (s *Service) revalidationRequested(r *http.Request) bool {
 // copy is the only copy.
 func (s *Service) cacheBypassRequested(r *http.Request) bool {
 	return shouldBypassCache(r) && s.originPolicy().CanFill()
+}
+
+// rejectMutationWithoutOrigin answers a mutation this deployment cannot carry out.
+// Returns true when it wrote the response. It MUST run before any cache
+// invalidation: the mutation handlers invalidate first and forward second, so a
+// later rejection would leave the named entries already destroyed — a client
+// receiving errors could still wipe the tier one key (or one 1000-key
+// DeleteObjects) at a time.
+func (s *Service) rejectMutationWithoutOrigin(w http.ResponseWriter, r *http.Request, operation string, start time.Time) bool {
+	if s.originPolicy().AcceptsMutations() {
+		return false
+	}
+	s3err.WriteError(w, r, s3err.ErrNotImplemented)
+	metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+	return true
 }
 
 // originPolicy returns the configured Origin, falling back to proxy behaviour when
@@ -543,6 +559,10 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandlePutObject")
 
+	if s.rejectMutationWithoutOrigin(w, r, "PutObject", start) {
+		return nil
+	}
+
 	// Invalidate cache BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
 	s.invalidateObject(context.Background(), bucket, key)
@@ -601,6 +621,10 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	bucket, key := ParseBucketKey(r)
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleDeleteObject")
+
+	if s.rejectMutationWithoutOrigin(w, r, "DeleteObject", start) {
+		return nil
+	}
 
 	// Invalidate cache BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
@@ -705,6 +729,10 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	bucket, key := ParseBucketKey(r)
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleCopyObject")
+
+	if s.rejectMutationWithoutOrigin(w, r, "CopyObject", time.Now()) {
+		return nil
+	}
 
 	// Invalidate cache for destination object BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
@@ -838,6 +866,10 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	ctx := r.Context()
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Str("uploadId", uploadId).Msg("HandleCompleteMultipartUpload")
+
+	if s.rejectMutationWithoutOrigin(w, r, "CompleteMultipartUpload", time.Now()) {
+		return nil
+	}
 
 	// Check ocache first for idempotent completion (works across TAG pods).
 	// A replay returns the already-completed response without touching upstream and

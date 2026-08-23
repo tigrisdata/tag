@@ -27,6 +27,14 @@ type Origin interface {
 	// fall-through would discard a perfectly good cached object.
 	CanRevalidate() bool
 
+	// AcceptsMutations reports whether writes and deletes can be carried out. A
+	// proxying TAG forwards them upstream; phase 1 of origin-less mode has nowhere
+	// to put them and must reject them BEFORE any cache invalidation runs — the
+	// mutation handlers invalidate first and forward second, so without this gate a
+	// rejected PUT (or a 1000-key DeleteObjects) still destroys the cached entries
+	// it named. Becomes a local commit in a later phase.
+	AcceptsMutations() bool
+
 	// TrustsUnauthenticated reports whether an unsigned request may read cached
 	// objects regardless of their ACL, because the deployment's trust boundary is
 	// the network rather than the request signature.
@@ -42,14 +50,16 @@ type proxyOrigin struct{}
 
 func (proxyOrigin) CanFill() bool               { return true }
 func (proxyOrigin) CanRevalidate() bool         { return true }
+func (proxyOrigin) AcceptsMutations() bool      { return true }
 func (proxyOrigin) TrustsUnauthenticated() bool { return false }
 
-// noOrigin is origin-less mode: TAG serves only what it already holds. Writes
-// land in local storage and a miss is a miss.
+// noOrigin is origin-less mode: TAG serves only what it already holds. A miss is
+// a miss, and mutations are rejected — local writes arrive in a later phase.
 type noOrigin struct{}
 
-func (noOrigin) CanFill() bool       { return false }
-func (noOrigin) CanRevalidate() bool { return false }
+func (noOrigin) CanFill() bool          { return false }
+func (noOrigin) CanRevalidate() bool    { return false }
+func (noOrigin) AcceptsMutations() bool { return false }
 
 // Still false: origin-less and auth-less are separate decisions, and conflating
 // them here would turn "no upstream" into an ACL bypass.
