@@ -77,6 +77,32 @@ type Service struct {
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
 	recentFooterWork *expirable.LRU[string, struct{}]
+	// origin answers the questions that depend on having an upstream to fall back
+	// to. See origin.go — it is policy, not I/O; the I/O is behind RequestForwarder.
+	origin Origin
+}
+
+// revalidationRequested reports whether the client asked for revalidation AND
+// this deployment can actually perform it.
+//
+// Both revalidation paths end at an upstream: the conditional-GET path directly,
+// and the block-mode path by falling through to the miss handler. With no origin
+// the fall-through would turn a client's Cache-Control: no-cache into a 404 for an
+// object TAG is holding perfectly good bytes for. Ignoring the header is the
+// correct degradation.
+func (s *Service) revalidationRequested(r *http.Request) bool {
+	return shouldForceRevalidate(r) && s.originPolicy().CanRevalidate()
+}
+
+// originPolicy returns the configured Origin, falling back to proxy behaviour when
+// unset. NewService always sets it; the fallback covers Services built as literals
+// (tests do this in a dozen places), where defaulting to "there is an upstream"
+// keeps them describing the mode they were written for.
+func (s *Service) originPolicy() Origin {
+	if s.origin == nil {
+		return proxyOrigin{}
+	}
+	return s.origin
 }
 
 // NewService creates a new proxy service.
@@ -152,6 +178,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		perPopulateCap:   perPopulateCap,
 		broadcastManager: broadcast.NewManager(channelBuf),
 		blockFetches:     make(map[string]*blockFetchState),
+		origin:           originFor(cfg.Upstream.Endpoint),
 	}
 	// Allocated only when the feature that uses it is on.
 	if cfg.Cache.ParquetOptimization {
@@ -599,7 +626,7 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
-	forceRevalidate := shouldForceRevalidate(r)
+	forceRevalidate := s.revalidationRequested(r)
 	bypassCache := shouldBypassCache(r)
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleHeadObject")

@@ -437,6 +437,13 @@ type LocalAuthConfig struct {
 // If proxySigner is non-nil, transparent proxy mode is enabled.
 // If localAuth is non-nil, local SigV4 validation is enabled for cache hits.
 func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string, maxIdleConnsPerHost int, proxySigner *auth.ProxySigner, localAuth *LocalAuthConfig) RequestForwarder {
+	// No endpoint means no origin: this TAG serves only what its cache holds.
+	// Checked first because the modes below are both ways of *reaching* an upstream,
+	// and neither is meaningful without one.
+	if tigrisEndpoint == "" {
+		return originlessForwarder{}
+	}
+
 	base := newBaseForwarder(tigrisEndpoint, region, maxIdleConnsPerHost)
 
 	if proxySigner != nil {

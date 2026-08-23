@@ -63,7 +63,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
-	forceRevalidate := shouldForceRevalidate(r)
+	forceRevalidate := s.revalidationRequested(r)
 	bypassCache := shouldBypassCache(r)
 	rangeHeader := r.Header.Get("Range")
 
@@ -226,6 +226,19 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// the hit/miss counter is recorded where this status is written to the response,
 	// so bypassed/disabled requests are not counted as misses.
 	xCache := s.cacheMissStatus(bypassCache)
+
+	// With no upstream, a miss is the whole answer. Return it here rather than
+	// entering the fetch paths below: both of them (range-with-background-fetch and
+	// broadcast coalescing) are built around an upstream response arriving, and a
+	// forwarder that cannot produce one leaves the broadcaster waiting on a fetch
+	// that never completes — the request hangs instead of 404ing.
+	if !s.originPolicy().CanFill() {
+		w.Header().Set("X-Cache", xCache)
+		metrics.RecordCacheMiss()
+		s3err.WriteError(w, r, s3err.ErrNoSuchKey)
+		metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+		return nil
+	}
 
 	// Range requests: forward immediately + trigger background cache fetch
 	if rangeHeader != "" {
