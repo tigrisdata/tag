@@ -67,9 +67,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	bypassCache := shouldBypassCache(r)
 	rangeHeader := r.Header.Get("Range")
 
-	// Conditional request headers
+	// Logged for request tracing; the conditional evaluation itself lives in
+	// writeNotModifiedFromCache.
 	ifNoneMatch := r.Header.Get("If-None-Match")
-	ifModifiedSince := r.Header.Get("If-Modified-Since")
 
 	log.Debug().
 		Str("bucket", bucket).
@@ -169,28 +169,10 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start, XCacheMiss)
 				}
 
-				// Check conditional request: If-None-Match
-				if ifNoneMatch != "" && meta.MatchesETag(ifNoneMatch) {
-					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified")
-					writeCacheStatus(w, XCacheHit)
-					w.Header().Set("ETag", meta.ETag)
-					w.WriteHeader(http.StatusNotModified)
-					metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+				// Conditional request (If-None-Match / If-Modified-Since) answered
+				// from cached metadata.
+				if s.writeNotModifiedFromCache(w, r, meta, "GetObject", start) {
 					return nil
-				}
-
-				// Check conditional request: If-Modified-Since
-				if ifModifiedSince != "" {
-					if t, parseErr := http.ParseTime(ifModifiedSince); parseErr == nil {
-						if !meta.IsModifiedSince(t) {
-							log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified (time)")
-							writeCacheStatus(w, XCacheHit)
-							w.Header().Set("ETag", meta.ETag)
-							w.WriteHeader(http.StatusNotModified)
-							metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
-							return nil
-						}
-					}
 				}
 
 				// Serve full response from cache.
@@ -725,6 +707,33 @@ func (s *Service) serveRangeFromCache(
 	metrics.RecordRangeFromCacheHit()
 	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
 	return true, nil
+}
+
+// writeNotModifiedFromCache answers a conditional request with 304 when the
+// cached entry satisfies the request's validators, preserving the historical
+// precedence: an If-None-Match match wins; otherwise an unexpired
+// If-Modified-Since. Returns true when it wrote the response. Shared by the
+// proxying GET hit path and the origin-less handler so the two cannot drift.
+func (s *Service) writeNotModifiedFromCache(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, operation string, start time.Time) bool {
+	matched := false
+	if inm := r.Header.Get("If-None-Match"); inm != "" && meta.MatchesETag(inm) {
+		matched = true
+	}
+	if !matched {
+		ims := r.Header.Get("If-Modified-Since")
+		if ims == "" {
+			return false
+		}
+		t, parseErr := http.ParseTime(ims)
+		if parseErr != nil || meta.IsModifiedSince(t) {
+			return false
+		}
+	}
+	writeCacheStatus(w, XCacheHit)
+	w.Header().Set("ETag", meta.ETag)
+	w.WriteHeader(http.StatusNotModified)
+	metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+	return true
 }
 
 // handleRangeWithBackgroundCache handles a Range request on cache miss.

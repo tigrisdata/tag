@@ -66,21 +66,8 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	// Conditional requests are answered from the cached metadata; there is no
 	// upstream for a client's Cache-Control to revalidate against, so no-cache and
 	// no-store are simply not consulted — the cached copy is the only copy.
-	if inm := r.Header.Get("If-None-Match"); inm != "" && meta.MatchesETag(inm) {
-		writeCacheStatus(w, XCacheHit)
-		w.Header().Set("ETag", meta.ETag)
-		w.WriteHeader(http.StatusNotModified)
-		metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+	if s.writeNotModifiedFromCache(w, r, meta, operation, start) {
 		return nil
-	}
-	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
-		if t, parseErr := http.ParseTime(ims); parseErr == nil && !meta.IsModifiedSince(t) {
-			writeCacheStatus(w, XCacheHit)
-			w.Header().Set("ETag", meta.ETag)
-			w.WriteHeader(http.StatusNotModified)
-			metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
-			return nil
-		}
 	}
 
 	if r.Method == http.MethodHead {
