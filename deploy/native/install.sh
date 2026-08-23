@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-TAG_VERSION="${TAG_VERSION:-v1.17.0}"
+TAG_VERSION="${TAG_VERSION:-v1.19.0}"
 TAG_RELEASES_URL="https://tag-releases.t3.storage.dev"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 

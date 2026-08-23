@@ -69,7 +69,7 @@ resources:
   - ../../base
 images:
   - name: tigrisdata/tag
-    newTag: v1.17.7
+    newTag: v1.19.0
 ```
 
 ## Production Considerations
@@ -86,7 +86,68 @@ images:
 
 **Vertical:** Adjust resource requests/limits in the StatefulSet. The default is 2-4 CPUs and 4-8 GiB memory per pod. SSD storage is recommended for cache performance. If you change the PVC volume size, also update `TAG_CACHE_MAX_DISK_USAGE` in the StatefulSet to match (value is in bytes).
 
-> **Memory note:** high pod memory is expected and healthy — most of it is reclaimable Linux page cache over the on-disk RocksDB cache, not the TAG process (its RSS is typically well under 1 GiB). It plateaus below the pod limit; treat it as page cache, not a leak. Only raise the memory limit (never lower the disk cache) if the working set trends up to the limit.
+#### Sizing memory: measure RSS, not working set
+
+Pod memory has two parts that behave very differently, and the headline number hides the one that matters.
+
+- **Working set** (`container_memory_working_set_bytes`, what `kubectl top` shows) includes reclaimable page cache over the on-disk RocksDB cache. It routinely sits near the limit and that is fine — the kernel reclaims it under pressure.
+- **RSS** (`container_memory_rss`) is anonymous memory. It **cannot** be reclaimed, and it is what the OOM killer acts on.
+
+**Size the limit against RSS.** A pod running at 97% working set with RSS at 45% of the limit is healthy; the same working set with RSS at 90% is one traffic burst from being killed. The two look identical in `kubectl top`.
+
+```promql
+# The number that decides whether you are safe. Watch this, not working set.
+max by (pod) (container_memory_rss{container="tag"}) / max by (pod) (container_spec_memory_limit_bytes{container="tag"})
+```
+
+RSS scales with configuration, not just cache size:
+
+| Contributor | Governed by |
+| --- | --- |
+| Populate + serve staging | `TAG_CACHE_MAX_POPULATE_MEMORY` (a hard cap) |
+| Per-request buffers | `TAG_MAX_INFLIGHT_REQUESTS` — budget roughly **10 MiB per in-flight request** |
+| Go heap + RocksDB cgo | Grows with load, not directly configurable |
+
+So a rough floor is `MAX_POPULATE_MEMORY + (MAX_INFLIGHT_REQUESTS × 10 MiB) + headroom`. The per-request figure is measured from one production workload and is a starting point, not a constant — confirm it against your own RSS before relying on it.
+
+> **Raising the inflight cap raises the memory floor.** These two settings are sized together. Increasing `TAG_MAX_INFLIGHT_REQUESTS` without matching memory converts reclaimable page cache into non-reclaimable per-request buffers and will OOM the pod — the working set barely moves while RSS climbs, so the change looks safe right up until the kill.
+
+Never lower the disk cache to save memory; raise the limit instead.
+
+### Admission control
+
+`TAG_MAX_INFLIGHT_REQUESTS` (default 1024) bounds concurrently-served S3 requests. Excess is shed with `503 SlowDown`; `/health`, `/metrics`, and `/debug/pprof/*` are exempt. `0` or unset uses the default, negative disables the bound.
+
+```yaml
+env:
+  - name: TAG_MAX_INFLIGHT_REQUESTS
+    value: "1024"
+```
+
+Shedding shows up as a non-zero rate here, with inflight pinned at the cap:
+
+```promql
+sum(rate(tag_admission_shed_total[5m]))        # requests rejected with 503 SlowDown
+max by (pod) (tag_inflight_requests)           # compare against the configured cap
+```
+
+Sustained shedding means the cap is too low for the offered load — but **raise it and the memory limit together**, per the sizing note above. Shedding is the gentler failure: a `503 SlowDown` is retried by S3 clients, while an OOM kill drops every in-flight request on the node and discards the warm cache. Prefer some shedding over a cap the memory cannot support.
+
+### Metadata caching on write
+
+`TAG_CACHE_META_ON_WRITE` caches an object's metadata entry when TAG proxies its write, so the first read does not spend an upstream round trip discovering the object exists. It is most useful where writers and readers overlap — an ingest pipeline feeding queries over recent data.
+
+```yaml
+env:
+  - name: TAG_CACHE_META_ON_WRITE
+    value: "true"
+```
+
+It changes what a read-after-write observes (metadata is served from cache rather than fetched), and is ETag-guarded against concurrent overwrites. Off by default.
+
+### Parquet optimization
+
+`TAG_CACHE_PARQUET_OPTIMIZATION` caches parquet metadata blocks ahead of the reader that needs them, from both a read trigger and a write trigger. Whether it helps depends on whether your footers exceed the tail block that already gets cached — see [Parquet optimization](parquet-optimization.md) for how to measure that before enabling it, and how to tell afterwards whether it worked.
 
 ### Block-aligned caching
 
