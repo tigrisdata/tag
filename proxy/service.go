@@ -15,7 +15,6 @@ import (
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy/broadcast"
-	"github.com/tigrisdata/tag/s3err"
 )
 
 const (
@@ -78,63 +77,6 @@ type Service struct {
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
 	recentFooterWork *expirable.LRU[string, struct{}]
-	// origin answers the questions that depend on having an upstream to fall back
-	// to. See origin.go — it is policy, not I/O; the I/O is behind RequestForwarder.
-	origin Origin
-}
-
-// revalidationRequested reports whether the client asked for revalidation AND
-// this deployment can actually perform it.
-//
-// Both revalidation paths end at an upstream: the conditional-GET path directly,
-// and the block-mode path by falling through to the miss handler. With no origin
-// the fall-through would turn a client's Cache-Control: no-cache into a 404 for an
-// object TAG is holding perfectly good bytes for. Ignoring the header is the
-// correct degradation.
-func (s *Service) revalidationRequested(r *http.Request) bool {
-	return shouldForceRevalidate(r) && s.originPolicy().CanRevalidate()
-}
-
-// cacheBypassRequested reports whether the client asked to skip the cache AND this
-// deployment can serve the request some other way.
-//
-// Cache-Control: no-store asks for a response that did not come from cache. With
-// no upstream there is no other source, so honoring it turns a cached object into
-// a 404 — the same failure revalidationRequested prevents, arriving by a different
-// header. Nothing is being served stale by ignoring it: with no origin, the cached
-// copy is the only copy.
-func (s *Service) cacheBypassRequested(r *http.Request) bool {
-	return shouldBypassCache(r) && s.originPolicy().CanFill()
-}
-
-// rejectMutationWithoutOrigin answers a mutation this deployment cannot carry out.
-// Returns true when it wrote the response. It MUST run before any cache
-// invalidation: the mutation handlers invalidate first and forward second, so a
-// later rejection would leave the named entries already destroyed — a client
-// receiving errors could still wipe the tier one key (or one 1000-key
-// DeleteObjects) at a time.
-func (s *Service) rejectMutationWithoutOrigin(w http.ResponseWriter, r *http.Request, operation string, start time.Time) bool {
-	if s.originPolicy().AcceptsMutations() {
-		return false
-	}
-	s3err.WriteError(w, r, s3err.ErrNotImplemented)
-	// A distinct status, not "success": a client persistently writing to an
-	// origin-less tier is a misconfiguration (e.g. a gateway pointed at the wrong
-	// endpoint), and it should be visible on the request dashboard rather than
-	// blending into the success rate.
-	metrics.RecordRequest(operation, "unsupported", time.Since(start).Seconds())
-	return true
-}
-
-// originPolicy returns the configured Origin, falling back to proxy behaviour when
-// unset. NewService always sets it; the fallback covers Services built as literals
-// (tests do this in a dozen places), where defaulting to "there is an upstream"
-// keeps them describing the mode they were written for.
-func (s *Service) originPolicy() Origin {
-	if s.origin == nil {
-		return proxyOrigin{}
-	}
-	return s.origin
 }
 
 // NewService creates a new proxy service.
@@ -222,7 +164,6 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		perPopulateCap:   perPopulateCap,
 		broadcastManager: broadcast.NewManager(channelBuf),
 		blockFetches:     make(map[string]*blockFetchState),
-		origin:           originFor(cfg.Upstream.Endpoint),
 	}
 	// Allocated only when the feature that uses it is on.
 	if cfg.Cache.ParquetOptimization {
@@ -575,10 +516,6 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandlePutObject")
 
-	if s.rejectMutationWithoutOrigin(w, r, "PutObject", start) {
-		return nil
-	}
-
 	// Invalidate cache BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
 	s.invalidateObject(context.Background(), bucket, key)
@@ -638,10 +575,6 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleDeleteObject")
 
-	if s.rejectMutationWithoutOrigin(w, r, "DeleteObject", start) {
-		return nil
-	}
-
 	// Invalidate cache BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
 	s.invalidateObject(context.Background(), bucket, key)
@@ -678,8 +611,8 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
-	forceRevalidate := s.revalidationRequested(r)
-	bypassCache := s.cacheBypassRequested(r)
+	forceRevalidate := shouldForceRevalidate(r)
+	bypassCache := shouldBypassCache(r)
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleHeadObject")
 
@@ -745,10 +678,6 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	bucket, key := ParseBucketKey(r)
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleCopyObject")
-
-	if s.rejectMutationWithoutOrigin(w, r, "CopyObject", time.Now()) {
-		return nil
-	}
 
 	// Invalidate cache for destination object BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
@@ -882,10 +811,6 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	ctx := r.Context()
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Str("uploadId", uploadId).Msg("HandleCompleteMultipartUpload")
-
-	if s.rejectMutationWithoutOrigin(w, r, "CompleteMultipartUpload", time.Now()) {
-		return nil
-	}
 
 	// Check ocache first for idempotent completion (works across TAG pods).
 	// A replay returns the already-completed response without touching upstream and

@@ -63,8 +63,8 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
-	forceRevalidate := s.revalidationRequested(r)
-	bypassCache := s.cacheBypassRequested(r)
+	forceRevalidate := shouldForceRevalidate(r)
+	bypassCache := shouldBypassCache(r)
 	rangeHeader := r.Header.Get("Range")
 
 	// Conditional request headers
@@ -226,15 +226,6 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// the hit/miss counter is recorded where this status is written to the response,
 	// so bypassed/disabled requests are not counted as misses.
 	xCache := s.cacheMissStatus(bypassCache)
-
-	// With no upstream, a miss is the whole answer. Return it here rather than
-	// entering the fetch paths below: both of them (range-with-background-fetch and
-	// broadcast coalescing) are built around an upstream response arriving, and a
-	// forwarder that cannot produce one leaves the broadcaster waiting on a fetch
-	// that never completes — the request hangs instead of 404ing.
-	if !s.originPolicy().CanFill() {
-		return s.serveMissWithoutOrigin(w, r, xCache, start)
-	}
 
 	// Range requests: forward immediately + trigger background cache fetch
 	if rangeHeader != "" {
@@ -739,16 +730,6 @@ func (s *Service) serveRangeFromCache(
 // handleRangeWithBackgroundCache handles a Range request on cache miss.
 // It forwards the Range request immediately while triggering a background
 // fetch of the full object for caching (if within size threshold).
-// serveMissWithoutOrigin answers a miss that cannot be filled. Routed through
-// writeCacheStatus so only a genuine MISS is counted — a DISABLED or BYPASS
-// request must not inflate the miss rate.
-func (s *Service) serveMissWithoutOrigin(w http.ResponseWriter, r *http.Request, xCache string, start time.Time) error {
-	writeCacheStatus(w, xCache)
-	s3err.WriteError(w, r, s3err.ErrNoSuchKey)
-	metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
-	return nil
-}
-
 func (s *Service) handleRangeWithBackgroundCache(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -757,15 +738,6 @@ func (s *Service) handleRangeWithBackgroundCache(
 	startTime time.Time,
 	xCache string,
 ) error {
-	// Guarded here rather than only at the miss short-circuit: the two cache-hit
-	// fall-throughs above (a block-mode range whose covering blocks cannot be
-	// fetched, and a whole-object range whose body is gone) reach this function
-	// without passing that check. Without this, the request below returns
-	// errNoOrigin and the client sees 500 InternalError for what is really a miss.
-	if !s.originPolicy().CanFill() {
-		return s.serveMissWithoutOrigin(w, r, xCache, startTime)
-	}
-
 	// Forward the Range request directly to client (low latency)
 	resp, err := s.forwarder.DoRequestWithCreds(ctx, r, accessKey, secretKey)
 	if err != nil {

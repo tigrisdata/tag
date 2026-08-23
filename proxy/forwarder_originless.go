@@ -31,45 +31,15 @@ type originlessForwarder struct{}
 // be indistinguishable from a real upstream answer.
 var errNoOrigin = errors.New("no upstream configured: this deployment serves only cached objects")
 
-// Forward answers from nothing: with no origin there is no fetch to make.
-//
-// The code depends on what was asked. Forward is the shared exit for far more
-// than object reads — HandlePassthrough routes ListObjects/ListBuckets/CreateBucket
-// and the multipart calls through it, and the write handlers land here too. Telling
-// a client that `s3 ls` failed because "the specified key does not exist" describes
-// the wrong thing entirely, and a rejected PUT is not a missing object.
-//
-// So: a read of a specific object is a genuine miss and gets NoSuchKey. Everything
-// else is an operation this mode does not implement, and says so.
+// Forward is a backstop, not a serve path. In origin-less mode the router
+// registers the origin-less handler set, so no request should reach a forwarder
+// at all — object reads are answered from cache by HandleOriginlessObject and
+// everything else is 501'd at the route table. Anything arriving here is a
+// route that escaped that set; answer NotImplemented rather than fabricate an
+// object-level response for an operation we cannot name.
 func (originlessForwarder) Forward(_ context.Context, w http.ResponseWriter, r *http.Request) error {
-	if isObjectRead(r) {
-		s3err.WriteError(w, r, s3err.ErrNoSuchKey)
-		return nil
-	}
 	s3err.WriteError(w, r, s3err.ErrNotImplemented)
 	return nil
-}
-
-// isObjectRead reports whether the request reads one named object, as opposed to
-// listing a bucket or mutating something. Only those can honestly answer NoSuchKey.
-func isObjectRead(r *http.Request) bool {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		return false
-	}
-	// A bucket-scoped GET is a list, not an object read.
-	_, key := ParseBucketKey(r)
-	if key == "" {
-		return false
-	}
-	// ?list-type / ?uploads and friends are bucket operations that can carry a
-	// prefix resembling a key.
-	q := r.URL.Query()
-	for _, listish := range []string{"list-type", "uploads", "versions", "delimiter"} {
-		if q.Has(listish) {
-			return false
-		}
-	}
-	return true
 }
 
 // ForwardWithCapture mirrors Forward. The capture reports the 404 so callers that

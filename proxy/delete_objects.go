@@ -84,12 +84,6 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 
 	log.Debug().Str("bucket", bucket).Msg("HandleDeleteObjects")
 
-	// Before the body is parsed: the loop below invalidates every named key before
-	// forwarding, and a rejected bulk delete must not wipe up to 1000 cached entries.
-	if s.rejectMutationWithoutOrigin(w, r, "DeleteObjects", start) {
-		return nil
-	}
-
 	// Read request body to buffer it for parsing and forwarding
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {

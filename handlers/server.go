@@ -147,6 +147,16 @@ func (s *Server) setupRouter() *mux.Router {
 		log.Info().Msg("pprof endpoints enabled at /debug/pprof/")
 	}
 
+	// Origin-less mode registers its own, much smaller handler set and returns.
+	// The proxying handlers below are never entered, so every path that assumes an
+	// upstream — revalidation, broadcast coalescing, background fetch, the mutation
+	// handlers with their invalidate-before-forward ordering — is unreachable by
+	// construction in this mode rather than guarded at runtime.
+	if s.service.Originless() {
+		s.setupOriginlessRoutes(r)
+		return r
+	}
+
 	// S3 API routes - path style
 	// The order matters - more specific routes should come first
 
@@ -302,6 +312,31 @@ func (rt *responseTracker) Flush() {
 	if f, ok := rt.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// setupOriginlessRoutes registers the origin-less handler set: GET/HEAD of a
+// single object served from cache, everything else 501 NotImplemented. The
+// object-subresource routes (?tagging, ?acl, ?uploadId, …) are pinned to the
+// unsupported handler FIRST so a subresource read cannot fall through to the
+// object route and be answered with the object body.
+func (s *Server) setupOriginlessRoutes(r *mux.Router) {
+	for _, q := range []string{"uploadId", "tagging", "acl", "uploads"} {
+		r.HandleFunc("/{bucket}/{object:.+}", s.handleOriginlessUnsupported).Queries(q, "")
+		r.HandleFunc("/{bucket}/{object:.+}", s.handleOriginlessUnsupported).Queries(q, "{v}")
+	}
+
+	r.HandleFunc("/{bucket}/{object:.+}", s.handleOriginlessObject).Methods("GET", "HEAD")
+
+	// Everything else — listings, mutations, bucket operations, unknown verbs.
+	r.PathPrefix("/").HandlerFunc(s.handleOriginlessUnsupported)
+}
+
+func (s *Server) handleOriginlessObject(w http.ResponseWriter, r *http.Request) {
+	handleWithError(w, r, s.service.HandleOriginlessObject)
+}
+
+func (s *Server) handleOriginlessUnsupported(w http.ResponseWriter, r *http.Request) {
+	handleWithError(w, r, s.service.HandleOriginlessUnsupported)
 }
 
 // handleWithError calls a handler function and handles any returned error.
