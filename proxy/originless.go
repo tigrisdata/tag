@@ -214,9 +214,8 @@ func (s *Service) originlessMiss(w http.ResponseWriter, r *http.Request, operati
 // HandleOriginlessBucket answers the bucket-lifecycle ceremony standard S3
 // tooling insists on. Origin-less TAG has no buckets — the keyspace is implicit
 // — so creation and deletion are honest no-ops: PUT (CreateBucket) answers 200,
-// HEAD 200, DELETE 204. Listing stays 501; pretending to enumerate an implicit
-// keyspace would be a lie, but accepting the ceremony lets stock fixtures (SDKs,
-// warp, the ceph s3-tests) run against the tier.
+// HEAD 200, DELETE 204. GET is a listing, served by HandleOriginlessList.
+// Accepting the ceremony lets stock fixtures (SDKs, warp, ceph s3-tests) run.
 func (s *Service) HandleOriginlessBucket(w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()
 	// Same query rule as objects: the SDK appends ?x-id=CreateBucket etc. to the

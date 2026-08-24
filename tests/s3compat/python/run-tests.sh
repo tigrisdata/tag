@@ -160,62 +160,6 @@ run_test() {
     fi
 }
 
-# Origin-less mode: run the subset of the suite that matches the origin-less
-# surface (single-object reads/writes, ranges, conditionals, metadata) against
-# an origin-less TAG. The stock teardown lists buckets and objects, which
-# origin-less answers 501 — and there is nothing to clean anyway: DeleteBucket
-# is a no-op and objects lapse by TTL. So the teardown is stubbed out.
-if [ -n "$ORIGINLESS" ]; then
-    test_originless=(
-        "test_object_head_zero_bytes"
-        "test_object_write_check_etag"
-        "test_object_write_cache_control"
-        "test_object_write_expires"
-        "test_object_write_read_update_read_delete"
-        "test_object_metadata_replaced_on_put"
-        "test_object_set_get_metadata_none_to_good"
-        "test_object_set_get_metadata_none_to_empty"
-        "test_object_read_not_exist"
-        "test_ranged_request_response_code"
-        "test_ranged_big_request_response_code"
-        "test_ranged_request_skip_leading_bytes_response_code"
-        "test_ranged_request_return_trailing_bytes_response_code"
-        "test_ranged_request_invalid_range"
-        "test_ranged_request_empty_object"
-        "test_get_object_ifmatch_good"
-        "test_get_object_ifmatch_failed"
-        "test_get_object_ifnonematch_failed"
-        "test_get_object_ifmodifiedsince_good"
-        "test_get_object_ifunmodifiedsince_good"
-        "test_get_object_ifunmodifiedsince_failed"
-    )
-
-    echo "Running origin-less S3 compatibility subset (${#test_originless[@]} tests)..."
-    for test in "${test_originless[@]}"; do
-        run_test "test_s3.py" "$test"
-    done
-
-    echo ""
-    echo "========================================="
-    echo "Origin-less S3 Compatibility Summary"
-    echo "========================================="
-    TOTAL_TESTS=$((PASSED_COUNT + ${#FAILED_TESTS[@]}))
-    echo "Total: $TOTAL_TESTS | Passed: $PASSED_COUNT | Failed: ${#FAILED_TESTS[@]}"
-    if [ "$TOTAL_TESTS" -eq 0 ]; then
-        echo "ERROR: zero tests ran — a vacuous pass is a harness bug, not a pass"
-        exit 1
-    fi
-    if [ ${#FAILED_TESTS[@]} -eq 0 ]; then
-        echo "All tests passed!"
-        exit 0
-    fi
-    echo "FAILED TESTS:"
-    for failed in "${FAILED_TESTS[@]}"; do
-        echo "  - $failed"
-    done
-    exit 1
-fi
-
 # Test arrays - curated list of tests relevant for TAG
 # Based on tigris-os gateway/tests/tests.sh
 
@@ -456,6 +400,68 @@ test_tagging=(
     # "test_put_tags_acl_public"
     # "test_delete_tags_obj_public"
 )
+
+# Origin-less mode: run the subset of the suite that matches the origin-less
+# surface (single-object reads/writes, ranges, conditionals, metadata) against
+# an origin-less TAG. The stock teardown lists buckets and objects, which
+# origin-less answers 501 — and there is nothing to clean anyway: DeleteBucket
+# is a no-op and objects lapse by TTL. So the teardown is stubbed out.
+if [ -n "$ORIGINLESS" ]; then
+    test_originless=(
+        "test_object_head_zero_bytes"
+        "test_object_write_check_etag"
+        "test_object_write_cache_control"
+        "test_object_write_expires"
+        "test_object_write_read_update_read_delete"
+        "test_object_metadata_replaced_on_put"
+        "test_object_set_get_metadata_none_to_good"
+        "test_object_set_get_metadata_none_to_empty"
+        "test_object_read_not_exist"
+        "test_ranged_request_response_code"
+        "test_ranged_big_request_response_code"
+        "test_ranged_request_skip_leading_bytes_response_code"
+        "test_ranged_request_return_trailing_bytes_response_code"
+        "test_ranged_request_invalid_range"
+        "test_ranged_request_empty_object"
+        "test_get_object_ifmatch_good"
+        "test_get_object_ifmatch_failed"
+        "test_get_object_ifnonematch_failed"
+        "test_get_object_ifmodifiedsince_good"
+        "test_get_object_ifunmodifiedsince_good"
+        "test_get_object_ifunmodifiedsince_failed"
+    )
+
+    echo "Running origin-less S3 compatibility subset (${#test_originless[@]} object tests + ${#test_s3[@]} listing tests)..."
+    for test in "${test_originless[@]}"; do
+        run_test "test_s3.py" "$test"
+    done
+    # The full listing category from the default suite: origin-less implements
+    # ListObjects and ListObjectsV2 over cached metadata.
+    for test in "${test_s3[@]}"; do
+        run_test "test_s3.py" "$test"
+    done
+    run_test "test_s3.py" "test_bucket_list_special_prefix"
+
+    echo ""
+    echo "========================================="
+    echo "Origin-less S3 Compatibility Summary"
+    echo "========================================="
+    TOTAL_TESTS=$((PASSED_COUNT + ${#FAILED_TESTS[@]}))
+    echo "Total: $TOTAL_TESTS | Passed: $PASSED_COUNT | Failed: ${#FAILED_TESTS[@]}"
+    if [ "$TOTAL_TESTS" -eq 0 ]; then
+        echo "ERROR: zero tests ran — a vacuous pass is a harness bug, not a pass"
+        exit 1
+    fi
+    if [ ${#FAILED_TESTS[@]} -eq 0 ]; then
+        echo "All tests passed!"
+        exit 0
+    fi
+    echo "FAILED TESTS:"
+    for failed in "${FAILED_TESTS[@]}"; do
+        echo "  - $failed"
+    done
+    exit 1
+fi
 
 # Run header validation tests
 echo "Running header validation tests..."

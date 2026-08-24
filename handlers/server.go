@@ -328,8 +328,10 @@ func (s *Server) setupOriginlessRoutes(r *mux.Router) {
 	r.HandleFunc("/{bucket}/{object:.+}", s.handleOriginlessDelete).Methods("DELETE")
 
 	// Bucket-lifecycle ceremony: honest no-ops so standard fixtures run.
+	// GET on a bucket is a listing, served from cached metadata.
 	for _, prefix := range []string{"/{bucket}", "/{bucket}/"} {
 		r.HandleFunc(prefix, s.handleOriginlessBucket).Methods("PUT", "HEAD", "DELETE")
+		r.HandleFunc(prefix, s.handleOriginlessList).Methods("GET")
 	}
 
 	// Everything else — listings, POST mutations, unknown verbs.
@@ -346,6 +348,10 @@ func (s *Server) handleOriginlessPut(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleOriginlessDelete(w http.ResponseWriter, r *http.Request) {
 	handleWithError(w, r, s.service.HandleOriginlessDelete)
+}
+
+func (s *Server) handleOriginlessList(w http.ResponseWriter, r *http.Request) {
+	handleWithError(w, r, s.service.HandleOriginlessList)
 }
 
 func (s *Server) handleOriginlessBucket(w http.ResponseWriter, r *http.Request) {

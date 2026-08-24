@@ -35,6 +35,7 @@ Plain single-object operations, against the local cache alone:
 - **`PUT`** stores the object under `cache.ttl` and returns its ETag. This is how the tier is populated — its callers write into it directly (in the tigris-os deployment, the gateway).
 - **`GET` / `HEAD`** serve from cache; a miss is `NoSuchKey`, the caller's cue to fall back to its authoritative store.
 - **`DELETE`** invalidates the entry (not required for correctness — entries lapse by TTL — but explicit expiry gets prompt removal).
+- **`ListObjects` / `ListObjectsV2`** enumerate the bucket's cached objects — prefix, delimiter rollup, pagination, `encoding-type=url` — so callers and operators can see what the tier holds. In cluster mode the listing is complete and ordered across all nodes (the storage layer K-way merges). The listing is **advisory**: it reflects metadata presence at scan time, and an entry mid-eviction can be listed yet answer `NoSuchKey` to the GET that follows — the read path stays the truth.
 
 Any query parameter — `?versionId`, `?partNumber`, `?tagging`, and the rest — selects a representation or an operation this mode does not implement, and answers `501` rather than doing something silently wrong. The one exception is `x-id`, the no-op operation tag `aws-sdk-go-v2` appends to every request, which is ignored. Server-side copy (`X-Amz-Copy-Source`) is also `501`:
 
@@ -44,7 +45,7 @@ Any query parameter — `?versionId`, `?partNumber`, `?tagging`, and the rest �
 
 `Cache-Control: no-cache` and `no-store` from clients are **not consulted**. Both exist to reach past a cache to an origin, and there is no origin: honoring either would turn a healthy cached object into a 404. Nothing is served stale by ignoring them — with no origin, the cached copy is the only copy.
 
-Everything else — listings, multipart, copies, tagging, ACLs — answers `501 NotImplemented`, rejected at the route table before touching anything.
+Everything else — `ListBuckets`, multipart, copies, tagging, ACLs — answers `501 NotImplemented`, rejected at the route table before touching anything.
 
 ### The visibility contract
 
@@ -71,7 +72,7 @@ The consequence is stated plainly: anything that can reach an origin-less TAG ca
 ## Current limits
 
 - **No multipart.** Objects arrive as single `PUT`s, bounded by `cache.size_threshold` (1 GiB default); larger bodies answer `EntityTooLarge`. The tigris-os gateway uploads blocks as single PUTs, so this matches the intended caller.
-- **No listings, no server-side copy, no tagging/ACL subresources.**
+- **No `ListBuckets`** (buckets are implicit; enumerating them would need a full scan), **no server-side copy, no tagging/ACL subresources.**
 - Cluster mode works — cross-node serving goes through the cache layer, not the upstream — but multi-node sizing guidance will come with the deployment documentation.
 
 ## Turning it off

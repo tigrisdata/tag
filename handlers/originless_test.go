@@ -263,7 +263,9 @@ func TestOriginlessRoutes_MutationsNeverReachHandlersOrTouchCache(t *testing.T) 
 	// Listings, subresources, and representation selectors are operations, not
 	// plain object reads. versionId and partNumber matter most: serving the
 	// current full object for them would be silently wrong data.
-	for _, target := range []string{"/b?list-type=2", "/", "/b/k1.txt?tagging", "/b/k1.txt?acl", "/b/k1.txt?versionId=abc", "/b/k1.txt?partNumber=2", "/b/k1.txt?attributes"} {
+	// Bucket listing now works and has its own test; the service-level listing,
+	// subresources, and representation selectors remain 501.
+	for _, target := range []string{"/", "/b/k1.txt?tagging", "/b/k1.txt?acl", "/b/k1.txt?versionId=abc", "/b/k1.txt?partNumber=2", "/b/k1.txt?attributes"} {
 		if w := do(s, http.MethodGet, target, nil); w.Code != http.StatusNotImplemented {
 			t.Fatalf("GET %s: code=%d, want 501", target, w.Code)
 		}
@@ -575,5 +577,93 @@ func TestOriginlessRoutes_BucketXIDAndPreconditionPrecedence(t *testing.T) {
 	// IUS alone, stale: 412.
 	if w := do(s, http.MethodGet, "/b/pc.txt", map[string]string{"If-Unmodified-Since": "Mon, 01 Jan 2001 00:00:00 GMT"}); w.Code != http.StatusPreconditionFailed {
 		t.Fatalf("stale IUS alone: code=%d, want 412", w.Code)
+	}
+}
+
+// Bucket listing serves from cached metadata: ordering, prefix, delimiter
+// rollup, pagination via V2 continuation tokens, and V1 markers.
+func TestOriginlessRoutes_ListObjects(t *testing.T) {
+	s, c := newOriginlessServer(t)
+	for _, k := range []string{"a/1.txt", "a/2.txt", "b/1.txt", "top.txt", "zed.txt"} {
+		seedObject(t, c, k, "", []byte("x"))
+	}
+
+	get := func(target string) string {
+		w := do(s, http.MethodGet, target, nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s: code=%d body=%q", target, w.Code, w.Body.String())
+		}
+		return w.Body.String()
+	}
+
+	// V2 plain: all five keys, sorted, KeyCount=5.
+	body := get("/b?list-type=2")
+	for _, want := range []string{"<Key>a/1.txt</Key>", "<Key>zed.txt</Key>", "<KeyCount>5</KeyCount>", "<IsTruncated>false</IsTruncated>"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("V2 listing missing %s in %s", want, body)
+		}
+	}
+
+	// Delimiter rollup: two common prefixes + two top-level keys.
+	body = get("/b?list-type=2&delimiter=%2F")
+	for _, want := range []string{"<Prefix>a/</Prefix>", "<Prefix>b/</Prefix>", "<Key>top.txt</Key>", "<KeyCount>4</KeyCount>"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("delimiter listing missing %s in %s", want, body)
+		}
+	}
+	if strings.Contains(body, "<Key>a/1.txt</Key>") {
+		t.Fatal("rolled-up member leaked into Contents")
+	}
+
+	// Prefix filter.
+	body = get("/b?list-type=2&prefix=a%2F")
+	if !strings.Contains(body, "<KeyCount>2</KeyCount>") || strings.Contains(body, "top.txt") {
+		t.Fatalf("prefix listing wrong: %s", body)
+	}
+
+	// Pagination: max-keys=2 pages through all five without loss or repeats.
+	seen := map[string]bool{}
+	token := ""
+	for i := 0; i < 5; i++ {
+		target := "/b?list-type=2&max-keys=2"
+		if token != "" {
+			target += "&continuation-token=" + token
+		}
+		body := get(target)
+		for _, line := range strings.Split(body, "<Key>") {
+			if idx := strings.Index(line, "</Key>"); idx > 0 {
+				k := line[:idx]
+				if seen[k] {
+					t.Fatalf("key %q repeated across pages", k)
+				}
+				seen[k] = true
+			}
+		}
+		if !strings.Contains(body, "<IsTruncated>true</IsTruncated>") {
+			break
+		}
+		start := strings.Index(body, "<NextContinuationToken>") + len("<NextContinuationToken>")
+		end := strings.Index(body, "</NextContinuationToken>")
+		token = body[start:end]
+	}
+	if len(seen) != 5 {
+		t.Fatalf("pagination lost keys: saw %d of 5 (%v)", len(seen), seen)
+	}
+
+	// V1 with marker.
+	body = get("/b?marker=b%2F1.txt")
+	if strings.Contains(body, "<Key>a/1.txt</Key>") || !strings.Contains(body, "<Key>top.txt</Key>") {
+		t.Fatalf("V1 marker wrong: %s", body)
+	}
+
+	// max-keys=0: empty, not truncated.
+	body = get("/b?list-type=2&max-keys=0")
+	if strings.Contains(body, "<Key>") || strings.Contains(body, "<IsTruncated>true") {
+		t.Fatalf("max-keys=0 wrong: %s", body)
+	}
+
+	// Unknown listing parameter: 501, not a wrong listing.
+	if w := do(s, http.MethodGet, "/b?list-type=2&versions", nil); w.Code != http.StatusNotImplemented {
+		t.Fatalf("unknown param: code=%d, want 501", w.Code)
 	}
 }

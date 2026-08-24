@@ -844,3 +844,62 @@ func isNotFoundError(err error) bool {
 		strings.Contains(errStr, "NotFound") ||
 		strings.Contains(errStr, "not found")
 }
+
+// ListedEntry is one object surfaced by ListMeta: its object key and decoded
+// metadata.
+type ListedEntry struct {
+	Key  string
+	Meta *CachedObjectMeta
+}
+
+// ListMeta returns up to limit cached objects in a bucket, in lexicographic key
+// order, starting strictly after startAfter (empty = from the beginning). It
+// scans metadata keys, optionally narrowed by keyPrefix, and decodes each meta
+// value delivered alongside the keys (one round trip; a value the transport
+// omitted for size is fetched individually).
+//
+// In cluster mode the underlying List performs a cluster-wide K-way merge on the
+// serving node, so the result is complete and ordered across all nodes.
+//
+// The listing is ADVISORY: it reflects metadata presence, not full-data
+// servability. An entry mid-eviction can appear here and still answer NoSuchKey
+// to a GET — the read path's completeness gate remains the truth.
+func (c *Cache) ListMeta(ctx context.Context, bucket, keyPrefix, startAfter string, limit int) ([]ListedEntry, bool, error) {
+	if !c.IsEnabled() {
+		return nil, false, nil
+	}
+	scanPrefix := metaKeyPrefix + bucket + "|" + keyPrefix
+	token := ""
+	if startAfter != "" {
+		// The ocache continuation token is the last raw key of the previous page,
+		// exclusive — exactly S3's marker semantics, translated to key space.
+		token = MakeMetaKey(bucket, startAfter)
+	}
+
+	kvs, _, hasMore, err := c.client.ListPageWithValues(ctx, scanPrefix, limit, token)
+	if err != nil {
+		return nil, false, err
+	}
+
+	stripPrefix := metaKeyPrefix + bucket + "|"
+	entries := make([]ListedEntry, 0, len(kvs))
+	for _, kv := range kvs {
+		objKey := strings.TrimPrefix(kv.Key, stripPrefix)
+		var meta *CachedObjectMeta
+		if kv.ValueOmitted || len(kv.Value) == 0 {
+			m, found, gerr := c.GetMeta(ctx, bucket, objKey)
+			if gerr != nil || !found {
+				continue // raced an eviction; the listing is advisory
+			}
+			meta = m
+		} else {
+			m, derr := DecodeMeta(kv.Value)
+			if derr != nil {
+				continue
+			}
+			meta = m
+		}
+		entries = append(entries, ListedEntry{Key: objKey, Meta: meta})
+	}
+	return entries, hasMore, nil
+}
