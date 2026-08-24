@@ -429,6 +429,15 @@ if [ -n "$ORIGINLESS" ]; then
         "test_get_object_ifmodifiedsince_good"
         "test_get_object_ifunmodifiedsince_good"
         "test_get_object_ifunmodifiedsince_failed"
+        "test_multi_object_delete"
+        "test_multi_objectv2_delete"
+        "test_put_object_ifmatch_good"
+        "test_put_object_ifmatch_failed"
+        "test_put_object_ifmatch_overwrite_existed_good"
+        "test_put_object_ifmatch_nonexisted_failed"
+        "test_put_object_ifnonmatch_good"
+        "test_put_object_ifnonmatch_failed"
+        "test_object_requestid_matches_header_on_error"
     )
 
     echo "Running origin-less S3 compatibility subset (${#test_originless[@]} object tests + ${#test_s3[@]} listing tests)..."

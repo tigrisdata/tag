@@ -113,11 +113,19 @@ func WriteErrorWithMessage(w http.ResponseWriter, r *http.Request, code ErrorCod
 		info = errorInfo{http.StatusInternalServerError, ErrInternalError, message}
 	}
 
+	// The response's x-amz-request-id header (set by middleware) is the request's
+	// identity; the XML body must echo the SAME value, since clients cross-check
+	// them. The old X-Request-ID request-header read predates that middleware and
+	// never matched anything a client compared against.
+	requestID := w.Header().Get("x-amz-request-id")
+	if requestID == "" {
+		requestID = r.Header.Get("X-Request-ID")
+	}
 	resp := ErrorResponse{
 		Code:      code,
 		Message:   message,
 		Resource:  r.URL.Path,
-		RequestID: r.Header.Get("X-Request-ID"),
+		RequestID: requestID,
 	}
 
 	log.Debug().

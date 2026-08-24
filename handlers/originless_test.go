@@ -247,7 +247,6 @@ func TestOriginlessRoutes_MutationsNeverReachHandlersOrTouchCache(t *testing.T) 
 	mutations := []struct {
 		name, method, target string
 	}{
-		{"bulk delete", http.MethodPost, "/b?delete"},
 		{"initiate multipart", http.MethodPost, "/b/k1.txt?uploads"},
 		{"complete multipart", http.MethodPost, "/b/k1.txt?uploadId=u1"},
 		{"upload part", http.MethodPut, "/b/k1.txt?uploadId=u1&partNumber=1"},
@@ -665,5 +664,83 @@ func TestOriginlessRoutes_ListObjects(t *testing.T) {
 	// Unknown listing parameter: 501, not a wrong listing.
 	if w := do(s, http.MethodGet, "/b?list-type=2&versions", nil); w.Code != http.StatusNotImplemented {
 		t.Fatalf("unknown param: code=%d, want 501", w.Code)
+	}
+}
+
+// Multi-delete invalidates every named key; deleting an absent key succeeds
+// (invalidation is idempotent); quiet mode omits confirmations.
+func TestOriginlessRoutes_MultiDelete(t *testing.T) {
+	s, c := newOriginlessServer(t)
+	seedObject(t, c, "m1.txt", "", []byte("1"))
+	seedObject(t, c, "m2.txt", "", []byte("2"))
+
+	body := `<Delete><Object><Key>m1.txt</Key></Object><Object><Key>m2.txt</Key></Object><Object><Key>absent.txt</Key></Object></Delete>`
+	req := httptest.NewRequest(http.MethodPost, "/b?delete", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || strings.Count(w.Body.String(), "<Deleted>") != 3 {
+		t.Fatalf("multi-delete: code=%d body=%q", w.Code, w.Body.String())
+	}
+	for _, k := range []string{"m1.txt", "m2.txt"} {
+		if g := do(s, http.MethodGet, "/b/"+k, nil); g.Code != http.StatusNotFound {
+			t.Fatalf("%s survived multi-delete: %d", k, g.Code)
+		}
+	}
+	// Quiet: no confirmations.
+	req = httptest.NewRequest(http.MethodPost, "/b?delete", strings.NewReader(`<Delete><Quiet>true</Quiet><Object><Key>m1.txt</Key></Object></Delete>`))
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "<Deleted>") {
+		t.Fatalf("quiet multi-delete: code=%d body=%q", w.Code, w.Body.String())
+	}
+}
+
+// Conditional writes: If-None-Match:* is put-if-absent; If-Match guards
+// overwrites; If-Match on a missing object is NoSuchKey (ceph semantics).
+func TestOriginlessRoutes_ConditionalPut(t *testing.T) {
+	s, _ := newOriginlessServer(t)
+
+	put := func(key, body string, hdr map[string]string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/b/"+key, strings.NewReader(body))
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+		return w
+	}
+
+	// put-if-absent succeeds, then refuses.
+	if w := put("c.txt", "v1", map[string]string{"If-None-Match": "*"}); w.Code != http.StatusOK {
+		t.Fatalf("INM* create: %d", w.Code)
+	}
+	etag := put("probe.txt", "x", nil).Header().Get("ETag")
+	_ = etag
+	if w := put("c.txt", "v2", map[string]string{"If-None-Match": "*"}); w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("INM* over existing: %d, want 412", w.Code)
+	}
+	// If-Match wrong etag: 412; right etag: 200; missing object: 404.
+	if w := put("c.txt", "v2", map[string]string{"If-Match": `"wrong"`}); w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("If-Match wrong: %d", w.Code)
+	}
+	g := do(s, http.MethodGet, "/b/c.txt", nil)
+	if w := put("c.txt", "v2", map[string]string{"If-Match": g.Header().Get("ETag")}); w.Code != http.StatusOK {
+		t.Fatalf("If-Match right: %d", w.Code)
+	}
+	if w := put("ghost.txt", "v", map[string]string{"If-Match": "*"}); w.Code != http.StatusNotFound {
+		t.Fatalf("If-Match on missing: %d, want 404", w.Code)
+	}
+}
+
+// Error bodies echo the response's x-amz-request-id, so clients can correlate.
+func TestOriginlessRoutes_RequestIDEcho(t *testing.T) {
+	s, _ := newOriginlessServer(t)
+	w := do(s, http.MethodGet, "/b/nope.txt", nil)
+	id := w.Header().Get("x-amz-request-id")
+	if id == "" {
+		t.Fatal("no x-amz-request-id header")
+	}
+	if !strings.Contains(w.Body.String(), "<RequestId>"+id+"</RequestId>") {
+		t.Fatalf("body does not echo request id %q: %s", id, w.Body.String())
 	}
 }

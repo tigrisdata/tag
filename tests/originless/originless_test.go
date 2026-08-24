@@ -238,7 +238,6 @@ func TestServePhase(t *testing.T) {
 
 	t.Run("mutations and listings answer 501 and leave the cache intact", func(t *testing.T) {
 		for name, r := range map[string]struct{ method, path string }{
-			"bulk delete":        {http.MethodPost, "/" + b + "?delete"},
 			"initiate multipart": {http.MethodPost, "/" + b + "/" + objKey + "?uploads"},
 			"upload part":        {http.MethodPut, "/" + b + "/" + objKey + "?uploadId=u1&partNumber=1"},
 			"versioned read":     {http.MethodGet, "/" + b + "/" + objKey + "?versionId=abc"},

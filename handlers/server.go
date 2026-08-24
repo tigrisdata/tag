@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/pprof"
@@ -153,6 +155,9 @@ func (s *Server) setupRouter() *mux.Router {
 	// handlers with their invalidate-before-forward ordering — is unreachable by
 	// construction in this mode rather than guarded at runtime.
 	if s.service.Originless() {
+		// Every response carries an x-amz-request-id, and error bodies echo it —
+		// clients (and the ceph suite) cross-check the two.
+		r.Use(requestIDMiddleware)
 		s.setupOriginlessRoutes(r)
 		return r
 	}
@@ -330,6 +335,7 @@ func (s *Server) setupOriginlessRoutes(r *mux.Router) {
 	// Bucket-lifecycle ceremony: honest no-ops so standard fixtures run.
 	// GET on a bucket is a listing, served from cached metadata.
 	for _, prefix := range []string{"/{bucket}", "/{bucket}/"} {
+		r.HandleFunc(prefix, s.handleOriginlessMultiDelete).Queries("delete", "").Methods("POST")
 		r.HandleFunc(prefix, s.handleOriginlessBucket).Methods("PUT", "HEAD", "DELETE")
 		r.HandleFunc(prefix, s.handleOriginlessList).Methods("GET")
 	}
@@ -348,6 +354,22 @@ func (s *Server) handleOriginlessPut(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleOriginlessDelete(w http.ResponseWriter, r *http.Request) {
 	handleWithError(w, r, s.service.HandleOriginlessDelete)
+}
+
+// requestIDMiddleware stamps every response with a fresh x-amz-request-id
+// before the handler runs, so error bodies can echo the value clients see.
+func requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err == nil {
+			w.Header().Set("x-amz-request-id", strings.ToUpper(hex.EncodeToString(b[:])))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) handleOriginlessMultiDelete(w http.ResponseWriter, r *http.Request) {
+	handleWithError(w, r, s.service.HandleOriginlessMultiDelete)
 }
 
 func (s *Server) handleOriginlessList(w http.ResponseWriter, r *http.Request) {

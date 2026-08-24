@@ -34,7 +34,8 @@ Plain single-object operations, against the local cache alone:
 
 - **`PUT`** stores the object under `cache.ttl` and returns its ETag. This is how the tier is populated — its callers write into it directly (in the tigris-os deployment, the gateway).
 - **`GET` / `HEAD`** serve from cache; a miss is `NoSuchKey`, the caller's cue to fall back to its authoritative store.
-- **`DELETE`** invalidates the entry (not required for correctness — entries lapse by TTL — but explicit expiry gets prompt removal).
+- **`DELETE`** invalidates the entry (not required for correctness — entries lapse by TTL — but explicit expiry gets prompt removal). **Multi-delete** (`POST ?delete`, up to 1000 keys) works the same way; deleting an absent key is a success, as on S3.
+- **Conditional writes**: `If-None-Match: *` is put-if-absent in one request; `If-Match` guards overwrites (against a missing object it answers `NoSuchKey`). Check-then-store, not atomic — the right idiom for a cache tier, not a coordination primitive.
 - **`ListObjects` / `ListObjectsV2`** enumerate the bucket's cached objects — prefix, delimiter rollup, pagination, `encoding-type=url` — so callers and operators can see what the tier holds. In cluster mode the listing is complete and ordered across all nodes (the storage layer K-way merges). The listing is **advisory**: it reflects metadata presence at scan time, and an entry mid-eviction can be listed yet answer `NoSuchKey` to the GET that follows — the read path stays the truth.
 
 Any query parameter — `?versionId`, `?partNumber`, `?tagging`, and the rest — selects a representation or an operation this mode does not implement, and answers `501` rather than doing something silently wrong. The one exception is `x-id`, the no-op operation tag `aws-sdk-go-v2` appends to every request, which is ignored. Server-side copy (`X-Amz-Copy-Source`) is also `501`:
@@ -65,6 +66,7 @@ The consequence is stated plainly: anything that can reach an origin-less TAG ca
 
 ## Observability
 
+- Every response carries an `x-amz-request-id`, echoed in error bodies, so a failing request can be correlated across client and TAG logs.
 - Unsupported operations are recorded under `tag_requests_total` with status `unsupported`, so a caller repeatedly issuing them shows up on the request dashboard instead of blending into the success rate.
 - Writes record as `PutObject`/`DeleteObject` with the usual statuses.
 - Hits and misses count in `tag_cache_hits_total` / `tag_cache_misses_total` as usual, and `X-Cache` reports `HIT`/`MISS` per response.

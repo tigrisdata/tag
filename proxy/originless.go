@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/xml"
 	"io"
 	"net/http"
 	"strconv"
@@ -314,6 +315,37 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		return nil
 	}
 
+	// Conditional writes. Check-then-store, not atomic — acceptable for a cache
+	// tier, and it gives callers the idiom that matters: If-None-Match: * turns
+	// put-if-absent into one request instead of an exists-probe plus a racy PUT.
+	// Semantics follow the ceph suite: If-Match against a MISSING object answers
+	// NoSuchKey (there is nothing to match), a present-but-different ETag is the
+	// 412; If-None-Match refuses when the object exists.
+	ifMatch := r.Header.Get("If-Match")
+	ifNoneMatch := r.Header.Get("If-None-Match")
+	if ifMatch != "" || ifNoneMatch != "" {
+		existing, found, merr := s.cache.GetMeta(ctx, bucket, key)
+		if merr != nil {
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return merr
+		}
+		exists := found && existing != nil
+		switch {
+		case ifMatch != "" && !exists:
+			s3err.WriteError(w, r, s3err.ErrNoSuchKey)
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return nil
+		case ifMatch != "" && ifMatch != "*" && !existing.MatchesETag(ifMatch):
+			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return nil
+		case ifNoneMatch != "" && exists && (ifNoneMatch == "*" || existing.MatchesETag(ifNoneMatch)):
+			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return nil
+		}
+	}
+
 	// Decoded size, not wire size: a streaming-signed SDK upload frames the body
 	// (aws-chunked) and declares the real length in X-Amz-Decoded-Content-Length.
 	// Judging the threshold by wire length would reject payloads that fit.
@@ -438,6 +470,65 @@ func (s *Service) HandleOriginlessDelete(w http.ResponseWriter, r *http.Request)
 	s.invalidateObject(r.Context(), bucket, key)
 	w.WriteHeader(http.StatusNoContent)
 	metrics.RecordRequest("DeleteObject", "success", time.Since(start).Seconds())
+	return nil
+}
+
+// multiDeleteResult is the S3 DeleteResult response.
+type multiDeleteResult struct {
+	XMLName xml.Name           `xml:"DeleteResult"`
+	Xmlns   string             `xml:"xmlns,attr"`
+	Deleted []multiDeletedItem `xml:"Deleted"`
+}
+
+type multiDeletedItem struct {
+	Key string `xml:"Key"`
+}
+
+// HandleOriginlessMultiDelete implements POST ?delete: invalidate every named
+// key. Deleting an absent key is a success, as on S3 — invalidation is
+// idempotent — so there is no Errors list to produce. Quiet mode omits the
+// per-key confirmations.
+func (s *Service) HandleOriginlessMultiDelete(w http.ResponseWriter, r *http.Request) error {
+	start := time.Now()
+	bucket, _ := ParseBucketKey(r)
+
+	q := r.URL.Query()
+	q.Del("delete")
+	q.Del("x-id")
+	if len(q) > 0 {
+		return s.HandleOriginlessUnsupported(w, r)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		metrics.RecordRequest("DeleteObjects", "error", time.Since(start).Seconds())
+		return err
+	}
+	var req deleteObjectsRequest
+	if err := xml.Unmarshal(body, &req); err != nil || len(req.Objects) == 0 || len(req.Objects) > 1000 {
+		s3err.WriteError(w, r, s3err.ErrInvalidRequest)
+		metrics.RecordRequest("DeleteObjects", "error", time.Since(start).Seconds())
+		return nil
+	}
+
+	res := multiDeleteResult{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/"}
+	for _, obj := range req.Objects {
+		s.invalidateObject(r.Context(), bucket, obj.Key)
+		if !req.Quiet {
+			res.Deleted = append(res.Deleted, multiDeletedItem{Key: obj.Key})
+		}
+	}
+
+	out, err := xml.Marshal(res)
+	if err != nil {
+		metrics.RecordRequest("DeleteObjects", "error", time.Since(start).Seconds())
+		return err
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(xml.Header))
+	w.Write(out)
+	metrics.RecordRequest("DeleteObjects", "success", time.Since(start).Seconds())
 	return nil
 }
 
