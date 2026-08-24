@@ -199,6 +199,14 @@ func TestOriginlessRoutes_IncompleteBlockEntryIsACleanMissNotATruncatedServe(t *
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("range over absent block: code=%d, want clean 404", w.Code)
 	}
+
+	// HEAD must agree with GET: an entry GET answers 404 for cannot claim to exist
+	// on HEAD — a caller using HEAD as its existence check would otherwise skip
+	// re-populating an entry that can never be served.
+	w = do(s, http.MethodHead, "/b/partial.bin", nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("HEAD over incomplete blocks: code=%d, want 404 to match GET", w.Code)
+	}
 }
 
 // A bad range on a PRESENT object is not a miss: the object exists, the range is
@@ -220,6 +228,11 @@ func TestOriginlessRoutes_BadRangeOnPresentObjectIs416NotMiss(t *testing.T) {
 	}
 	if ok, err := c.PutMetaTombstoneAware(ctx, "b", "obj.bin", meta, 60, time.Now().UnixNano()); err != nil || !ok {
 		t.Fatalf("seed meta: ok=%v err=%v", ok, err)
+	}
+
+	// HEAD on a complete block-mode entry still answers 200.
+	if w := do(s, http.MethodHead, "/b/obj.bin", nil); w.Code != http.StatusOK {
+		t.Fatalf("HEAD on complete entry: code=%d, want 200", w.Code)
 	}
 
 	for name, rng := range map[string]string{

@@ -73,6 +73,13 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	}
 
 	if r.Method == http.MethodHead {
+		// HEAD must agree with what GET can actually serve. Without this probe an
+		// entry with evicted blocks answers HEAD 200 / GET 404 — and a caller using
+		// HEAD as its existence check (the tigris-os distribute worker skips
+		// re-population when IsObjectExists is true) would then never heal the entry.
+		if meta.BlockSize > 0 && !s.blockEntryComplete(ctx, bucket, key, meta) {
+			return s.originlessMiss(w, r, operation, start)
+		}
 		meta.WriteHeaders(w)
 		writeCacheStatus(w, XCacheHit)
 		w.WriteHeader(meta.StatusCode)
@@ -117,11 +124,7 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	}
 
 	if meta.BlockSize > 0 {
-		if meta.ContentLength <= 0 {
-			return s.originlessMiss(w, r, operation, start)
-		}
-		b0, bK := coveringBlocks(0, meta.ContentLength-1, meta.BlockSize)
-		if !s.allBlocksPresent(ctx, bucket, key, meta, b0, bK) {
+		if !s.blockEntryComplete(ctx, bucket, key, meta) {
 			return s.originlessMiss(w, r, operation, start)
 		}
 		served, assembleErr := s.serveFullObjectFromBlockCache(ctx, w, bucket, key, "", "", meta, start)
@@ -157,6 +160,17 @@ func (s *Service) allBlocksPresent(ctx context.Context, bucket, key string, meta
 		}
 	}
 	return true
+}
+
+// blockEntryComplete reports whether every block of a block-mode entry is
+// present — the shared answer for "does this object exist here" (HEAD) and "can
+// the full object be served" (GET), so the two can never disagree.
+func (s *Service) blockEntryComplete(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) bool {
+	if meta.ContentLength <= 0 {
+		return false
+	}
+	b0, bK := coveringBlocks(0, meta.ContentLength-1, meta.BlockSize)
+	return s.allBlocksPresent(ctx, bucket, key, meta, b0, bK)
 }
 
 // originlessMiss answers the one thing a miss can be in this mode.
