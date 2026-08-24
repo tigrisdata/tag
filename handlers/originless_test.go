@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -407,5 +408,41 @@ func TestOriginlessRoutes_BadRangeOnPresentObjectIs416NotMiss(t *testing.T) {
 		if w.Code != http.StatusRequestedRangeNotSatisfiable {
 			t.Fatalf("%s range: code=%d, want 416", name, w.Code)
 		}
+	}
+}
+
+// A streaming-signed SDK upload frames the body with aws-chunked encoding. The
+// stored bytes — and the ETag — must be the decoded object, never the framing:
+// framed bytes served with a 200 are corruption the caller cannot detect.
+func TestOriginlessRoutes_AWSChunkedPutStoresDecodedBody(t *testing.T) {
+	s, _ := newOriginlessServer(t)
+
+	payload := "decoded payload bytes"
+	framed := fmt.Sprintf("%x;chunk-signature=deadbeef\r\n%s\r\n0;chunk-signature=deadbeef\r\n\r\n", len(payload), payload)
+
+	req := httptest.NewRequest(http.MethodPut, "/b/chunked.txt", strings.NewReader(framed))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprint(len(payload)))
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("chunked PUT: code=%d", w.Code)
+	}
+
+	g := do(s, http.MethodGet, "/b/chunked.txt", nil)
+	if g.Code != http.StatusOK || g.Body.String() != payload {
+		t.Fatalf("GET after chunked PUT: code=%d body=%q, want the DECODED payload", g.Code, g.Body.String())
+	}
+
+	// The decoded length is what the threshold judges: a decoded size over the
+	// limit is rejected even when the wire bytes have not been read yet.
+	req = httptest.NewRequest(http.MethodPut, "/b/big-chunked.txt", strings.NewReader(framed))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprint(int64(1)<<40))
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("oversized decoded length: code=%d, want 400 EntityTooLarge", w.Code)
 	}
 }

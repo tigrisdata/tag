@@ -242,16 +242,47 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		return nil
 	}
 
+	// Decoded size, not wire size: a streaming-signed SDK upload frames the body
+	// (aws-chunked) and declares the real length in X-Amz-Decoded-Content-Length.
+	// Judging the threshold by wire length would reject payloads that fit.
+	declaredSize := teeObjectSize(r)
 	maxSize := s.config.Cache.SizeThreshold
-	if r.ContentLength > maxSize {
+	if declaredSize > maxSize {
 		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return nil
 	}
 
+	// The buffer below is real memory held for the duration of the store, so it
+	// draws on the same populate budget and count ceiling as every other cache
+	// write — without this, concurrent large PUTs would allocate past the
+	// configured budget unbounded. Shed with SlowDown when the budget declines:
+	// under pressure a retryable 503 beats an OOM kill.
+	weight := declaredSize
+	if weight <= 0 {
+		weight = smallObjectThreshold
+	}
+	if weight > s.perPopulateCap {
+		weight = s.perPopulateCap
+	}
+	if !s.acquireCacheSlot(ctx, weight, priorityWarmWrite) {
+		s3err.WriteError(w, r, s3err.ErrSlowDown)
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return nil
+	}
+	defer s.releaseCacheSlot(weight)
+
+	// Unwrap AWS chunked framing so the stored bytes — and the ETag computed over
+	// them — are the object, not the wire encoding. Storing the framing serves
+	// corrupt bytes with a 200, which the caller cannot detect as a miss.
+	reader := r.Body
+	if IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) {
+		reader = io.NopCloser(newAWSChunkedReader(r.Body))
+	}
+
 	// LimitReader at threshold+1: a body that exceeds the declared length or the
 	// threshold is detected by the extra byte rather than silently truncated.
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxSize+1))
+	body, err := io.ReadAll(io.LimitReader(reader, maxSize+1))
 	if err != nil {
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return err
