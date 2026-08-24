@@ -455,9 +455,9 @@ s3-test-originless: build
 	B="tag-diag-originless-$$(date +%s)-$$$$"; \
 	DATA_DIR=/tmp/tag-originless-cache; \
 	UPSTREAM=$${TAG_UPSTREAM_ENDPOINT:-https://t3.storage.dev}; \
-	cleanup() { pkill -f "./$(BINARY_NAME)" 2>/dev/null || true; }; \
+	cleanup() { pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; }; \
 	trap cleanup EXIT; \
-	pkill -f "./$(BINARY_NAME)" 2>/dev/null || true; \
+	pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; \
 	lsof -ti:$(TAG_LOCAL_HTTP_PORT) | xargs kill 2>/dev/null || true; sleep 1; \
 	rm -rf $$DATA_DIR && mkdir -p $$DATA_DIR; \
 	echo "--- Phase 1: warm through proxy mode ($$B)"; \
@@ -468,8 +468,8 @@ s3-test-originless: build
 	timeout 30 bash -c 'until curl -s http://localhost:$(TAG_LOCAL_HTTP_PORT)/health >/dev/null 2>&1; do sleep 1; done'; \
 	ORIGINLESS_PHASE=warm ORIGINLESS_BUCKET=$$B $(CGO_ENV) go test -tags originless -v -timeout 120s -run TestWarmPhase ./tests/originless/; \
 	echo "--- Phase 2: flip to origin-less (same cache dir, no creds, no upstream)"; \
-	pkill -f "./$(BINARY_NAME)" 2>/dev/null || true; \
-	timeout 40 bash -c 'while pgrep -f "\./$(BINARY_NAME)" >/dev/null 2>&1; do sleep 0.5; done' || \
+	pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; \
+	timeout 40 bash -c 'while pgrep -fx "./$(BINARY_NAME)" >/dev/null 2>&1; do sleep 0.5; done' || \
 		{ echo "proxy-mode TAG did not exit; RocksDB lock would collide"; exit 1; }; \
 	sleep 1; \
 	env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u TAG_UPSTREAM_ENDPOINT \
@@ -480,7 +480,7 @@ s3-test-originless: build
 	timeout 60 bash -c 'until curl -s http://localhost:$(TAG_LOCAL_HTTP_PORT)/health >/dev/null 2>&1; do sleep 1; done'; \
 	ORIGINLESS_PHASE=serve ORIGINLESS_BUCKET=$$B $(CGO_ENV) go test -tags originless -v -timeout 120s -run TestServePhase ./tests/originless/; \
 	echo "--- Phase 3: cleanup (directly against upstream)"; \
-	pkill -f "./$(BINARY_NAME)" 2>/dev/null || true; \
+	pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; \
 	ORIGINLESS_PHASE=cleanup ORIGINLESS_BUCKET=$$B ORIGINLESS_UPSTREAM=$$UPSTREAM \
 		$(CGO_ENV) go test -tags originless -v -timeout 60s -run TestCleanupPhase ./tests/originless/; \
 	rm -rf $$DATA_DIR; \
