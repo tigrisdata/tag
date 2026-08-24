@@ -616,7 +616,7 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	isAnonymous := isAnonymousRequest(r, result, err)
 
 	if (result == AuthValidated || isAnonymous) && !bypassCache && s.cache.IsEnabled() {
-		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
+		meta, found, cacheErr := s.cache.GetMetaForHeaders(ctx, bucket, key)
 		cacheHit := cacheErr == nil && found && meta != nil
 		if cacheHit && isAnonymous && !meta.IsPublicRead() {
 			cacheHit = false

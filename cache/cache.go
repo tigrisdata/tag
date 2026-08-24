@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/rs/zerolog/log"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/ocache/coordinator"
@@ -39,6 +41,29 @@ var ErrNotFound = errors.New("not found in cache")
 // ErrCacheDisabled indicates the cache is disabled.
 var ErrCacheDisabled = errors.New("cache is disabled")
 
+const (
+	// The count and encoded-size caps bound both the retained JSON and its decoded
+	// string fields. Larger metadata continues through the ordinary decode path.
+	maxDecodedMetaEntries    = 4096
+	maxDecodedMetaEntryBytes = 16 * 1024
+
+	// A decoded snapshot is admitted only after this many decodes for a key in
+	// a small direct-mapped window. Waiting through a two-hit burst avoids copying
+	// metadata that will not be read from the resident tier.
+	decodedMetaAdmissionThreshold = 3
+	decodedMetaAdmissionSlots     = 64
+	decodedMetaResidentSlots      = 4096
+
+	decodedMetaAdmissionCountBits       = 2
+	decodedMetaAdmissionCountMask       = uint64((1 << decodedMetaAdmissionCountBits) - 1)
+	decodedMetaAdmissionFingerprintMask = (uint64(1) << (64 - decodedMetaAdmissionCountBits)) - 1
+)
+
+type decodedMetaEntry struct {
+	meta    *CachedObjectMeta
+	encoded []byte
+}
+
 // Cache wraps ocache client for TAG.
 type Cache struct {
 	client       cacheclient.CacheClient
@@ -46,6 +71,17 @@ type Cache struct {
 	tombstoneTTL int64 // seconds; must outlive the longest racing cache-populate
 	enabled      bool
 	closed       bool
+
+	// decodedMeta retains decoded immutable snapshots. GetMeta validates the
+	// backend metadata bytes before returning one, so an observed update, delete,
+	// expiry, or invalidation from another cache node cannot expose a stale snapshot.
+	decodedMeta *lru.Cache[string, decodedMetaEntry]
+
+	// decodedMetaAdmission packs a key fingerprint and its observation count in
+	// a direct-mapped slot. The resident filter avoids taking the LRU lock when a
+	// key cannot have a snapshot.
+	decodedMetaAdmission [decodedMetaAdmissionSlots]atomic.Uint64
+	decodedMetaResident  [decodedMetaResidentSlots]atomic.Uint64
 }
 
 // NewCacheWithClient creates a cache with an injected client.
@@ -61,11 +97,163 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 		enabled = cfg.IsEnabled()
 		sizeThreshold = cfg.SizeThreshold
 	}
-	return &Cache{
+	c := &Cache{
 		client:       client,
 		defaultTTL:   ttl,
 		tombstoneTTL: TombstoneTTLSeconds(sizeThreshold),
 		enabled:      enabled,
+	}
+	if enabled && client != nil {
+		decodedMeta, err := lru.New[string, decodedMetaEntry](maxDecodedMetaEntries)
+		if err != nil {
+			panic(fmt.Sprintf("create decoded metadata cache: %v", err))
+		}
+		c.decodedMeta = decodedMeta
+	}
+	return c
+}
+
+func cloneCachedObjectMeta(meta *CachedObjectMeta) *CachedObjectMeta {
+	clone := *meta
+	if meta.UserMetadata != nil {
+		clone.UserMetadata = make(map[string]string, len(meta.UserMetadata))
+		for key, value := range meta.UserMetadata {
+			clone.UserMetadata[key] = value
+		}
+	}
+	return &clone
+}
+
+func (c *Cache) getDecodedMeta(metaKey string, hash uint64, metaBytes []byte, cloneResult bool) (*CachedObjectMeta, bool) {
+	if c.decodedMeta == nil || c.decodedMetaResidentSlot(hash).Load() != hash {
+		return nil, false
+	}
+
+	// A hit does not need to update recency: losing a hot snapshot to a later
+	// admission only falls back to decoding, while Peek keeps parallel HEAD hits
+	// on the read lock.
+	entry, ok := c.decodedMeta.Peek(metaKey)
+	if !ok {
+		c.forgetDecodedMetaHash(hash)
+		return nil, false
+	}
+	if !bytes.Equal(entry.encoded, metaBytes) {
+		c.decodedMeta.Remove(metaKey)
+		c.forgetDecodedMetaHash(hash)
+		return nil, false
+	}
+	if cloneResult {
+		return cloneCachedObjectMeta(entry.meta), true
+	}
+	return entry.meta, true
+}
+
+// decodedMetaKeyHash identifies an admission candidate without retaining a
+// request-owned key string. Collisions can only admit an extra snapshot; every
+// returned snapshot is still checked against its authoritative bytes.
+func decodedMetaKeyHash(key string) uint64 {
+	const (
+		offset = 14695981039346656037
+		prime  = 1099511628211
+	)
+
+	hash := uint64(offset)
+	for i := 0; i < len(key); i++ {
+		hash ^= uint64(key[i])
+		hash *= prime
+	}
+	// Zero is the empty resident-slot sentinel. Preserve every other hash bit so
+	// power-of-two admission and resident tables can use their full width.
+	if hash == 0 {
+		return 1
+	}
+	return hash
+}
+
+func (c *Cache) decodedMetaResidentSlot(hash uint64) *atomic.Uint64 {
+	return &c.decodedMetaResident[hash&(decodedMetaResidentSlots-1)]
+}
+
+func (c *Cache) decodedMetaAdmissionSlot(hash uint64) *atomic.Uint64 {
+	return &c.decodedMetaAdmission[hash&(decodedMetaAdmissionSlots-1)]
+}
+
+func (c *Cache) admitDecodedMeta(hash uint64) bool {
+	if c.decodedMeta == nil {
+		return false
+	}
+
+	fingerprint := hash & decodedMetaAdmissionFingerprintMask
+	slot := c.decodedMetaAdmissionSlot(hash)
+	for {
+		current := slot.Load()
+		count := current & decodedMetaAdmissionCountMask
+		if count == 0 || current>>decodedMetaAdmissionCountBits != fingerprint {
+			if slot.CompareAndSwap(current, fingerprint<<decodedMetaAdmissionCountBits|1) {
+				return false
+			}
+			continue
+		}
+		if count >= decodedMetaAdmissionThreshold {
+			return true
+		}
+		if slot.CompareAndSwap(current, current+1) {
+			return count+1 >= decodedMetaAdmissionThreshold
+		}
+	}
+}
+
+func (c *Cache) forgetDecodedMetaHash(hash uint64) {
+	fingerprint := hash & decodedMetaAdmissionFingerprintMask
+	slot := c.decodedMetaAdmissionSlot(hash)
+	for {
+		current := slot.Load()
+		if current&decodedMetaAdmissionCountMask == 0 || current>>decodedMetaAdmissionCountBits != fingerprint {
+			break
+		}
+		if slot.CompareAndSwap(current, 0) {
+			break
+		}
+	}
+	c.decodedMetaResidentSlot(hash).CompareAndSwap(hash, 0)
+}
+
+func (c *Cache) forgetDecodedMetaAdmission(metaKey string) {
+	if c.decodedMeta != nil {
+		c.forgetDecodedMetaHash(decodedMetaKeyHash(metaKey))
+	}
+}
+
+func (c *Cache) putDecodedMeta(metaKey string, meta *CachedObjectMeta, metaBytes []byte) {
+	c.putDecodedMetaWithOwnership(metaKey, meta, metaBytes, false)
+}
+
+// putDecodedMetaForHeaders takes ownership of a freshly decoded value whose
+// caller only reads response headers. This avoids a second metadata copy on the
+// admission read; GetMeta continues to retain an independent caller-owned copy.
+func (c *Cache) putDecodedMetaForHeaders(metaKey string, meta *CachedObjectMeta, metaBytes []byte) {
+	c.putDecodedMetaWithOwnership(metaKey, meta, metaBytes, true)
+}
+
+func (c *Cache) putDecodedMetaWithOwnership(metaKey string, meta *CachedObjectMeta, metaBytes []byte, takeMeta bool) {
+	if c.decodedMeta == nil || len(metaBytes) > maxDecodedMetaEntryBytes {
+		return
+	}
+	if !takeMeta {
+		meta = cloneCachedObjectMeta(meta)
+	}
+	c.decodedMeta.Add(metaKey, decodedMetaEntry{
+		meta:    meta,
+		encoded: bytes.Clone(metaBytes),
+	})
+	hash := decodedMetaKeyHash(metaKey)
+	c.decodedMetaResidentSlot(hash).Store(hash)
+}
+
+func (c *Cache) deleteDecodedMeta(metaKey string) {
+	if c.decodedMeta != nil {
+		c.decodedMeta.Remove(metaKey)
+		c.forgetDecodedMetaAdmission(metaKey)
 	}
 }
 
@@ -132,7 +320,10 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 		return err
 	}
 
-	// Store metadata AFTER body is complete
+	// Store metadata AFTER body is complete. Evict before the backend mutation:
+	// a client can report an error after committing it, and a write does not copy
+	// metadata into the resident tier until repeated reads can amortize that work.
+	c.deleteDecodedMeta(metaKey)
 	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
 		// Leave the versioned body to age out via TTL rather than deleting it
@@ -213,6 +404,9 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 	// concurrent invalidation deletes meta+body, resurrecting stale metadata.
 	tombTs := c.GetTombstoneTimestamp(ctx, bucket, key)
 	if tombTs >= writeStartTime {
+		// The tombstone supersedes any prior metadata snapshot even though this
+		// populate did not become visible itself.
+		c.deleteDecodedMeta(metaKey)
 		log.Debug().Str("bucket", bucket).Str("key", key).
 			Int64("tombstone_ts", tombTs).
 			Int64("write_start", writeStartTime).
@@ -225,7 +419,10 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		return false, nil
 	}
 
-	// Write metadata AFTER body (makes entry visible)
+	// Write metadata AFTER body (makes entry visible). Do not retain a prior
+	// decoded snapshot while the backend write result is uncertain, and defer
+	// resident copies until repeated reads can amortize them.
+	c.deleteDecodedMeta(metaKey)
 	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
 		// Same rationale as the tombstone branch: leave the versioned body to TTL
@@ -242,35 +439,67 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 	return true, nil
 }
 
-// GetMeta retrieves only object metadata from cache (no body).
-// Use this for HEAD requests to avoid fetching the body.
+// GetMeta retrieves only object metadata from cache (no body). Returned metadata
+// is caller-owned, including on a resident-tier hit.
 func (c *Cache) GetMeta(ctx context.Context, bucket, key string) (*CachedObjectMeta, bool, error) {
+	return c.getMeta(ctx, bucket, key, true)
+}
+
+// GetMetaForHeaders retrieves metadata for a caller that only reads it while
+// constructing response headers. On a resident-tier hit it can return the
+// immutable resident snapshot directly; callers must not mutate it.
+func (c *Cache) GetMetaForHeaders(ctx context.Context, bucket, key string) (*CachedObjectMeta, bool, error) {
+	return c.getMeta(ctx, bucket, key, false)
+}
+
+func (c *Cache) getMeta(ctx context.Context, bucket, key string, cloneResult bool) (*CachedObjectMeta, bool, error) {
 	if !c.IsEnabled() {
 		return nil, false, nil
 	}
 
 	metaKey := MakeMetaKey(bucket, key)
 
-	// Get metadata
+	// Read the authoritative metadata bytes first. A matching decoded snapshot
+	// avoids JSON work while this byte comparison keeps resident state coherent
+	// with updates, deletes, expiry, and invalidations from every cache node.
 	metaBytes, err := c.client.Get(ctx, metaKey)
 	if err != nil {
 		if isNotFoundError(err) {
+			c.deleteDecodedMeta(metaKey)
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (meta only)")
 			return nil, false, nil
 		}
+		// A transient read failure is not evidence that the metadata changed. Do
+		// not serve the resident value for this failed request, but retain it so
+		// the next successful byte-validated read can reuse the decoded snapshot.
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta get error")
 		return nil, false, err
 	}
-
 	if metaBytes == nil {
+		c.deleteDecodedMeta(metaKey)
 		return nil, false, nil
 	}
 
-	// Decode metadata
+	metaKeyHash := decodedMetaKeyHash(metaKey)
+	if meta, ok := c.getDecodedMeta(metaKey, metaKeyHash, metaBytes, cloneResult); ok {
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit (decoded meta)")
+		return meta, true, nil
+	}
+
 	meta, err := DecodeMeta(metaBytes)
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta decode error")
 		return nil, false, err
+	}
+	// Admit only on a third recently repeated read. This refills after
+	// restart or eviction for clustered reads without copying a two-hit burst;
+	// every later tier hit still validates the backend bytes first.
+	if len(metaBytes) <= maxDecodedMetaEntryBytes && c.admitDecodedMeta(metaKeyHash) {
+		if cloneResult {
+			c.putDecodedMeta(metaKey, meta, metaBytes)
+		} else {
+			c.putDecodedMetaForHeaders(metaKey, meta, metaBytes)
+		}
 	}
 
 	log.Debug().
@@ -336,6 +565,9 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	}
 
 	metaKey := MakeMetaKey(bucket, key)
+	// Evict before deleting the backend metadata. A backend error can be reported
+	// after a mutation commits, so the local decoded value must fail closed.
+	c.deleteDecodedMeta(metaKey)
 
 	// Delete only the metadata. That is sufficient to make subsequent reads miss
 	// (a read resolves the body from meta.ETag, so with meta gone there is no body
@@ -654,11 +886,15 @@ func (c *Cache) PutMetaTombstoneAware(
 	// invalidated at or after our write start, skip so we don't resurrect stale metadata.
 	tombTs := c.GetTombstoneTimestamp(ctx, bucket, key)
 	if tombTs >= writeStartTime {
+		// A skipped write still observed an invalidation, so it cannot leave a
+		// previously decoded value resident.
+		c.deleteDecodedMeta(metaKey)
 		log.Debug().Str("bucket", bucket).Str("key", key).
 			Int64("tombstone_ts", tombTs).Int64("write_start", writeStartTime).
 			Msg("Skipping block-mode meta write - tombstone detected")
 		return false, nil
 	}
+	c.deleteDecodedMeta(metaKey)
 	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
 		return false, err
@@ -732,6 +968,9 @@ func (c *Cache) WriteTombstone(ctx context.Context, bucket, key string) error {
 	if !c.IsEnabled() {
 		return nil
 	}
+	// A tombstone is an explicit metadata coherence point even when its caller
+	// deletes the backend entry separately.
+	c.deleteDecodedMeta(MakeMetaKey(bucket, key))
 	tombKey := MakeTombstoneKey(bucket, key)
 	ts := time.Now().UnixNano()
 	data := make([]byte, 8)
@@ -789,6 +1028,9 @@ func (c *Cache) Close() error {
 
 	log.Info().Msg("Closing cache client")
 	c.closed = true
+	if c.decodedMeta != nil {
+		c.decodedMeta.Purge()
+	}
 	if c.client != nil {
 		return c.client.Close()
 	}
