@@ -153,3 +153,50 @@ func TestOriginlessRoutes_MutationsNeverReachHandlersOrTouchCache(t *testing.T) 
 		}
 	}
 }
+
+// The truncation hazard: block-mode serves stream optimistically — headers first,
+// missing blocks recovered from upstream mid-stream. With no origin that recovery
+// fails AFTER the 200/206 is committed, handing the client a truncated body. The
+// origin-less handler must therefore probe every covering block first and answer a
+// clean NoSuchKey before any header is written.
+func TestOriginlessRoutes_IncompleteBlockEntryIsACleanMissNotATruncatedServe(t *testing.T) {
+	s, c := newOriginlessServer(t)
+	ctx := context.Background()
+
+	blockSize := int64(1024)
+	// Two blocks; only block 0 is written. BlocksComplete deliberately lies — that
+	// is exactly the state (blocks evicted after the meta was stamped) that makes
+	// the shared helpers stream optimistically.
+	meta := &cache.CachedObjectMeta{
+		Bucket: "b", Key: "partial.bin", StatusCode: http.StatusOK,
+		ETag: `"blk"`, ContentLength: 2 * blockSize, ContentType: "application/octet-stream",
+		ACL: "public-read", CachedAt: time.Now().Unix(), LastModified: time.Now().Unix(),
+		BlockSize: blockSize, BlocksComplete: true,
+	}
+	if err := c.PutBlock(ctx, "b", "partial.bin", meta.ETag, blockSize, 0, make([]byte, blockSize), 60); err != nil {
+		t.Fatalf("seed block 0: %v", err)
+	}
+	if ok, err := c.PutMetaTombstoneAware(ctx, "b", "partial.bin", meta, 60, time.Now().UnixNano()); err != nil || !ok {
+		t.Fatalf("seed meta: ok=%v err=%v", ok, err)
+	}
+
+	// Full GET: block 1 is absent, so this must be a clean 404 — never a committed
+	// 200 with a short body.
+	w := do(s, http.MethodGet, "/b/partial.bin", nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("full GET over incomplete blocks: code=%d body_len=%d, want clean 404", w.Code, w.Body.Len())
+	}
+
+	// A range covered entirely by the present block still serves: the probe is
+	// per-covering-block, not all-or-nothing on the object.
+	w = do(s, http.MethodGet, "/b/partial.bin", map[string]string{"Range": "bytes=0-99"})
+	if w.Code != http.StatusPartialContent || int64(w.Body.Len()) != 100 {
+		t.Fatalf("range over present block: code=%d len=%d, want 206/100", w.Code, w.Body.Len())
+	}
+
+	// A range touching the absent block: clean 404.
+	w = do(s, http.MethodGet, "/b/partial.bin", map[string]string{"Range": "bytes=1000-1100"})
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("range over absent block: code=%d, want clean 404", w.Code)
+	}
+}

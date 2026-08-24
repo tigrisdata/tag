@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/s3err"
 )
@@ -78,12 +80,24 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 		return nil
 	}
 
-	// The serve helpers below are shared with the proxying mode. Their
-	// fetch-missing-blocks paths go through the forwarder, which in this mode
-	// errors instead of fetching — so an entry with evicted blocks degrades to a
-	// clean miss here rather than a partial serve.
+	// The serve helpers below are shared with the proxying mode, and the
+	// block-mode ones stream OPTIMISTICALLY: they commit headers first and recover
+	// a mid-stream missing block from upstream (streamRemainderFromUpstream). With
+	// no origin that recovery fails after the 200/206 is already sent, leaving the
+	// client a truncated body instead of a miss. So block-mode serves are gated on
+	// a presence probe of every covering block — absent anything, this is a clean
+	// NoSuchKey before a single header is written. Whole-object (non-block) serves
+	// need no probe: they fail before committing.
 	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
 		if meta.BlockSize > 0 {
+			ranges, rerr := parseRangeHeader(rangeHeader, meta.ContentLength)
+			if rerr != nil || len(ranges) != 1 {
+				return s.originlessMiss(w, r, operation, start)
+			}
+			b0, bK := coveringBlocks(ranges[0].start, ranges[0].end, meta.BlockSize)
+			if !s.allBlocksPresent(ctx, bucket, key, meta, b0, bK) {
+				return s.originlessMiss(w, r, operation, start)
+			}
 			served, rangeErr := s.serveRangeFromBlockCache(ctx, w, r, bucket, key, "", "", meta, rangeHeader, start)
 			if served {
 				return rangeErr
@@ -101,6 +115,13 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	}
 
 	if meta.BlockSize > 0 {
+		if meta.ContentLength <= 0 {
+			return s.originlessMiss(w, r, operation, start)
+		}
+		b0, bK := coveringBlocks(0, meta.ContentLength-1, meta.BlockSize)
+		if !s.allBlocksPresent(ctx, bucket, key, meta, b0, bK) {
+			return s.originlessMiss(w, r, operation, start)
+		}
 		served, assembleErr := s.serveFullObjectFromBlockCache(ctx, w, bucket, key, "", "", meta, start)
 		if served {
 			return assembleErr
@@ -116,6 +137,24 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 		return s.originlessMiss(w, r, operation, start)
 	}
 	return nil
+}
+
+// allBlocksPresent probes every block in [b0,bK] before a block-mode serve
+// commits its headers. A probe is a point lookup, so even a large object costs
+// one read per covering block — the price of guaranteeing that this mode never
+// sends a 200/206 it cannot finish. A probe-to-serve race (eviction between the
+// probe and the read) is still possible and still truncates; the probe narrows
+// the window from "any evicted block" to "evicted in the microseconds between
+// probe and read", which is the strongest guarantee available without holding
+// every block in memory first.
+func (s *Service) allBlocksPresent(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, b0, bK int64) bool {
+	for i := b0; i <= bK; i++ {
+		present, err := s.cache.BlockExistsErr(ctx, bucket, key, meta.ETag, meta.BlockSize, i)
+		if err != nil || !present {
+			return false
+		}
+	}
+	return true
 }
 
 // originlessMiss answers the one thing a miss can be in this mode.
