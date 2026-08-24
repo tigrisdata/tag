@@ -48,6 +48,8 @@ One rule decides every answer:
 
 An entry whose blocks were partly evicted, or whose body is gone leaving orphaned metadata, answers `NoSuchKey` to `GET`, `HEAD`, and conditionals alike — it never answers `HEAD 200` or `304 Not Modified` from metadata it cannot back with bytes. This matters because callers use `HEAD` as an existence check to decide whether to (re)populate the tier: a false "exists" would suppress exactly the healing that makes the entry servable again. A zero-length object is the boundary case: nothing can be missing from it, so it stays visible and servable.
 
+One qualification: the completeness check runs immediately before serving, and an eviction can land in the moment between the two. A response that has already committed its status can then be cut short mid-body — the client sees an aborted transfer (a short read against the declared `Content-Length`), not a clean `NoSuchKey`. The window is a race of microseconds, not a steady state, but callers should treat an aborted transfer from this tier the same way they treat a miss: retry against the authoritative store. Detection is unambiguous, since the received byte count never matches the declared length.
+
 ## Trust model (this phase)
 
 Only **anonymous requests for objects cached with a `public-read` ACL** are served. TAG validates signatures by learning keys from its upstream, and there is no upstream — so signed requests cannot be validated and answer `NoSuchKey`, indistinguishable from absence. Serving regardless of ACL, for deployments whose network is the trust boundary, is a planned explicit switch — not a side effect of removing the origin.
