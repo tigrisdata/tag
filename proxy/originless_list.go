@@ -309,7 +309,7 @@ func (s *Service) walkListing(r *http.Request, bucket string, p *listParams) (
 	items := 0
 
 	for {
-		page, hasMore, lerr := s.cache.ListMeta(r.Context(), bucket, p.prefix, after, maxListKeys)
+		page, nextAfter, hasMore, lerr := s.cache.ListMeta(r.Context(), bucket, p.prefix, after, maxListKeys)
 		if lerr != nil {
 			return nil, nil, false, listCursor{}, lerr
 		}
@@ -341,8 +341,13 @@ func (s *Service) walkListing(r *http.Request, bucket string, p *listParams) (
 			items++
 			prev = e.Key
 		}
-		if len(page) > 0 {
-			after = page[len(page)-1].Key
+		// Advance by the RAW scan cursor, not the surviving entries: a page whose
+		// entries were all skipped must still move forward or the walk spins on
+		// one token until the server timeout.
+		if nextAfter != "" {
+			after = nextAfter
+		} else if hasMore {
+			return contents, prefixes, false, listCursor{}, fmt.Errorf("listing scan returned no cursor with more pages claimed")
 		}
 		if !hasMore {
 			return contents, prefixes, false, listCursor{}, nil

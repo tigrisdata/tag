@@ -744,3 +744,30 @@ func TestOriginlessRoutes_RequestIDEcho(t *testing.T) {
 		t.Fatalf("body does not echo request id %q: %s", id, w.Body.String())
 	}
 }
+
+// Conditional PUT existence is SERVABLE existence: If-None-Match:* over an
+// orphaned meta (body gone) must store — that is the healing put-if-absent —
+// and If-Match against it answers NoSuchKey, matching every read shape.
+func TestOriginlessRoutes_ConditionalPutHonorsVisibilityContract(t *testing.T) {
+	s, c := newOriginlessServer(t)
+	ctx := context.Background()
+	meta := &cache.CachedObjectMeta{
+		Bucket: "b", Key: "orphan2.txt", StatusCode: http.StatusOK,
+		ETag: `"gone"`, ContentLength: 5, ACL: "public-read",
+		CachedAt: time.Now().Unix(), LastModified: time.Now().Unix(),
+	}
+	if ok, err := c.PutMetaTombstoneAware(ctx, "b", "orphan2.txt", meta, 60, time.Now().UnixNano()); err != nil || !ok {
+		t.Fatalf("seed orphan meta: ok=%v err=%v", ok, err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/b/orphan2.txt", strings.NewReader("healed"))
+	req.Header.Set("If-None-Match", "*")
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("INM* over orphaned meta must heal, got %d", w.Code)
+	}
+	if g := do(s, http.MethodGet, "/b/orphan2.txt", nil); g.Code != http.StatusOK || g.Body.String() != "healed" {
+		t.Fatalf("healed entry: code=%d body=%q", g.Code, g.Body.String())
+	}
+}

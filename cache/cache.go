@@ -864,9 +864,13 @@ type ListedEntry struct {
 // The listing is ADVISORY: it reflects metadata presence, not full-data
 // servability. An entry mid-eviction can appear here and still answer NoSuchKey
 // to a GET — the read path's completeness gate remains the truth.
-func (c *Cache) ListMeta(ctx context.Context, bucket, keyPrefix, startAfter string, limit int) ([]ListedEntry, bool, error) {
+// The second return is the raw scan cursor — the LAST KEY SCANNED, whether or
+// not it survived decoding — so a caller paging the scan always advances even
+// when every entry on a page was skipped. Deriving the cursor from surviving
+// entries instead would loop forever on a page of skips.
+func (c *Cache) ListMeta(ctx context.Context, bucket, keyPrefix, startAfter string, limit int) ([]ListedEntry, string, bool, error) {
 	if !c.IsEnabled() {
-		return nil, false, nil
+		return nil, "", false, nil
 	}
 	scanPrefix := metaKeyPrefix + bucket + "|" + keyPrefix
 	token := ""
@@ -878,10 +882,14 @@ func (c *Cache) ListMeta(ctx context.Context, bucket, keyPrefix, startAfter stri
 
 	kvs, _, hasMore, err := c.client.ListPageWithValues(ctx, scanPrefix, limit, token)
 	if err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 
 	stripPrefix := metaKeyPrefix + bucket + "|"
+	nextAfter := ""
+	if len(kvs) > 0 {
+		nextAfter = strings.TrimPrefix(kvs[len(kvs)-1].Key, stripPrefix)
+	}
 	entries := make([]ListedEntry, 0, len(kvs))
 	for _, kv := range kvs {
 		objKey := strings.TrimPrefix(kv.Key, stripPrefix)
@@ -901,5 +909,5 @@ func (c *Cache) ListMeta(ctx context.Context, bucket, keyPrefix, startAfter stri
 		}
 		entries = append(entries, ListedEntry{Key: objKey, Meta: meta})
 	}
-	return entries, hasMore, nil
+	return entries, nextAfter, hasMore, nil
 }

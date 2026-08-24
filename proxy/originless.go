@@ -329,7 +329,11 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return merr
 		}
-		exists := found && existing != nil
+		// Existence means SERVABLE existence — the same gate every read uses. An
+		// incomplete entry (orphaned meta, missing blocks) is invisible on every
+		// request shape, so If-None-Match:* must store over it (that IS the
+		// healing put-if-absent) and If-Match must answer NoSuchKey, not 412.
+		exists := found && existing != nil && s.entryServable(ctx, bucket, key, existing)
 		switch {
 		case ifMatch != "" && !exists:
 			s3err.WriteError(w, r, s3err.ErrNoSuchKey)
