@@ -188,9 +188,17 @@ func main() {
 		log.Warn().Err(err).Msg("Failed to load credentials from environment")
 	}
 
-	// Initialize proxy signer if transparent proxy is enabled
+	// Initialize proxy signer if transparent proxy is enabled.
+	// Skipped without an origin: the proxy signer exists to prove TAG's identity to
+	// Tigris, so with no upstream there is nothing to sign for and the credential
+	// requirement below would be a startup failure for no reason.
 	var proxySigner *auth.ProxySigner
-	if cfg.Upstream.IsTransparentProxy() {
+	if !cfg.Upstream.HasOrigin() {
+		log.Info().
+			Bool("cache_grpc_auth", cfg.Cache.IsGRPCAuthEnabled()).
+			Msg("Origin-less mode: no upstream configured. Cache misses are served as NoSuchKey and the deployment's trust boundary is the network. Writes and unauthenticated reads of non-public objects are NOT yet supported in this mode")
+	}
+	if cfg.Upstream.HasOrigin() && cfg.Upstream.IsTransparentProxy() {
 		accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
 		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 		if accessKey == "" || secretKey == "" {
@@ -198,7 +206,7 @@ func main() {
 		}
 		proxySigner = auth.NewProxySigner(accessKey, secretKey)
 		log.Info().Msg("Transparent proxy mode enabled")
-	} else {
+	} else if cfg.Upstream.HasOrigin() {
 		log.Info().Str("endpoint", cfg.Upstream.Endpoint).Msg("Signing mode enabled")
 		if !config.IsTigrisEndpoint(cfg.Upstream.Endpoint) {
 			log.Warn().Str("endpoint", cfg.Upstream.Endpoint).

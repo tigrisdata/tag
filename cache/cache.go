@@ -504,6 +504,23 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 	return nil
 }
 
+// BodyExistsErr reports whether a whole-object body is present, with the same
+// error contract as BlockExistsErr: genuine absence is (false, nil), a transient
+// probe failure is (false, err). Same first-byte probe, on the body key.
+func (c *Cache) BodyExistsErr(ctx context.Context, bucket, key, etag string) (present bool, err error) {
+	if !c.IsEnabled() || etag == "" {
+		return false, nil
+	}
+	e := c.getRangeStreamByKey(ctx, MakeBodyKey(bucket, key, etag), bucket, key, 0, 0, io.Discard)
+	if e == nil {
+		return true, nil
+	}
+	if errors.Is(e, ErrNotFound) {
+		return false, nil // genuinely absent
+	}
+	return false, e // transient failure — not proof of absence
+}
+
 // BlockExists reports whether the given block of a block-mode object is present in cache.
 // It probes the block's first byte (quirk-safe, cheap), so a not-found or any read error
 // returns false — the caller then (re)fetches the block. See RFC 0001.

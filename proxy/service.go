@@ -143,6 +143,18 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		Int64("serve_staging_cap_bytes", stagingCap).
 		Msg("Cache-populate limits configured")
 
+	// The deployment mode is derived twice — NewForwarder picks the forwarder from
+	// the endpoint it is handed, and originFor below reads the same endpoint from
+	// cfg. main.go feeds both from one config so they agree, but nothing else ties
+	// them together, and the quadrants disagree dangerously in opposite directions:
+	// a no-origin policy with a real forwarder silently 404s objects the upstream
+	// has, while the reverse turns every miss into a 500. Refuse to construct the
+	// incoherent Service rather than let either happen.
+	_, forwarderIsOriginless := forwarder.(originlessForwarder)
+	if forwarderIsOriginless == cfg.Upstream.HasOrigin() {
+		panic("proxy.NewService: forwarder and upstream config disagree about whether an origin exists")
+	}
+
 	svc := &Service{
 		forwarder:        forwarder,
 		cache:            cache,

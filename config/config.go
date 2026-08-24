@@ -153,6 +153,23 @@ type UpstreamConfig struct {
 	Region              string `yaml:"region"`                  // AWS region for signing (default: auto)
 	MaxIdleConnsPerHost int    `yaml:"max_idle_conns_per_host"` // HTTP connection pool size per host (default: 100)
 	TransparentProxy    *bool  `yaml:"transparent_proxy"`       // Forward client requests as-is with proxy headers (default: true when nil)
+
+	// Disabled runs TAG with no upstream at all: a cache miss is the final answer
+	// (NoSuchKey) rather than something to fetch, and writes land only in local
+	// storage. For a tier whose contents are pushed in by its client rather than
+	// pulled from an origin.
+	//
+	// Mutually exclusive with Endpoint. When set, applyDefaults leaves Endpoint
+	// empty, which is what every downstream consumer keys off — Endpoint is the
+	// single source of truth for whether an origin exists, and this flag only
+	// suppresses the default that would otherwise invent one.
+	Disabled bool `yaml:"disabled"`
+}
+
+// HasOrigin reports whether an upstream is configured. False only in origin-less
+// mode, which applyDefaults guarantees by leaving Endpoint empty.
+func (u *UpstreamConfig) HasOrigin() bool {
+	return u.Endpoint != ""
 }
 
 // IsTransparentProxy returns whether transparent proxy mode is enabled.
@@ -347,11 +364,17 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Read the deployment mode first: it decides whether an endpoint default applies.
+	applyUpstreamModeEnv(&cfg)
+
 	// Apply defaults
 	applyDefaults(&cfg)
 
 	// Override from environment variables
 	applyEnvOverrides(&cfg)
+
+	// Resolve mode-dependent defaults once both file and environment have been read.
+	resolveClusterAuthDefault(&cfg)
 
 	// Validate configuration
 	if err := validate(&cfg); err != nil {
@@ -365,12 +388,34 @@ func Load(path string) (*Config, error) {
 // Panics if the resulting configuration is invalid (e.g., disallowed upstream endpoint).
 func NewDefault() *Config {
 	cfg := &Config{}
+	applyUpstreamModeEnv(cfg)
 	applyDefaults(cfg)
 	applyEnvOverrides(cfg)
+	resolveClusterAuthDefault(cfg)
 	if err := validate(cfg); err != nil {
 		panic(fmt.Sprintf("invalid default configuration: %v", err))
 	}
 	return cfg
+}
+
+// applyUpstreamModeEnv reads the origin-less switch. It runs before applyDefaults
+// so that no endpoint is ever invented in this mode — which means any non-empty
+// Endpoint later on is one the operator supplied, and validate() can reject the
+// combination without having to guess whether a value was defaulted.
+//
+// Honors an explicit false so the environment can override a YAML
+// upstream.disabled: true, matching TAG_TRANSPARENT_PROXY. Unrecognized values
+// leave the setting untouched rather than silently flipping the deployment mode.
+func applyUpstreamModeEnv(cfg *Config) {
+	val := strings.ToLower(strings.TrimSpace(os.Getenv("TAG_UPSTREAM_DISABLED")))
+	switch val {
+	case "":
+		return
+	case "true", "1":
+		cfg.Upstream.Disabled = true
+	case "false", "0":
+		cfg.Upstream.Disabled = false
+	}
 }
 
 // applyDefaults sets default values for unset configuration fields.
@@ -388,8 +433,11 @@ func applyDefaults(cfg *Config) {
 	// PprofEnabled defaults to false (disabled for security)
 	// Use TAG_PPROF_ENABLED=true to enable
 
-	// Upstream defaults
-	if cfg.Upstream.Endpoint == "" {
+	// Upstream defaults. Origin-less mode must not pick up the default endpoint —
+	// Endpoint being empty is precisely how the rest of the process recognises that
+	// there is no origin. Validate() rejects the contradictory combination, so an
+	// endpoint surviving here means the operator did not ask for origin-less.
+	if !cfg.Upstream.Disabled && cfg.Upstream.Endpoint == "" {
 		cfg.Upstream.Endpoint = DefaultUpstreamEndpoint
 	}
 	if cfg.Upstream.Region == "" {
@@ -710,14 +758,59 @@ func applyEnvOverrides(cfg *Config) {
 
 // validate checks that the final configuration is valid.
 func validate(cfg *Config) error {
-	if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint, cfg.Upstream.IsTransparentProxy()); err != nil {
+	if err := validateOrigin(&cfg.Upstream); err != nil {
 		return err
+	}
+	// Skipped in origin-less mode: there is no endpoint to validate, and an empty
+	// one is the state that signals the mode rather than a misconfiguration.
+	if cfg.Upstream.HasOrigin() {
+		if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint, cfg.Upstream.IsTransparentProxy()); err != nil {
+			return err
+		}
 	}
 	if err := validateTLS(&cfg.Server); err != nil {
 		return err
 	}
 	if err := validateEvictionPolicy(cfg.Cache.EvictionPolicy); err != nil {
 		return err
+	}
+	return nil
+}
+
+// resolveClusterAuthDefault turns cross-node gRPC auth off by default in
+// origin-less mode.
+//
+// gRPC auth derives its token from the AWS credentials TAG uses upstream. An
+// origin-less deployment has no upstream and therefore no such credentials, so
+// leaving the default on means either refusing to start or inventing dummy keys —
+// and dummy keys are worse than no auth, because they look like authentication
+// while proving nothing.
+//
+// The mode also carries its own trust model: origin-less TAG is an internal tier
+// whose boundary is the network, and its peers sit inside that same boundary.
+// Authenticating a node to its neighbour there adds ceremony, not safety.
+//
+// Only the *default* moves. An explicit true is still honoured (and still fails
+// fast without credentials), so an operator who wants it can have it — the
+// resolved value also lands in the startup config log, so the choice is visible
+// rather than implied.
+func resolveClusterAuthDefault(cfg *Config) {
+	if !cfg.Upstream.HasOrigin() && cfg.Cache.GRPCAuth == nil {
+		cfg.Cache.SetGRPCAuth(false)
+	}
+}
+
+// validateOrigin rejects asking for origin-less mode while also configuring an
+// upstream. The two are contradictory, and resolving it silently either way would
+// pick a behaviour the operator did not ask for: honouring the endpoint turns a
+// cache-only tier into a proxy, and honouring the flag discards a configured
+// origin. Fail at startup instead.
+func validateOrigin(u *UpstreamConfig) error {
+	if u.Disabled && u.Endpoint != "" {
+		return fmt.Errorf(
+			"upstream.disabled cannot be combined with upstream.endpoint %q: origin-less mode has no upstream, so configure one or the other",
+			u.Endpoint,
+		)
 	}
 	return nil
 }

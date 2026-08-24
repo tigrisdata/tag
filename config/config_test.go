@@ -1300,3 +1300,151 @@ func TestMetaOnWrite_OverrideByEnv(t *testing.T) {
 		})
 	}
 }
+
+// Origin-less mode is derived from the endpoint being absent, so applyDefaults
+// must not invent one — the default endpoint would silently turn a cache-only
+// deployment back into a proxy.
+func TestUpstreamDisabled_SuppressesEndpointDefault(t *testing.T) {
+	cfg := &Config{}
+	cfg.Upstream.Disabled = true
+	applyDefaults(cfg)
+
+	if cfg.Upstream.Endpoint != "" {
+		t.Fatalf("endpoint = %q, want empty so the mode stays origin-less", cfg.Upstream.Endpoint)
+	}
+	if cfg.Upstream.HasOrigin() {
+		t.Fatal("HasOrigin must be false when the upstream is disabled")
+	}
+}
+
+func TestUpstreamDefault_StillAppliedWhenNotDisabled(t *testing.T) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+
+	if cfg.Upstream.Endpoint != DefaultUpstreamEndpoint {
+		t.Fatalf("endpoint = %q, want the default %q", cfg.Upstream.Endpoint, DefaultUpstreamEndpoint)
+	}
+	if !cfg.Upstream.HasOrigin() {
+		t.Fatal("HasOrigin must be true for a normal deployment")
+	}
+}
+
+// Resolving this silently either way would pick a behaviour nobody asked for:
+// honouring the endpoint turns a cache-only tier into a proxy, honouring the flag
+// discards a configured origin.
+func TestUpstreamDisabled_WithEndpointIsRejected(t *testing.T) {
+	cfg := &Config{}
+	cfg.Upstream.Disabled = true
+	cfg.Upstream.Endpoint = "https://t3.storage.dev"
+
+	if err := validate(cfg); err == nil {
+		t.Fatal("disabled upstream combined with an endpoint must be rejected at startup")
+	}
+}
+
+// An empty endpoint is the signal for the mode, not a malformed URL, so endpoint
+// validation must not run against it.
+func TestUpstreamDisabled_SkipsEndpointValidation(t *testing.T) {
+	cfg := NewDefault()
+	cfg.Upstream.Disabled = true
+	cfg.Upstream.Endpoint = ""
+
+	if err := validate(cfg); err != nil {
+		t.Fatalf("origin-less config must validate, got %v", err)
+	}
+}
+
+// The mode is read before defaults are applied, so no endpoint is ever invented.
+func TestUpstreamDisabled_EnvYieldsNoEndpoint(t *testing.T) {
+	t.Setenv("TAG_UPSTREAM_DISABLED", "true")
+
+	cfg := &Config{}
+	applyUpstreamModeEnv(cfg)
+	applyDefaults(cfg)
+	applyEnvOverrides(cfg)
+
+	if cfg.Upstream.Endpoint != "" {
+		t.Fatalf("endpoint = %q, want none in origin-less mode", cfg.Upstream.Endpoint)
+	}
+}
+
+// An explicit false must be able to override a YAML upstream.disabled: true,
+// matching how TAG_TRANSPARENT_PROXY behaves.
+func TestUpstreamDisabled_EnvFalseRestoresTheOrigin(t *testing.T) {
+	t.Setenv("TAG_UPSTREAM_DISABLED", "false")
+
+	cfg := &Config{}
+	cfg.Upstream.Disabled = true // as if set in YAML
+	applyUpstreamModeEnv(cfg)
+	applyDefaults(cfg)
+
+	if !cfg.Upstream.HasOrigin() {
+		t.Fatal("an explicit false must restore the default upstream")
+	}
+}
+
+// An endpoint the operator actually configured must survive to trip validation,
+// rather than being silently cleared.
+func TestUpstreamDisabled_EnvKeepsExplicitEndpointForValidation(t *testing.T) {
+	t.Setenv("TAG_UPSTREAM_DISABLED", "true")
+	t.Setenv("TAG_UPSTREAM_ENDPOINT", "https://t3.storage.dev")
+
+	cfg := &Config{}
+	applyUpstreamModeEnv(cfg)
+	applyDefaults(cfg)
+	applyEnvOverrides(cfg)
+
+	if err := validate(cfg); err == nil {
+		t.Fatal("an explicitly configured endpoint alongside the flag must be rejected")
+	}
+}
+
+func TestUpstreamDisabled_UnrecognizedEnvValueLeavesOriginIntact(t *testing.T) {
+	t.Setenv("TAG_UPSTREAM_DISABLED", "yes")
+
+	cfg := &Config{}
+	applyUpstreamModeEnv(cfg)
+	applyDefaults(cfg)
+	applyEnvOverrides(cfg)
+
+	if !cfg.Upstream.HasOrigin() {
+		t.Fatal("an unrecognized value must not drop the upstream")
+	}
+}
+
+// gRPC auth derives its token from the AWS credentials TAG uses upstream. With no
+// upstream there are none, so defaulting it on would force either a startup
+// failure or dummy keys — and dummy keys look like auth while proving nothing.
+func TestOriginless_DefaultsClusterAuthOff(t *testing.T) {
+	cfg := &Config{}
+	cfg.Upstream.Disabled = true
+	applyDefaults(cfg)
+	resolveClusterAuthDefault(cfg)
+
+	if cfg.Cache.IsGRPCAuthEnabled() {
+		t.Fatal("origin-less mode must not require cluster auth credentials it cannot have")
+	}
+}
+
+func TestOriginless_ExplicitClusterAuthIsHonored(t *testing.T) {
+	cfg := &Config{}
+	cfg.Upstream.Disabled = true
+	cfg.Cache.SetGRPCAuth(true)
+	applyDefaults(cfg)
+	resolveClusterAuthDefault(cfg)
+
+	if !cfg.Cache.IsGRPCAuthEnabled() {
+		t.Fatal("an explicit request for cluster auth must survive the origin-less default")
+	}
+}
+
+// The proxying path is unchanged: cluster auth stays on unless explicitly disabled.
+func TestWithOrigin_ClusterAuthStaysOn(t *testing.T) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+	resolveClusterAuthDefault(cfg)
+
+	if !cfg.Cache.IsGRPCAuthEnabled() {
+		t.Fatal("a deployment with an origin must keep cluster auth enabled by default")
+	}
+}
