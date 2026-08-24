@@ -245,9 +245,18 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// Decoded size, not wire size: a streaming-signed SDK upload frames the body
 	// (aws-chunked) and declares the real length in X-Amz-Decoded-Content-Length.
 	// Judging the threshold by wire length would reject payloads that fit.
+	//
+	// The declared size is REQUIRED, as on real S3 (411 without one): the budget
+	// reservation below must equal the bytes this handler can actually hold, and
+	// with no declared size the only safe reservation would be the full threshold
+	// for every request.
 	declaredSize := teeObjectSize(r)
-	maxSize := s.config.Cache.SizeThreshold
-	if declaredSize > maxSize {
+	if declaredSize < 0 {
+		s3err.WriteError(w, r, s3err.ErrMissingContentLength)
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return nil
+	}
+	if declaredSize > s.config.Cache.SizeThreshold {
 		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return nil
@@ -255,16 +264,11 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 
 	// The buffer below is real memory held for the duration of the store, so it
 	// draws on the same populate budget and count ceiling as every other cache
-	// write — without this, concurrent large PUTs would allocate past the
-	// configured budget unbounded. Shed with SlowDown when the budget declines:
-	// under pressure a retryable 503 beats an OOM kill.
-	weight := declaredSize
-	if weight <= 0 {
-		weight = smallObjectThreshold
-	}
-	if weight > s.perPopulateCap {
-		weight = s.perPopulateCap
-	}
+	// write. The reservation is EXACTLY the limiter's bound — declared size plus
+	// the one detection byte — never a clamped or nominal figure: a reservation
+	// smaller than the possible buffer re-creates the OOM the budget prevents.
+	// Shed with SlowDown when the budget declines; a retryable 503 beats a kill.
+	weight := declaredSize + 1
 	if !s.acquireCacheSlot(ctx, weight, priorityWarmWrite) {
 		s3err.WriteError(w, r, s3err.ErrSlowDown)
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
@@ -280,15 +284,17 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		reader = io.NopCloser(newAWSChunkedReader(r.Body))
 	}
 
-	// LimitReader at threshold+1: a body that exceeds the declared length or the
-	// threshold is detected by the extra byte rather than silently truncated.
-	body, err := io.ReadAll(io.LimitReader(reader, maxSize+1))
+	// The limiter bound matches the reservation: declared size plus one byte, so
+	// a body longer than declared is detected rather than buffered past what was
+	// admitted, and a shorter one is an IncompleteBody — both are the client
+	// misdescribing the request, not data to store under a wrong ETag.
+	body, err := io.ReadAll(io.LimitReader(reader, weight))
 	if err != nil {
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return err
 	}
-	if int64(len(body)) > maxSize {
-		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
+	if int64(len(body)) != declaredSize {
+		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return nil
 	}

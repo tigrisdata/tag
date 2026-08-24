@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -444,5 +445,48 @@ func TestOriginlessRoutes_AWSChunkedPutStoresDecodedBody(t *testing.T) {
 	s.router.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("oversized decoded length: code=%d, want 400 EntityTooLarge", w.Code)
+	}
+}
+
+// The budget reservation equals the limiter's bound, so the declared length is
+// load-bearing: a body that does not match it is the client misdescribing the
+// request, and is refused rather than stored under a wrong ETag.
+func TestOriginlessRoutes_PutDeclaredLengthIsEnforced(t *testing.T) {
+	s, _ := newOriginlessServer(t)
+
+	// Shorter than declared: IncompleteBody.
+	req := httptest.NewRequest(http.MethodPut, "/b/short.txt", strings.NewReader("ten bytes!"))
+	req.ContentLength = 100
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "IncompleteBody") {
+		t.Fatalf("short body: code=%d body=%q", w.Code, w.Body.String())
+	}
+
+	// Longer than declared: the limiter detects the overrun at declared+1 — the
+	// buffer never grows past what was admitted against the budget.
+	req = httptest.NewRequest(http.MethodPut, "/b/long.txt", strings.NewReader("twenty bytes of body"))
+	req.ContentLength = 5
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("over-declared body: code=%d", w.Code)
+	}
+
+	// Unknown length: 411, as on real S3 — with no declared size there is nothing
+	// truthful to reserve.
+	req = httptest.NewRequest(http.MethodPut, "/b/unknown.txt", io.NopCloser(strings.NewReader("x")))
+	req.ContentLength = -1
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusLengthRequired {
+		t.Fatalf("unknown length: code=%d, want 411", w.Code)
+	}
+
+	// None of the refusals stored anything.
+	for _, k := range []string{"short.txt", "long.txt", "unknown.txt"} {
+		if g := do(s, http.MethodGet, "/b/"+k, nil); g.Code != http.StatusNotFound {
+			t.Fatalf("%s: refused PUT stored something (code=%d)", k, g.Code)
+		}
 	}
 }
