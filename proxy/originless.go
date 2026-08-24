@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -206,6 +207,26 @@ func (s *Service) originlessMiss(w http.ResponseWriter, r *http.Request, operati
 	return nil
 }
 
+// originlessPutSize returns the number of body bytes a PUT declares. For a
+// streaming (aws-chunked) payload that is X-Amz-Decoded-Content-Length —
+// REQUIRED, and zero is valid (the SDK's empty-body default); sizing a framed
+// body by its wire Content-Length would reject valid uploads as IncompleteBody.
+// For a plain payload it is Content-Length, which Go reports as -1 when absent.
+func originlessPutSize(r *http.Request) (int64, bool) {
+	if IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) {
+		dcl := r.Header.Get("X-Amz-Decoded-Content-Length")
+		if dcl == "" {
+			return 0, false
+		}
+		n, err := strconv.ParseInt(dcl, 10, 64)
+		return n, err == nil && n >= 0
+	}
+	if r.ContentLength < 0 {
+		return 0, false
+	}
+	return r.ContentLength, true
+}
+
 // originlessPlainObject reports whether the request is a plain single-object
 // operation: no query parameters beyond the SDK's no-op x-id tag, and no
 // copy-source header (server-side copy needs a source read this mode does not
@@ -249,9 +270,10 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// The declared size is REQUIRED, as on real S3 (411 without one): the budget
 	// reservation below must equal the bytes this handler can actually hold, and
 	// with no declared size the only safe reservation would be the full threshold
-	// for every request.
-	declaredSize := teeObjectSize(r)
-	if declaredSize < 0 {
+	// for every request. Zero is a valid declaration — an empty object is the AWS
+	// SDK's default for empty bodies and must not be sized by its wire framing.
+	declaredSize, ok := originlessPutSize(r)
+	if !ok {
 		s3err.WriteError(w, r, s3err.ErrMissingContentLength)
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return nil
@@ -267,9 +289,20 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// write. The reservation is EXACTLY the limiter's bound — declared size plus
 	// the one detection byte — never a clamped or nominal figure: a reservation
 	// smaller than the possible buffer re-creates the OOM the budget prevents.
-	// Shed with SlowDown when the budget declines; a retryable 503 beats a kill.
+	//
+	// Admission is NON-BLOCKING (the read-miss path): a client-facing PUT must
+	// shed with a retryable SlowDown immediately, not park on the budget's
+	// condition variable — a reservation larger than the whole budget would
+	// otherwise wait out the server timeout before failing. An object too large
+	// to EVER fit the configured budget is a configuration mismatch and answers
+	// EntityTooLarge up front rather than SlowDown forever.
 	weight := declaredSize + 1
-	if !s.acquireCacheSlot(ctx, weight, priorityWarmWrite) {
+	if s.populateBudget != nil && weight > s.populateBudget.total {
+		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return nil
+	}
+	if !s.acquireCacheSlot(ctx, weight, priorityReadMiss) {
 		s3err.WriteError(w, r, s3err.ErrSlowDown)
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return nil

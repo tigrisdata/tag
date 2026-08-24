@@ -490,3 +490,60 @@ func TestOriginlessRoutes_PutDeclaredLengthIsEnforced(t *testing.T) {
 		}
 	}
 }
+
+// An empty streaming upload is the SDK's default for empty bodies: the decoded
+// length header says 0 and the wire carries only framing. It must store an empty
+// object, not be rejected as IncompleteBody by its framing size.
+func TestOriginlessRoutes_EmptyStreamingPutStoresEmptyObject(t *testing.T) {
+	s, _ := newOriginlessServer(t)
+
+	framed := "0;chunk-signature=deadbeef\r\n\r\n"
+	req := httptest.NewRequest(http.MethodPut, "/b/empty-stream.txt", strings.NewReader(framed))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	req.Header.Set("X-Amz-Decoded-Content-Length", "0")
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("empty streaming PUT: code=%d body=%q", w.Code, w.Body.String())
+	}
+	if g := do(s, http.MethodGet, "/b/empty-stream.txt", nil); g.Code != http.StatusOK || g.Body.Len() != 0 {
+		t.Fatalf("read-back: code=%d len=%d", g.Code, g.Body.Len())
+	}
+
+	// A streaming PUT without the decoded-length header has nothing truthful to
+	// reserve: 411.
+	req = httptest.NewRequest(http.MethodPut, "/b/no-dcl.txt", strings.NewReader(framed))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusLengthRequired {
+		t.Fatalf("streaming without decoded length: code=%d, want 411", w.Code)
+	}
+}
+
+// A declared size that can never fit the configured budget answers
+// EntityTooLarge immediately — never a blocking wait, never SlowDown-forever.
+func TestOriginlessRoutes_PutLargerThanBudgetFailsFast(t *testing.T) {
+	cfg := config.NewDefault()
+	cfg.Upstream.Disabled = true
+	cfg.Upstream.Endpoint = ""
+	cfg.Cache.SizeThreshold = 1 << 30
+	cfg.Cache.MaxPopulateMemoryBytes = 1 << 20 // 1 MiB budget, threshold far larger
+	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	svc := proxy.NewService(proxy.NewForwarder(nil, "", "auto", 10, nil, nil), c, cfg)
+	srv := NewServer(svc, "127.0.0.1", 0, false, 0)
+
+	req := httptest.NewRequest(http.MethodPut, "/b/huge.txt", strings.NewReader("tiny"))
+	req.ContentLength = 512 << 20 // declared 512 MiB against a 1 MiB budget
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { srv.router.ServeHTTP(w, req); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("over-budget PUT hung instead of failing fast")
+	}
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "EntityTooLarge") {
+		t.Fatalf("over-budget PUT: code=%d body=%q", w.Code, w.Body.String())
+	}
+}

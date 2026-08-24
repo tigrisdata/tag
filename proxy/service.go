@@ -279,6 +279,7 @@ const warmPopulateAcquireTimeout = 30 * time.Second
 type byteBudget struct {
 	mu          sync.Mutex
 	cond        *sync.Cond // signaled on release so waiting warm-on-write acquirers wake
+	total       int64 // configured capacity; immutable after construction
 	remaining   int64
 	pendingWarm int64 // sum of weights of warm-on-write acquirers currently waiting
 	reserveCap  int64 // max bytes read-miss/staging will hold back for pending warm-on-write
@@ -314,7 +315,7 @@ func newByteBudget(total int64, reserveFraction float64, perPopulateCap int64) *
 	}
 	// Default: staging may use the whole budget (no extra cap). Callers that run block-serve
 	// staging (NewService) set a smaller stagingCap to guarantee populates a floor.
-	b := &byteBudget{remaining: total, reserveCap: cap, stagingCap: total}
+	b := &byteBudget{total: total, remaining: total, reserveCap: cap, stagingCap: total}
 	b.cond = sync.NewCond(&b.mu)
 	return b
 }
