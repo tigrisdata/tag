@@ -593,31 +593,60 @@ func TestDecodedMetaTierRetainsSnapshotAcrossTransientGetError(t *testing.T) {
 	}
 }
 
+func TestIsMetaNotFoundError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"grpc not found", status.Error(codes.NotFound, "key not found"), true},
+		{"unavailable routing", status.Error(codes.Unavailable, "routing error: node not found in ring"), false},
+		{"unavailable forwarding", status.Error(codes.Unavailable, "forwarding error: key not found"), false},
+		{"plain missing-key text", errors.New("key not found"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isMetaNotFoundError(tc.err); got != tc.want {
+				t.Fatalf("isMetaNotFoundError(%v) = %t, want %t", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDecodedMetaTierRetainsSnapshotAcrossRoutingGetError(t *testing.T) {
-	ctx := context.Background()
-	client := newDecodedMetaTestClient(cacheclient.ModeCluster)
-	c := newDecodedMetaTestCache(t, client)
-	const bucket, key = "bucket", "routing-get"
+	for _, tc := range []struct {
+		name    string
+		message string
+	}{
+		{"ring lookup", "routing error: node not found in ring"},
+		{"forwarded miss", "forwarding error: key not found"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			client := newDecodedMetaTestClient(cacheclient.ModeCluster)
+			c := newDecodedMetaTestCache(t, client)
+			const bucket, key = "bucket", "routing-get"
 
-	if err := c.PutWithMeta(ctx, bucket, key, testDecodedMeta(bucket, key, `"v1"`), []byte("body"), 60); err != nil {
-		t.Fatalf("PutWithMeta: %v", err)
-	}
-	admitDecodedMeta(t, c, bucket, key)
-	replaceDecodedSnapshot(t, c, bucket, key, `"resident"`)
+			if err := c.PutWithMeta(ctx, bucket, key, testDecodedMeta(bucket, key, `"v1"`), []byte("body"), 60); err != nil {
+				t.Fatalf("PutWithMeta: %v", err)
+			}
+			admitDecodedMeta(t, c, bucket, key)
+			replaceDecodedSnapshot(t, c, bucket, key, `"resident"`)
 
-	routingErr := status.Error(codes.Unavailable, "routing error: node not found in ring")
-	client.setFailMetaGets(routingErr)
-	meta, found, err := c.GetMeta(ctx, bucket, key)
-	if got := status.Code(err); got != codes.Unavailable || found || meta != nil {
-		t.Fatalf("GetMeta during routing failure = (meta=%v, found=%t, code=%v), want (nil, false, Unavailable)", meta, found, got)
-	}
-	if _, ok := c.decodedMeta.Peek(MakeMetaKey(bucket, key)); !ok {
-		t.Fatal("routing metadata read error evicted the decoded snapshot")
-	}
+			unavailableErr := status.Error(codes.Unavailable, tc.message)
+			client.setFailMetaGets(unavailableErr)
+			meta, found, err := c.GetMeta(ctx, bucket, key)
+			if got := status.Code(err); got != codes.Unavailable || found || meta != nil {
+				t.Fatalf("GetMeta during unavailable failure = (meta=%v, found=%t, code=%v), want (nil, false, Unavailable)", meta, found, got)
+			}
+			if _, ok := c.decodedMeta.Peek(MakeMetaKey(bucket, key)); !ok {
+				t.Fatal("unavailable metadata read error evicted the decoded snapshot")
+			}
 
-	client.setFailMetaGets(nil)
-	if got := mustGetDecodedMeta(t, c, bucket, key).ETag; got != `"resident"` {
-		t.Fatalf("metadata after routing read recovery = %s, want retained resident snapshot", got)
+			client.setFailMetaGets(nil)
+			if got := mustGetDecodedMeta(t, c, bucket, key).ETag; got != `"resident"` {
+				t.Fatalf("metadata after unavailable read recovery = %s, want retained resident snapshot", got)
+			}
+		})
 	}
 }
 
