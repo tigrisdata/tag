@@ -30,7 +30,7 @@ No AWS credentials are required. Startup logs a single line stating the mode and
 
 ## What it serves
 
-`GET` and `HEAD` of a single object, from cache alone:
+**Plain** `GET` and `HEAD` of a single object, from cache alone. Any query parameter — `?versionId`, `?partNumber`, `?tagging`, and the rest — selects a representation or an operation this mode does not implement, and answers `501` rather than silently serving the current full object. The one exception is `x-id`, the no-op operation tag `aws-sdk-go-v2` appends to every request, which is ignored:
 
 - **Hit** — served exactly as the proxying mode serves it: full objects, ranges (including block-mode entries), `If-None-Match` / `If-Modified-Since` conditionals, with the `X-Cache` header set.
 - **Miss** — `NoSuchKey`, immediately. This is the signal the calling system uses to fall back to its authoritative store.

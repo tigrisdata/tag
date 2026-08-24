@@ -365,6 +365,8 @@ help:
 	@echo "  s3-test-local-blocks   - Start TAG locally with block-aligned caching on (small block_size)"
 	@echo "  s3-test-local-cluster  - Start TAG locally as a 2-node cluster"
 	@echo "  s3-test-local-cluster-blocks - Start a 2-node cluster with block-aligned caching on"
+	@echo "  s3-test-originless     - Hermetic origin-less lifecycle: warm via local mock upstream, flip, serve"
+	@echo "                           e.g. make s3-test-originless   (no credentials or network needed)"
 	@echo "  s3-tests               - Run S3 compatibility tests (Python s3-tests)"
 	@echo "  s3-tests-clean         - Remove cloned s3-tests repository"
 	@echo "  s3-test-local-down     - Stop local TAG and cleanup"
@@ -441,6 +443,47 @@ s3-test-local: build
 	@timeout 30 bash -c 'until curl -s http://localhost:$(TAG_LOCAL_HTTP_PORT)/health > /dev/null 2>&1; do sleep 1; done' || \
 		(echo "TAG failed to start"; exit 1)
 	@echo "TAG is ready at http://localhost:$(TAG_LOCAL_HTTP_PORT)"
+
+.PHONY: s3-test-originless
+s3-test-originless: build
+	@echo "Running origin-less lifecycle test (warm via mock upstream -> flip -> serve)..."
+	@set -e; \
+	B="originless-ci"; \
+	DATA_DIR=/tmp/tag-originless-cache; \
+	MOCK_PORT=18100; \
+	cleanup() { pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; lsof -ti:$$MOCK_PORT | xargs kill 2>/dev/null || true; }; \
+	trap cleanup EXIT; \
+	pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; \
+	lsof -ti:$(TAG_LOCAL_HTTP_PORT) | xargs kill 2>/dev/null || true; \
+	lsof -ti:$$MOCK_PORT | xargs kill 2>/dev/null || true; sleep 1; \
+	rm -rf $$DATA_DIR && mkdir -p $$DATA_DIR; \
+	echo "--- Phase 1: warm through proxy mode against the local mock upstream"; \
+	CGO_ENABLED=0 go run ./tests/originless/mockupstream :$$MOCK_PORT & \
+	timeout 30 bash -c "until curl -s http://localhost:$$MOCK_PORT/ >/dev/null 2>&1; do sleep 0.5; done"; \
+	AWS_ACCESS_KEY_ID=originless-test AWS_SECRET_ACCESS_KEY=originless-test \
+		TAG_UPSTREAM_ENDPOINT=http://localhost:$$MOCK_PORT TAG_CACHE_DISK_PATH=$$DATA_DIR \
+		TAG_CACHE_NODE_ID=tag-originless TAG_CACHE_CLUSTER_ADDR=:$(TAG_LOCAL_CLUSTER_PORT) \
+		TAG_CACHE_GRPC_ADDR=:$(TAG_LOCAL_GRPC_PORT) TAG_LOG_LEVEL=warn \
+		./$(BINARY_NAME) & \
+	timeout 30 bash -c 'until curl -s http://localhost:$(TAG_LOCAL_HTTP_PORT)/health >/dev/null 2>&1; do sleep 1; done'; \
+	ORIGINLESS_PHASE=warm ORIGINLESS_BUCKET=$$B AWS_ACCESS_KEY_ID=originless-test AWS_SECRET_ACCESS_KEY=originless-test CGO_ENABLED=0 go test -tags originless -v -timeout 120s -run TestWarmPhase ./tests/originless/; \
+	echo "--- Phase 2: flip to origin-less (same cache dir, no creds, no upstream)"; \
+	pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; \
+	timeout 40 bash -c 'while pgrep -fx "./$(BINARY_NAME)" >/dev/null 2>&1; do sleep 0.5; done' || \
+		{ echo "proxy-mode TAG did not exit; RocksDB lock would collide"; exit 1; }; \
+	\
+	lsof -ti:$$MOCK_PORT | xargs kill 2>/dev/null || true; \
+	sleep 1; \
+	env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u TAG_UPSTREAM_ENDPOINT \
+		TAG_UPSTREAM_DISABLED=true TAG_CACHE_DISK_PATH=$$DATA_DIR \
+		TAG_CACHE_NODE_ID=tag-originless TAG_CACHE_CLUSTER_ADDR=:$(TAG_LOCAL_CLUSTER_PORT) \
+		TAG_CACHE_GRPC_ADDR=:$(TAG_LOCAL_GRPC_PORT) TAG_LOG_LEVEL=warn \
+		./$(BINARY_NAME) & \
+	timeout 60 bash -c 'until curl -s http://localhost:$(TAG_LOCAL_HTTP_PORT)/health >/dev/null 2>&1; do sleep 1; done'; \
+	ORIGINLESS_PHASE=serve ORIGINLESS_BUCKET=$$B CGO_ENABLED=0 go test -tags originless -v -timeout 120s -run TestServePhase ./tests/originless/; \
+	pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; \
+	rm -rf $$DATA_DIR; \
+	echo "origin-less lifecycle: PASS"
 
 .PHONY: s3-test-local-down
 s3-test-local-down:

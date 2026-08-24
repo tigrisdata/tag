@@ -62,6 +62,17 @@ func TestOriginlessRoutes_ReadsServeFromCacheAlone(t *testing.T) {
 		t.Fatalf("miss: code=%d body=%q", w.Code, w.Body.String())
 	}
 
+	// The SDK operation tag must not defeat the plain-read rule: aws-sdk-go-v2
+	// appends ?x-id=GetObject to every GetObject, and the tigris-os gateway is
+	// exactly such a client.
+	if w := do(s, http.MethodGet, "/b/pub.txt?x-id=GetObject", nil); w.Code != http.StatusOK {
+		t.Fatalf("SDK-tagged GET: code=%d, want 200", w.Code)
+	}
+	// But x-id does not launder other parameters through.
+	if w := do(s, http.MethodGet, "/b/pub.txt?x-id=GetObject&versionId=abc", nil); w.Code != http.StatusNotImplemented {
+		t.Fatalf("x-id plus versionId: code=%d, want 501", w.Code)
+	}
+
 	// Hit: served with body and HIT header.
 	w := do(s, http.MethodGet, "/b/pub.txt", nil)
 	if w.Code != http.StatusOK || w.Body.String() != "hello world" {
@@ -139,8 +150,10 @@ func TestOriginlessRoutes_MutationsNeverReachHandlersOrTouchCache(t *testing.T) 
 		}
 	}
 
-	// Listings and subresources are operations, not objects.
-	for _, target := range []string{"/b?list-type=2", "/", "/b/k1.txt?tagging", "/b/k1.txt?acl"} {
+	// Listings, subresources, and representation selectors are operations, not
+	// plain object reads. versionId and partNumber matter most: serving the
+	// current full object for them would be silently wrong data.
+	for _, target := range []string{"/b?list-type=2", "/", "/b/k1.txt?tagging", "/b/k1.txt?acl", "/b/k1.txt?versionId=abc", "/b/k1.txt?partNumber=2", "/b/k1.txt?attributes"} {
 		if w := do(s, http.MethodGet, target, nil); w.Code != http.StatusNotImplemented {
 			t.Fatalf("GET %s: code=%d, want 501", target, w.Code)
 		}

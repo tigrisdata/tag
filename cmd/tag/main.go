@@ -314,9 +314,12 @@ func main() {
 		objectCache = cache.NewDisabledCache()
 	}
 
-	// 3. Initialize local auth for transparent proxy
+	// 3. Initialize local auth for transparent proxy.
+	// Gated on an origin like the proxy signer above: local auth validates against
+	// keys learned from the upstream, so with no origin the machinery would be
+	// built, logged as enabled, and never consulted.
 	var localAuth *proxy.LocalAuthConfig
-	if cfg.Upstream.IsTransparentProxy() {
+	if cfg.Upstream.HasOrigin() && cfg.Upstream.IsTransparentProxy() {
 		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 		derivedKeyStore := auth.NewDerivedKeyStore(auth.DefaultDerivedKeyTTL)
 		keyUnwrapper, err := auth.NewKeyUnwrapper(secretKey)

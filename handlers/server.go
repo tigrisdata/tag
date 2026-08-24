@@ -320,11 +320,9 @@ func (rt *responseTracker) Flush() {
 // unsupported handler FIRST so a subresource read cannot fall through to the
 // object route and be answered with the object body.
 func (s *Server) setupOriginlessRoutes(r *mux.Router) {
-	for _, q := range []string{"uploadId", "tagging", "acl", "uploads"} {
-		r.HandleFunc("/{bucket}/{object:.+}", s.handleOriginlessUnsupported).Queries(q, "")
-		r.HandleFunc("/{bucket}/{object:.+}", s.handleOriginlessUnsupported).Queries(q, "{v}")
-	}
-
+	// No per-parameter route pins: the handler itself rejects ANY query parameter
+	// (versionId, partNumber, tagging, …) as 501, so the enumeration cannot go
+	// stale as S3 grows parameters.
 	r.HandleFunc("/{bucket}/{object:.+}", s.handleOriginlessObject).Methods("GET", "HEAD")
 
 	// Everything else — listings, mutations, bucket operations, unknown verbs.

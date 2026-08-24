@@ -40,6 +40,24 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
 
+	// Plain reads only. A query parameter selects a representation or an
+	// operation this mode does not implement — ?versionId asks for a specific
+	// version, ?partNumber for one part, ?tagging for a subresource — and serving
+	// the current full object for those is silently wrong data, not a convenience.
+	// One rule instead of an enumerated parameter list that goes stale.
+	//
+	// The single exception is x-id, the operation tag aws-sdk-go-v2 appends to
+	// every plain request (?x-id=GetObject). It restates what method+path already
+	// say and selects nothing, and rejecting it would 501 every standard SDK read
+	// — including the tigris-os gateway this mode exists to serve.
+	if r.URL.RawQuery != "" {
+		q := r.URL.Query()
+		q.Del("x-id")
+		if len(q) > 0 {
+			return s.HandleOriginlessUnsupported(w, r)
+		}
+	}
+
 	operation := "GetObject"
 	if r.Method == http.MethodHead {
 		operation = "HeadObject"
