@@ -466,7 +466,7 @@ s3-test-originless: build
 		TAG_CACHE_GRPC_ADDR=:$(TAG_LOCAL_GRPC_PORT) TAG_LOG_LEVEL=warn \
 		./$(BINARY_NAME) & \
 	timeout 30 bash -c 'until curl -s http://localhost:$(TAG_LOCAL_HTTP_PORT)/health >/dev/null 2>&1; do sleep 1; done'; \
-	ORIGINLESS_PHASE=warm ORIGINLESS_BUCKET=$$B $(CGO_ENV) go test -tags originless -v -timeout 120s -run TestWarmPhase ./tests/originless/; \
+	ORIGINLESS_PHASE=warm ORIGINLESS_BUCKET=$$B CGO_ENABLED=0 go test -tags originless -v -timeout 120s -run TestWarmPhase ./tests/originless/; \
 	echo "--- Phase 2: flip to origin-less (same cache dir, no creds, no upstream)"; \
 	pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; \
 	timeout 40 bash -c 'while pgrep -fx "./$(BINARY_NAME)" >/dev/null 2>&1; do sleep 0.5; done' || \
@@ -478,11 +478,11 @@ s3-test-originless: build
 		TAG_CACHE_GRPC_ADDR=:$(TAG_LOCAL_GRPC_PORT) TAG_LOG_LEVEL=warn \
 		./$(BINARY_NAME) & \
 	timeout 60 bash -c 'until curl -s http://localhost:$(TAG_LOCAL_HTTP_PORT)/health >/dev/null 2>&1; do sleep 1; done'; \
-	ORIGINLESS_PHASE=serve ORIGINLESS_BUCKET=$$B $(CGO_ENV) go test -tags originless -v -timeout 120s -run TestServePhase ./tests/originless/; \
+	ORIGINLESS_PHASE=serve ORIGINLESS_BUCKET=$$B CGO_ENABLED=0 go test -tags originless -v -timeout 120s -run TestServePhase ./tests/originless/; \
 	echo "--- Phase 3: cleanup (directly against upstream)"; \
 	pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; \
 	ORIGINLESS_PHASE=cleanup ORIGINLESS_BUCKET=$$B ORIGINLESS_UPSTREAM=$$UPSTREAM \
-		$(CGO_ENV) go test -tags originless -v -timeout 60s -run TestCleanupPhase ./tests/originless/; \
+		CGO_ENABLED=0 go test -tags originless -v -timeout 60s -run TestCleanupPhase ./tests/originless/; \
 	rm -rf $$DATA_DIR; \
 	echo "origin-less lifecycle: PASS"
 
