@@ -140,6 +140,33 @@ func newHeadCacheBenchmarkFixture(tb testing.TB, keyCount int) *headCacheBenchma
 	return newHeadCacheBenchmarkFixtureWithMeta(tb, keyCount, newHeadCacheBenchmarkMeta)
 }
 
+// waitForHeadCacheBenchmarkWriteReady waits for the local replica to become
+// healthy in the ring. WaitReady reaches ACTIVE before the first heartbeat can
+// make that replica eligible for a write, so a fixture can otherwise fail while
+// populating its untimed input.
+func waitForHeadCacheBenchmarkWriteReady(embeddedCache *embedded.Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const readyKey = "head-cache-benchmark-ready"
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		if err := embeddedCache.Put(ctx, readyKey, []byte("ready"), 1); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for first embedded-cache write: %w", lastErr)
+		case <-ticker.C:
+		}
+	}
+}
+
 // newHeadCacheBenchmarkEmbeddedCache retries only startup work that can lose a
 // just-released loopback port to another benchmark process. A successful attempt
 // is the sole cache used by the timed benchmark; retries never repeat a sample.
@@ -178,6 +205,11 @@ func newHeadCacheBenchmarkEmbeddedCache(tb testing.TB, cfg *config.Config) *embe
 		if err != nil {
 			_ = embeddedCache.Close()
 			lastErr = fmt.Errorf("wait for embedded cache: %w", err)
+			continue
+		}
+		if err := waitForHeadCacheBenchmarkWriteReady(embeddedCache); err != nil {
+			_ = embeddedCache.Close()
+			lastErr = err
 			continue
 		}
 		tb.Cleanup(func() { _ = embeddedCache.Close() })
