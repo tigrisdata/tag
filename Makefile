@@ -115,6 +115,38 @@ TEST ?=
 TESTRUN ?=
 TESTFLAGS := $(if $(TEST),-run $(TEST),$(if $(TESTRUN),-run $(TESTRUN),))
 
+# Output path for the standalone embedded-cache HEAD benchmark test binary.
+BENCH_OUTPUT ?= /tmp/tag-head-cache-benchmark.test
+
+# The Linux benchmark target links the real embedded RocksDB cache in minimal
+# benchmark workers, where runtime compression libraries may be present without
+# their development symlinks. Build the one missing static dependency from a
+# pinned source archive and link the host runtime libraries through output-lane
+# symlinks.
+HEAD_CACHE_BENCH_NATIVE_DIR ?= $(dir $(BENCH_OUTPUT))head-cache-benchmark-native
+HEAD_CACHE_BENCH_SNAPPY_VERSION := 1.2.2
+HEAD_CACHE_BENCH_SNAPPY_URL := https://github.com/google/snappy/archive/refs/tags/$(HEAD_CACHE_BENCH_SNAPPY_VERSION).tar.gz
+HEAD_CACHE_BENCH_SNAPPY_SHA256 := 90f74bc1fbf78a6c56b3c4a082a05103b3a56bb17bca1a27e052ea11723292dc
+HEAD_CACHE_BENCH_SNAPPY_ARCHIVE := $(HEAD_CACHE_BENCH_NATIVE_DIR)/snappy-$(HEAD_CACHE_BENCH_SNAPPY_VERSION).tar.gz
+HEAD_CACHE_BENCH_SNAPPY_SOURCE_DIR := $(HEAD_CACHE_BENCH_NATIVE_DIR)/snappy-$(HEAD_CACHE_BENCH_SNAPPY_VERSION)
+HEAD_CACHE_BENCH_SNAPPY_BUILD_DIR := $(HEAD_CACHE_BENCH_NATIVE_DIR)/snappy-build
+HEAD_CACHE_BENCH_SNAPPY_LIB := $(HEAD_CACHE_BENCH_SNAPPY_BUILD_DIR)/libsnappy.a
+HEAD_CACHE_BENCH_SYSTEM_LIB_DIR := $(HEAD_CACHE_BENCH_NATIVE_DIR)/system-libs
+
+ifeq ($(UNAME_S),Darwin)
+HEAD_CACHE_BENCH_CGO_ENV := $(CGO_ENV)
+HEAD_CACHE_BENCH_BUILD_TAGS := $(BUILD_TAGS)
+else
+HEAD_CACHE_BENCH_CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -lrocksdb -ljemalloc -ldl -lstdc++ -lm \
+	-L$(HEAD_CACHE_BENCH_SYSTEM_LIB_DIR) -lz -lbz2 -L$(HEAD_CACHE_BENCH_SNAPPY_BUILD_DIR) -lsnappy \
+	-llz4 -lzstd -pthread
+HEAD_CACHE_BENCH_CGO_ENV := CGO_ENABLED=1 CGO_CFLAGS="-I$(ROCKSDB_STATIC_DIR)/include" CGO_LDFLAGS="$(HEAD_CACHE_BENCH_CGO_LDFLAGS)"
+# Suppress grocksdb's default -l<compression> flags: the target supplies the
+# exact libraries above so it does not require the system development packages.
+HEAD_CACHE_BENCH_BUILD_TAGS := -tags grocksdb_no_link
+HEAD_CACHE_BENCH_DEPS := head-cache-benchmark-system-libs head-cache-benchmark-snappy
+endif
+
 # Build targets
 .PHONY: all
 all: build
@@ -193,6 +225,54 @@ test: build
 .PHONY: test-all
 test-all: test test-integration
 	@echo "All tests completed!"
+
+# Build a test binary so the embedded-cache HEAD benchmark can be run repeatedly
+# without recompiling between samples. The Linux target builds a pinned static
+# Snappy library in the benchmark output lane; it still runs the normal embedded
+# RocksDB storage implementation.
+.PHONY: build-head-cache-benchmark
+build-head-cache-benchmark: rocksdb-static $(HEAD_CACHE_BENCH_DEPS)
+	@mkdir -p "$(dir $(BENCH_OUTPUT))"
+	$(HEAD_CACHE_BENCH_CGO_ENV) go test $(HEAD_CACHE_BENCH_BUILD_TAGS) $(TEST_LDFLAGS) -c -o "$(BENCH_OUTPUT)" ./cmd/tag
+
+ifeq ($(UNAME_S),Linux)
+.PHONY: head-cache-benchmark-system-libs
+head-cache-benchmark-system-libs:
+	@set -eu; \
+	PATH="$$PATH:/sbin:/usr/sbin"; export PATH; \
+	if ! command -v ldconfig >/dev/null; then \
+		echo "ldconfig is required to locate runtime compression libraries"; \
+		exit 1; \
+	fi; \
+	mkdir -p "$(HEAD_CACHE_BENCH_SYSTEM_LIB_DIR)"; \
+	for library in z bz2 lz4 zstd; do \
+		path=$$(ldconfig -p | awk -v prefix="lib$$library.so" 'index($$1, prefix) == 1 { print $$NF; exit }'); \
+		if [ -z "$$path" ]; then \
+			echo "runtime library lib$$library.so was not found"; \
+			exit 1; \
+		fi; \
+		ln -sf "$$path" "$(HEAD_CACHE_BENCH_SYSTEM_LIB_DIR)/lib$$library.so"; \
+	done
+
+.PHONY: head-cache-benchmark-snappy
+head-cache-benchmark-snappy:
+	@set -eu; \
+	if ! command -v cmake >/dev/null; then \
+		echo "cmake is required to build the embedded-cache benchmark dependency"; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$(HEAD_CACHE_BENCH_SNAPPY_LIB)" ]; then \
+		mkdir -p "$(HEAD_CACHE_BENCH_NATIVE_DIR)"; \
+		rm -rf "$(HEAD_CACHE_BENCH_SNAPPY_SOURCE_DIR)" "$(HEAD_CACHE_BENCH_SNAPPY_BUILD_DIR)"; \
+		curl -fsSL "$(HEAD_CACHE_BENCH_SNAPPY_URL)" -o "$(HEAD_CACHE_BENCH_SNAPPY_ARCHIVE)"; \
+		printf '%s  %s\n' "$(HEAD_CACHE_BENCH_SNAPPY_SHA256)" "$(HEAD_CACHE_BENCH_SNAPPY_ARCHIVE)" | sha256sum -c -; \
+		tar -xzf "$(HEAD_CACHE_BENCH_SNAPPY_ARCHIVE)" -C "$(HEAD_CACHE_BENCH_NATIVE_DIR)"; \
+		cmake -S "$(HEAD_CACHE_BENCH_SNAPPY_SOURCE_DIR)" -B "$(HEAD_CACHE_BENCH_SNAPPY_BUILD_DIR)" \
+			-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+			-DSNAPPY_BUILD_TESTS=OFF -DSNAPPY_BUILD_BENCHMARKS=OFF; \
+		cmake --build "$(HEAD_CACHE_BENCH_SNAPPY_BUILD_DIR)" --parallel 2; \
+	fi
+endif
 
 .PHONY: test-auth
 test-auth:
@@ -324,6 +404,14 @@ help:
 	@echo "  verify-jemalloc - Verify jemalloc is the linked, active allocator (Linux; run by build)"
 	@echo "                    Example: make build (auto-runs it) or make verify-jemalloc after a build"
 	@echo "  rocksdb-static  - Download RocksDB static artifacts (auto-downloaded by build)"
+	@echo "  build-head-cache-benchmark - Build the embedded-cache HEAD benchmark test binary"
+	@echo "                    Example: make build-head-cache-benchmark BENCH_OUTPUT=/tmp/head-cache-benchmark.test"
+ifeq ($(UNAME_S),Linux)
+	@echo "  head-cache-benchmark-system-libs - Link runtime compression libraries for the HEAD benchmark (Linux)"
+	@echo "                    Example: make head-cache-benchmark-system-libs"
+	@echo "  head-cache-benchmark-snappy - Build pinned static Snappy for the HEAD benchmark (Linux)"
+	@echo "                    Example: make head-cache-benchmark-snappy"
+endif
 	@echo ""
 	@echo "  Build requires RocksDB static artifacts which are auto-downloaded."
 	@echo "  Platforms supported: Linux-x86_64, Linux-aarch64, macOS-arm64"
