@@ -317,20 +317,31 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		reader = io.NopCloser(newAWSChunkedReader(r.Body))
 	}
 
-	// The limiter bound matches the reservation: declared size plus one byte, so
-	// a body longer than declared is detected rather than buffered past what was
-	// admitted, and a shorter one is an IncompleteBody — both are the client
-	// misdescribing the request, not data to store under a wrong ETag.
-	body, err := io.ReadAll(io.LimitReader(reader, weight))
-	if err != nil {
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
-		return err
-	}
-	if int64(len(body)) != declaredSize {
+	// The allocation IS the reservation: one buffer of exactly declared+1 bytes,
+	// filled with ReadFull. io.ReadAll would grow its backing array geometrically
+	// and could retain up to ~2x the reservation — the undercount the budget
+	// exists to prevent. The extra byte detects a body longer than declared; a
+	// shorter one is an IncompleteBody. Both are the client misdescribing the
+	// request, not data to store under a wrong ETag.
+	buf := make([]byte, weight)
+	n, err := io.ReadFull(reader, buf)
+	switch {
+	case err == nil:
+		// Filled declared+1 bytes: the body is longer than declared.
 		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return nil
+	case err == io.EOF || err == io.ErrUnexpectedEOF:
+		if int64(n) != declaredSize {
+			s3err.WriteError(w, r, s3err.ErrIncompleteBody)
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return nil
+		}
+	default:
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return err
 	}
+	body := buf[:declaredSize]
 
 	sum := md5.Sum(body)
 	etag := `"` + hex.EncodeToString(sum[:]) + `"`
