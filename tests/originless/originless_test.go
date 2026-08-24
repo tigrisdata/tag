@@ -273,13 +273,27 @@ func TestCleanupPhase(t *testing.T) {
 	ctx := context.Background()
 	// Directly against the upstream: TAG is origin-less (or down) and cannot delete.
 	client := sdkClient(t, os.Getenv("ORIGINLESS_UPSTREAM"), false)
-	for _, key := range []string{objKey, emptyKey} {
-		if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(b), Key: aws.String(key)}); err != nil {
-			t.Logf("delete %s: %v", key, err)
+
+	// Sweep everything rather than the keys we think we wrote, then retry the
+	// bucket delete: object deletion is eventually consistent, and a DeleteBucket
+	// issued immediately after the deletes can still see them (observed as a 409
+	// BucketNotEmpty in CI for a bucket that was in fact empty moments later).
+	for attempt := 1; attempt <= 6; attempt++ {
+		list, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(b)})
+		if err != nil {
+			t.Fatalf("list for cleanup: %v", err)
 		}
+		for _, obj := range list.Contents {
+			if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(b), Key: obj.Key}); err != nil {
+				t.Logf("delete %s: %v", aws.ToString(obj.Key), err)
+			}
+		}
+		if _, err := client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(b)}); err == nil {
+			fmt.Println("cleaned", b)
+			return
+		} else if attempt == 6 {
+			t.Errorf("delete bucket after %d attempts: %v", attempt, err)
+		}
+		time.Sleep(2 * time.Second)
 	}
-	if _, err := client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(b)}); err != nil {
-		t.Errorf("delete bucket: %v", err)
-	}
-	fmt.Println("cleaned", b)
 }
