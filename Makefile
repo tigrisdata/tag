@@ -451,7 +451,7 @@ s3-test-originless: build
 	B="originless-ci"; \
 	DATA_DIR=/tmp/tag-originless-cache; \
 	MOCK_PORT=18100; \
-	cleanup() { pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; pkill -f "originless/mockupstream" 2>/dev/null || true; lsof -ti:$$MOCK_PORT | xargs kill 2>/dev/null || true; }; \
+	cleanup() { pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; lsof -ti:$$MOCK_PORT | xargs kill 2>/dev/null || true; }; \
 	trap cleanup EXIT; \
 	pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; \
 	lsof -ti:$(TAG_LOCAL_HTTP_PORT) | xargs kill 2>/dev/null || true; \
@@ -471,7 +471,7 @@ s3-test-originless: build
 	pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; \
 	timeout 40 bash -c 'while pgrep -fx "./$(BINARY_NAME)" >/dev/null 2>&1; do sleep 0.5; done' || \
 		{ echo "proxy-mode TAG did not exit; RocksDB lock would collide"; exit 1; }; \
-	pkill -f "originless/mockupstream" 2>/dev/null || true; \
+	\
 	lsof -ti:$$MOCK_PORT | xargs kill 2>/dev/null || true; \
 	sleep 1; \
 	env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u TAG_UPSTREAM_ENDPOINT \
