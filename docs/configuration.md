@@ -9,6 +9,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `AWS_ACCESS_KEY_ID`               | S3 access key (must have read-only access for all buckets accessed through TAG) | (required)               |
 | `AWS_SECRET_ACCESS_KEY`           | S3 secret key for authentication                                                | (required)               |
 | `TAG_UPSTREAM_ENDPOINT`           | Tigris S3 endpoint URL                                                          | `https://t3.storage.dev` |
+| `TAG_UPSTREAM_DISABLED`           | Origin-less mode: no upstream at all — misses answer `NoSuchKey`, mutations `501`. `true`/`1` enable, explicit `false`/`0` override YAML, anything else is ignored. Mutually exclusive with an endpoint. See [Origin-less mode](originless-mode.md) | `false`                  |
 | `TAG_UPSTREAM_REGION`             | Upstream region for SigV4 signing scope                                         | `auto`                   |
 | `TAG_MAX_IDLE_CONNS_PER_HOST`     | HTTP connection pool size per upstream host                                     | `100`                    |
 | `TAG_CACHE_TTL`                   | Default TTL for cached objects (Go duration, e.g. `12h`, `30m`)                 | `24h`                    |
@@ -104,6 +105,13 @@ upstream:
   # When false, TAG validates and re-signs requests (signing mode).
   # Default: true
   transparent_proxy: true
+
+  # Origin-less mode: run with no upstream at all. Cache misses answer NoSuchKey
+  # and every mutation answers 501; TAG serves only what its cache already holds.
+  # Mutually exclusive with endpoint — setting both is a startup error.
+  # See docs/originless-mode.md before enabling.
+  # Default: false
+  disabled: false
 
 # Cache configuration (embedded OCache)
 cache:
@@ -340,7 +348,7 @@ upstream:
 
 Notes:
 
-- The `endpoint` must be an absolute `http://` or `https://` URL with a host; TAG refuses to start otherwise (in any mode).
+- The `endpoint` must be an absolute `http://` or `https://` URL with a host; TAG refuses to start otherwise. The one configuration without an endpoint is [origin-less mode](originless-mode.md), which has no upstream to validate.
 - Set `region` to match the backend. The default `auto` is Tigris-specific; region-sensitive services such as AWS S3 return signature errors unless the region matches the endpoint (e.g., `us-east-1` for `s3.us-east-1.amazonaws.com`).
 - Transparent proxy mode and its zero-config, no-double-auth experience are Tigris-only. Third-party backends are supported on a best-effort, community-supported basis.
 - TAG logs a warning at startup when signing mode runs against a non-Tigris endpoint.

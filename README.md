@@ -124,6 +124,7 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 - **Docker** — single-node and cluster Compose in [`deploy/docker/`](deploy/docker/); see [docs/docker.md](docs/docker.md).
 - **TLS/HTTPS** — see [docs/tls.md](docs/tls.md).
 - **Parquet workloads** — caching parquet metadata ahead of the reader that needs it; see [docs/parquet-optimization.md](docs/parquet-optimization.md).
+- **Origin-less mode** — running TAG as a cache tier with no upstream, for systems that own their own fallback; see [docs/originless-mode.md](docs/originless-mode.md).
 - **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Architecture
