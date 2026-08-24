@@ -187,6 +187,7 @@ if [ -n "$ORIGINLESS" ]; then
         "test_get_object_ifnonematch_failed"
         "test_get_object_ifmodifiedsince_good"
         "test_get_object_ifunmodifiedsince_good"
+        "test_get_object_ifunmodifiedsince_failed"
     )
 
     echo "Running origin-less S3 compatibility subset (${#test_originless[@]} tests)..."
