@@ -65,6 +65,21 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 		return s.originlessMiss(w, r, operation, start)
 	}
 
+	// ONE existence gate for the whole handler: an entry is visible only when its
+	// data is fully present — every block of a block-mode entry, the body of a
+	// whole-object one. Every answer below (304, HEAD 200, any serve) implies
+	// existence, and each of HEAD, conditionals, and the serve paths independently
+	// answering that question is exactly how three review rounds of
+	// existence-vs-serveability disagreements happened. An incomplete entry is
+	// simply invisible: metadata alone cannot be served, and claiming existence
+	// from it makes HEAD-as-existence callers (the tigris-os distribute worker
+	// skips re-population when IsObjectExists is true) skip the healing that would
+	// make the entry servable again. A probe-to-serve race can still truncate a
+	// concurrent eviction; the gate narrows the window, nothing can close it.
+	if !s.entryServable(ctx, bucket, key, meta) {
+		return s.originlessMiss(w, r, operation, start)
+	}
+
 	// Conditional requests are answered from the cached metadata; there is no
 	// upstream for a client's Cache-Control to revalidate against, so no-cache and
 	// no-store are simply not consulted — the cached copy is the only copy.
@@ -73,13 +88,6 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	}
 
 	if r.Method == http.MethodHead {
-		// HEAD must agree with what GET can actually serve. Without this probe an
-		// entry with evicted blocks answers HEAD 200 / GET 404 — and a caller using
-		// HEAD as its existence check (the tigris-os distribute worker skips
-		// re-population when IsObjectExists is true) would then never heal the entry.
-		if meta.BlockSize > 0 && !s.blockEntryComplete(ctx, bucket, key, meta) {
-			return s.originlessMiss(w, r, operation, start)
-		}
 		meta.WriteHeaders(w)
 		writeCacheStatus(w, XCacheHit)
 		w.WriteHeader(meta.StatusCode)
@@ -97,16 +105,10 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	// need no probe: they fail before committing.
 	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
 		if meta.BlockSize > 0 {
-			// Probe only a well-formed single range. A malformed, unsatisfiable, or
-			// multi-range request is NOT a miss — the object is present — and
-			// serveRangeFromBlockCache owns the 416 for those (it answers and
-			// reports served), so it must be reached rather than short-circuited.
-			if ranges, rerr := parseRangeHeader(rangeHeader, meta.ContentLength); rerr == nil && len(ranges) == 1 {
-				b0, bK := coveringBlocks(ranges[0].start, ranges[0].end, meta.BlockSize)
-				if !s.allBlocksPresent(ctx, bucket, key, meta, b0, bK) {
-					return s.originlessMiss(w, r, operation, start)
-				}
-			}
+			// The existence gate above proved every block present, so a non-serve
+			// here is a budget shed or a probe-to-serve race, not routine absence.
+			// serveRangeFromBlockCache keeps ownership of the 416 for malformed,
+			// unsatisfiable, and multi-range requests.
 			served, rangeErr := s.serveRangeFromBlockCache(ctx, w, r, bucket, key, "", "", meta, rangeHeader, start)
 			if served {
 				return rangeErr
@@ -124,9 +126,6 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	}
 
 	if meta.BlockSize > 0 {
-		if !s.blockEntryComplete(ctx, bucket, key, meta) {
-			return s.originlessMiss(w, r, operation, start)
-		}
 		served, assembleErr := s.serveFullObjectFromBlockCache(ctx, w, bucket, key, "", "", meta, start)
 		if served {
 			return assembleErr
@@ -162,15 +161,20 @@ func (s *Service) allBlocksPresent(ctx context.Context, bucket, key string, meta
 	return true
 }
 
-// blockEntryComplete reports whether every block of a block-mode entry is
-// present — the shared answer for "does this object exist here" (HEAD) and "can
-// the full object be served" (GET), so the two can never disagree.
-func (s *Service) blockEntryComplete(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) bool {
-	if meta.ContentLength <= 0 {
-		return false
+// entryServable is the handler's single existence answer: all blocks present for
+// a block-mode entry, the body present for a whole-object one. Everything the
+// handler says — 304, HEAD 200, a served body — flows from this one predicate, so
+// existence and serveability cannot disagree.
+func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) bool {
+	if meta.BlockSize > 0 {
+		if meta.ContentLength <= 0 {
+			return false
+		}
+		b0, bK := coveringBlocks(0, meta.ContentLength-1, meta.BlockSize)
+		return s.allBlocksPresent(ctx, bucket, key, meta, b0, bK)
 	}
-	b0, bK := coveringBlocks(0, meta.ContentLength-1, meta.BlockSize)
-	return s.allBlocksPresent(ctx, bucket, key, meta, b0, bK)
+	present, err := s.cache.BodyExistsErr(ctx, bucket, key, meta.ETag)
+	return err == nil && present
 }
 
 // originlessMiss answers the one thing a miss can be in this mode.

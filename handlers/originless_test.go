@@ -187,25 +187,51 @@ func TestOriginlessRoutes_IncompleteBlockEntryIsACleanMissNotATruncatedServe(t *
 		t.Fatalf("full GET over incomplete blocks: code=%d body_len=%d, want clean 404", w.Code, w.Body.Len())
 	}
 
-	// A range covered entirely by the present block still serves: the probe is
-	// per-covering-block, not all-or-nothing on the object.
-	w = do(s, http.MethodGet, "/b/partial.bin", map[string]string{"Range": "bytes=0-99"})
-	if w.Code != http.StatusPartialContent || int64(w.Body.Len()) != 100 {
-		t.Fatalf("range over present block: code=%d len=%d, want 206/100", w.Code, w.Body.Len())
+	// The contract: an incomplete entry is INVISIBLE — every request shape answers
+	// exactly as if the object were absent. Anything else lets one path imply an
+	// existence another path denies, and a HEAD/304-as-existence caller (the
+	// tigris-os distribute worker skips re-population when IsObjectExists is true)
+	// would then never heal an entry that can never be served.
+	shapes := map[string]*httptest.ResponseRecorder{
+		"range over present block": do(s, http.MethodGet, "/b/partial.bin", map[string]string{"Range": "bytes=0-99"}),
+		"range over absent block":  do(s, http.MethodGet, "/b/partial.bin", map[string]string{"Range": "bytes=1000-1100"}),
+		"HEAD":                     do(s, http.MethodHead, "/b/partial.bin", nil),
+		"If-None-Match":            do(s, http.MethodGet, "/b/partial.bin", map[string]string{"If-None-Match": `"blk"`}),
+	}
+	for name, w := range shapes {
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("%s on incomplete entry: code=%d, want 404 (entry must be invisible)", name, w.Code)
+		}
+	}
+}
+
+// A whole-object (non-block) entry whose body is gone is metadata orphaned by an
+// eviction: it must be as invisible as the incomplete block entry above, on every
+// request shape — a HEAD 200 or a 304 from bare metadata would tell an existence
+// checker to skip the re-population that would make the entry servable.
+func TestOriginlessRoutes_BodylessWholeObjectEntryIsInvisible(t *testing.T) {
+	s, c := newOriginlessServer(t)
+	ctx := context.Background()
+
+	// PutMetaTombstoneAware writes metadata alone — exactly the orphaned state a
+	// body eviction leaves behind.
+	meta := &cache.CachedObjectMeta{
+		Bucket: "b", Key: "orphan.txt", StatusCode: http.StatusOK,
+		ETag: `"orph"`, ContentLength: 11, ContentType: "text/plain",
+		ACL: "public-read", CachedAt: time.Now().Unix(), LastModified: time.Now().Unix(),
+	}
+	if ok, err := c.PutMetaTombstoneAware(ctx, "b", "orphan.txt", meta, 60, time.Now().UnixNano()); err != nil || !ok {
+		t.Fatalf("seed meta: ok=%v err=%v", ok, err)
 	}
 
-	// A range touching the absent block: clean 404.
-	w = do(s, http.MethodGet, "/b/partial.bin", map[string]string{"Range": "bytes=1000-1100"})
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("range over absent block: code=%d, want clean 404", w.Code)
-	}
-
-	// HEAD must agree with GET: an entry GET answers 404 for cannot claim to exist
-	// on HEAD — a caller using HEAD as its existence check would otherwise skip
-	// re-populating an entry that can never be served.
-	w = do(s, http.MethodHead, "/b/partial.bin", nil)
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("HEAD over incomplete blocks: code=%d, want 404 to match GET", w.Code)
+	for name, w := range map[string]*httptest.ResponseRecorder{
+		"GET":           do(s, http.MethodGet, "/b/orphan.txt", nil),
+		"HEAD":          do(s, http.MethodHead, "/b/orphan.txt", nil),
+		"If-None-Match": do(s, http.MethodGet, "/b/orphan.txt", map[string]string{"If-None-Match": `"orph"`}),
+	} {
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("%s on body-less entry: code=%d, want 404", name, w.Code)
+		}
 	}
 }
 
