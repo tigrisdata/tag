@@ -17,6 +17,8 @@ import (
 	"github.com/tigrisdata/ocache/coordinator"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // localityChecker is an optional CacheClient capability: it reports whether a
@@ -464,7 +466,7 @@ func (c *Cache) getMeta(ctx context.Context, bucket, key string, cloneResult boo
 	// with updates, deletes, expiry, and invalidations from every cache node.
 	metaBytes, err := c.client.Get(ctx, metaKey)
 	if err != nil {
-		if isNotFoundError(err) {
+		if isMetaNotFoundError(err) {
 			c.deleteDecodedMeta(metaKey)
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (meta only)")
 			return nil, false, nil
@@ -1056,6 +1058,20 @@ func (c *Cache) GetMode() string {
 		return "disabled"
 	}
 	return string(c.client.GetMode())
+}
+
+// isMetaNotFoundError reports a confirmed metadata-key miss. It is deliberately
+// narrower than isNotFoundError: routing failures can mention "not found" even
+// though their cached value remains valid and must keep its decoded snapshot.
+func isMetaNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if status.Code(err) == codes.NotFound {
+		return true
+	}
+	errStr := err.Error()
+	return errStr == "not found" || strings.Contains(errStr, "key not found")
 }
 
 // isNotFoundError checks if the error indicates a cache miss.

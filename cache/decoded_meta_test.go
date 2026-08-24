@@ -12,6 +12,8 @@ import (
 
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/config"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // decodedMetaTestClient records metadata reads while delegating storage behavior
@@ -588,6 +590,34 @@ func TestDecodedMetaTierRetainsSnapshotAcrossTransientGetError(t *testing.T) {
 	client.setFailMetaGets(nil)
 	if got := mustGetDecodedMeta(t, c, bucket, key).ETag; got != `"resident"` {
 		t.Fatalf("metadata after transient read recovery = %s, want retained resident snapshot", got)
+	}
+}
+
+func TestDecodedMetaTierRetainsSnapshotAcrossRoutingGetError(t *testing.T) {
+	ctx := context.Background()
+	client := newDecodedMetaTestClient(cacheclient.ModeCluster)
+	c := newDecodedMetaTestCache(t, client)
+	const bucket, key = "bucket", "routing-get"
+
+	if err := c.PutWithMeta(ctx, bucket, key, testDecodedMeta(bucket, key, `"v1"`), []byte("body"), 60); err != nil {
+		t.Fatalf("PutWithMeta: %v", err)
+	}
+	admitDecodedMeta(t, c, bucket, key)
+	replaceDecodedSnapshot(t, c, bucket, key, `"resident"`)
+
+	routingErr := status.Error(codes.Unavailable, "routing error: node not found in ring")
+	client.setFailMetaGets(routingErr)
+	meta, found, err := c.GetMeta(ctx, bucket, key)
+	if got := status.Code(err); got != codes.Unavailable || found || meta != nil {
+		t.Fatalf("GetMeta during routing failure = (meta=%v, found=%t, code=%v), want (nil, false, Unavailable)", meta, found, got)
+	}
+	if _, ok := c.decodedMeta.Peek(MakeMetaKey(bucket, key)); !ok {
+		t.Fatal("routing metadata read error evicted the decoded snapshot")
+	}
+
+	client.setFailMetaGets(nil)
+	if got := mustGetDecodedMeta(t, c, bucket, key).ETag; got != `"resident"` {
+		t.Fatalf("metadata after routing read recovery = %s, want retained resident snapshot", got)
 	}
 }
 
