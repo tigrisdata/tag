@@ -2,34 +2,34 @@
 
 // Package originless is the end-to-end suite for origin-less mode, driven by the
 // s3-test-originless Makefile target. It runs against a REAL tag binary over HTTP
-// in three phases, selected by ORIGINLESS_PHASE:
+// in two phases, selected by ORIGINLESS_PHASE, and is fully hermetic — no
+// credentials, no network upstream, no shared account:
 //
-//	warm    — TAG in proxy mode against live Tigris. Creates a public bucket,
-//	          writes objects, and reads them anonymously through TAG so entries
-//	          are cached with the inferred public-read ACL — the only entries
-//	          phase-1 origin-less will serve. Asserts a HIT so the disk cache is
-//	          proven warm before the mode flip.
-//	serve   — the SAME cache directory, TAG restarted with no upstream, no
-//	          credentials, and no upstream reachable at all. Asserts the whole
-//	          origin-less contract over the wire.
-//	cleanup — deletes the test bucket directly against the upstream (TAG is not
-//	          involved; origin-less TAG cannot delete anything).
+//	warm  — TAG in proxy mode against a local in-memory mock upstream
+//	        (tests/originless/mockupstream). Objects are written through TAG and
+//	        read anonymously so entries are cached with the inferred public-read
+//	        ACL — the only entries phase-1 origin-less serves. A HIT is asserted
+//	        so the disk cache is proven warm.
+//	serve — the SAME cache directory, TAG restarted with no upstream and no
+//	        credentials in its environment. Asserts the whole origin-less
+//	        contract over the wire with a stock aws-sdk-go-v2 client.
 //
-// The suite exists because the mode's unit tests seed the cache in-process; only
-// this harness proves the real lifecycle — warmed in proxy mode, served
-// origin-less from the same disk — with a stock aws-sdk-go-v2 client (which
-// appends ?x-id to every request) and a genuinely unreachable origin.
+// In production this tier is its own deployment: the tigris gateway writes into
+// it and reads from it directly, and content never arrives via a proxy-mode
+// flip. The mock-upstream warm is a stand-in for those gateway writes until
+// local writes land (phase 3), at which point the warm phase becomes SDK PUTs
+// against origin-less TAG itself and the mock is deleted. What the flip DOES
+// faithfully exercise, and what this suite is for, is the serve contract of a
+// real binary over a real RocksDB cache with a genuinely absent origin.
 package originless
 
 import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -105,15 +105,9 @@ func TestWarmPhase(t *testing.T) {
 	ctx := context.Background()
 	client := sdkClient(t, endpoint(), false)
 
-	// Public bucket: objects inherit public-read, which is what lets an anonymous
-	// GET succeed and re-cache the entry with the inferred ACL.
-	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{
-		Bucket: aws.String(b),
-		ACL:    types.BucketCannedACLPublicRead,
-	}); err != nil {
-		t.Fatalf("create public bucket: %v", err)
-	}
-
+	// No CreateBucket: the mock upstream is keyspace-only. The mock's 200 on an
+	// anonymous GET is what stands in for "public" — TAG caches the entry with the
+	// inferred public-read ACL, exactly as it does for a genuinely public bucket.
 	for key, body := range map[string][]byte{objKey: []byte(objContent), emptyKey: {}} {
 		if _, err := client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(b), Key: aws.String(key), Body: bytes.NewReader(body),
@@ -260,40 +254,4 @@ func TestServePhase(t *testing.T) {
 			t.Fatalf("miss took %v — a hang means a fetch path escaped the router", d)
 		}
 	})
-}
-
-func TestCleanupPhase(t *testing.T) {
-	if phase() != "cleanup" {
-		t.Skip("not the cleanup phase")
-	}
-	b := bucket(t)
-	if !strings.HasPrefix(b, "tag-diag-") {
-		t.Fatalf("refusing to clean bucket %q without the tag-diag- test prefix", b)
-	}
-	ctx := context.Background()
-	// Directly against the upstream: TAG is origin-less (or down) and cannot delete.
-	client := sdkClient(t, os.Getenv("ORIGINLESS_UPSTREAM"), false)
-
-	// Sweep everything rather than the keys we think we wrote, then retry the
-	// bucket delete: object deletion is eventually consistent, and a DeleteBucket
-	// issued immediately after the deletes can still see them (observed as a 409
-	// BucketNotEmpty in CI for a bucket that was in fact empty moments later).
-	for attempt := 1; attempt <= 6; attempt++ {
-		list, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(b)})
-		if err != nil {
-			t.Fatalf("list for cleanup: %v", err)
-		}
-		for _, obj := range list.Contents {
-			if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(b), Key: obj.Key}); err != nil {
-				t.Logf("delete %s: %v", aws.ToString(obj.Key), err)
-			}
-		}
-		if _, err := client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(b)}); err == nil {
-			fmt.Println("cleaned", b)
-			return
-		} else if attempt == 6 {
-			t.Errorf("delete bucket after %d attempts: %v", attempt, err)
-		}
-		time.Sleep(2 * time.Second)
-	}
 }

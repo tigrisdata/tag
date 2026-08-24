@@ -112,12 +112,11 @@ jobs:
       - name: Install system dependencies
         run: make install-deps
 
-      # The full lifecycle in one target: warm the cache through proxy mode against
-      # live Tigris, restart the SAME cache directory with no upstream and no
-      # credentials, assert the origin-less contract with a stock aws-sdk-go-v2
-      # client, then clean up directly against the upstream.
+      # Fully hermetic — no credentials, no network upstream. Warms a real cache
+      # directory through proxy mode against a local in-memory mock (a stand-in
+      # for the tigris gateway's direct writes until phase-3 local writes land),
+      # restarts the SAME directory origin-less with credentials and endpoint
+      # scrubbed from the environment, and asserts the whole contract with a
+      # stock aws-sdk-go-v2 client.
       - name: Run origin-less lifecycle test
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: make s3-test-originless
