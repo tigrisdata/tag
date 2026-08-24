@@ -219,7 +219,9 @@ func (s *Service) originlessMiss(w http.ResponseWriter, r *http.Request, operati
 // warp, the ceph s3-tests) run against the tier.
 func (s *Service) HandleOriginlessBucket(w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()
-	if r.URL.RawQuery != "" {
+	// Same query rule as objects: the SDK appends ?x-id=CreateBucket etc. to the
+	// ceremony calls too, and rejecting the tag would 501 every stock client.
+	if !originlessPlainObject(r) {
 		return s.HandleOriginlessUnsupported(w, r)
 	}
 	switch r.Method {
@@ -239,9 +241,14 @@ func (s *Service) HandleOriginlessBucket(w http.ResponseWriter, r *http.Request)
 // it wrote the response. The 304 conditionals (If-None-Match/If-Modified-Since)
 // are evaluated separately, after these.
 func writePreconditionFailed(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta) bool {
-	if im := r.Header.Get("If-Match"); im != "" && im != "*" && !meta.MatchesETag(im) {
-		s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
-		return true
+	if im := r.Header.Get("If-Match"); im != "" {
+		if im != "*" && !meta.MatchesETag(im) {
+			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+			return true
+		}
+		// RFC 7232 §3.4: when If-Match is present, If-Unmodified-Since is ignored
+		// — a matching ETag with a stale date must serve, not 412.
+		return false
 	}
 	if ius := r.Header.Get("If-Unmodified-Since"); ius != "" {
 		if t, err := http.ParseTime(ius); err == nil && meta.IsModifiedSince(t) {

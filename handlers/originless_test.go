@@ -549,3 +549,31 @@ func TestOriginlessRoutes_PutLargerThanBudgetFailsFast(t *testing.T) {
 		t.Fatalf("over-budget PUT: code=%d body=%q", w.Code, w.Body.String())
 	}
 }
+
+// The SDK's x-id tag rides on the bucket ceremony too; and per RFC 7232 a
+// present If-Match suppresses If-Unmodified-Since entirely.
+func TestOriginlessRoutes_BucketXIDAndPreconditionPrecedence(t *testing.T) {
+	s, c := newOriginlessServer(t)
+
+	if w := do(s, http.MethodPut, "/newbucket?x-id=CreateBucket", nil); w.Code != http.StatusOK {
+		t.Fatalf("CreateBucket with x-id: code=%d", w.Code)
+	}
+
+	seedObject(t, c, "pc.txt", "", []byte("data"))
+	// Matching If-Match + stale If-Unmodified-Since: must serve (If-Match wins).
+	w := do(s, http.MethodGet, "/b/pc.txt", map[string]string{
+		"If-Match":            `"abc"`,
+		"If-Unmodified-Since": "Mon, 01 Jan 2001 00:00:00 GMT",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("If-Match match + stale IUS: code=%d, want 200", w.Code)
+	}
+	// If-Match mismatch: 412 regardless.
+	if w := do(s, http.MethodGet, "/b/pc.txt", map[string]string{"If-Match": `"nope"`}); w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("If-Match mismatch: code=%d, want 412", w.Code)
+	}
+	// IUS alone, stale: 412.
+	if w := do(s, http.MethodGet, "/b/pc.txt", map[string]string{"If-Unmodified-Since": "Mon, 01 Jan 2001 00:00:00 GMT"}); w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("stale IUS alone: code=%d, want 412", w.Code)
+	}
+}
