@@ -279,7 +279,7 @@ const warmPopulateAcquireTimeout = 30 * time.Second
 type byteBudget struct {
 	mu          sync.Mutex
 	cond        *sync.Cond // signaled on release so waiting warm-on-write acquirers wake
-	total       int64 // configured capacity; immutable after construction
+	total       int64      // configured capacity; immutable after construction
 	remaining   int64
 	pendingWarm int64 // sum of weights of warm-on-write acquirers currently waiting
 	reserveCap  int64 // max bytes read-miss/staging will hold back for pending warm-on-write
