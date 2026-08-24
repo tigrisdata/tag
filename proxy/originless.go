@@ -173,6 +173,14 @@ func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *c
 		b0, bK := coveringBlocks(0, meta.ContentLength-1, meta.BlockSize)
 		return s.allBlocksPresent(ctx, bucket, key, meta, b0, bK)
 	}
+	// A zero-length object is vacuously servable: no byte can be missing, and the
+	// first-byte probe below cannot see one anyway — the embedded backend returns
+	// nil + zero bytes for a present-but-empty body and an absent one alike (the
+	// quirk countingWriter exists for). Serving from metadata alone is exact for an
+	// empty body, evicted or not.
+	if meta.ContentLength == 0 {
+		return true
+	}
 	present, err := s.cache.BodyExistsErr(ctx, bucket, key, meta.ETag)
 	return err == nil && present
 }

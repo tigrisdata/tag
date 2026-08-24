@@ -154,6 +154,24 @@ func TestOriginlessRoutes_MutationsNeverReachHandlersOrTouchCache(t *testing.T) 
 	}
 }
 
+// A zero-length object has no bytes to probe, and the storage backend cannot
+// distinguish a present empty body from an absent one. It must stay visible —
+// nothing can be missing from it.
+func TestOriginlessRoutes_EmptyObjectIsServableNotAMiss(t *testing.T) {
+	s, c := newOriginlessServer(t)
+	seedObject(t, c, "empty.txt", "public-read", []byte{})
+
+	if w := do(s, http.MethodGet, "/b/empty.txt", nil); w.Code != http.StatusOK || w.Body.Len() != 0 {
+		t.Fatalf("GET empty: code=%d len=%d, want 200/0", w.Code, w.Body.Len())
+	}
+	if w := do(s, http.MethodHead, "/b/empty.txt", nil); w.Code != http.StatusOK {
+		t.Fatalf("HEAD empty: code=%d, want 200", w.Code)
+	}
+	if w := do(s, http.MethodGet, "/b/empty.txt", map[string]string{"If-None-Match": `"abc"`}); w.Code != http.StatusNotModified {
+		t.Fatalf("INM empty: code=%d, want 304", w.Code)
+	}
+}
+
 // The truncation hazard: block-mode serves stream optimistically — headers first,
 // missing blocks recovered from upstream mid-stream. With no origin that recovery
 // fails AFTER the 200/206 is committed, handing the client a truncated body. The
