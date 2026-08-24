@@ -139,8 +139,10 @@ func TestOriginlessRoutes_MutationsNeverReachHandlersOrTouchCache(t *testing.T) 
 		}
 	}
 
-	// Listings and subresources are operations, not objects.
-	for _, target := range []string{"/b?list-type=2", "/", "/b/k1.txt?tagging", "/b/k1.txt?acl"} {
+	// Listings, subresources, and representation selectors are operations, not
+	// plain object reads. versionId and partNumber matter most: serving the
+	// current full object for them would be silently wrong data.
+	for _, target := range []string{"/b?list-type=2", "/", "/b/k1.txt?tagging", "/b/k1.txt?acl", "/b/k1.txt?versionId=abc", "/b/k1.txt?partNumber=2", "/b/k1.txt?attributes"} {
 		if w := do(s, http.MethodGet, target, nil); w.Code != http.StatusNotImplemented {
 			t.Fatalf("GET %s: code=%d, want 501", target, w.Code)
 		}

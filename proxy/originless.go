@@ -40,6 +40,15 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
 
+	// Plain reads only. Any query parameter selects a representation or an
+	// operation this mode does not implement — ?versionId asks for a specific
+	// version, ?partNumber for one part, ?tagging for a subresource — and serving
+	// the current full object for those is silently wrong data, not a convenience.
+	// One rule instead of an enumerated parameter list that goes stale.
+	if r.URL.RawQuery != "" {
+		return s.HandleOriginlessUnsupported(w, r)
+	}
+
 	operation := "GetObject"
 	if r.Method == http.MethodHead {
 		operation = "HeadObject"
