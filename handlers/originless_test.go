@@ -200,3 +200,36 @@ func TestOriginlessRoutes_IncompleteBlockEntryIsACleanMissNotATruncatedServe(t *
 		t.Fatalf("range over absent block: code=%d, want clean 404", w.Code)
 	}
 }
+
+// A bad range on a PRESENT object is not a miss: the object exists, the range is
+// wrong, and the answer is 416 InvalidRange — the probe must not short-circuit
+// that into NoSuchKey and make a present object look absent.
+func TestOriginlessRoutes_BadRangeOnPresentObjectIs416NotMiss(t *testing.T) {
+	s, c := newOriginlessServer(t)
+	ctx := context.Background()
+
+	blockSize := int64(1024)
+	meta := &cache.CachedObjectMeta{
+		Bucket: "b", Key: "obj.bin", StatusCode: http.StatusOK,
+		ETag: `"blk"`, ContentLength: blockSize, ContentType: "application/octet-stream",
+		ACL: "public-read", CachedAt: time.Now().Unix(), LastModified: time.Now().Unix(),
+		BlockSize: blockSize, BlocksComplete: true,
+	}
+	if err := c.PutBlock(ctx, "b", "obj.bin", meta.ETag, blockSize, 0, make([]byte, blockSize), 60); err != nil {
+		t.Fatalf("seed block: %v", err)
+	}
+	if ok, err := c.PutMetaTombstoneAware(ctx, "b", "obj.bin", meta, 60, time.Now().UnixNano()); err != nil || !ok {
+		t.Fatalf("seed meta: ok=%v err=%v", ok, err)
+	}
+
+	for name, rng := range map[string]string{
+		"unsatisfiable": "bytes=99999-100000",
+		"malformed":     "bytes=notarange",
+		"multi-range":   "bytes=0-1,10-11",
+	} {
+		w := do(s, http.MethodGet, "/b/obj.bin", map[string]string{"Range": rng})
+		if w.Code != http.StatusRequestedRangeNotSatisfiable {
+			t.Fatalf("%s range: code=%d, want 416", name, w.Code)
+		}
+	}
+}

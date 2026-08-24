@@ -90,13 +90,15 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	// need no probe: they fail before committing.
 	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
 		if meta.BlockSize > 0 {
-			ranges, rerr := parseRangeHeader(rangeHeader, meta.ContentLength)
-			if rerr != nil || len(ranges) != 1 {
-				return s.originlessMiss(w, r, operation, start)
-			}
-			b0, bK := coveringBlocks(ranges[0].start, ranges[0].end, meta.BlockSize)
-			if !s.allBlocksPresent(ctx, bucket, key, meta, b0, bK) {
-				return s.originlessMiss(w, r, operation, start)
+			// Probe only a well-formed single range. A malformed, unsatisfiable, or
+			// multi-range request is NOT a miss — the object is present — and
+			// serveRangeFromBlockCache owns the 416 for those (it answers and
+			// reports served), so it must be reached rather than short-circuited.
+			if ranges, rerr := parseRangeHeader(rangeHeader, meta.ContentLength); rerr == nil && len(ranges) == 1 {
+				b0, bK := coveringBlocks(ranges[0].start, ranges[0].end, meta.BlockSize)
+				if !s.allBlocksPresent(ctx, bucket, key, meta, b0, bK) {
+					return s.originlessMiss(w, r, operation, start)
+				}
 			}
 			served, rangeErr := s.serveRangeFromBlockCache(ctx, w, r, bucket, key, "", "", meta, rangeHeader, start)
 			if served {
