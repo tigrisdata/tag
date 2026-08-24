@@ -62,6 +62,17 @@ func TestOriginlessRoutes_ReadsServeFromCacheAlone(t *testing.T) {
 		t.Fatalf("miss: code=%d body=%q", w.Code, w.Body.String())
 	}
 
+	// The SDK operation tag must not defeat the plain-read rule: aws-sdk-go-v2
+	// appends ?x-id=GetObject to every GetObject, and the tigris-os gateway is
+	// exactly such a client.
+	if w := do(s, http.MethodGet, "/b/pub.txt?x-id=GetObject", nil); w.Code != http.StatusOK {
+		t.Fatalf("SDK-tagged GET: code=%d, want 200", w.Code)
+	}
+	// But x-id does not launder other parameters through.
+	if w := do(s, http.MethodGet, "/b/pub.txt?x-id=GetObject&versionId=abc", nil); w.Code != http.StatusNotImplemented {
+		t.Fatalf("x-id plus versionId: code=%d, want 501", w.Code)
+	}
+
 	// Hit: served with body and HIT header.
 	w := do(s, http.MethodGet, "/b/pub.txt", nil)
 	if w.Code != http.StatusOK || w.Body.String() != "hello world" {
