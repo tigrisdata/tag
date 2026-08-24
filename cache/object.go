@@ -133,7 +133,9 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter, opts ...WriteHead
 	if m.ContentType != "" {
 		w.Header().Set("Content-Type", m.ContentType)
 	}
-	if m.ContentLength > 0 {
+	if m.ContentLength >= 0 {
+		// Zero included: S3 sends Content-Length: 0 for an empty object, and a HEAD
+		// without it makes clients read the length as unknown rather than zero.
 		w.Header().Set("Content-Length", strconv.FormatInt(m.ContentLength, 10))
 	}
 	if m.LastModified > 0 {
@@ -172,8 +174,12 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter, opts ...WriteHead
 	}
 	// Write user metadata with lowercase keys per S3 convention
 	for k, v := range m.UserMetadata {
+		// Written via the map directly so the wire name stays lowercase, as S3
+		// sends it. Header.Set would canonicalize to X-Amz-Meta-..., and botocore
+		// derives its Metadata keys from the case-preserved wire name — canonical
+		// casing turns the user's key "meta1" into "Meta1" on the client.
 		lk := strings.ToLower(k)
-		w.Header().Set(lk, v)
+		w.Header()[lk] = []string{v}
 	}
 
 	// Apply options (may override headers like Content-Length for range responses)

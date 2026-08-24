@@ -21,6 +21,7 @@ const (
 	ErrNoSuchBucket                 ErrorCode = "NoSuchBucket"
 	ErrNoSuchKey                    ErrorCode = "NoSuchKey"
 	ErrEntityTooLarge               ErrorCode = "EntityTooLarge"
+	ErrPreconditionFailed           ErrorCode = "PreconditionFailed"
 	ErrNoSuchUpload                 ErrorCode = "NoSuchUpload"
 	ErrInvalidAccessKeyId           ErrorCode = "InvalidAccessKeyId"
 	ErrSignatureDoesNotMatch        ErrorCode = "SignatureDoesNotMatch"
@@ -70,6 +71,7 @@ var errorMap = map[ErrorCode]errorInfo{
 	ErrNoSuchBucket:                 {http.StatusNotFound, ErrNoSuchBucket, "The specified bucket does not exist"},
 	ErrNoSuchKey:                    {http.StatusNotFound, ErrNoSuchKey, "The specified key does not exist"},
 	ErrEntityTooLarge:               {http.StatusBadRequest, ErrEntityTooLarge, "Your proposed upload exceeds the maximum allowed size"},
+	ErrPreconditionFailed:           {http.StatusPreconditionFailed, ErrPreconditionFailed, "At least one of the pre-conditions you specified did not hold"},
 	ErrNoSuchUpload:                 {http.StatusNotFound, ErrNoSuchUpload, "The specified multipart upload does not exist"},
 	ErrInvalidAccessKeyId:           {http.StatusForbidden, ErrInvalidAccessKeyId, "The AWS access key ID you provided does not exist in our records"},
 	ErrSignatureDoesNotMatch:        {http.StatusForbidden, ErrSignatureDoesNotMatch, "The request signature we calculated does not match the signature you provided"},

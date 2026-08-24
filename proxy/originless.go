@@ -97,6 +97,10 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	// Conditional requests are answered from the cached metadata; there is no
 	// upstream for a client's Cache-Control to revalidate against, so no-cache and
 	// no-store are simply not consulted — the cached copy is the only copy.
+	if writePreconditionFailed(w, r, meta) {
+		metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+		return nil
+	}
 	if s.writeNotModifiedFromCache(w, r, meta, operation, start) {
 		return nil
 	}
@@ -205,6 +209,47 @@ func (s *Service) originlessMiss(w http.ResponseWriter, r *http.Request, operati
 	s3err.WriteError(w, r, s3err.ErrNoSuchKey)
 	metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
 	return nil
+}
+
+// HandleOriginlessBucket answers the bucket-lifecycle ceremony standard S3
+// tooling insists on. Origin-less TAG has no buckets — the keyspace is implicit
+// — so creation and deletion are honest no-ops: PUT (CreateBucket) answers 200,
+// HEAD 200, DELETE 204. Listing stays 501; pretending to enumerate an implicit
+// keyspace would be a lie, but accepting the ceremony lets stock fixtures (SDKs,
+// warp, the ceph s3-tests) run against the tier.
+func (s *Service) HandleOriginlessBucket(w http.ResponseWriter, r *http.Request) error {
+	start := time.Now()
+	if r.URL.RawQuery != "" {
+		return s.HandleOriginlessUnsupported(w, r)
+	}
+	switch r.Method {
+	case http.MethodPut, http.MethodHead:
+		w.WriteHeader(http.StatusOK)
+	case http.MethodDelete:
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		return s.HandleOriginlessUnsupported(w, r)
+	}
+	metrics.RecordRequest("Bucket", "success", time.Since(start).Seconds())
+	return nil
+}
+
+// writePreconditionFailed answers the 412 preconditions (RFC 7232 order:
+// If-Match before If-Unmodified-Since) from cached metadata. Returns true when
+// it wrote the response. The 304 conditionals (If-None-Match/If-Modified-Since)
+// are evaluated separately, after these.
+func writePreconditionFailed(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta) bool {
+	if im := r.Header.Get("If-Match"); im != "" && im != "*" && !meta.MatchesETag(im) {
+		s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+		return true
+	}
+	if ius := r.Header.Get("If-Unmodified-Since"); ius != "" {
+		if t, err := http.ParseTime(ius); err == nil && meta.IsModifiedSince(t) {
+			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+			return true
+		}
+	}
+	return false
 }
 
 // originlessPutSize returns the number of body bytes a PUT declares. For a
@@ -349,9 +394,12 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	meta := &cache.CachedObjectMeta{
 		Bucket: bucket, Key: key, StatusCode: http.StatusOK,
 		ETag: etag, ContentLength: int64(len(body)),
-		ContentType:  r.Header.Get("Content-Type"),
-		CacheControl: r.Header.Get("Cache-Control"),
-		CachedAt:     time.Now().Unix(), LastModified: time.Now().Unix(),
+		ContentType:        r.Header.Get("Content-Type"),
+		CacheControl:       r.Header.Get("Cache-Control"),
+		Expires:            r.Header.Get("Expires"),
+		ContentDisposition: r.Header.Get("Content-Disposition"),
+		ContentLanguage:    r.Header.Get("Content-Language"),
+		CachedAt:           time.Now().Unix(), LastModified: time.Now().Unix(),
 		UserMetadata: make(map[string]string),
 	}
 	for name, vals := range r.Header {

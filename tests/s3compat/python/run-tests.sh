@@ -129,6 +129,19 @@ def pytest_configure(config):
     sf.nuke_bucket = _nuke_bucket_force
 EOF
 
+# Origin-less runs replace the conftest: no force-delete (there is no upstream)
+# and no cleanup at all — buckets are implicit no-ops and objects lapse by TTL;
+# the stock teardown's ListBuckets/ListObjects would fail on 501s.
+if [ -n "$ORIGINLESS" ]; then
+    cat <<'EOF' >conftest.py
+def pytest_configure(config):
+    import s3tests.functional as sf
+
+    sf.nuke_prefixed_buckets = lambda *a, **k: None
+    sf.nuke_bucket = lambda *a, **k: None
+EOF
+fi
+
 # If specific test path is provided as argument, run that
 if [ $# -ge 1 ]; then
     tox -- "s3tests/functional/$1"
@@ -146,6 +159,61 @@ run_test() {
         FAILED_TESTS+=("${test_file}::${test_name}")
     fi
 }
+
+# Origin-less mode: run the subset of the suite that matches the origin-less
+# surface (single-object reads/writes, ranges, conditionals, metadata) against
+# an origin-less TAG. The stock teardown lists buckets and objects, which
+# origin-less answers 501 — and there is nothing to clean anyway: DeleteBucket
+# is a no-op and objects lapse by TTL. So the teardown is stubbed out.
+if [ -n "$ORIGINLESS" ]; then
+    test_originless=(
+        "test_object_head_zero_bytes"
+        "test_object_write_check_etag"
+        "test_object_write_cache_control"
+        "test_object_write_expires"
+        "test_object_write_read_update_read_delete"
+        "test_object_metadata_replaced_on_put"
+        "test_object_set_get_metadata_none_to_good"
+        "test_object_set_get_metadata_none_to_empty"
+        "test_object_read_not_exist"
+        "test_ranged_request_response_code"
+        "test_ranged_big_request_response_code"
+        "test_ranged_request_skip_leading_bytes_response_code"
+        "test_ranged_request_return_trailing_bytes_response_code"
+        "test_ranged_request_invalid_range"
+        "test_ranged_request_empty_object"
+        "test_get_object_ifmatch_good"
+        "test_get_object_ifmatch_failed"
+        "test_get_object_ifnonematch_failed"
+        "test_get_object_ifmodifiedsince_good"
+        "test_get_object_ifunmodifiedsince_good"
+    )
+
+    echo "Running origin-less S3 compatibility subset (${#test_originless[@]} tests)..."
+    for test in "${test_originless[@]}"; do
+        run_test "test_s3.py" "$test"
+    done
+
+    echo ""
+    echo "========================================="
+    echo "Origin-less S3 Compatibility Summary"
+    echo "========================================="
+    TOTAL_TESTS=$((PASSED_COUNT + ${#FAILED_TESTS[@]}))
+    echo "Total: $TOTAL_TESTS | Passed: $PASSED_COUNT | Failed: ${#FAILED_TESTS[@]}"
+    if [ "$TOTAL_TESTS" -eq 0 ]; then
+        echo "ERROR: zero tests ran — a vacuous pass is a harness bug, not a pass"
+        exit 1
+    fi
+    if [ ${#FAILED_TESTS[@]} -eq 0 ]; then
+        echo "All tests passed!"
+        exit 0
+    fi
+    echo "FAILED TESTS:"
+    for failed in "${FAILED_TESTS[@]}"; do
+        echo "  - $failed"
+    done
+    exit 1
+fi
 
 # Test arrays - curated list of tests relevant for TAG
 # Based on tigris-os gateway/tests/tests.sh

@@ -475,6 +475,9 @@ s3-test-originless: build
 	stop_tag; \
 	start_originless; \
 	ORIGINLESS_PHASE=serve ORIGINLESS_BUCKET=$$B CGO_ENABLED=0 go test -tags originless -v -timeout 120s -run TestServePhase ./tests/originless/; \
+	echo "--- Phase 3: ceph s3-tests subset against origin-less TAG"; \
+	ORIGINLESS=1 AWS_ACCESS_KEY_ID=originless-test AWS_SECRET_ACCESS_KEY=originless-test \
+		bash -c 'cd tests/s3compat/python && ./run-tests.sh'; \
 	pkill -fx "./$(BINARY_NAME)" 2>/dev/null || true; \
 	rm -rf $$DATA_DIR; \
 	echo "origin-less lifecycle: PASS"

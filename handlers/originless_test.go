@@ -154,8 +154,10 @@ func TestOriginlessRoutes_WriteReadDeleteLoop(t *testing.T) {
 	if g.Header().Get("ETag") != etag {
 		t.Fatalf("ETag: put=%q get=%q", etag, g.Header().Get("ETag"))
 	}
-	if g.Header().Get("X-Amz-Meta-Origin") != "gateway" {
-		t.Fatalf("user metadata lost: %q", g.Header().Get("X-Amz-Meta-Origin"))
+	// Raw-map read: user metadata is written with a lowercase wire name (S3's
+	// convention), which Header.Get's canonicalizing lookup cannot see.
+	if got := g.Header()["x-amz-meta-origin"]; len(got) != 1 || got[0] != "gateway" {
+		t.Fatalf("user metadata lost: %v", got)
 	}
 
 	// Overwrite: new content serves, new ETag.
