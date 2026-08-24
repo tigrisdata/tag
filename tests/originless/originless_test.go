@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -238,7 +239,6 @@ func TestServePhase(t *testing.T) {
 	t.Run("mutations and listings answer 501 and leave the cache intact", func(t *testing.T) {
 		for name, r := range map[string]struct{ method, path string }{
 			"bulk delete":        {http.MethodPost, "/" + b + "?delete"},
-			"list":               {http.MethodGet, "/" + b + "?list-type=2"},
 			"initiate multipart": {http.MethodPost, "/" + b + "/" + objKey + "?uploads"},
 			"upload part":        {http.MethodPut, "/" + b + "/" + objKey + "?uploadId=u1&partNumber=1"},
 			"versioned read":     {http.MethodGet, "/" + b + "/" + objKey + "?versionId=abc"},
@@ -256,6 +256,20 @@ func TestServePhase(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode != http.StatusOK || string(body) != objContent {
 			t.Fatalf("after rejected mutations: status=%d body=%q", resp.StatusCode, body)
+		}
+	})
+
+	t.Run("listing shows the warmed objects", func(t *testing.T) {
+		resp := rawDo(t, http.MethodGet, "/"+b+"?list-type=2", nil)
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("listing: %d", resp.StatusCode)
+		}
+		for _, key := range []string{objKey, emptyKey} {
+			if !strings.Contains(string(body), "<Key>"+key+"</Key>") {
+				t.Fatalf("listing missing %s: %s", key, body)
+			}
 		}
 	})
 
