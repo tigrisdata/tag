@@ -112,11 +112,10 @@ jobs:
       - name: Install system dependencies
         run: make install-deps
 
-      # Fully hermetic — no credentials, no network upstream. Warms a real cache
-      # directory through proxy mode against a local in-memory mock (a stand-in
-      # for the tigris gateway's direct writes until phase-3 local writes land),
-      # restarts the SAME directory origin-less with credentials and endpoint
-      # scrubbed from the environment, and asserts the whole contract with a
-      # stock aws-sdk-go-v2 client.
+      # Fully hermetic — no credentials, no network. Exercises the production
+      # topology exactly: origin-less TAG populated by direct SDK writes (as the
+      # tigris gateway does), restarted on the same cache directory to prove
+      # persistence, then the whole read/write contract asserted with a stock
+      # aws-sdk-go-v2 client.
       - name: Run origin-less lifecycle test
         run: make s3-test-originless

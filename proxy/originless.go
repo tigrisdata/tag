@@ -2,7 +2,11 @@ package proxy
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -11,20 +15,27 @@ import (
 	"github.com/tigrisdata/tag/s3err"
 )
 
-// Origin-less mode: TAG with no upstream, serving only what its cache holds.
+// Origin-less mode: TAG with no upstream, serving and storing on its own.
 //
-// The mode is expressed at the ROUTER, not inside the proxy handlers: the server
-// registers this handler set instead of the proxying one, so every path that
-// assumes an upstream — revalidation, broadcast coalescing, background fetch, the
-// mutation handlers with their invalidate-before-forward ordering — is unreachable
-// by construction rather than defused guard-by-guard. What this file does not
-// call, this mode cannot do.
+// The mode is expressed at the ROUTER: the server registers this handler set
+// instead of the proxying one, so every path that assumes an upstream —
+// revalidation, broadcast coalescing, background fetch, the proxy mutation
+// handlers with their invalidate-before-forward ordering — is unreachable by
+// construction. What this file does not implement, the mode cannot do.
 //
-// Phase-1 trust model: only anonymous requests for public-read objects are
-// served. Signed requests cannot be validated (signature validation learns keys
-// from an upstream), and non-public objects are withheld until the explicit
-// auth-less trust decision lands in a later phase. Both answer NoSuchKey rather
-// than a 403, so an unauthorized probe cannot distinguish "absent" from "held".
+// Trust model: THE NETWORK IS THE BOUNDARY. Origin-less TAG cannot validate
+// signatures (signature validation learns keys from an upstream), so requests
+// are served and accepted regardless of authentication or cached ACL — an
+// Authorization header is ignored, not evaluated. Deploy this mode only on a
+// network segment reachable solely by its intended callers; the explicit,
+// contradiction-checked upstream.disabled switch is the consent for that trade.
+//
+// Reads:  GET/HEAD of one object from cache; a miss is NoSuchKey, the caller's
+//         cue to fall back to its authoritative store.
+// Writes: PUT stores the object in the local cache under cache.ttl; DELETE
+//         invalidates. This is how the tier is populated — by its callers,
+//         directly (e.g. the tigris gateway).
+// Everything else — listings, multipart, copies, tagging, ACLs — answers 501.
 
 // Originless reports whether this Service runs without an upstream. The server
 // uses it to select which handler set to register.
@@ -40,22 +51,12 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
 
-	// Plain reads only. A query parameter selects a representation or an
-	// operation this mode does not implement — ?versionId asks for a specific
-	// version, ?partNumber for one part, ?tagging for a subresource — and serving
-	// the current full object for those is silently wrong data, not a convenience.
-	// One rule instead of an enumerated parameter list that goes stale.
-	//
-	// The single exception is x-id, the operation tag aws-sdk-go-v2 appends to
-	// every plain request (?x-id=GetObject). It restates what method+path already
-	// say and selects nothing, and rejecting it would 501 every standard SDK read
-	// — including the tigris-os gateway this mode exists to serve.
-	if r.URL.RawQuery != "" {
-		q := r.URL.Query()
-		q.Del("x-id")
-		if len(q) > 0 {
-			return s.HandleOriginlessUnsupported(w, r)
-		}
+	// Plain reads only: a query parameter (beyond the SDK's no-op x-id tag)
+	// selects a representation or operation this mode does not implement —
+	// ?versionId, ?partNumber, ?tagging — and serving the current full object for
+	// those would be silently wrong data.
+	if !originlessPlainObject(r) {
+		return s.HandleOriginlessUnsupported(w, r)
 	}
 
 	operation := "GetObject"
@@ -74,12 +75,6 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 
 	meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
 	if cacheErr != nil || !found || meta == nil {
-		return s.originlessMiss(w, r, operation, start)
-	}
-
-	// Phase-1 trust: anonymous + public-read only. NoSuchKey either way — absence
-	// and denial must be indistinguishable to a probe.
-	if !hasNoAuthCredentials(r) || !meta.IsPublicRead() {
 		return s.originlessMiss(w, r, operation, start)
 	}
 
@@ -208,6 +203,106 @@ func (s *Service) originlessMiss(w http.ResponseWriter, r *http.Request, operati
 	writeCacheStatus(w, XCacheMiss)
 	s3err.WriteError(w, r, s3err.ErrNoSuchKey)
 	metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+	return nil
+}
+
+// originlessPlainObject reports whether the request is a plain single-object
+// operation: no query parameters beyond the SDK's no-op x-id tag, and no
+// copy-source header (server-side copy needs a source read this mode does not
+// implement as an operation).
+func originlessPlainObject(r *http.Request) bool {
+	if r.Header.Get("X-Amz-Copy-Source") != "" {
+		return false
+	}
+	if r.URL.RawQuery == "" {
+		return true
+	}
+	q := r.URL.Query()
+	q.Del("x-id")
+	return len(q) == 0
+}
+
+// HandleOriginlessPut stores an object directly into the local cache — the
+// population path for this tier. The body is buffered to compute the ETag
+// (bodies are keyed by ETag so each version is immutable), bounded by the cache
+// size threshold, and stored under cache.ttl. Overwrites follow the proxying
+// mode's semantics: new meta points at the new ETag-keyed body; the old body
+// ages out by TTL.
+func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) error {
+	start := time.Now()
+	ctx := r.Context()
+	bucket, key := ParseBucketKey(r)
+
+	if !originlessPlainObject(r) {
+		return s.HandleOriginlessUnsupported(w, r)
+	}
+	if !s.cache.IsEnabled() {
+		s3err.WriteError(w, r, s3err.ErrNotImplemented)
+		metrics.RecordRequest("PutObject", "unsupported", time.Since(start).Seconds())
+		return nil
+	}
+
+	maxSize := s.config.Cache.SizeThreshold
+	if r.ContentLength > maxSize {
+		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return nil
+	}
+
+	// LimitReader at threshold+1: a body that exceeds the declared length or the
+	// threshold is detected by the extra byte rather than silently truncated.
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxSize+1))
+	if err != nil {
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return err
+	}
+	if int64(len(body)) > maxSize {
+		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return nil
+	}
+
+	sum := md5.Sum(body)
+	etag := `"` + hex.EncodeToString(sum[:]) + `"`
+
+	meta := &cache.CachedObjectMeta{
+		Bucket: bucket, Key: key, StatusCode: http.StatusOK,
+		ETag: etag, ContentLength: int64(len(body)),
+		ContentType:  r.Header.Get("Content-Type"),
+		CacheControl: r.Header.Get("Cache-Control"),
+		CachedAt:     time.Now().Unix(), LastModified: time.Now().Unix(),
+		UserMetadata: make(map[string]string),
+	}
+	for name, vals := range r.Header {
+		if strings.HasPrefix(strings.ToLower(name), "x-amz-meta-") && len(vals) > 0 {
+			meta.UserMetadata[strings.ToLower(name)] = vals[0]
+		}
+	}
+
+	if err := s.cache.PutWithMeta(ctx, bucket, key, meta, body, int(s.config.Cache.TTL.Seconds())); err != nil {
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return err
+	}
+
+	w.Header().Set("ETag", etag)
+	w.WriteHeader(http.StatusOK)
+	metrics.RecordRequest("PutObject", "success", time.Since(start).Seconds())
+	return nil
+}
+
+// HandleOriginlessDelete invalidates the object. Deletion is not required for
+// correctness — entries lapse by cache.ttl — but a caller that expires objects
+// explicitly (the tigris gateway may, on object expiry) gets prompt removal.
+func (s *Service) HandleOriginlessDelete(w http.ResponseWriter, r *http.Request) error {
+	start := time.Now()
+	bucket, key := ParseBucketKey(r)
+
+	if !originlessPlainObject(r) {
+		return s.HandleOriginlessUnsupported(w, r)
+	}
+	s.invalidateObject(r.Context(), bucket, key)
+	w.WriteHeader(http.StatusNoContent)
+	metrics.RecordRequest("DeleteObject", "success", time.Since(start).Seconds())
 	return nil
 }
 

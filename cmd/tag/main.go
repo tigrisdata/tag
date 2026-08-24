@@ -196,7 +196,7 @@ func main() {
 	if !cfg.Upstream.HasOrigin() {
 		log.Info().
 			Bool("cache_grpc_auth", cfg.Cache.IsGRPCAuthEnabled()).
-			Msg("Origin-less mode: no upstream configured. Cache misses are served as NoSuchKey and the deployment's trust boundary is the network. Writes and unauthenticated reads of non-public objects are NOT yet supported in this mode")
+			Msg("Origin-less mode: no upstream configured. Reads serve from cache regardless of authentication (the network is the trust boundary — deploy only on a private segment); misses answer NoSuchKey; PUT stores locally under cache.ttl; DELETE invalidates; listings/multipart/copies answer 501")
 	}
 	if cfg.Upstream.HasOrigin() && cfg.Upstream.IsTransparentProxy() {
 		accessKey := os.Getenv("AWS_ACCESS_KEY_ID")

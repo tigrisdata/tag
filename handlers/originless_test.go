@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -108,26 +109,132 @@ func TestOriginlessRoutes_ReadsServeFromCacheAlone(t *testing.T) {
 	}
 }
 
-func TestOriginlessRoutes_TrustModelIsAnonymousPublicReadOnly(t *testing.T) {
+// The network is the trust boundary: reads serve regardless of the cached ACL
+// and regardless of authentication. A signed request's signature cannot be
+// validated without an upstream, so it is ignored rather than evaluated — the
+// tigris gateway's S3 client signs every request, and rejecting signed reads
+// would 404 the mode's primary caller.
+func TestOriginlessRoutes_NetworkTrustServesRegardlessOfACLAndAuth(t *testing.T) {
 	s, c := newOriginlessServer(t)
 	seedObject(t, c, "private.txt", "", []byte("secret"))
 
-	// Anonymous read of a non-public object: NoSuchKey, indistinguishable from absent.
-	if w := do(s, http.MethodGet, "/b/private.txt", nil); w.Code != http.StatusNotFound {
-		t.Fatalf("anonymous private read: code=%d", w.Code)
+	if w := do(s, http.MethodGet, "/b/private.txt", nil); w.Code != http.StatusOK || w.Body.String() != "secret" {
+		t.Fatalf("anonymous read of non-public entry: code=%d body=%q", w.Code, w.Body.String())
 	}
-	// A signed request cannot be validated without an upstream: same answer.
 	hdr := map[string]string{"Authorization": "AWS4-HMAC-SHA256 Credential=AKIA/20260823/auto/s3/aws4_request, SignedHeaders=host, Signature=deadbeef"}
-	if w := do(s, http.MethodGet, "/b/private.txt", hdr); w.Code != http.StatusNotFound {
-		t.Fatalf("signed private read: code=%d", w.Code)
+	if w := do(s, http.MethodGet, "/b/private.txt", hdr); w.Code != http.StatusOK {
+		t.Fatalf("signed read: code=%d, want 200 (auth ignored, not evaluated)", w.Code)
 	}
 }
 
-// The property the router dispatch exists for: mutations are rejected at the
-// route table, so the proxying mutation handlers — which invalidate BEFORE
-// forwarding — are never entered, and cached data cannot be destroyed by a
-// rejected write. Under the guard-based design this failure needed five separate
-// guards; here it is structural.
+// The population path: PUT stores into the local cache, GET serves it back,
+// DELETE removes it. This is the production loop — the tigris gateway writes
+// and reads this tier directly.
+func TestOriginlessRoutes_WriteReadDeleteLoop(t *testing.T) {
+	s, _ := newOriginlessServer(t)
+
+	// PUT with a body (the SDK's x-id tag must not break writes either).
+	req := httptest.NewRequest(http.MethodPut, "/b/loop.txt?x-id=PutObject", strings.NewReader("written directly"))
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("X-Amz-Meta-Origin", "gateway")
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Header().Get("ETag") == "" {
+		t.Fatalf("PUT: code=%d etag=%q", w.Code, w.Header().Get("ETag"))
+	}
+	etag := w.Header().Get("ETag")
+
+	// Read back: bytes, headers, and user metadata round-trip.
+	g := do(s, http.MethodGet, "/b/loop.txt", nil)
+	if g.Code != http.StatusOK || g.Body.String() != "written directly" {
+		t.Fatalf("GET after PUT: code=%d body=%q", g.Code, g.Body.String())
+	}
+	if g.Header().Get("ETag") != etag {
+		t.Fatalf("ETag: put=%q get=%q", etag, g.Header().Get("ETag"))
+	}
+	if g.Header().Get("X-Amz-Meta-Origin") != "gateway" {
+		t.Fatalf("user metadata lost: %q", g.Header().Get("X-Amz-Meta-Origin"))
+	}
+
+	// Overwrite: new content serves, new ETag.
+	req = httptest.NewRequest(http.MethodPut, "/b/loop.txt", strings.NewReader("rewritten"))
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Header().Get("ETag") == etag {
+		t.Fatalf("overwrite: code=%d etag unchanged=%v", w.Code, w.Header().Get("ETag") == etag)
+	}
+	if g := do(s, http.MethodGet, "/b/loop.txt", nil); g.Body.String() != "rewritten" {
+		t.Fatalf("GET after overwrite: %q", g.Body.String())
+	}
+
+	// DELETE, then the entry is gone on every shape.
+	if w := do(s, http.MethodDelete, "/b/loop.txt", nil); w.Code != http.StatusNoContent {
+		t.Fatalf("DELETE: code=%d", w.Code)
+	}
+	if g := do(s, http.MethodGet, "/b/loop.txt", nil); g.Code != http.StatusNotFound {
+		t.Fatalf("GET after DELETE: code=%d", g.Code)
+	}
+	if h := do(s, http.MethodHead, "/b/loop.txt", nil); h.Code != http.StatusNotFound {
+		t.Fatalf("HEAD after DELETE: code=%d", h.Code)
+	}
+}
+
+// The write surface stays narrow: copies, multipart parts, and oversized bodies
+// are refused without touching cached data.
+func TestOriginlessRoutes_WriteSurfaceLimits(t *testing.T) {
+	s, c := newOriginlessServer(t)
+	seedObject(t, c, "kept.txt", "", []byte("kept"))
+
+	// Server-side copy: 501, and the destination entry is untouched.
+	req := httptest.NewRequest(http.MethodPut, "/b/kept.txt", nil)
+	req.Header.Set("X-Amz-Copy-Source", "/b/other.txt")
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("copy: code=%d, want 501", w.Code)
+	}
+	if g := do(s, http.MethodGet, "/b/kept.txt", nil); g.Code != http.StatusOK {
+		t.Fatalf("destination after rejected copy: code=%d", g.Code)
+	}
+
+	// UploadPart (PUT with uploadId): 501.
+	req = httptest.NewRequest(http.MethodPut, "/b/kept.txt?uploadId=u1&partNumber=1", strings.NewReader("part"))
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("upload part: code=%d, want 501", w.Code)
+	}
+
+	// A body over the size threshold: EntityTooLarge, nothing stored.
+	big := bytes.Repeat([]byte("x"), 128)
+	cfgLimited := config.NewDefault()
+	cfgLimited.Upstream.Disabled = true
+	cfgLimited.Upstream.Endpoint = ""
+	cfgLimited.Cache.SizeThreshold = 64
+	cLimited := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfgLimited.Cache)
+	svc := proxy.NewService(proxy.NewForwarder(nil, "", "auto", 10, nil, nil), cLimited, cfgLimited)
+	srv := NewServer(svc, "127.0.0.1", 0, false, 0)
+	req = httptest.NewRequest(http.MethodPut, "/b/big.txt", bytes.NewReader(big))
+	w = httptest.NewRecorder()
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("oversized PUT: code=%d, want 400 EntityTooLarge", w.Code)
+	}
+	if g := doOn(srv, http.MethodGet, "/b/big.txt"); g.Code != http.StatusNotFound {
+		t.Fatalf("oversized PUT must store nothing: code=%d", g.Code)
+	}
+}
+
+func doOn(s *Server, method, target string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, httptest.NewRequest(method, target, nil))
+	return w
+}
+
+// Unsupported operations answer 501 at the route table and cannot touch cached
+// data — the proxying mutation handlers (which invalidate before forwarding) are
+// never entered. PUT and DELETE are no longer in this list: they are the mode's
+// own write path, covered by the write/read/delete loop test.
 func TestOriginlessRoutes_MutationsNeverReachHandlersOrTouchCache(t *testing.T) {
 	s, c := newOriginlessServer(t)
 	seedObject(t, c, "k1.txt", "public-read", []byte("v1"))
@@ -136,13 +243,12 @@ func TestOriginlessRoutes_MutationsNeverReachHandlersOrTouchCache(t *testing.T) 
 	mutations := []struct {
 		name, method, target string
 	}{
-		{"put", http.MethodPut, "/b/k1.txt"},
-		{"delete", http.MethodDelete, "/b/k1.txt"},
 		{"bulk delete", http.MethodPost, "/b?delete"},
-		{"copy", http.MethodPut, "/b/k1.txt"}, // copy is a PUT; header irrelevant, route rejects it
 		{"initiate multipart", http.MethodPost, "/b/k1.txt?uploads"},
 		{"complete multipart", http.MethodPost, "/b/k1.txt?uploadId=u1"},
 		{"upload part", http.MethodPut, "/b/k1.txt?uploadId=u1&partNumber=1"},
+		{"tagging write", http.MethodPut, "/b/k1.txt?tagging"},
+		{"acl write", http.MethodPut, "/b/k1.txt?acl"},
 	}
 	for _, m := range mutations {
 		if w := do(s, m.method, m.target, nil); w.Code != http.StatusNotImplemented {

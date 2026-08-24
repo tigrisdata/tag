@@ -20,6 +20,7 @@ const (
 	ErrBucketAlreadyOwnedByYou      ErrorCode = "BucketAlreadyOwnedByYou"
 	ErrNoSuchBucket                 ErrorCode = "NoSuchBucket"
 	ErrNoSuchKey                    ErrorCode = "NoSuchKey"
+	ErrEntityTooLarge               ErrorCode = "EntityTooLarge"
 	ErrNoSuchUpload                 ErrorCode = "NoSuchUpload"
 	ErrInvalidAccessKeyId           ErrorCode = "InvalidAccessKeyId"
 	ErrSignatureDoesNotMatch        ErrorCode = "SignatureDoesNotMatch"
@@ -68,6 +69,7 @@ var errorMap = map[ErrorCode]errorInfo{
 	ErrBucketAlreadyOwnedByYou:      {http.StatusConflict, ErrBucketAlreadyOwnedByYou, "Your previous request to create the named bucket succeeded"},
 	ErrNoSuchBucket:                 {http.StatusNotFound, ErrNoSuchBucket, "The specified bucket does not exist"},
 	ErrNoSuchKey:                    {http.StatusNotFound, ErrNoSuchKey, "The specified key does not exist"},
+	ErrEntityTooLarge:               {http.StatusBadRequest, ErrEntityTooLarge, "Your proposed upload exceeds the maximum allowed size"},
 	ErrNoSuchUpload:                 {http.StatusNotFound, ErrNoSuchUpload, "The specified multipart upload does not exist"},
 	ErrInvalidAccessKeyId:           {http.StatusForbidden, ErrInvalidAccessKeyId, "The AWS access key ID you provided does not exist in our records"},
 	ErrSignatureDoesNotMatch:        {http.StatusForbidden, ErrSignatureDoesNotMatch, "The request signature we calculated does not match the signature you provided"},

@@ -1,26 +1,18 @@
 //go:build originless
 
 // Package originless is the end-to-end suite for origin-less mode, driven by the
-// s3-test-originless Makefile target. It runs against a REAL tag binary over HTTP
-// in two phases, selected by ORIGINLESS_PHASE, and is fully hermetic — no
-// credentials, no network upstream, no shared account:
+// s3-test-originless Makefile target. Fully hermetic — no credentials, no
+// network, no mock — because it exercises exactly the production topology: an
+// origin-less TAG written to and read from directly by its caller (in
+// production, the tigris gateway; here, a stock aws-sdk-go-v2 client).
 //
-//	warm  — TAG in proxy mode against a local in-memory mock upstream
-//	        (tests/originless/mockupstream). Objects are written through TAG and
-//	        read anonymously so entries are cached with the inferred public-read
-//	        ACL — the only entries phase-1 origin-less serves. A HIT is asserted
-//	        so the disk cache is proven warm.
-//	serve — the SAME cache directory, TAG restarted with no upstream and no
-//	        credentials in its environment. Asserts the whole origin-less
-//	        contract over the wire with a stock aws-sdk-go-v2 client.
+// Phases, selected by ORIGINLESS_PHASE:
 //
-// In production this tier is its own deployment: the tigris gateway writes into
-// it and reads from it directly, and content never arrives via a proxy-mode
-// flip. The mock-upstream warm is a stand-in for those gateway writes until
-// local writes land (phase 3), at which point the warm phase becomes SDK PUTs
-// against origin-less TAG itself and the mock is deleted. What the flip DOES
-// faithfully exercise, and what this suite is for, is the serve contract of a
-// real binary over a real RocksDB cache with a genuinely absent origin.
+//	warm  — SDK PUTs against origin-less TAG populate the tier, and reads verify
+//	        the round trip.
+//	serve — TAG restarted on the SAME cache directory (persistence across
+//	        restart), then the full read/write contract is asserted over the
+//	        wire.
 package originless
 
 import (
@@ -103,37 +95,28 @@ func TestWarmPhase(t *testing.T) {
 	}
 	b := bucket(t)
 	ctx := context.Background()
-	client := sdkClient(t, endpoint(), false)
+	client := sdkClient(t, endpoint(), true) // unsigned: the network is the boundary
 
-	// No CreateBucket: the mock upstream is keyspace-only. The mock's 200 on an
-	// anonymous GET is what stands in for "public" — TAG caches the entry with the
-	// inferred public-read ACL, exactly as it does for a genuinely public bucket.
+	// Populate the tier the way production does: direct PUTs.
 	for key, body := range map[string][]byte{objKey: []byte(objContent), emptyKey: {}} {
-		if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+		out, err := client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(b), Key: aws.String(key), Body: bytes.NewReader(body),
-		}); err != nil {
+		})
+		if err != nil {
 			t.Fatalf("put %s: %v", key, err)
+		}
+		if aws.ToString(out.ETag) == "" {
+			t.Fatalf("put %s returned no ETag", key)
 		}
 	}
 
-	// Anonymous GETs through TAG: the first fetches from Tigris and caches with
-	// the inferred public-read ACL; the second must HIT, proving the disk cache
-	// holds a phase-1-servable entry before the mode flip.
+	// Immediate read-back through the same surface.
 	for _, key := range []string{objKey, emptyKey} {
 		resp := rawDo(t, http.MethodGet, "/"+b+"/"+key, nil)
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("anonymous GET %s: %d", key, resp.StatusCode)
-		}
-		time.Sleep(waitPopulate)
-
-		resp = rawDo(t, http.MethodGet, "/"+b+"/"+key, nil)
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Cache") != "HIT" {
-			t.Fatalf("second anonymous GET %s: status=%d X-Cache=%q, want 200/HIT",
-				key, resp.StatusCode, resp.Header.Get("X-Cache"))
+			t.Fatalf("read-back %s: %d", key, resp.StatusCode)
 		}
 	}
 }
@@ -162,6 +145,41 @@ func TestServePhase(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode != http.StatusOK || len(body) != 0 {
 			t.Fatalf("status=%d len=%d, want 200/0", resp.StatusCode, len(body))
+		}
+	})
+
+	t.Run("signed requests are served too (auth ignored, not evaluated)", func(t *testing.T) {
+		resp := rawDo(t, http.MethodGet, "/"+b+"/"+objKey, map[string]string{
+			"Authorization": "AWS4-HMAC-SHA256 Credential=AKIA/20260824/auto/s3/aws4_request, SignedHeaders=host, Signature=deadbeef",
+		})
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("signed GET: %d — the gateway signs every request; rejecting it breaks the primary caller", resp.StatusCode)
+		}
+	})
+
+	t.Run("write-delete loop works after restart", func(t *testing.T) {
+		client := sdkClient(t, endpoint(), true)
+		ctx := context.Background()
+		if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(b), Key: aws.String("post-restart.txt"), Body: bytes.NewReader([]byte("fresh")),
+		}); err != nil {
+			t.Fatalf("put after restart: %v", err)
+		}
+		out, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(b), Key: aws.String("post-restart.txt")})
+		if err != nil {
+			t.Fatalf("get after put: %v", err)
+		}
+		body, _ := io.ReadAll(out.Body)
+		out.Body.Close()
+		if string(body) != "fresh" {
+			t.Fatalf("body=%q", body)
+		}
+		if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(b), Key: aws.String("post-restart.txt")}); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if _, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(b), Key: aws.String("post-restart.txt")}); err == nil {
+			t.Fatal("get after delete must miss")
 		}
 	})
 
@@ -219,11 +237,10 @@ func TestServePhase(t *testing.T) {
 
 	t.Run("mutations and listings answer 501 and leave the cache intact", func(t *testing.T) {
 		for name, r := range map[string]struct{ method, path string }{
-			"put":                {http.MethodPut, "/" + b + "/" + objKey},
-			"delete":             {http.MethodDelete, "/" + b + "/" + objKey},
 			"bulk delete":        {http.MethodPost, "/" + b + "?delete"},
 			"list":               {http.MethodGet, "/" + b + "?list-type=2"},
 			"initiate multipart": {http.MethodPost, "/" + b + "/" + objKey + "?uploads"},
+			"upload part":        {http.MethodPut, "/" + b + "/" + objKey + "?uploadId=u1&partNumber=1"},
 			"versioned read":     {http.MethodGet, "/" + b + "/" + objKey + "?versionId=abc"},
 		} {
 			resp := rawDo(t, r.method, r.path, nil)

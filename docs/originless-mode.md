@@ -4,7 +4,7 @@ TAG normally sits in front of an upstream: misses are fetched, writes are forwar
 
 It exists for deployments where TAG is a cache *tier* inside a larger system, and that system owns the fallback: a caller that receives `NoSuchKey` reads from its own authoritative store instead. TAG then never needs to be durable — losing an entry costs the caller a slower read, never the data.
 
-It is **off by default**, and it is deliberately incremental: this first phase serves reads only. See [Current limits](#current-limits) before enabling it anywhere.
+It is **off by default**. Enabling it is also the consent to its trust model — read [Trust model](#trust-model) before deploying it anywhere.
 
 ## Enabling it
 
@@ -30,7 +30,13 @@ No AWS credentials are required. Startup logs a single line stating the mode and
 
 ## What it serves
 
-**Plain** `GET` and `HEAD` of a single object, from cache alone. Any query parameter — `?versionId`, `?partNumber`, `?tagging`, and the rest — selects a representation or an operation this mode does not implement, and answers `501` rather than silently serving the current full object. The one exception is `x-id`, the no-op operation tag `aws-sdk-go-v2` appends to every request, which is ignored:
+Plain single-object operations, against the local cache alone:
+
+- **`PUT`** stores the object under `cache.ttl` and returns its ETag. This is how the tier is populated — its callers write into it directly (in the tigris-os deployment, the gateway).
+- **`GET` / `HEAD`** serve from cache; a miss is `NoSuchKey`, the caller's cue to fall back to its authoritative store.
+- **`DELETE`** invalidates the entry (not required for correctness — entries lapse by TTL — but explicit expiry gets prompt removal).
+
+Any query parameter — `?versionId`, `?partNumber`, `?tagging`, and the rest — selects a representation or an operation this mode does not implement, and answers `501` rather than doing something silently wrong. The one exception is `x-id`, the no-op operation tag `aws-sdk-go-v2` appends to every request, which is ignored. Server-side copy (`X-Amz-Copy-Source`) is also `501`:
 
 - **Hit** — served exactly as the proxying mode serves it: full objects, ranges (including block-mode entries), `If-None-Match` / `If-Modified-Since` conditionals, with the `X-Cache` header set.
 - **Miss** — `NoSuchKey`, immediately. This is the signal the calling system uses to fall back to its authoritative store.
@@ -38,7 +44,7 @@ No AWS credentials are required. Startup logs a single line stating the mode and
 
 `Cache-Control: no-cache` and `no-store` from clients are **not consulted**. Both exist to reach past a cache to an origin, and there is no origin: honoring either would turn a healthy cached object into a 404. Nothing is served stale by ignoring them — with no origin, the cached copy is the only copy.
 
-Every other operation — writes, deletes, copies, multipart, listings, tagging, ACLs — answers `501 NotImplemented`. These are rejected before they touch anything, so a stray write cannot invalidate or delete cached data.
+Everything else — listings, multipart, copies, tagging, ACLs — answers `501 NotImplemented`, rejected at the route table before touching anything.
 
 ### The visibility contract
 
@@ -50,20 +56,23 @@ An entry whose blocks were partly evicted, or whose body is gone leaving orphane
 
 One qualification: the completeness check runs immediately before serving, and an eviction can land in the moment between the two. A response that has already committed its status can then be cut short mid-body — the client sees an aborted transfer (a short read against the declared `Content-Length`), not a clean `NoSuchKey`. The window is a race of microseconds, not a steady state, but callers should treat an aborted transfer from this tier the same way they treat a miss: retry against the authoritative store. Detection is unambiguous, since the received byte count never matches the declared length.
 
-## Trust model (this phase)
+## Trust model
 
-Only **anonymous requests for objects cached with a `public-read` ACL** are served. TAG validates signatures by learning keys from its upstream, and there is no upstream — so signed requests cannot be validated and answer `NoSuchKey`, indistinguishable from absence. Serving regardless of ACL, for deployments whose network is the trust boundary, is a planned explicit switch — not a side effect of removing the origin.
+**The network is the boundary.** Origin-less TAG cannot validate signatures — signature validation learns keys from an upstream, and there is none — so requests are served and accepted **regardless of authentication and regardless of any cached ACL**. An `Authorization` header is ignored, not evaluated. This is what the mode's primary caller requires: the tigris gateway signs every request, and evaluating unverifiable signatures would reject them all.
+
+The consequence is stated plainly: anything that can reach an origin-less TAG can read everything it holds and write into it. Deploy it only on a network segment reachable solely by its intended callers — a NetworkPolicy admitting only the gateway, not a convention. The explicit, contradiction-checked `upstream.disabled` switch is the deliberate consent for this trade; there is no separate flag to soften it, because a mode that half-trusts the network serves nothing useful.
 
 ## Observability
 
-- Rejected operations are recorded under `tag_requests_total` with status `unsupported` — a caller persistently writing to an origin-less tier (a misconfigured client, for instance) shows up on the request dashboard instead of blending into the success rate.
+- Unsupported operations are recorded under `tag_requests_total` with status `unsupported`, so a caller repeatedly issuing them shows up on the request dashboard instead of blending into the success rate.
+- Writes record as `PutObject`/`DeleteObject` with the usual statuses.
 - Hits and misses count in `tag_cache_hits_total` / `tag_cache_misses_total` as usual, and `X-Cache` reports `HIT`/`MISS` per response.
 
 ## Current limits
 
-This phase is intentionally narrow. In particular, **nothing can write to an origin-less TAG yet** — mutations are rejected, so the cache can only serve entries it already holds. Local writes (letting callers `PUT` directly into the tier) and the network-trust read switch are subsequent phases. Until then this mode is for validating the read path, not for production population.
-
-Cluster mode works — cross-node serving goes through the cache layer, not the upstream — but sizing and multi-node validation guidance will come with the deployment documentation once the mode is production-complete.
+- **No multipart.** Objects arrive as single `PUT`s, bounded by `cache.size_threshold` (1 GiB default); larger bodies answer `EntityTooLarge`. The tigris-os gateway uploads blocks as single PUTs, so this matches the intended caller.
+- **No listings, no server-side copy, no tagging/ACL subresources.**
+- Cluster mode works — cross-node serving goes through the cache layer, not the upstream — but multi-node sizing guidance will come with the deployment documentation.
 
 ## Turning it off
 

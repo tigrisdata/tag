@@ -324,6 +324,8 @@ func (s *Server) setupOriginlessRoutes(r *mux.Router) {
 	// (versionId, partNumber, tagging, …) as 501, so the enumeration cannot go
 	// stale as S3 grows parameters.
 	r.HandleFunc("/{bucket}/{object:.+}", s.handleOriginlessObject).Methods("GET", "HEAD")
+	r.HandleFunc("/{bucket}/{object:.+}", s.handleOriginlessPut).Methods("PUT")
+	r.HandleFunc("/{bucket}/{object:.+}", s.handleOriginlessDelete).Methods("DELETE")
 
 	// Everything else — listings, mutations, bucket operations, unknown verbs.
 	r.PathPrefix("/").HandlerFunc(s.handleOriginlessUnsupported)
@@ -331,6 +333,14 @@ func (s *Server) setupOriginlessRoutes(r *mux.Router) {
 
 func (s *Server) handleOriginlessObject(w http.ResponseWriter, r *http.Request) {
 	handleWithError(w, r, s.service.HandleOriginlessObject)
+}
+
+func (s *Server) handleOriginlessPut(w http.ResponseWriter, r *http.Request) {
+	handleWithError(w, r, s.service.HandleOriginlessPut)
+}
+
+func (s *Server) handleOriginlessDelete(w http.ResponseWriter, r *http.Request) {
+	handleWithError(w, r, s.service.HandleOriginlessDelete)
 }
 
 func (s *Server) handleOriginlessUnsupported(w http.ResponseWriter, r *http.Request) {
