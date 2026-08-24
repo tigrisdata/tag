@@ -1060,11 +1060,15 @@ func (c *Cache) GetMode() string {
 	return string(c.client.GetMode())
 }
 
-// isMetaNotFoundError reports a confirmed metadata-key miss. It intentionally
-// accepts only the cache client's gRPC NotFound status: forwarding and routing
-// failures can contain missing-key text while their resident snapshot is valid.
+// isMetaNotFoundError reports a confirmed metadata-key miss. The cache service
+// uses this exact status message for an absent key; other NotFound statuses can
+// describe topology or routing state and must not evict a resident snapshot.
 func isMetaNotFoundError(err error) bool {
-	return err != nil && status.Code(err) == codes.NotFound
+	if err == nil {
+		return false
+	}
+	st, ok := status.FromError(err)
+	return ok && st.Code() == codes.NotFound && st.Message() == "key not found"
 }
 
 // isNotFoundError checks if the error indicates a cache miss.

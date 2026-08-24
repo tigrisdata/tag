@@ -600,6 +600,8 @@ func TestIsMetaNotFoundError(t *testing.T) {
 		want bool
 	}{
 		{"grpc not found", status.Error(codes.NotFound, "key not found"), true},
+		{"grpc topology not found", status.Error(codes.NotFound, "topology not available"), false},
+		{"grpc resource not found", status.Error(codes.NotFound, "resource not found"), false},
 		{"unavailable routing", status.Error(codes.Unavailable, "routing error: node not found in ring"), false},
 		{"unavailable forwarding", status.Error(codes.Unavailable, "forwarding error: key not found"), false},
 		{"plain missing-key text", errors.New("key not found"), false},
@@ -647,6 +649,33 @@ func TestDecodedMetaTierRetainsSnapshotAcrossRoutingGetError(t *testing.T) {
 				t.Fatalf("metadata after unavailable read recovery = %s, want retained resident snapshot", got)
 			}
 		})
+	}
+}
+
+func TestDecodedMetaTierRetainsSnapshotAcrossTopologyNotFoundGetError(t *testing.T) {
+	ctx := context.Background()
+	client := newDecodedMetaTestClient(cacheclient.ModeCluster)
+	c := newDecodedMetaTestCache(t, client)
+	const bucket, key = "bucket", "topology-not-found"
+
+	if err := c.PutWithMeta(ctx, bucket, key, testDecodedMeta(bucket, key, `"v1"`), []byte("body"), 60); err != nil {
+		t.Fatalf("PutWithMeta: %v", err)
+	}
+	admitDecodedMeta(t, c, bucket, key)
+	replaceDecodedSnapshot(t, c, bucket, key, `"resident"`)
+
+	client.setFailMetaGets(status.Error(codes.NotFound, "topology not available"))
+	meta, found, err := c.GetMeta(ctx, bucket, key)
+	if status.Code(err) != codes.NotFound || found || meta != nil {
+		t.Fatalf("GetMeta during topology failure = (meta=%v, found=%t, code=%v), want (nil, false, NotFound)", meta, found, status.Code(err))
+	}
+	if _, ok := c.decodedMeta.Peek(MakeMetaKey(bucket, key)); !ok {
+		t.Fatal("topology NotFound evicted the decoded snapshot")
+	}
+
+	client.setFailMetaGets(nil)
+	if got := mustGetDecodedMeta(t, c, bucket, key).ETag; got != `"resident"` {
+		t.Fatalf("metadata after topology read recovery = %s, want retained resident snapshot", got)
 	}
 }
 
