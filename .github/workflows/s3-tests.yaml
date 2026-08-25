@@ -114,7 +114,7 @@ jobs:
 
       # Fully hermetic — no credentials, no network. Exercises the production
       # topology exactly: origin-less TAG populated by direct SDK writes (as the
-      # tigris gateway does), restarted on the same cache directory to prove
+      # fronting gateway would), restarted on the same cache directory to prove
       # persistence, the whole read/write contract asserted with a stock
       # aws-sdk-go-v2 client, and then the ceph s3-tests subset covering the
       # origin-less surface (object writes/reads, ranges, conditionals,

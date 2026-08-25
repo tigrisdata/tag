@@ -36,7 +36,7 @@ import (
 //         cue to fall back to its authoritative store.
 // Writes: PUT stores the object in the local cache under cache.ttl; DELETE
 //         invalidates. This is how the tier is populated — by its callers,
-//         directly (e.g. the tigris gateway).
+//         directly.
 // Everything else — listings, multipart, copies, tagging, ACLs — answers 501.
 
 // Originless reports whether this Service runs without an upstream. The server
@@ -87,9 +87,9 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	// answering that question is exactly how three review rounds of
 	// existence-vs-serveability disagreements happened. An incomplete entry is
 	// simply invisible: metadata alone cannot be served, and claiming existence
-	// from it makes HEAD-as-existence callers (the tigris-os distribute worker
-	// skips re-population when IsObjectExists is true) skip the healing that would
-	// make the entry servable again. A probe-to-serve race can still truncate a
+	// from it makes HEAD-as-existence callers — anything that skips re-population
+	// when a HEAD says the object exists — skip the healing that would make the
+	// entry servable again. A probe-to-serve race can still truncate a
 	// concurrent eviction; the gate narrows the window, nothing can close it.
 	if !s.entryServable(ctx, bucket, key, meta) {
 		return s.originlessMiss(w, r, operation, start)
@@ -463,7 +463,7 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 
 // HandleOriginlessDelete invalidates the object. Deletion is not required for
 // correctness — entries lapse by cache.ttl — but a caller that expires objects
-// explicitly (the tigris gateway may, on object expiry) gets prompt removal.
+// explicitly (a caller expiring objects on its own schedule) gets prompt removal.
 func (s *Service) HandleOriginlessDelete(w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()
 	bucket, key := ParseBucketKey(r)

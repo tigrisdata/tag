@@ -590,7 +590,7 @@ func (s *Server) handleListObjectsV2(w http.ResponseWriter, r *http.Request) {
 
 // handleCompleteMultipartUpload handles CompleteMultipartUpload with idempotency caching.
 // This caches successful completion responses in ocache to support idempotent calls,
-// matching tigris-os behavior where a second CompleteMultipartUpload returns success.
+// matching the upstream's behavior, where a second CompleteMultipartUpload returns success.
 func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	if !validateBucketName(w, r) {
 		return

@@ -4,7 +4,8 @@
 // s3-test-originless Makefile target. Fully hermetic — no credentials, no
 // network, no mock — because it exercises exactly the production topology: an
 // origin-less TAG written to and read from directly by its caller (in
-// production, the tigris gateway; here, a stock aws-sdk-go-v2 client).
+// production, a storage gateway that owns the fallback; here, a stock
+// aws-sdk-go-v2 client).
 //
 // Phases, selected by ORIGINLESS_PHASE:
 //

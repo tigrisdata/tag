@@ -32,7 +32,7 @@ No AWS credentials are required. Startup logs a single line stating the mode and
 
 Plain single-object operations, against the local cache alone:
 
-- **`PUT`** stores the object under `cache.ttl` and returns its ETag. This is how the tier is populated — its callers write into it directly (in the tigris-os deployment, the gateway).
+- **`PUT`** stores the object under `cache.ttl` and returns its ETag. This is how the tier is populated — its callers write into it directly.
 - **`GET` / `HEAD`** serve from cache; a miss is `NoSuchKey`, the caller's cue to fall back to its authoritative store.
 - **`DELETE`** invalidates the entry (not required for correctness — entries lapse by TTL — but explicit expiry gets prompt removal). **Multi-delete** (`POST ?delete`, up to 1000 keys) works the same way; deleting an absent key is a success, as on S3.
 - **Conditional writes**: `If-None-Match: *` is put-if-absent in one request; `If-Match` guards overwrites (against a missing object it answers `NoSuchKey`). Check-then-store, not atomic — the right idiom for a cache tier, not a coordination primitive.
@@ -60,7 +60,7 @@ One qualification: the completeness check runs immediately before serving, and a
 
 ## Trust model
 
-**The network is the boundary.** Origin-less TAG cannot validate signatures — signature validation learns keys from an upstream, and there is none — so requests are served and accepted **regardless of authentication and regardless of any cached ACL**. An `Authorization` header is ignored, not evaluated. This is what the mode's primary caller requires: the tigris gateway signs every request, and evaluating unverifiable signatures would reject them all.
+**The network is the boundary.** Origin-less TAG cannot validate signatures — signature validation learns keys from an upstream, and there is none — so requests are served and accepted **regardless of authentication and regardless of any cached ACL**. An `Authorization` header is ignored, not evaluated. This is what typical callers require: S3 clients sign every request by default, and evaluating unverifiable signatures would reject them all.
 
 The consequence is stated plainly: anything that can reach an origin-less TAG can read everything it holds and write into it. Deploy it only on a network segment reachable solely by its intended callers — a NetworkPolicy admitting only the gateway, not a convention. The explicit, contradiction-checked `upstream.disabled` switch is the deliberate consent for this trade; there is no separate flag to soften it, because a mode that half-trusts the network serves nothing useful.
 
@@ -73,7 +73,7 @@ The consequence is stated plainly: anything that can reach an origin-less TAG ca
 
 ## Current limits
 
-- **No multipart.** Objects arrive as single `PUT`s, bounded by `cache.size_threshold` (1 GiB default); larger bodies answer `EntityTooLarge`. The tigris-os gateway uploads blocks as single PUTs, so this matches the intended caller.
+- **No multipart.** Objects arrive as single `PUT`s, bounded by `cache.size_threshold` (1 GiB default); larger bodies answer `EntityTooLarge`. Callers that upload objects as single PUTs — the intended shape for this tier — are unaffected.
 - **No `ListBuckets`** (buckets are implicit; enumerating them would need a full scan), **no server-side copy, no tagging/ACL subresources.**
 - Cluster mode works — cross-node serving goes through the cache layer, not the upstream — but multi-node sizing guidance will come with the deployment documentation.
 

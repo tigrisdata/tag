@@ -66,7 +66,7 @@ func TestOriginlessRoutes_ReadsServeFromCacheAlone(t *testing.T) {
 	}
 
 	// The SDK operation tag must not defeat the plain-read rule: aws-sdk-go-v2
-	// appends ?x-id=GetObject to every GetObject, and the tigris-os gateway is
+	// appends ?x-id=GetObject to every GetObject, and any stock-SDK caller is
 	// exactly such a client.
 	if w := do(s, http.MethodGet, "/b/pub.txt?x-id=GetObject", nil); w.Code != http.StatusOK {
 		t.Fatalf("SDK-tagged GET: code=%d, want 200", w.Code)
@@ -114,8 +114,8 @@ func TestOriginlessRoutes_ReadsServeFromCacheAlone(t *testing.T) {
 // The network is the trust boundary: reads serve regardless of the cached ACL
 // and regardless of authentication. A signed request's signature cannot be
 // validated without an upstream, so it is ignored rather than evaluated — the
-// tigris gateway's S3 client signs every request, and rejecting signed reads
-// would 404 the mode's primary caller.
+// callers' S3 clients sign every request by default, and rejecting signed
+// reads would 404 them all.
 func TestOriginlessRoutes_NetworkTrustServesRegardlessOfACLAndAuth(t *testing.T) {
 	s, c := newOriginlessServer(t)
 	seedObject(t, c, "private.txt", "", []byte("secret"))
@@ -130,8 +130,8 @@ func TestOriginlessRoutes_NetworkTrustServesRegardlessOfACLAndAuth(t *testing.T)
 }
 
 // The population path: PUT stores into the local cache, GET serves it back,
-// DELETE removes it. This is the production loop — the tigris gateway writes
-// and reads this tier directly.
+// DELETE removes it. This is the production loop — callers write to and read
+// from this tier directly.
 func TestOriginlessRoutes_WriteReadDeleteLoop(t *testing.T) {
 	s, _ := newOriginlessServer(t)
 
@@ -332,7 +332,7 @@ func TestOriginlessRoutes_IncompleteBlockEntryIsACleanMissNotATruncatedServe(t *
 	// The contract: an incomplete entry is INVISIBLE — every request shape answers
 	// exactly as if the object were absent. Anything else lets one path imply an
 	// existence another path denies, and a HEAD/304-as-existence caller (the
-	// tigris-os distribute worker skips re-population when IsObjectExists is true)
+	// caller that skips re-population when a HEAD says the object exists)
 	// would then never heal an entry that can never be served.
 	shapes := map[string]*httptest.ResponseRecorder{
 		"range over present block": do(s, http.MethodGet, "/b/partial.bin", map[string]string{"Range": "bytes=0-99"}),

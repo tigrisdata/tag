@@ -36,7 +36,7 @@ func TestIsParquetKey(t *testing.T) {
 		key  string
 		want bool
 	}{
-		{"metrics/date=2026-08-19/hour=01/minute=40/ingestor.data.01M0.parquet", true},
+		{"metrics/date=2026-08-19/hour=01/minute=40/writer.data.01M0.parquet", true},
 		{"UPPER.PARQUET", true},
 		{"manifest.json", false},
 		{"parquet", false},

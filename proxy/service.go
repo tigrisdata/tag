@@ -805,7 +805,7 @@ func (s *Service) HandlePassthrough(w http.ResponseWriter, r *http.Request) erro
 
 // HandleCompleteMultipartUpload handles CompleteMultipartUpload with idempotency caching.
 // This caches successful completion responses in ocache to support idempotent calls,
-// matching tigris-os behavior where a second CompleteMultipartUpload call returns success.
+// matching the upstream's behavior, where a second CompleteMultipartUpload call returns success.
 func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request) error {
 	bucket, key := ParseBucketKey(r)
 	uploadId := r.URL.Query().Get("uploadId")
@@ -854,7 +854,7 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		// Warm-on-write is the only way to make a multipart-completed object hot:
 		// TAG never sees its assembled body, so a write-through tee is impossible.
 		s.warmOnWrite(r, bucket, key)
-		// The path that matters for parquet: ingestors write via multipart, so this
+		// The path that matters for parquet: writers typically upload via multipart, so this
 		// is where a freshly written file's metadata gets warmed (RFC 0002).
 		s.warmParquetFooterOnWrite(r, bucket, key)
 		// Prototype: establish the metadata entry so the first read does not pay an
