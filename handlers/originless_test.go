@@ -499,6 +499,24 @@ func TestOriginlessRoutes_LargePutStoresBlocks(t *testing.T) {
 		t.Fatalf("cross-boundary range: code=%d body=%q", g.Code, g.Body.Bytes())
 	}
 
+	// DELETE writes a tombstone; a PUT that starts after it must still land.
+	// The tombstone gate compares nanosecond stamps — a seconds-unit
+	// writeStartTime would read the live tombstone as newer and silently skip
+	// the meta write under a 200, leaving the object invisible.
+	if w := do(s, http.MethodDelete, "/b/big.bin", nil); w.Code != http.StatusNoContent {
+		t.Fatalf("DELETE: code=%d", w.Code)
+	}
+	body2 := bytes.Repeat([]byte("fedcba9876543210"), 224)
+	req = httptest.NewRequest(http.MethodPut, "/b/big.bin", bytes.NewReader(body2))
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("re-PUT after DELETE: code=%d", w.Code)
+	}
+	if g := do(s, http.MethodGet, "/b/big.bin", nil); g.Code != http.StatusOK || !bytes.Equal(g.Body.Bytes(), body2) {
+		t.Fatalf("GET after delete-then-reput: code=%d len=%d — a skipped meta write makes the PUT a silent no-op", g.Code, g.Body.Len())
+	}
+
 	// Below the boundary: whole-object entry, no block meta.
 	req = httptest.NewRequest(http.MethodPut, "/b/small.bin", strings.NewReader("tiny"))
 	w = httptest.NewRecorder()

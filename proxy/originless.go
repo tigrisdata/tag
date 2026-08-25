@@ -469,7 +469,10 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	ttl := int(s.config.Cache.TTL.Seconds())
 	if s.config.Cache.IsBlockCachingEnabled() && meta.ContentLength >= s.config.Cache.BlockSize {
 		meta.BlockSize = s.config.Cache.BlockSize
-		if err := s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.Unix()); err != nil {
+		// writeStartTime is UnixNano — the tombstone gate compares against
+		// nanosecond stamps; seconds would read every live tombstone as newer
+		// and silently skip the meta write under a 200.
+		if err := s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano()); err != nil {
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return err
 		}
