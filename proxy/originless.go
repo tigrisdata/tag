@@ -386,10 +386,16 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// to EVER fit the configured budget is a configuration mismatch and answers
 	// EntityTooLarge up front rather than SlowDown forever.
 	streaming := IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256"))
+	blockBound := s.config.Cache.IsBlockCachingEnabled() && declaredSize >= s.config.Cache.BlockSize
 	bufSize := declaredSize + 1
 	weight := bufSize
 	if streaming {
 		weight += awsChunkedReaderBufSize
+	}
+	if blockBound {
+		// putBlocksFromStream stages one block-size buffer while the full body
+		// is still held; both are live at once, so both are reserved.
+		weight += s.config.Cache.BlockSize
 	}
 	if s.populateBudget != nil && weight > s.populateBudget.total {
 		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
@@ -457,8 +463,11 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// through the same writer: putBlocksFromStream is the shared full-object
 	// populate path, so block entries written here are indistinguishable from
 	// proxy-populated ones — one read path, one visibility gate.
+	// blockBound was decided at admission from the same size (declared ==
+	// len(body), enforced above), so the staging buffer reserved there is
+	// exactly the one this branch allocates.
 	ttl := int(s.config.Cache.TTL.Seconds())
-	if s.config.Cache.IsBlockCachingEnabled() && meta.ContentLength >= s.config.Cache.BlockSize {
+	if blockBound {
 		meta.BlockSize = s.config.Cache.BlockSize
 		// writeStartTime is UnixNano — the tombstone gate compares against
 		// nanosecond stamps; seconds would read every live tombstone as newer

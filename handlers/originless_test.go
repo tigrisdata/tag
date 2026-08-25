@@ -757,6 +757,40 @@ func TestOriginlessRoutes_StreamingPutReservesDecoderBuffer(t *testing.T) {
 	}
 }
 
+// A block-mode-bound PUT holds its full body while putBlocksFromStream stages
+// one more block-size buffer, so admission must weigh both. Pinned by a budget
+// between the two weights: the same PUT is refused when the staging buffer
+// counts and admitted when the budget has room for it.
+func TestOriginlessRoutes_BlockBoundPutReservesStagingBuffer(t *testing.T) {
+	newSrv := func(budget int64) *Server {
+		cfg := config.NewDefault()
+		cfg.Upstream.Disabled = true
+		cfg.Upstream.Endpoint = ""
+		cfg.Cache.SizeThreshold = 1 << 30
+		cfg.Cache.BlockSize = 1024
+		cfg.Cache.MaxPopulateMemoryBytes = budget
+		c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+		return NewServer(proxy.NewService(proxy.NewForwarder(nil, "", "auto", 10, nil, nil), c, cfg), "127.0.0.1", 0, false, 0)
+	}
+	body := strings.Repeat("x", 2048) // >= BlockSize → block-bound; weight = 2049 + 1024
+
+	// Budget covers body+1 but not the staging block: refused up front.
+	req := httptest.NewRequest(http.MethodPut, "/b/blk.bin", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	newSrv(3<<10).router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "EntityTooLarge") {
+		t.Fatalf("block-bound PUT must be weighed with its staging buffer: code=%d body=%q", w.Code, w.Body.String())
+	}
+
+	// Budget covers both: admitted and stored.
+	req = httptest.NewRequest(http.MethodPut, "/b/blk.bin", strings.NewReader(body))
+	w = httptest.NewRecorder()
+	newSrv(8<<10).router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("block-bound PUT within budget: code=%d body=%q", w.Code, w.Body.String())
+	}
+}
+
 // The SDK's x-id tag rides on the bucket ceremony too; and per RFC 7232 a
 // present If-Match suppresses If-Unmodified-Since entirely.
 func TestOriginlessRoutes_BucketXIDAndPreconditionPrecedence(t *testing.T) {
