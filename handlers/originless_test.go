@@ -451,6 +451,42 @@ func TestOriginlessRoutes_AWSChunkedPutStoresDecodedBody(t *testing.T) {
 	}
 }
 
+// Every streaming marker an AWS SDK can send shares the same chunk framing —
+// SigV4, SigV4A (ECDSA), each with and without trailing checksums, and
+// unsigned-with-trailer. A marker that slips past detection stores the framing
+// as object bytes with an ETag over the framing: silent corruption.
+func TestOriginlessRoutes_AllStreamingVariantsDecode(t *testing.T) {
+	s, _ := newOriginlessServer(t)
+
+	payload := "decoded payload bytes"
+	signedChunks := fmt.Sprintf("%x;chunk-signature=deadbeef\r\n%s\r\n0;chunk-signature=deadbeef\r\n", len(payload), payload)
+	unsignedChunks := fmt.Sprintf("%x\r\n%s\r\n0\r\n", len(payload), payload)
+	trailer := "x-amz-checksum-crc32:AAAAAA==\r\n\r\n"
+
+	for i, tc := range []struct {
+		marker, wire string
+	}{
+		{"STREAMING-AWS4-HMAC-SHA256-PAYLOAD", signedChunks + "\r\n"},
+		{"STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER", signedChunks + trailer},
+		{"STREAMING-UNSIGNED-PAYLOAD-TRAILER", unsignedChunks + trailer},
+		{"STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD", signedChunks + "\r\n"},
+		{"STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER", signedChunks + trailer},
+	} {
+		key := fmt.Sprintf("/b/variant-%d.txt", i)
+		req := httptest.NewRequest(http.MethodPut, key, strings.NewReader(tc.wire))
+		req.Header.Set("X-Amz-Content-Sha256", tc.marker)
+		req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprint(len(payload)))
+		w := httptest.NewRecorder()
+		s.router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: PUT code=%d body=%q", tc.marker, w.Code, w.Body.String())
+		}
+		if g := do(s, http.MethodGet, key, nil); g.Body.String() != payload {
+			t.Fatalf("%s: stored %q, want the DECODED payload", tc.marker, g.Body.String())
+		}
+	}
+}
+
 // Content-Encoding describes the stored bytes, so it must survive the round
 // trip — minus the aws-chunked token, whose framing PUT decodes away. Dropping
 // it entirely would serve gzip bytes that clients read as the raw object;
