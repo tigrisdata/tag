@@ -451,6 +451,61 @@ func TestOriginlessRoutes_AWSChunkedPutStoresDecodedBody(t *testing.T) {
 	}
 }
 
+// Content-Encoding describes the stored bytes, so it must survive the round
+// trip — minus the aws-chunked token, whose framing PUT decodes away. Dropping
+// it entirely would serve gzip bytes that clients read as the raw object;
+// keeping aws-chunked would advertise framing the stored bytes no longer carry.
+func TestOriginlessRoutes_PutPreservesContentEncoding(t *testing.T) {
+	s, _ := newOriginlessServer(t)
+
+	// Plain upload of pre-encoded bytes: header round-trips verbatim.
+	req := httptest.NewRequest(http.MethodPut, "/b/enc.gz", strings.NewReader("gzip-encoded bytes"))
+	req.Header.Set("Content-Encoding", "gzip")
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT with Content-Encoding: code=%d", w.Code)
+	}
+	if g := do(s, http.MethodGet, "/b/enc.gz", nil); g.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("GET Content-Encoding=%q, want gzip", g.Header().Get("Content-Encoding"))
+	}
+
+	// Streaming upload with a combined value: aws-chunked is stripped (that
+	// layer was decoded), the remaining encoding survives.
+	payload := "still gzip bytes"
+	framed := fmt.Sprintf("%x;chunk-signature=deadbeef\r\n%s\r\n0;chunk-signature=deadbeef\r\n\r\n", len(payload), payload)
+	req = httptest.NewRequest(http.MethodPut, "/b/enc2.gz", strings.NewReader(framed))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	req.Header.Set("Content-Encoding", "aws-chunked,gzip")
+	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprint(len(payload)))
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("chunked PUT with combined encoding: code=%d", w.Code)
+	}
+	g := do(s, http.MethodGet, "/b/enc2.gz", nil)
+	if g.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("GET Content-Encoding=%q, want gzip (aws-chunked stripped)", g.Header().Get("Content-Encoding"))
+	}
+	if g.Body.String() != payload {
+		t.Fatalf("body=%q, want decoded payload", g.Body.String())
+	}
+
+	// aws-chunked alone: no residual header on the stored object.
+	req = httptest.NewRequest(http.MethodPut, "/b/enc3.txt", strings.NewReader(framed))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprint(len(payload)))
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("chunked PUT: code=%d", w.Code)
+	}
+	if g := do(s, http.MethodGet, "/b/enc3.txt", nil); g.Header().Get("Content-Encoding") != "" {
+		t.Fatalf("GET Content-Encoding=%q, want empty", g.Header().Get("Content-Encoding"))
+	}
+}
+
 // The budget reservation equals the limiter's bound, so the declared length is
 // load-bearing: a body that does not match it is the client misdescribing the
 // request, and is refused rather than stored under a wrong ETag.

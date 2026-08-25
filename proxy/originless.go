@@ -433,10 +433,21 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	sum := md5.Sum(body)
 	etag := `"` + hex.EncodeToString(sum[:]) + `"`
 
+	// Store the client's Content-Encoding minus the aws-chunked token: that
+	// layer was decoded above, while dropping the header entirely would serve,
+	// e.g., gzip bytes that readers interpret as the raw object.
+	var contentEncoding []string
+	for _, part := range strings.Split(r.Header.Get("Content-Encoding"), ",") {
+		if p := strings.TrimSpace(part); p != "" && p != "aws-chunked" {
+			contentEncoding = append(contentEncoding, p)
+		}
+	}
+
 	meta := &cache.CachedObjectMeta{
 		Bucket: bucket, Key: key, StatusCode: http.StatusOK,
 		ETag: etag, ContentLength: int64(len(body)),
 		ContentType:        r.Header.Get("Content-Type"),
+		ContentEncoding:    strings.Join(contentEncoding, ","),
 		CacheControl:       r.Header.Get("Cache-Control"),
 		Expires:            r.Header.Get("Expires"),
 		ContentDisposition: r.Header.Get("Content-Disposition"),
