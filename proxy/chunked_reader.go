@@ -62,9 +62,14 @@ type awsChunkedReader struct {
 	done      bool
 }
 
+// awsChunkedReaderBufSize is the decoder's internal bufio buffer. Named so
+// budget accounting (origin-less PUT admission) can reserve exactly what the
+// decoder allocates.
+const awsChunkedReaderBufSize = 64 * 1024
+
 func newAWSChunkedReader(r io.Reader) *awsChunkedReader {
 	return &awsChunkedReader{
-		reader: bufio.NewReaderSize(r, 64*1024),
+		reader: bufio.NewReaderSize(r, awsChunkedReaderBufSize),
 	}
 }
 

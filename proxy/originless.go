@@ -371,11 +371,13 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		return nil
 	}
 
-	// The buffer below is real memory held for the duration of the store, so it
-	// draws on the same populate budget and count ceiling as every other cache
-	// write. The reservation is EXACTLY the limiter's bound — declared size plus
-	// the one detection byte — never a clamped or nominal figure: a reservation
-	// smaller than the possible buffer re-creates the OOM the budget prevents.
+	// The memory below is held for the duration of the store, so it draws on the
+	// same populate budget and count ceiling as every other cache write. The
+	// reservation is EXACTLY what the request allocates — the declared size plus
+	// the one detection byte, plus the chunked decoder's bufio buffer when the
+	// body is streaming-framed — never a clamped or nominal figure: a
+	// reservation smaller than the real allocation re-creates the OOM the budget
+	// prevents, one small unaccounted buffer at a time.
 	//
 	// Admission is NON-BLOCKING (the read-miss path): a client-facing PUT must
 	// shed with a retryable SlowDown immediately, not park on the budget's
@@ -383,7 +385,12 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// otherwise wait out the server timeout before failing. An object too large
 	// to EVER fit the configured budget is a configuration mismatch and answers
 	// EntityTooLarge up front rather than SlowDown forever.
-	weight := declaredSize + 1
+	streaming := IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256"))
+	bufSize := declaredSize + 1
+	weight := bufSize
+	if streaming {
+		weight += awsChunkedReaderBufSize
+	}
 	if s.populateBudget != nil && weight > s.populateBudget.total {
 		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
@@ -400,17 +407,18 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// them — are the object, not the wire encoding. Storing the framing serves
 	// corrupt bytes with a 200, which the caller cannot detect as a miss.
 	reader := r.Body
-	if IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) {
+	if streaming {
 		reader = io.NopCloser(newAWSChunkedReader(r.Body))
 	}
 
 	// The allocation IS the reservation: one buffer of exactly declared+1 bytes,
-	// filled with ReadFull. io.ReadAll would grow its backing array geometrically
-	// and could retain up to ~2x the reservation — the undercount the budget
-	// exists to prevent. The extra byte detects a body longer than declared; a
-	// shorter one is an IncompleteBody. Both are the client misdescribing the
-	// request, not data to store under a wrong ETag.
-	buf := make([]byte, weight)
+	// filled with ReadFull (the reservation additionally covers the decoder's
+	// bufio buffer for streaming bodies). io.ReadAll would grow its backing array
+	// geometrically and could retain up to ~2x the reservation — the undercount
+	// the budget exists to prevent. The extra byte detects a body longer than
+	// declared; a shorter one is an IncompleteBody. Both are the client
+	// misdescribing the request, not data to store under a wrong ETag.
+	buf := make([]byte, bufSize)
 	n, err := io.ReadFull(reader, buf)
 	switch {
 	case err == nil:

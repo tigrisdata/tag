@@ -723,6 +723,40 @@ func TestOriginlessRoutes_PutLargerThanBudgetFailsFast(t *testing.T) {
 	}
 }
 
+// A streaming PUT allocates the chunked decoder's bufio buffer on top of the
+// declared+1 read buffer, so its reservation must cover both — otherwise
+// concurrent small streaming PUTs exceed the populate budget one unaccounted
+// 64 KiB at a time. Pinned by a budget sized between the two weights: the same
+// declared size is admitted plain and refused streaming.
+func TestOriginlessRoutes_StreamingPutReservesDecoderBuffer(t *testing.T) {
+	cfg := config.NewDefault()
+	cfg.Upstream.Disabled = true
+	cfg.Upstream.Endpoint = ""
+	cfg.Cache.SizeThreshold = 1 << 30
+	cfg.Cache.MaxPopulateMemoryBytes = 32 << 10 // plain 16Ki+1 fits; streaming +64Ki cannot
+	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	svc := proxy.NewService(proxy.NewForwarder(nil, "", "auto", 10, nil, nil), c, cfg)
+	srv := NewServer(svc, "127.0.0.1", 0, false, 0)
+
+	body := strings.Repeat("x", 16<<10)
+	req := httptest.NewRequest(http.MethodPut, "/b/plain.txt", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("plain PUT within budget: code=%d", w.Code)
+	}
+
+	framed := fmt.Sprintf("%x;chunk-signature=deadbeef\r\n%s\r\n0;chunk-signature=deadbeef\r\n\r\n", len(body), body)
+	req = httptest.NewRequest(http.MethodPut, "/b/streamed.txt", strings.NewReader(framed))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprint(len(body)))
+	w = httptest.NewRecorder()
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "EntityTooLarge") {
+		t.Fatalf("streaming PUT must be weighed with its decoder buffer: code=%d body=%q", w.Code, w.Body.String())
+	}
+}
+
 // The SDK's x-id tag rides on the bucket ceremony too; and per RFC 7232 a
 // present If-Match suppresses If-Unmodified-Since entirely.
 func TestOriginlessRoutes_BucketXIDAndPreconditionPrecedence(t *testing.T) {
