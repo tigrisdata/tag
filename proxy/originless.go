@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -434,33 +433,17 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	sum := md5.Sum(body)
 	etag := `"` + hex.EncodeToString(sum[:]) + `"`
 
-	// Store the client's Content-Encoding minus the aws-chunked token: that
-	// layer was decoded above, while dropping the header entirely would serve,
-	// e.g., gzip bytes that readers interpret as the raw object.
-	var contentEncoding []string
-	for _, part := range strings.Split(r.Header.Get("Content-Encoding"), ",") {
-		if p := strings.TrimSpace(part); p != "" && !strings.EqualFold(p, "aws-chunked") {
-			contentEncoding = append(contentEncoding, p)
-		}
-	}
-
-	meta := &cache.CachedObjectMeta{
-		Bucket: bucket, Key: key, StatusCode: http.StatusOK,
-		ETag: etag, ContentLength: int64(len(body)),
-		ContentType:        r.Header.Get("Content-Type"),
-		ContentEncoding:    strings.Join(contentEncoding, ","),
-		CacheControl:       r.Header.Get("Cache-Control"),
-		Expires:            r.Header.Get("Expires"),
-		ContentDisposition: r.Header.Get("Content-Disposition"),
-		ContentLanguage:    r.Header.Get("Content-Language"),
-		CachedAt:           time.Now().Unix(), LastModified: time.Now().Unix(),
-		UserMetadata: make(map[string]string),
-	}
-	for name, vals := range r.Header {
-		if strings.HasPrefix(strings.ToLower(name), "x-amz-meta-") && len(vals) > 0 {
-			meta.UserMetadata[strings.ToLower(name)] = vals[0]
-		}
-	}
+	// Same header→meta mapping as the proxying populate path, then override
+	// what a terminal store owns: the ETag is computed (never client-supplied),
+	// ContentLength is the decoded body (the wire length counts chunk framing),
+	// Content-Encoding drops the aws-chunked token (that layer was decoded above;
+	// dropping the header entirely would serve gzip bytes read as the raw
+	// object), and LastModified is the write time, not a client header.
+	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, r.Header)
+	meta.ETag = etag
+	meta.ContentLength = int64(len(body))
+	meta.ContentEncoding = stripAWSChunkedToken(r.Header.Get("Content-Encoding"))
+	meta.LastModified = time.Now().Unix()
 
 	// Same whole-vs-block boundary as proxying mode (size, not access pattern),
 	// through the same writer: putBlocksFromStream is the shared full-object

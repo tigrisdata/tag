@@ -488,6 +488,21 @@ func prepareForwardedRequest(fwdReq *http.Request, contentLength int64, chunked 
 	}
 }
 
+// stripAWSChunkedToken removes the aws-chunked token from a Content-Encoding
+// value, preserving any remaining encodings ("aws-chunked,gzip" → "gzip").
+// Content-coding tokens are case-insensitive (RFC 9110), and chunked decoding
+// keys off the streaming SHA-256 marker rather than this header's spelling, so
+// any casing of the token must be stripped once the framing is decoded.
+func stripAWSChunkedToken(ce string) string {
+	var remaining []string
+	for _, part := range strings.Split(ce, ",") {
+		if p := strings.TrimSpace(part); p != "" && !strings.EqualFold(p, "aws-chunked") {
+			remaining = append(remaining, p)
+		}
+	}
+	return strings.Join(remaining, ",")
+}
+
 // stripAWSChunkedEncoding removes "aws-chunked" from the Content-Encoding header.
 // AWS S3 allows combined values like "aws-chunked,gzip". After decoding the chunked
 // layer, we strip only the aws-chunked token and preserve any remaining encodings.
@@ -497,17 +512,10 @@ func stripAWSChunkedEncoding(req *http.Request) {
 		return
 	}
 
-	var remaining []string
-	for _, part := range strings.Split(ce, ",") {
-		if strings.TrimSpace(part) != "aws-chunked" {
-			remaining = append(remaining, strings.TrimSpace(part))
-		}
-	}
-
-	if len(remaining) == 0 {
+	if remaining := stripAWSChunkedToken(ce); remaining == "" {
 		req.Header.Del("Content-Encoding")
 	} else {
-		req.Header.Set("Content-Encoding", strings.Join(remaining, ","))
+		req.Header.Set("Content-Encoding", remaining)
 	}
 }
 
