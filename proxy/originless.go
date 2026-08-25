@@ -438,7 +438,7 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// e.g., gzip bytes that readers interpret as the raw object.
 	var contentEncoding []string
 	for _, part := range strings.Split(r.Header.Get("Content-Encoding"), ",") {
-		if p := strings.TrimSpace(part); p != "" && p != "aws-chunked" {
+		if p := strings.TrimSpace(part); p != "" && !strings.EqualFold(p, "aws-chunked") {
 			contentEncoding = append(contentEncoding, p)
 		}
 	}

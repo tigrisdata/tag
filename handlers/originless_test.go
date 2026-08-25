@@ -476,7 +476,9 @@ func TestOriginlessRoutes_PutPreservesContentEncoding(t *testing.T) {
 	framed := fmt.Sprintf("%x;chunk-signature=deadbeef\r\n%s\r\n0;chunk-signature=deadbeef\r\n\r\n", len(payload), payload)
 	req = httptest.NewRequest(http.MethodPut, "/b/enc2.gz", strings.NewReader(framed))
 	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
-	req.Header.Set("Content-Encoding", "aws-chunked,gzip")
+	// Mixed case: content-coding tokens are case-insensitive (RFC 9110), and
+	// decoding keys off the streaming SHA-256 marker, not the header spelling.
+	req.Header.Set("Content-Encoding", "AWS-Chunked,gzip")
 	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprint(len(payload)))
 	w = httptest.NewRecorder()
 	s.router.ServeHTTP(w, req)
