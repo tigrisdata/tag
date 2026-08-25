@@ -344,15 +344,27 @@ func (s *Server) setupOriginlessRoutes(r *mux.Router) {
 	r.PathPrefix("/").HandlerFunc(s.handleOriginlessUnsupported)
 }
 
+// Every origin-less wrapper applies the same bucket-name validation as the 17
+// proxy-mode wrappers: an invalid name must be 400 in both modes, never stored
+// into (and listed from) the shared cache keyspace by one of them.
 func (s *Server) handleOriginlessObject(w http.ResponseWriter, r *http.Request) {
+	if !validateBucketName(w, r) {
+		return
+	}
 	handleWithError(w, r, s.service.HandleOriginlessObject)
 }
 
 func (s *Server) handleOriginlessPut(w http.ResponseWriter, r *http.Request) {
+	if !validateBucketName(w, r) {
+		return
+	}
 	handleWithError(w, r, s.service.HandleOriginlessPut)
 }
 
 func (s *Server) handleOriginlessDelete(w http.ResponseWriter, r *http.Request) {
+	if !validateBucketName(w, r) {
+		return
+	}
 	handleWithError(w, r, s.service.HandleOriginlessDelete)
 }
 
@@ -369,14 +381,23 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleOriginlessMultiDelete(w http.ResponseWriter, r *http.Request) {
+	if !validateBucketName(w, r) {
+		return
+	}
 	handleWithError(w, r, s.service.HandleOriginlessMultiDelete)
 }
 
 func (s *Server) handleOriginlessList(w http.ResponseWriter, r *http.Request) {
+	if !validateBucketName(w, r) {
+		return
+	}
 	handleWithError(w, r, s.service.HandleOriginlessList)
 }
 
 func (s *Server) handleOriginlessBucket(w http.ResponseWriter, r *http.Request) {
+	if !validateBucketName(w, r) {
+		return
+	}
 	handleWithError(w, r, s.service.HandleOriginlessBucket)
 }
 

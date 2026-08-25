@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -91,7 +92,13 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	// when a HEAD says the object exists — skip the healing that would make the
 	// entry servable again. A probe-to-serve race can still truncate a
 	// concurrent eviction; the gate narrows the window, nothing can close it.
-	if !s.entryServable(ctx, bucket, key, meta) {
+	servable, servErr := s.entryServable(ctx, bucket, key, meta)
+	if servErr != nil {
+		// A transient probe failure is not absence: 500-retry, never a false miss.
+		metrics.RecordRequest(operation, "error", time.Since(start).Seconds())
+		return servErr
+	}
+	if !servable {
 		return s.originlessMiss(w, r, operation, start)
 	}
 
@@ -170,24 +177,30 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 // the window from "any evicted block" to "evicted in the microseconds between
 // probe and read", which is the strongest guarantee available without holding
 // every block in memory first.
-func (s *Service) allBlocksPresent(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, b0, bK int64) bool {
+// A probe ERROR is not proof of absence (the BlockExistsErr contract): it
+// propagates, so a transient blip answers 500-retry, never a false NoSuchKey —
+// which conditional PUT would otherwise read as "safe to overwrite".
+func (s *Service) allBlocksPresent(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, b0, bK int64) (bool, error) {
 	for i := b0; i <= bK; i++ {
 		present, err := s.cache.BlockExistsErr(ctx, bucket, key, meta.ETag, meta.BlockSize, i)
-		if err != nil || !present {
-			return false
+		if err != nil {
+			return false, err
+		}
+		if !present {
+			return false, nil
 		}
 	}
-	return true
+	return true, nil
 }
 
 // entryServable is the handler's single existence answer: all blocks present for
 // a block-mode entry, the body present for a whole-object one. Everything the
 // handler says — 304, HEAD 200, a served body — flows from this one predicate, so
 // existence and serveability cannot disagree.
-func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) bool {
+func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) (bool, error) {
 	if meta.BlockSize > 0 {
 		if meta.ContentLength <= 0 {
-			return false
+			return false, nil
 		}
 		b0, bK := coveringBlocks(0, meta.ContentLength-1, meta.BlockSize)
 		return s.allBlocksPresent(ctx, bucket, key, meta, b0, bK)
@@ -198,10 +211,9 @@ func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *c
 	// quirk countingWriter exists for). Serving from metadata alone is exact for an
 	// empty body, evicted or not.
 	if meta.ContentLength == 0 {
-		return true
+		return true, nil
 	}
-	present, err := s.cache.BodyExistsErr(ctx, bucket, key, meta.ETag)
-	return err == nil && present
+	return s.cache.BodyExistsErr(ctx, bucket, key, meta.ETag)
 }
 
 // originlessMiss answers the one thing a miss can be in this mode.
@@ -283,6 +295,18 @@ func originlessPutSize(r *http.Request) (int64, bool) {
 // operation: no query parameters beyond the SDK's no-op x-id tag, and no
 // copy-source header (server-side copy needs a source read this mode does not
 // implement as an operation).
+// originlessIgnoredParams are query parameters that select no operation or
+// representation: the SDK's no-op tag, and the auth parameters presigned URLs
+// attach (SigV4 and SigV2). Auth is ignored in this mode — the network is the
+// boundary — so a presigned request is served exactly like its header-signed
+// twin: the signature is stripped, not evaluated.
+var originlessIgnoredParams = []string{
+	"x-id",
+	"X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires",
+	"X-Amz-SignedHeaders", "X-Amz-Signature", "X-Amz-Security-Token",
+	"AWSAccessKeyId", "Signature", "Expires",
+}
+
 func originlessPlainObject(r *http.Request) bool {
 	if r.Header.Get("X-Amz-Copy-Source") != "" {
 		return false
@@ -291,7 +315,9 @@ func originlessPlainObject(r *http.Request) bool {
 		return true
 	}
 	q := r.URL.Query()
-	q.Del("x-id")
+	for _, p := range originlessIgnoredParams {
+		q.Del(p)
+	}
 	return len(q) == 0
 }
 
@@ -333,7 +359,17 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		// incomplete entry (orphaned meta, missing blocks) is invisible on every
 		// request shape, so If-None-Match:* must store over it (that IS the
 		// healing put-if-absent) and If-Match must answer NoSuchKey, not 412.
-		exists := found && existing != nil && s.entryServable(ctx, bucket, key, existing)
+		// A probe ERROR aborts: read as "absent" it would let If-None-Match:*
+		// overwrite a live object during a transient blip.
+		exists := found && existing != nil
+		if exists {
+			var servErr error
+			exists, servErr = s.entryServable(ctx, bucket, key, existing)
+			if servErr != nil {
+				metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+				return servErr
+			}
+		}
 		switch {
 		case ifMatch != "" && !exists:
 			s3err.WriteError(w, r, s3err.ErrNoSuchKey)
@@ -432,12 +468,21 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return nil
-	case err == io.EOF || err == io.ErrUnexpectedEOF:
+	// errors.Is, not equality: the chunked decoder WRAPS its errors ("reading
+	// chunk header: %w"), so a body truncated inside a chunk header carries a
+	// wrapped io.EOF that == would miss.
+	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
 		if int64(n) != declaredSize {
 			s3err.WriteError(w, r, s3err.ErrIncompleteBody)
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return nil
 		}
+	case streaming:
+		// Any other failure reading a streaming body is the decoder rejecting
+		// the client's chunk framing — a malformed request, not a server fault.
+		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return nil
 	default:
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return err
@@ -466,17 +511,20 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// blockBound was decided at admission from the same size (declared ==
 	// len(body), enforced above), so the staging buffer reserved there is
 	// exactly the one this branch allocates.
+	//
+	// Both branches are tombstone-aware with writeStartTime = the handler's
+	// start (UnixNano — the gate compares nanosecond stamps): a DELETE arriving
+	// mid-PUT wins regardless of object size, and the 200 below is the legal
+	// PUT-then-DELETE serialization of that race — never a size-dependent flip
+	// in which write survives.
 	ttl := int(s.config.Cache.TTL.Seconds())
 	if blockBound {
 		meta.BlockSize = s.config.Cache.BlockSize
-		// writeStartTime is UnixNano — the tombstone gate compares against
-		// nanosecond stamps; seconds would read every live tombstone as newer
-		// and silently skip the meta write under a 200.
 		if err := s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano()); err != nil {
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return err
 		}
-	} else if err := s.cache.PutWithMeta(ctx, bucket, key, meta, body, ttl); err != nil {
+	} else if _, err := s.cache.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano()); err != nil {
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return err
 	}
@@ -529,10 +577,20 @@ func (s *Service) HandleOriginlessMultiDelete(w http.ResponseWriter, r *http.Req
 		return s.HandleOriginlessUnsupported(w, r)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	// The cap must exceed the largest legal request — 1000 keys at S3's 1024-byte
+	// key limit is ~1.05 MB of XML — and overflow must be an explicit 400: a
+	// silently truncated document would fail the XML parse with a misleading
+	// error (or worse, parse to a prefix of the requested deletions).
+	const maxMultiDeleteBody = 2 << 20
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxMultiDeleteBody+1))
 	if err != nil {
 		metrics.RecordRequest("DeleteObjects", "error", time.Since(start).Seconds())
 		return err
+	}
+	if len(body) > maxMultiDeleteBody {
+		s3err.WriteError(w, r, s3err.ErrInvalidRequest)
+		metrics.RecordRequest("DeleteObjects", "error", time.Since(start).Seconds())
+		return nil
 	}
 	var req deleteObjectsRequest
 	if err := xml.Unmarshal(body, &req); err != nil || len(req.Objects) == 0 || len(req.Objects) > 1000 {
