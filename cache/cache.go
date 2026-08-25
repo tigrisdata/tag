@@ -482,10 +482,13 @@ func (c *Cache) getMeta(ctx context.Context, bucket, key string, cloneResult boo
 		return nil, false, nil
 	}
 
-	metaKeyHash := decodedMetaKeyHash(metaKey)
-	if meta, ok := c.getDecodedMeta(metaKey, metaKeyHash, metaBytes, cloneResult); ok {
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit (decoded meta)")
-		return meta, true, nil
+	var metaKeyHash uint64
+	if len(metaBytes) <= maxDecodedMetaEntryBytes {
+		metaKeyHash = decodedMetaKeyHash(metaKey)
+		if meta, ok := c.getDecodedMeta(metaKey, metaKeyHash, metaBytes, cloneResult); ok {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit (decoded meta)")
+			return meta, true, nil
+		}
 	}
 
 	meta, err := DecodeMeta(metaBytes)

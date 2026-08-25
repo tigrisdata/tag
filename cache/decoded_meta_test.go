@@ -268,6 +268,13 @@ func TestDecodedMetaTierSkipsOversizedEntries(t *testing.T) {
 	if _, ok := c.decodedMeta.Get(MakeMetaKey(bucket, key)); ok {
 		t.Fatal("backend read retained oversized metadata")
 	}
+	hash := decodedMetaKeyHash(MakeMetaKey(bucket, key))
+	if got := c.decodedMetaAdmissionSlot(hash).Load(); got != 0 {
+		t.Fatalf("oversized metadata updated admission state: %d", got)
+	}
+	if got := c.decodedMetaResidentSlot(hash).Load(); got != 0 {
+		t.Fatalf("oversized metadata updated resident state: %d", got)
+	}
 }
 
 func TestDecodedMetaTierAdmitsAtCapEntries(t *testing.T) {
