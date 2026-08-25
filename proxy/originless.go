@@ -501,7 +501,13 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, r.Header)
 	meta.ETag = etag
 	meta.ContentLength = int64(len(body))
-	meta.ContentEncoding = stripAWSChunkedToken(r.Header.Get("Content-Encoding"))
+	meta.ContentEncoding = r.Header.Get("Content-Encoding")
+	if streaming {
+		// Strip only what was actually decoded: the aws-chunked layer is
+		// removed above only for streaming-marked bodies, and advertising a
+		// non-streaming body as decoded would mislabel stored bytes.
+		meta.ContentEncoding = stripAWSChunkedToken(meta.ContentEncoding)
+	}
 	meta.LastModified = time.Now().Unix()
 
 	// Same whole-vs-block boundary as proxying mode (size, not access pattern),
@@ -572,7 +578,9 @@ func (s *Service) HandleOriginlessMultiDelete(w http.ResponseWriter, r *http.Req
 
 	q := r.URL.Query()
 	q.Del("delete")
-	q.Del("x-id")
+	for _, p := range originlessIgnoredParams {
+		q.Del(p) // presigned multi-deletes are served like header-signed ones
+	}
 	if len(q) > 0 {
 		return s.HandleOriginlessUnsupported(w, r)
 	}

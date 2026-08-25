@@ -140,6 +140,9 @@ func parseListParams(r *http.Request) (*listParams, bool) {
 		"list-type": true, "prefix": true, "delimiter": true, "max-keys": true,
 		"encoding-type": true, "x-id": true, "fetch-owner": true,
 	}
+	for _, p := range originlessIgnoredParams {
+		allowed[p] = true // presigned listings are served like header-signed ones
+	}
 	if p.v2 {
 		allowed["continuation-token"] = true
 		allowed["start-after"] = true

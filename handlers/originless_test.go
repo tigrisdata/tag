@@ -882,6 +882,36 @@ func TestOriginlessRoutes_PresignedURLsAreServed(t *testing.T) {
 	if w := do(s, http.MethodDelete, "/bkt/signed.txt"+presigned, nil); w.Code != http.StatusNoContent {
 		t.Fatalf("presigned DELETE: code=%d", w.Code)
 	}
+
+	// The contract covers EVERY served surface: listing and multi-delete strip
+	// the same auth params, not just the single-object handlers.
+	if w := do(s, http.MethodGet, "/bkt"+presigned+"&list-type=2", nil); w.Code != http.StatusOK {
+		t.Fatalf("presigned ListObjectsV2: code=%d body=%q", w.Code, w.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodPost, "/bkt?delete&X-Amz-Signature=deadbeef&X-Amz-Expires=300",
+		strings.NewReader("<Delete><Object><Key>signed.txt</Key></Object></Delete>"))
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("presigned multi-delete: code=%d body=%q", w.Code, w.Body.String())
+	}
+}
+
+// Content-Encoding: aws-chunked on a NON-streaming body is stored verbatim —
+// no streaming marker means nothing was decoded, and stripping the token would
+// advertise framed bytes as the raw object.
+func TestOriginlessRoutes_ChunkedEncodingKeptWhenNotDecoded(t *testing.T) {
+	s, _ := newOriginlessServer(t)
+	req := httptest.NewRequest(http.MethodPut, "/bkt/undecoded.bin", strings.NewReader("framed-looking bytes"))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PUT: code=%d", w.Code)
+	}
+	if g := do(s, http.MethodGet, "/bkt/undecoded.bin", nil); g.Header().Get("Content-Encoding") != "aws-chunked" {
+		t.Fatalf("Content-Encoding=%q, want aws-chunked kept — nothing was decoded", g.Header().Get("Content-Encoding"))
+	}
 }
 
 // The multi-delete body cap must admit the largest legal request (1000 keys at
