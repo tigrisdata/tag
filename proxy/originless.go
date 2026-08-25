@@ -555,10 +555,23 @@ func (s *Service) HandleOriginlessDelete(w http.ResponseWriter, r *http.Request)
 	if !originlessPlainObject(r) {
 		return s.HandleOriginlessUnsupported(w, r)
 	}
-	s.invalidateObject(r.Context(), bucket, key)
+	// The cache is the only store: an acked-but-failed delete would keep
+	// serving the object until TTL with no signal to retry on. 500, not 204.
+	if err := s.invalidateObject(r.Context(), bucket, key); err != nil {
+		metrics.RecordRequest("DeleteObject", "error", time.Since(start).Seconds())
+		return err
+	}
 	w.WriteHeader(http.StatusNoContent)
 	metrics.RecordRequest("DeleteObject", "success", time.Since(start).Seconds())
 	return nil
+}
+
+// multiDeleteError is a per-key failure in the DeleteResult — S3's channel for
+// partial multi-delete failure, reported even in Quiet mode.
+type multiDeleteError struct {
+	Key     string `xml:"Key"`
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
 }
 
 // multiDeleteResult is the S3 DeleteResult response.
@@ -566,6 +579,7 @@ type multiDeleteResult struct {
 	XMLName xml.Name           `xml:"DeleteResult"`
 	Xmlns   string             `xml:"xmlns,attr"`
 	Deleted []multiDeletedItem `xml:"Deleted"`
+	Errors  []multiDeleteError `xml:"Error"`
 }
 
 type multiDeletedItem struct {
@@ -613,7 +627,18 @@ func (s *Service) HandleOriginlessMultiDelete(w http.ResponseWriter, r *http.Req
 
 	res := multiDeleteResult{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/"}
 	for _, obj := range req.Objects {
-		s.invalidateObject(r.Context(), bucket, obj.Key)
+		// A failed invalidation is a per-key <Error>, S3's channel for partial
+		// failure (the response stays 200): the cache is the only store, so
+		// confirming the key as Deleted would leave it serving until TTL.
+		// Errors are reported even in Quiet mode, which suppresses only the
+		// per-key confirmations.
+		if err := s.invalidateObject(r.Context(), bucket, obj.Key); err != nil {
+			res.Errors = append(res.Errors, multiDeleteError{
+				Key: obj.Key, Code: "InternalError",
+				Message: "invalidation failed; the key may still be served until it is retried or expires",
+			})
+			continue
+		}
 		if !req.Quiet {
 			res.Deleted = append(res.Deleted, multiDeletedItem{Key: obj.Key})
 		}

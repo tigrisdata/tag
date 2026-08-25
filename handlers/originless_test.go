@@ -978,6 +978,61 @@ func TestOriginlessRoutes_InvalidBucketNameRejected(t *testing.T) {
 	}
 }
 
+type deleteFailingClient struct {
+	cacheclient.CacheClient
+	fail bool
+}
+
+func (f *deleteFailingClient) Delete(ctx context.Context, key string) error {
+	if f.fail {
+		return fmt.Errorf("delete blip")
+	}
+	return f.CacheClient.Delete(ctx, key)
+}
+
+// The cache is the only store, so a failed delete must surface: 500 on single
+// DELETE (retry signal), per-key <Error> on multi-delete (S3's partial-failure
+// channel, reported even in Quiet mode) — never an ack that leaves the key
+// serving until TTL.
+func TestOriginlessRoutes_DeleteFailureIsSurfaced(t *testing.T) {
+	cfg := config.NewDefault()
+	cfg.Upstream.Disabled = true
+	cfg.Upstream.Endpoint = ""
+	fc := &deleteFailingClient{CacheClient: cacheclient.NewMemoryCache()}
+	c := cache.NewCacheWithClient(fc, &cfg.Cache)
+	s := NewServer(proxy.NewService(proxy.NewForwarder(nil, "", "auto", 10, nil, nil), c, cfg), "127.0.0.1", 0, false, 0)
+
+	req := httptest.NewRequest(http.MethodPut, "/bkt/doomed.txt", strings.NewReader("data"))
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("seed PUT: %d", w.Code)
+	}
+
+	fc.fail = true
+	if w := do(s, http.MethodDelete, "/bkt/doomed.txt", nil); w.Code != http.StatusInternalServerError {
+		t.Fatalf("DELETE during blip: code=%d, want 500 — a 204 acks a delete that did not happen", w.Code)
+	}
+	// Quiet multi-delete: failures still reported, confirmations suppressed.
+	req = httptest.NewRequest(http.MethodPost, "/bkt?delete",
+		strings.NewReader("<Delete><Quiet>true</Quiet><Object><Key>doomed.txt</Key></Object></Delete>"))
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "<Error>") ||
+		!strings.Contains(w.Body.String(), "<Key>doomed.txt</Key>") ||
+		strings.Contains(w.Body.String(), "<Deleted>") {
+		t.Fatalf("quiet multi-delete during blip: code=%d body=%q, want per-key <Error> and no <Deleted>", w.Code, w.Body.String())
+	}
+
+	fc.fail = false
+	if w := do(s, http.MethodDelete, "/bkt/doomed.txt", nil); w.Code != http.StatusNoContent {
+		t.Fatalf("DELETE after blip clears: %d", w.Code)
+	}
+	if g := do(s, http.MethodGet, "/bkt/doomed.txt", nil); g.Code != http.StatusNotFound {
+		t.Fatalf("GET after successful delete: %d", g.Code)
+	}
+}
+
 // A small-object PUT after DELETE must land: the whole-object branch is
 // tombstone-aware with the handler's start time, so a PUT that begins after
 // the DELETE always wins — the same semantics as the block-bound branch.

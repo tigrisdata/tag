@@ -732,16 +732,21 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 // as an error rather than success: a false-green delete metric would hide the very
 // read-after-write hazard the invalidation exists to prevent, since the stale entry
 // is still in place. It is a no-op when the cache is disabled.
-func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
+// The error return matters only to origin-less callers, where the cache is the
+// only store and an acked-but-failed delete keeps serving until TTL. Proxy-mode
+// callers ignore it: there the origin is authoritative and the upstream DELETE
+// already succeeded, so a failed local invalidation is a stale-cache blip.
+func (s *Service) invalidateObject(ctx context.Context, bucket, key string) error {
 	if !s.cache.IsEnabled() {
-		return
+		return nil
 	}
 	if err := s.cache.Delete(ctx, bucket, key); err != nil {
 		metrics.RecordCacheOperation("delete", "error")
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache invalidation failed")
-		return
+		return err
 	}
 	metrics.RecordCacheOperation("delete", "success")
+	return nil
 }
 
 // warmOnWrite repopulates the cache after a successful write by triggering a
