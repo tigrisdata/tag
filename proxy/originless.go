@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -461,7 +462,18 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		}
 	}
 
-	if err := s.cache.PutWithMeta(ctx, bucket, key, meta, body, int(s.config.Cache.TTL.Seconds())); err != nil {
+	// Same whole-vs-block boundary as proxying mode (size, not access pattern),
+	// through the same writer: putBlocksFromStream is the shared full-object
+	// populate path, so block entries written here are indistinguishable from
+	// proxy-populated ones — one read path, one visibility gate.
+	ttl := int(s.config.Cache.TTL.Seconds())
+	if s.config.Cache.IsBlockCachingEnabled() && meta.ContentLength >= s.config.Cache.BlockSize {
+		meta.BlockSize = s.config.Cache.BlockSize
+		if err := s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.Unix()); err != nil {
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return err
+		}
+	} else if err := s.cache.PutWithMeta(ctx, bucket, key, meta, body, ttl); err != nil {
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return err
 	}

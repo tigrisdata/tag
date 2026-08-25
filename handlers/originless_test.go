@@ -451,6 +451,67 @@ func TestOriginlessRoutes_AWSChunkedPutStoresDecodedBody(t *testing.T) {
 	}
 }
 
+// A PUT at or above block_size goes through the SAME block writer as the
+// proxying populate path (putBlocksFromStream): same size boundary, same
+// blocks-first-meta-last ordering, so an origin-less-written large object is
+// indistinguishable from a proxy-populated one. Below the boundary it stays a
+// whole-object entry.
+func TestOriginlessRoutes_LargePutStoresBlocks(t *testing.T) {
+	cfg := config.NewDefault()
+	cfg.Upstream.Disabled = true
+	cfg.Upstream.Endpoint = ""
+	cfg.Cache.BlockSize = 1024
+
+	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	fwd := proxy.NewForwarder(nil, "", "auto", 10, nil, nil)
+	s := NewServer(proxy.NewService(fwd, c, cfg), "127.0.0.1", 0, false, 0)
+	ctx := context.Background()
+
+	// 3.5 blocks: exercises full blocks plus a short tail block.
+	body := bytes.Repeat([]byte("0123456789abcdef"), 224) // 3584 bytes
+	req := httptest.NewRequest(http.MethodPut, "/b/big.bin", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("large PUT: code=%d body=%q", w.Code, w.Body.String())
+	}
+
+	meta, found, err := c.GetMeta(ctx, "b", "big.bin")
+	if err != nil || !found {
+		t.Fatalf("GetMeta: found=%v err=%v", found, err)
+	}
+	if meta.BlockSize != 1024 || !meta.BlocksComplete {
+		t.Fatalf("meta.BlockSize=%d BlocksComplete=%v, want a complete block-mode entry", meta.BlockSize, meta.BlocksComplete)
+	}
+	for idx := int64(0); idx <= 3; idx++ {
+		present, err := c.BlockExistsErr(ctx, "b", "big.bin", meta.ETag, meta.BlockSize, idx)
+		if err != nil || !present {
+			t.Fatalf("block %d: present=%v err=%v", idx, present, err)
+		}
+	}
+
+	// Serves whole and across a block boundary.
+	if g := do(s, http.MethodGet, "/b/big.bin", nil); g.Code != http.StatusOK || !bytes.Equal(g.Body.Bytes(), body) {
+		t.Fatalf("GET: code=%d len=%d, want 200 with the full body", g.Code, g.Body.Len())
+	}
+	g := do(s, http.MethodGet, "/b/big.bin", map[string]string{"Range": "bytes=1000-1100"})
+	if g.Code != http.StatusPartialContent || !bytes.Equal(g.Body.Bytes(), body[1000:1101]) {
+		t.Fatalf("cross-boundary range: code=%d body=%q", g.Code, g.Body.Bytes())
+	}
+
+	// Below the boundary: whole-object entry, no block meta.
+	req = httptest.NewRequest(http.MethodPut, "/b/small.bin", strings.NewReader("tiny"))
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("small PUT: code=%d", w.Code)
+	}
+	meta, found, err = c.GetMeta(ctx, "b", "small.bin")
+	if err != nil || !found || meta.BlockSize != 0 {
+		t.Fatalf("small object: found=%v err=%v BlockSize=%d, want whole-object entry", found, err, meta.BlockSize)
+	}
+}
+
 // Every streaming marker an AWS SDK can send shares the same chunk framing —
 // SigV4, SigV4A (ECDSA), each with and without trailing checksums, and
 // unsigned-with-trailer. A marker that slips past detection stores the framing

@@ -32,7 +32,7 @@ No AWS credentials are required. Startup logs a single line stating the mode and
 
 Plain single-object operations, against the local cache alone:
 
-- **`PUT`** stores the object under `cache.ttl` and returns its ETag. This is how the tier is populated — its callers write into it directly.
+- **`PUT`** stores the object under `cache.ttl` and returns its ETag. This is how the tier is populated — its callers write into it directly. Objects at or above `cache.block_size` are stored block-aligned when block caching is enabled (the default) — the same size boundary and the same writer as the proxying mode's populate path, so the entries are indistinguishable from proxy-populated ones.
 - **`GET` / `HEAD`** serve from cache; a miss is `NoSuchKey`, the caller's cue to fall back to its authoritative store.
 - **`DELETE`** invalidates the entry (not required for correctness — entries lapse by TTL — but explicit expiry gets prompt removal). **Multi-delete** (`POST ?delete`, up to 1000 keys) works the same way; deleting an absent key is a success, as on S3.
 - **Conditional writes**: `If-None-Match: *` is put-if-absent in one request; `If-Match` guards overwrites (against a missing object it answers `NoSuchKey`). Check-then-store, not atomic — the right idiom for a cache tier, not a coordination primitive.
