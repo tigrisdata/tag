@@ -608,6 +608,22 @@ func TestOriginlessRoutes_PutPreservesContentEncoding(t *testing.T) {
 		t.Fatalf("body=%q, want decoded payload", g.Body.String())
 	}
 
+	// Repeated field lines are one comma-joined list per RFC 9110: the second
+	// value must survive the strip, not be lost to a first-value-only Get.
+	req = httptest.NewRequest(http.MethodPut, "/bkt/enc4.gz", strings.NewReader(framed))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	req.Header.Add("Content-Encoding", "aws-chunked")
+	req.Header.Add("Content-Encoding", "gzip")
+	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprint(len(payload)))
+	w = httptest.NewRecorder()
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("chunked PUT with repeated encoding lines: code=%d", w.Code)
+	}
+	if g := do(s, http.MethodGet, "/bkt/enc4.gz", nil); g.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("repeated field lines: Content-Encoding=%q, want gzip", g.Header().Get("Content-Encoding"))
+	}
+
 	// aws-chunked alone: no residual header on the stored object.
 	req = httptest.NewRequest(http.MethodPut, "/bkt/enc3.txt", strings.NewReader(framed))
 	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")

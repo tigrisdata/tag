@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -501,7 +502,10 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, r.Header)
 	meta.ETag = etag
 	meta.ContentLength = int64(len(body))
-	meta.ContentEncoding = r.Header.Get("Content-Encoding")
+	// Values, not Get: repeated Content-Encoding field lines are legal HTTP and
+	// equivalent to one comma-joined list ("aws-chunked" + "gzip" ≡
+	// "aws-chunked,gzip"); Get would keep only the first and lose the rest.
+	meta.ContentEncoding = strings.Join(r.Header.Values("Content-Encoding"), ",")
 	if streaming {
 		// Strip only what was actually decoded: the aws-chunked layer is
 		// removed above only for streaming-marked bodies, and advertising a
