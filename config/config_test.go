@@ -545,9 +545,9 @@ func TestLoad_SizeThresholdOverrideByEnv(t *testing.T) {
 			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
 				t.Fatalf("Failed to create temp file: %v", err)
 			}
-			if tc.env != "" {
-				t.Setenv("TAG_CACHE_SIZE_THRESHOLD", tc.env)
-			}
+			// Unconditional: an empty value reads as unset (envInt64 skips
+			// blanks), and it shields the test from an inherited variable.
+			t.Setenv("TAG_CACHE_SIZE_THRESHOLD", tc.env)
 			cfg, err := Load(tmpFile)
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
