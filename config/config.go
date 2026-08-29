@@ -617,7 +617,8 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Cache.EvictionPolicy = val
 		}
 		// Override concurrent cache-write limit from environment
-		if n, ok := envInt("TAG_CACHE_MAX_CONCURRENT_WRITES"); ok && n > 0 {
+		// n != 0 for the same 0-default / negative-disables contract as above.
+		if n, ok := envInt("TAG_CACHE_MAX_CONCURRENT_WRITES"); ok && n != 0 {
 			cfg.Cache.MaxConcurrentWrites = n
 		}
 		// Override cache-populate memory budget from environment (negative disables)
@@ -679,8 +680,10 @@ func applyEnvOverrides(cfg *Config) {
 	}
 
 	// Override the ingress in-flight request limit from environment
+	// n != 0, not n > 0: the documented contract is 0/unset = default and
+	// NEGATIVE = disabled, matching the yaml field and the populate-memory override.
 	if val := os.Getenv("TAG_MAX_INFLIGHT_REQUESTS"); val != "" {
-		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+		if n, err := strconv.Atoi(val); err == nil && n != 0 {
 			cfg.Server.MaxInflightRequests = n
 		}
 	}

@@ -1333,3 +1333,24 @@ func TestMetaOnWrite_OverrideByEnv(t *testing.T) {
 		})
 	}
 }
+
+// The documented contract for both knobs: 0/unset uses the default, a NEGATIVE
+// value disables — the env path must honor it like the yaml path does.
+func TestLoad_NegativeEnvDisablesLimits(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	t.Setenv("TAG_MAX_INFLIGHT_REQUESTS", "-1")
+	t.Setenv("TAG_CACHE_MAX_CONCURRENT_WRITES", "-1")
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Server.MaxInflightRequests != -1 {
+		t.Errorf("MaxInflightRequests = %d, want -1 (disabled)", cfg.Server.MaxInflightRequests)
+	}
+	if cfg.Cache.MaxConcurrentWrites != -1 {
+		t.Errorf("MaxConcurrentWrites = %d, want -1 (disabled)", cfg.Cache.MaxConcurrentWrites)
+	}
+}
