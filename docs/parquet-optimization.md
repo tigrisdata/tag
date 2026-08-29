@@ -69,11 +69,13 @@ For arbitrarily sized objects the tail averages half a block, so a footer of a f
 **To find out for your data**, enable the flag on one node and read the histogram:
 
 ```promql
-# Median parquet footer size. Compare against cache.block_size.
+# Median parquet footer size, in bytes.
 histogram_quantile(0.5, sum(rate(tag_cache_parquet_footer_bytes_bucket[1h])) by (le))
 ```
 
-`tag_cache_parquet_footer_bytes` is recorded for **every** parquet object whose trailer is read — including ones that are not prefetched — so it describes the whole population, not just the part that was acted on. If the distribution sits well below your typical tail-block size, this optimization has nothing to do and should stay off.
+`tag_cache_parquet_footer_bytes` is recorded for **every** parquet object whose trailer is read — including ones that are not prefetched — so it describes the whole population, not just the part that was acted on.
+
+Compare that figure against the **tail block, not `block_size`**. Since the tail averages half a block across arbitrarily sized objects, `block_size / 2` is the practical yardstick: a median footer near or above it means the prefetch fires on a large share of your objects, and a median well below it means this optimization has little to do and should stay off. Comparing against the full `block_size` understates how often it fires and will talk you out of a change worth making.
 
 ---
 

@@ -526,6 +526,39 @@ func TestLoad_BlockSizeDefaultAndOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_SizeThresholdOverrideByEnv(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		env  string
+		want int64
+	}{
+		{"default", "cache:\n  enabled: true\n", "", DefaultCacheSizeThreshold},
+		{"env override honored", "cache:\n  enabled: true\n", "268435456", 268435456}, // 256 MiB
+		{"env overrides yaml", "cache:\n  enabled: true\n  size_threshold: 1048576\n", "268435456", 268435456},
+		{"non-positive env ignored", "cache:\n  enabled: true\n", "-1", DefaultCacheSizeThreshold},
+		{"malformed env ignored", "cache:\n  enabled: true\n", "big", DefaultCacheSizeThreshold},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			// Unconditional: an empty value reads as unset (envInt64 skips
+			// blanks), and it shields the test from an inherited variable.
+			t.Setenv("TAG_CACHE_SIZE_THRESHOLD", tc.env)
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.SizeThreshold != tc.want {
+				t.Errorf("SizeThreshold = %d, want %d", cfg.Cache.SizeThreshold, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoad_BlockCachingEnabledOverrideByEnv(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1298,5 +1331,26 @@ func TestMetaOnWrite_OverrideByEnv(t *testing.T) {
 				t.Errorf("Cache.MetaOnWrite = %v, want %v", cfg.Cache.MetaOnWrite, tc.want)
 			}
 		})
+	}
+}
+
+// The documented contract for both knobs: 0/unset uses the default, a NEGATIVE
+// value disables — the env path must honor it like the yaml path does.
+func TestLoad_NegativeEnvDisablesLimits(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte("cache:\n  enabled: true\n"), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	t.Setenv("TAG_MAX_INFLIGHT_REQUESTS", "-1")
+	t.Setenv("TAG_CACHE_MAX_CONCURRENT_WRITES", "-1")
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Server.MaxInflightRequests != -1 {
+		t.Errorf("MaxInflightRequests = %d, want -1 (disabled)", cfg.Server.MaxInflightRequests)
+	}
+	if cfg.Cache.MaxConcurrentWrites != -1 {
+		t.Errorf("MaxConcurrentWrites = %d, want -1 (disabled)", cfg.Cache.MaxConcurrentWrites)
 	}
 }
