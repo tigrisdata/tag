@@ -205,7 +205,7 @@ type CacheConfig struct {
 	// object's tail is a reliable signal that the whole metadata region is about to
 	// be read. When the metadata spans more than the (partial) tail block, TAG
 	// fetches the remaining metadata blocks in the background instead of letting the
-	// reader discover them as misses. Measured on production parseable data, footers
+	// reader discover them as misses. Measured on a production analytics workload, footers
 	// run ~1.25% of object size, so a 300 MB object carries ~3.5 MB of metadata --
 	// several blocks at a 1 MiB block_size. Off by default: it reads 8 bytes of
 	// object content to size the footer, which is format-specific behavior an
