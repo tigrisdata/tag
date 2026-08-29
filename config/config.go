@@ -636,6 +636,10 @@ func applyEnvOverrides(cfg *Config) {
 		if n, ok := envInt64("TAG_CACHE_BLOCK_SIZE"); ok && n > 0 {
 			cfg.Cache.BlockSize = n
 		}
+		// Override the max cacheable object size from environment (0/unset keeps the default).
+		if n, ok := envInt64("TAG_CACHE_SIZE_THRESHOLD"); ok && n > 0 {
+			cfg.Cache.SizeThreshold = n
+		}
 		// Override the warm-on-write populate reservation fraction from environment.
 		// f != 0 mirrors the sibling budget overrides: an env "0" means "use the
 		// default" (per the documented 0-or-unset contract), not "disable" — a
