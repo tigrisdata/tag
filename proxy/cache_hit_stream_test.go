@@ -11,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
+	"github.com/tigrisdata/tag/metrics"
 )
 
 type testStreamCacheClient struct {
@@ -144,6 +146,8 @@ func TestHandleGetObject_LargeEmptyCacheHitFallsBackBeforeHeaders(t *testing.T) 
 
 func TestHandleGetObject_LargeCacheHitPostCommitErrorDoesNotFallBack(t *testing.T) {
 	body := bytes.Repeat([]byte("cached body"), 8192)
+	beforeErrors := requestCount(t, "error")
+	beforeSuccesses := requestCount(t, "success")
 	firstChunk := body[:32768]
 	streamErr := errors.New("cache stream failed after first byte")
 	stream := func(_ context.Context, _ string, w io.Writer) error {
@@ -179,4 +183,20 @@ func TestHandleGetObject_LargeCacheHitPostCommitErrorDoesNotFallBack(t *testing.
 	if !bytes.Equal(w.Body.Bytes(), firstChunk) {
 		t.Fatalf("body mismatch: got %d bytes, want %d", w.Body.Len(), len(firstChunk))
 	}
+	if got := requestCount(t, "error"); got != beforeErrors+1 {
+		t.Fatalf("error request count = %v, want %v", got, beforeErrors+1)
+	}
+	if got := requestCount(t, "success"); got != beforeSuccesses {
+		t.Fatalf("success request count = %v, want %v", got, beforeSuccesses)
+	}
+}
+
+func requestCount(t *testing.T, status string) float64 {
+	t.Helper()
+
+	var metric dto.Metric
+	if err := metrics.RequestsTotal.WithLabelValues("GetObject", status).Write(&metric); err != nil {
+		t.Fatalf("read %s request count: %v", status, err)
+	}
+	return metric.GetCounter().GetValue()
 }

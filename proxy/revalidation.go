@@ -311,22 +311,25 @@ func (s *Service) serveFromCache(
 	// pipe and a second copy.
 	cw := &lazyCommitWriter{w: w, meta: meta}
 	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.ETag, cw)
+	status := "success"
 	if bodyErr != nil {
 		if !cw.committed {
 			return fmt.Errorf("cache body unavailable: %w", bodyErr)
 		}
 		// The response is already committed. Do not return the error to the
 		// caller: HandleGetObject would otherwise try to append an upstream
-		// response to the partial cached body.
+		// response to the partial cached body. The response is incomplete,
+		// however, so record the request as an error.
 		log.Warn().Err(bodyErr).Str("bucket", bucket).Str("key", key).
 			Msg("Failed to stream cache body after headers committed")
+		status = "error"
 	}
 	if !cw.committed {
 		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
 	}
 
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-	metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
 	return nil
 }
 
