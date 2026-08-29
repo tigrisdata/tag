@@ -167,6 +167,23 @@ func benchmarkBackgroundCachePopulate(b *testing.B, blockMode bool) {
 		if !deadline.Stop() {
 			<-deadline.C
 		}
+
+		// The foreground listener sends its cache-completion signal before its
+		// deferred cache-slot release. Wait for that release before starting the
+		// next measured batch, otherwise the old relay arm can skip a trigger
+		// even though the previous batch has reported completion.
+		slotDeadline := time.NewTimer(10 * time.Second)
+		for len(svc.cacheSemaphore) != 0 {
+			select {
+			case <-slotDeadline.C:
+				b.Fatal("background cache slots did not release")
+			default:
+				runtime.Gosched()
+			}
+		}
+		if !slotDeadline.Stop() {
+			<-slotDeadline.C
+		}
 	}
 }
 
