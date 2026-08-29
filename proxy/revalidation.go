@@ -305,33 +305,25 @@ func (s *Service) serveFromCache(
 		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
 	}
 
-	// Large objects: stream via pipe
-	pr, pw := io.Pipe()
-	go func() {
-		err := s.cache.GetBodyStream(ctx, bucket, key, meta.ETag, pw)
-		if err != nil {
-			pw.CloseWithError(err)
-		} else {
-			pw.Close()
+	// Large objects: stream directly to a writer that commits only when the
+	// cache produces its first nonempty chunk. This preserves the pre-commit
+	// fallback for an absent or empty body without staging the stream through a
+	// pipe and a second copy.
+	cw := &lazyCommitWriter{w: w, meta: meta}
+	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.ETag, cw)
+	if bodyErr != nil {
+		if !cw.committed {
+			return fmt.Errorf("cache body unavailable: %w", bodyErr)
 		}
-	}()
-
-	// Read first byte to verify body exists
-	firstByte := make([]byte, 1)
-	n, readErr := pr.Read(firstByte)
-	if readErr != nil {
-		pr.Close()
-		return fmt.Errorf("cache body unavailable: %w", readErr)
+		// The response is already committed. Do not return the error to the
+		// caller: HandleGetObject would otherwise try to append an upstream
+		// response to the partial cached body.
+		log.Warn().Err(bodyErr).Str("bucket", bucket).Str("key", key).
+			Msg("Failed to stream cache body after headers committed")
 	}
-
-	meta.WriteHeaders(w)
-	writeCacheStatus(w, XCacheHit)
-	w.WriteHeader(meta.StatusCode)
-
-	cw := &countingWriter{w: w}
-	cw.Write(firstByte[:n])
-	io.Copy(cw, pr)
-	pr.Close()
+	if !cw.committed {
+		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
+	}
 
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
 	metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
