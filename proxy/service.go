@@ -63,16 +63,17 @@ func (s *Service) cacheMissStatus(bypassCache bool) string {
 
 // Service provides the core caching proxy logic.
 type Service struct {
-	forwarder               RequestForwarder
-	cache                   *cache.Cache
-	config                  *config.Config
-	cacheSemaphore          chan struct{}               // Count ceiling on concurrent cache-populate ops (nil = unlimited)
-	populateBudget          *byteBudget                 // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
-	perPopulateCap          int64                       // Max bytes a single populate can buffer (reservation ceiling)
-	broadcastManager        *broadcast.Manager          // For streaming request coalescing
-	activeBackgroundFetches sync.Map                    // Dedup for background full-object fetches (range caching)
-	blockFetchMu            sync.Mutex                  // Guards blockFetches
-	blockFetches            map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
+	forwarder                   RequestForwarder
+	cache                       *cache.Cache
+	config                      *config.Config
+	cacheSemaphore              chan struct{}               // Count ceiling on concurrent cache-populate ops (nil = unlimited)
+	populateBudget              *byteBudget                 // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
+	perPopulateCap              int64                       // Max bytes a foreground broadcast populate can buffer
+	backgroundPopulateWriterCap int64                       // Bytes reserved for direct writer buffers before response inspection
+	broadcastManager            *broadcast.Manager          // For streaming request coalescing
+	activeBackgroundFetches     sync.Map                    // Dedup for background full-object fetches (range caching)
+	blockFetchMu                sync.Mutex                  // Guards blockFetches
+	blockFetches                map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
 	// recentFooterWork suppresses repeat footer scans for an object version that was
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
@@ -90,17 +91,20 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 	// populate must pass both:
 	//   1. A hard COUNT ceiling (MaxConcurrentWrites) — caps total in-flight populates.
 	//   2. A BYTE budget (MaxPopulateMemoryBytes) — caps aggregate buffered memory.
-	// The byte budget is what prevents the OOM failure mode: each populate reserves
-	// min(object size, per-populate buffer ceiling), so many small objects populate
-	// concurrently while a burst of large objects is throttled to keep buffered
-	// memory bounded (a byte-unaware count alone can pin many GB — e.g. 256 large
-	// populates × ~64–80MB ≈ 16–20GB).
+	// The byte budget is what prevents the OOM failure mode: foreground populates reserve
+	// min(object size, their relay ceiling), while direct background populates reserve
+	// their smaller writer/scratch ceiling. Many small foreground objects can populate
+	// concurrently while large or buffer-heavy paths are throttled to keep memory bounded
+	// (a byte-unaware count alone can pin many GB — e.g. 256 large populates × ~64–80MB).
 	var cacheSem chan struct{}
 	if cfg.Cache.MaxConcurrentWrites > 0 {
 		cacheSem = make(chan struct{}, cfg.Cache.MaxConcurrentWrites)
 	}
 
 	perPopulateCap := perPopulateBufferBytes(cfg)
+	// The response size is unknown at admission, so reserve the writer buffers first;
+	// a block scratch buffer is added after the response selects block representation.
+	backgroundPopulateWriterCap := backgroundPopulateWriterBufferBytes()
 
 	var populateBudget *byteBudget
 	// stagingCap is the share of the budget block-serve staging may hold; logged below.
@@ -113,7 +117,11 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		if cfg.Cache.WarmOnWrite {
 			reserveFraction = cfg.Cache.WarmOnWriteReservedFraction
 		}
-		populateBudget = newByteBudget(total, reserveFraction, perPopulateCap)
+		// Warm-on-write uses the direct background writer, so its reservation floor
+		// must cover the largest direct representation (writer plus optional block
+		// scratch) rather than the much larger foreground broadcast pipeline. The byte
+		// budget still admits foreground populates against their own per-populate weight.
+		populateBudget = newByteBudget(total, reserveFraction, backgroundPopulateBufferBytes(cfg))
 		// Block-serve staging buffers (pre-commit range/first-block assembly, the streaming
 		// pipeline's bounded prefetch window) draw from this SAME budget — so max_populate_memory_bytes is
 		// an honest total, not a hidden 2x — but are capped at HALF of it. A warm multi-block
@@ -140,18 +148,20 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		Int("max_concurrent_writes", cfg.Cache.MaxConcurrentWrites).
 		Int64("max_populate_memory_bytes", cfg.Cache.MaxPopulateMemoryBytes).
 		Int64("per_populate_buffer_cap_bytes", perPopulateCap).
+		Int64("background_populate_writer_buffer_cap_bytes", backgroundPopulateWriterCap).
 		Int64("serve_staging_cap_bytes", stagingCap).
 		Msg("Cache-populate limits configured")
 
 	svc := &Service{
-		forwarder:        forwarder,
-		cache:            cache,
-		config:           cfg,
-		cacheSemaphore:   cacheSem,
-		populateBudget:   populateBudget,
-		perPopulateCap:   perPopulateCap,
-		broadcastManager: broadcast.NewManager(channelBuf),
-		blockFetches:     make(map[string]*blockFetchState),
+		forwarder:                   forwarder,
+		cache:                       cache,
+		config:                      cfg,
+		cacheSemaphore:              cacheSem,
+		populateBudget:              populateBudget,
+		perPopulateCap:              perPopulateCap,
+		backgroundPopulateWriterCap: backgroundPopulateWriterCap,
+		broadcastManager:            broadcast.NewManager(channelBuf),
+		blockFetches:                make(map[string]*blockFetchState),
 	}
 	// Allocated only when the feature that uses it is on.
 	if cfg.Cache.ParquetOptimization {
@@ -160,13 +170,12 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 	return svc
 }
 
-// perPopulateBufferBytes returns the maximum bytes a single cache-populate can
-// buffer: the broadcast listener channel (channel_buffer chunks) plus the
-// cache-write queue in setupCacheListener (channel_buffer/4 chunks, floored at 64).
-// Each queued chunk retains at least a pooled DefaultChunkSize backing array
+// perPopulateBufferBytes returns the maximum bytes a foreground broadcast
+// populate can buffer: the broadcast listener channel (channel_buffer chunks) plus
+// the cache-write queue in setupCacheListener (channel_buffer/4 chunks, floored at
+// 64). Each queued chunk retains at least a pooled DefaultChunkSize backing array
 // (broadcast.GetChunkBuf pools DefaultChunkSize buffers), so a smaller configured
-// chunk_size still holds that much per chunk — charge the larger of the two. This
-// is the ceiling a populate ever reserves; smaller objects reserve their actual size.
+// chunk_size still holds that much per chunk — charge the larger of the two.
 func perPopulateBufferBytes(cfg *config.Config) int64 {
 	chunkSize := int64(cfg.Broadcast.ChunkSize)
 	if chunkSize < broadcast.DefaultChunkSize {
@@ -183,16 +192,73 @@ func perPopulateBufferBytes(cfg *config.Config) int64 {
 	return (channelBuf + queue) * chunkSize
 }
 
-// populateWeight is the byte weight a populate reserves against the memory budget:
-// the object's size, capped at the per-populate buffer ceiling (a populate never
-// buffers more than the pipeline can hold). Unknown/negative sizes (e.g. chunked
-// responses) reserve the full ceiling. It never exceeds the total budget, so an
-// object larger than the whole budget can still populate one-at-a-time. Always ≥ 1.
+const (
+	// backgroundCacheClientStreamBufferBytes covers the largest sender buffer retained by
+	// the clustered cache client's streaming Put path.
+	backgroundCacheClientStreamBufferBytes = int64(1 << 20)
+	// backgroundCacheServerChunkBufferBytes covers the destination gRPC server's first
+	// received chunk while a clustered streaming Put is reconstructed for storage.
+	backgroundCacheServerChunkBufferBytes = int64(1 << 20)
+	// backgroundStorageFileBufferBytes mirrors ocache/storage v1.11.0's fixed 1 MiB
+	// FileManager.Write buffer.
+	backgroundStorageFileBufferBytes = int64(1 << 20)
+	// Storage.Put requests inline_threshold+1 bytes for its first read. With the
+	// default 64 KiB threshold this request uses the large tier of ocache's shared
+	// buffer pool, which can retain the 1 MiB capacity returned by FileManager.Write.
+	// Charge that retained capacity, not only the requested 64 KiB plus one byte.
+	backgroundStorageProbeBufferBytes = int64(1 << 20)
+)
+
+// backgroundPopulateBufferBytes returns the conservative memory reservation for
+// a direct background full-object populate. The clustered cache client may retain a
+// 1 MiB sender buffer and the destination gRPC server may retain its first chunk, while
+// the embedded storage writer retains its 1 MiB first-read and 1 MiB file-copy buffers.
+// Block-mode full fetches additionally retain one configured block scratch buffer while
+// PutBlockStream consumes it. This path has no listener channel or intermediate queue,
+// so it must not inherit the foreground relay ceiling.
+func backgroundPopulateWriterBufferBytes() int64 {
+	return backgroundCacheClientStreamBufferBytes + backgroundCacheServerChunkBufferBytes +
+		backgroundStorageFileBufferBytes + backgroundStorageProbeBufferBytes
+}
+
+func backgroundPopulateBufferBytes(cfg *config.Config) int64 {
+	writer := backgroundPopulateWriterBufferBytes()
+	if cfg.Cache.IsBlockCachingEnabled() && cfg.Cache.BlockSize > 0 {
+		writer += int64(cfg.Cache.BlockSize)
+	}
+	return writer
+}
+
+// populateWeight is the byte weight a foreground broadcast populate reserves
+// against the memory budget: the object's size, capped at the foreground relay
+// buffer ceiling. Unknown/negative sizes reserve the full ceiling. Background
+// full-object populates use backgroundPopulateWeight because they stream directly
+// into the cache and have a separate, smaller reservation ceiling.
 func (s *Service) populateWeight(contentLength int64) int64 {
 	w := s.perPopulateCap
 	if contentLength > 0 && contentLength < w {
 		w = contentLength
 	}
+	return s.clampPopulateWeight(w)
+}
+
+// backgroundPopulateWeight reserves the direct writer buffers before the upstream
+// response reveals its size. A block scratch buffer is reserved separately after the
+// response selects block representation. It does not clamp to a smaller memory budget:
+// a direct writer cannot honor a budget below its minimum buffers, so acquireCacheSlot
+// must reject that populate instead of admitting it with an under-sized reservation.
+func (s *Service) backgroundPopulateWeight() int64 {
+	w := s.backgroundPopulateWriterCap
+	if w <= 0 {
+		w = backgroundPopulateWriterBufferBytes()
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+func (s *Service) clampPopulateWeight(w int64) int64 {
 	if w < 1 {
 		w = 1
 	}
@@ -267,6 +333,7 @@ const warmPopulateAcquireTimeout = 30 * time.Second
 type byteBudget struct {
 	mu          sync.Mutex
 	cond        *sync.Cond // signaled on release so waiting warm-on-write acquirers wake
+	total       int64      // configured budget; used to reject an impossible single reservation
 	remaining   int64
 	pendingWarm int64 // sum of weights of warm-on-write acquirers currently waiting
 	reserveCap  int64 // max bytes read-miss/staging will hold back for pending warm-on-write
@@ -302,7 +369,7 @@ func newByteBudget(total int64, reserveFraction float64, perPopulateCap int64) *
 	}
 	// Default: staging may use the whole budget (no extra cap). Callers that run block-serve
 	// staging (NewService) set a smaller stagingCap to guarantee populates a floor.
-	b := &byteBudget{remaining: total, reserveCap: cap, stagingCap: total}
+	b := &byteBudget{total: total, remaining: total, reserveCap: cap, stagingCap: total}
 	b.cond = sync.NewCond(&b.mu)
 	return b
 }
@@ -325,6 +392,24 @@ func (b *byteBudget) tryAcquireReadMiss(n int64) bool {
 	return true
 }
 
+// tryAcquireWarm reserves n bytes for a warm-on-write populate without waiting. It
+// briefly registers the request as pending so a concurrent read-miss admission yields
+// to it, but it never holds a count slot while waiting for already-held bytes.
+func (b *byteBudget) tryAcquireWarm(n int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n > b.total {
+		return false
+	}
+	b.pendingWarm += n
+	defer func() { b.pendingWarm -= n }()
+	if b.remaining < n {
+		return false
+	}
+	b.remaining -= n
+	return true
+}
+
 // acquireWarm reserves n bytes for a warm-on-write populate, waiting (bounded by
 // ctx) for budget and taking priority over read-miss populates: while it waits it
 // registers pendingWarm so read-miss acquirers yield, then parks on the condition
@@ -333,6 +418,9 @@ func (b *byteBudget) tryAcquireReadMiss(n int64) bool {
 func (b *byteBudget) acquireWarm(ctx context.Context, n int64) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if n > b.total {
+		return false
+	}
 	b.pendingWarm += n
 	defer func() { b.pendingWarm -= n }()
 
@@ -399,6 +487,31 @@ func (b *byteBudget) releaseStaging(n int64) {
 	b.mu.Unlock()
 }
 
+// acquireCacheBytes reserves additional populate memory without taking another count
+// slot. Warm-on-write reserves may wait; read-miss reservations remain non-blocking.
+func (s *Service) acquireCacheBytes(ctx context.Context, weight int64, prio populatePriority) bool {
+	if weight <= 0 || s.populateBudget == nil {
+		return true
+	}
+	if prio == priorityWarmWrite {
+		return s.populateBudget.acquireWarm(ctx, weight)
+	}
+	return s.populateBudget.tryAcquireReadMiss(weight)
+}
+
+// tryAcquireCacheBytes reserves representation-specific populate memory without
+// waiting. A response has already consumed the initial writer reservation, so a
+// missing block scratch buffer must shed the populate rather than hold its count slot.
+func (s *Service) tryAcquireCacheBytes(weight int64, prio populatePriority) bool {
+	if weight <= 0 || s.populateBudget == nil {
+		return true
+	}
+	if prio == priorityWarmWrite {
+		return s.populateBudget.tryAcquireWarm(weight)
+	}
+	return s.populateBudget.tryAcquireReadMiss(weight)
+}
+
 // acquireCacheSlot tries to reserve a cache-populate slot without blocking,
 // reserving `weight` bytes against the memory budget. It returns true (and must be
 // paired with releaseCacheSlot passing the SAME weight) when both the count slot
@@ -412,7 +525,7 @@ func (s *Service) acquireCacheSlot(ctx context.Context, weight int64, prio popul
 	// count slot for the whole wait, shedding read-miss populates that have budget
 	// headroom and exhausting MaxConcurrentWrites under a burst of warms.
 	if prio == priorityWarmWrite {
-		if s.populateBudget != nil && !s.populateBudget.acquireWarm(ctx, weight) {
+		if !s.acquireCacheBytes(ctx, weight, prio) {
 			return false
 		}
 		// The count slot is shared with read-miss populates, so protecting only the
@@ -440,7 +553,7 @@ func (s *Service) acquireCacheSlot(ctx context.Context, weight int64, prio popul
 			return false
 		}
 	}
-	if s.populateBudget != nil && !s.populateBudget.tryAcquireReadMiss(weight) {
+	if !s.acquireCacheBytes(ctx, weight, prio) {
 		if s.cacheSemaphore != nil {
 			<-s.cacheSemaphore // hand back the count slot we just took
 		}

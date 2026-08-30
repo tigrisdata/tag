@@ -236,11 +236,15 @@ type CacheConfig struct {
 	MaxConcurrentWrites int `yaml:"max_concurrent_writes"`
 	// MaxPopulateMemoryBytes bounds the aggregate memory buffered by ALL cache buffering —
 	// cache-populate and block-serve staging together — as one honest total: buffering never
-	// exceeds this value. Each populate reserves its object size, capped at the per-populate
-	// buffer ceiling (~(channel_buffer + max(channel_buffer/4, 64)) × chunk_size); when it can't
-	// fit, the object is served from upstream uncached. Small objects reserve little (high
-	// concurrency) while a burst of large objects is throttled — this is what actually bounds
-	// populate memory, since a byte-unaware count can pin many GB under large-object fan-out.
+	// exceeds this value. Foreground coalesced populates reserve their object size, capped at
+	// the broadcast listener plus relay-queue ceiling (~(channel_buffer + max(channel_buffer/4,
+	// 64)) × chunk_size). Direct background full-object populates reserve the clustered
+	// cache client's retained 1 MiB sender buffer and destination gRPC first-chunk buffer,
+	// the embedded storage writer's retained 1 MiB first-read buffer and 1 MiB file-copy
+	// buffer, plus one configured block scratch buffer when block mode can select it.
+	// When a populate cannot fit,
+	// the object is served from upstream uncached. This is what actually
+	// bounds populate memory, since a byte-unaware count can pin many GB under large-object fan-out.
 	// Applied independently of MaxConcurrentWrites (both limits apply). 0 or unset uses
 	// DefaultCacheMaxPopulateMemoryBytes; a negative value disables the budget (count-only).
 	//
