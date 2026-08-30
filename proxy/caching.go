@@ -361,6 +361,15 @@ func (s *Service) setupCacheListener(
 	return pipeWriter, errCh
 }
 
+// acquireWarmPopulateSlot gives each warm-on-write reservation its own bounded wait
+// context. A block-scratch retry can happen after the upstream fetch, so it must not
+// reuse the initial acquisition context whose timeout began before that fetch.
+func (s *Service) acquireWarmPopulateSlot(ctx context.Context, weight int64) bool {
+	acqCtx, cancel := context.WithTimeout(ctx, warmPopulateAcquireTimeout)
+	defer cancel()
+	return s.acquireCacheSlot(acqCtx, weight, priorityWarmWrite)
+}
+
 // fetchFullObjectToCache fetches the full object and caches it.
 // This makes a full-object request (no Range header) and streams directly to cache.
 // When anonymous is true the fetch is unsigned and, if it succeeds, the object is
@@ -389,15 +398,15 @@ func (s *Service) fetchFullObjectToCache(
 	// channel or relay queue to reserve.
 	weight := s.backgroundPopulateWeight()
 	// Warm-on-write populates wait (bounded) for their reserved budget and take
-	// priority; read-miss populates acquire non-blocking. Bound the warm wait so a
-	// starved warm doesn't hold a count slot for the whole fetch timeout.
-	acqCtx := ctx
+	// priority; read-miss populates acquire non-blocking. The warm helper creates a
+	// fresh wait context for every reservation, including a post-fetch scratch retry.
+	acquired := false
 	if prio == priorityWarmWrite {
-		var cancel context.CancelFunc
-		acqCtx, cancel = context.WithTimeout(ctx, warmPopulateAcquireTimeout)
-		defer cancel()
+		acquired = s.acquireWarmPopulateSlot(ctx, weight)
+	} else {
+		acquired = s.acquireCacheSlot(ctx, weight, prio)
 	}
-	if !s.acquireCacheSlot(acqCtx, weight, prio) {
+	if !acquired {
 		metrics.RecordCachePopulateSkipped(prio.metricSource())
 		return errCachePopulateDeclined
 	}
@@ -495,7 +504,7 @@ func (s *Service) fetchFullObjectToCache(
 				s.releaseCacheSlot(weight)
 				slotOwned = false
 				combinedWeight := weight + blockScratchWeight
-				if !s.acquireCacheSlot(acqCtx, combinedWeight, prio) {
+				if !s.acquireWarmPopulateSlot(ctx, combinedWeight) {
 					_, _ = io.Copy(io.Discard, resp.Body)
 					metrics.RecordCachePopulateSkipped(prio.metricSource())
 					return errCachePopulateDeclined
