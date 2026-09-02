@@ -29,11 +29,10 @@ func TestBuildTransparentRequest_StreamingPayload(t *testing.T) {
 		req.Header.Set("X-Amz-Content-Sha256", StreamingPayloadHash)
 		req.Header.Set("X-Amz-Decoded-Content-Length", "4")
 
-		fwdReq, restore, err := fwd.buildTransparentRequest(t.Context(), req)
+		fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
 		if err != nil {
 			t.Fatalf("buildTransparentRequest() error = %v", err)
 		}
-		defer restore()
 
 		if ce := fwdReq.Header.Get("Content-Encoding"); ce != "aws-chunked" {
 			t.Errorf("Content-Encoding = %q, want %q", ce, "aws-chunked")
@@ -53,11 +52,10 @@ func TestBuildTransparentRequest_StreamingPayload(t *testing.T) {
 		req.Header.Set("X-Amz-Content-Sha256", StreamingUnsignedTrailerHash)
 		req.Header.Set("X-Amz-Decoded-Content-Length", "5")
 
-		fwdReq, restore, err := fwd.buildTransparentRequest(t.Context(), req)
+		fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
 		if err != nil {
 			t.Fatalf("buildTransparentRequest() error = %v", err)
 		}
-		defer restore()
 
 		if ce := fwdReq.Header.Get("Content-Encoding"); ce != "aws-chunked" {
 			t.Errorf("Content-Encoding = %q, want %q", ce, "aws-chunked")
@@ -73,11 +71,10 @@ func TestBuildTransparentRequest_StreamingPayload(t *testing.T) {
 		req.Header.Set("X-Amz-Decoded-Content-Length", "4")
 		req.Header.Set("Content-Encoding", "aws-chunked")
 
-		fwdReq, restore, err := fwd.buildTransparentRequest(t.Context(), req)
+		fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
 		if err != nil {
 			t.Fatalf("buildTransparentRequest() error = %v", err)
 		}
-		defer restore()
 
 		// Should not duplicate aws-chunked
 		if ce := fwdReq.Header.Get("Content-Encoding"); ce != "aws-chunked" {
@@ -94,11 +91,10 @@ func TestBuildTransparentRequest_StreamingPayload(t *testing.T) {
 		req.Header.Set("X-Amz-Decoded-Content-Length", "4")
 		req.Header.Set("Content-Encoding", "aws-chunked,gzip")
 
-		fwdReq, restore, err := fwd.buildTransparentRequest(t.Context(), req)
+		fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
 		if err != nil {
 			t.Fatalf("buildTransparentRequest() error = %v", err)
 		}
-		defer restore()
 
 		// Should not modify when aws-chunked already present
 		if ce := fwdReq.Header.Get("Content-Encoding"); ce != "aws-chunked,gzip" {
@@ -115,11 +111,10 @@ func TestBuildTransparentRequest_StreamingPayload(t *testing.T) {
 		req.Header.Set("X-Amz-Decoded-Content-Length", "4")
 		req.Header.Set("Content-Encoding", "gzip")
 
-		fwdReq, restore, err := fwd.buildTransparentRequest(t.Context(), req)
+		fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
 		if err != nil {
 			t.Fatalf("buildTransparentRequest() error = %v", err)
 		}
-		defer restore()
 
 		if ce := fwdReq.Header.Get("Content-Encoding"); ce != "aws-chunked,gzip" {
 			t.Errorf("Content-Encoding = %q, want %q", ce, "aws-chunked,gzip")
@@ -135,11 +130,10 @@ func TestBuildTransparentRequest_StreamingPayload(t *testing.T) {
 		req.Header.Set("X-Amz-Decoded-Content-Length", "4")
 		req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=key/date/region/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=sig")
 
-		fwdReq, restore, err := fwd.buildTransparentRequest(t.Context(), req)
+		fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
 		if err != nil {
 			t.Fatalf("buildTransparentRequest() error = %v", err)
 		}
-		defer restore()
 
 		if got := fwdReq.Header.Get("X-Amz-Content-Sha256"); got != StreamingPayloadHash {
 			t.Errorf("X-Amz-Content-Sha256 = %q, want %q", got, StreamingPayloadHash)
@@ -157,11 +151,10 @@ func TestBuildTransparentRequest_StreamingPayload(t *testing.T) {
 		req.ContentLength = 4
 		req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
 
-		fwdReq, restore, err := fwd.buildTransparentRequest(t.Context(), req)
+		fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
 		if err != nil {
 			t.Fatalf("buildTransparentRequest() error = %v", err)
 		}
-		defer restore()
 
 		if ce := fwdReq.Header.Get("Content-Encoding"); ce != "" {
 			t.Errorf("Content-Encoding = %q, want empty for non-streaming", ce)
@@ -179,11 +172,10 @@ func TestBuildTransparentRequest_StreamingPayload(t *testing.T) {
 		// content-encoding IS in SignedHeaders — must not be mutated
 		req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=key/20260214/us-east-1/s3/aws4_request,SignedHeaders=content-encoding;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=sig")
 
-		fwdReq, restore, err := fwd.buildTransparentRequest(t.Context(), req)
+		fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
 		if err != nil {
 			t.Fatalf("buildTransparentRequest() error = %v", err)
 		}
-		defer restore()
 
 		// Content-Encoding should be preserved as-is (no aws-chunked prepended)
 		if ce := fwdReq.Header.Get("Content-Encoding"); ce != "gzip" {
@@ -200,11 +192,10 @@ func TestBuildTransparentRequest_StreamingPayload(t *testing.T) {
 		req.Header.Set("X-Amz-Decoded-Content-Length", "4")
 		req.Header.Set("Content-Encoding", "AWS-CHUNKED")
 
-		fwdReq, restore, err := fwd.buildTransparentRequest(t.Context(), req)
+		fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
 		if err != nil {
 			t.Fatalf("buildTransparentRequest() error = %v", err)
 		}
-		defer restore()
 
 		// Should not duplicate — case-insensitive match should detect AWS-CHUNKED
 		if ce := fwdReq.Header.Get("Content-Encoding"); ce != "AWS-CHUNKED" {
@@ -268,11 +259,10 @@ func TestBuildTransparentRequest_DateHandling(t *testing.T) {
 				req.Header.Set("X-Amz-Date", tt.amzDateHeader)
 			}
 
-			fwdReq, restore, err := fwd.buildTransparentRequest(t.Context(), req)
+			fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
 			if err != nil {
 				t.Fatalf("buildTransparentRequest() error = %v", err)
 			}
-			defer restore()
 
 			// Check Date header preserved
 			gotDate := fwdReq.Header.Get("Date")
@@ -304,7 +294,7 @@ func TestBuildTransparentRequest_DateHandling(t *testing.T) {
 	}
 }
 
-func TestBuildTransparentRequest_BorrowsAndRestoresHeaders(t *testing.T) {
+func TestBuildTransparentRequest_BorrowsHeaderValues(t *testing.T) {
 	fwd := &transparentForwarder{
 		baseForwarder:    newBaseForwarder("https://upstream.example.com", "us-east-1", 10),
 		proxySigner:      auth.NewProxySigner("test-access-key", "test-secret-key"),
@@ -315,6 +305,9 @@ func TestBuildTransparentRequest_BorrowsAndRestoresHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Host = "client.example.com"
+	unrelatedHeader := make([]string, 2, 4)
+	unrelatedHeader[0] = "one"
+	unrelatedHeader[1] = "two"
 	req.Header = http.Header{
 		"Authorization":             {"client-auth"},
 		"Date":                      {"Wed, 11 Feb 2026 05:55:14 GMT"},
@@ -324,13 +317,13 @@ func TestBuildTransparentRequest_BorrowsAndRestoresHeaders(t *testing.T) {
 		"X-Tigris-Proxy-Access-Key": {"client-access-key"},
 		"X-Tigris-Proxy-Timestamp":  {"client-timestamp"},
 		"X-Tigris-Proxy-Signature":  {"client-signature"},
-		"X-Unrelated":               {"one", "two"},
+		"X-Unrelated":               unrelatedHeader,
 	}
 	original := req.Header.Clone()
 	unrelatedValues := req.Header["X-Unrelated"]
 	authorizationValues := req.Header["Authorization"]
 
-	fwdReq, restore, err := fwd.buildTransparentRequest(t.Context(), req)
+	fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
 	if err != nil {
 		t.Fatalf("buildTransparentRequest() error = %v", err)
 	}
@@ -344,11 +337,17 @@ func TestBuildTransparentRequest_BorrowsAndRestoresHeaders(t *testing.T) {
 	if &fwdReq.Header["X-Unrelated"][0] != &unrelatedValues[0] {
 		t.Error("unrelated header value slice was copied")
 	}
-	fwdReq.Header.Set("X-Borrowed-Map", "visible-on-original")
-	if got := req.Header.Get("X-Borrowed-Map"); got != "visible-on-original" {
-		t.Errorf("borrowed header map is not shared, got %q", got)
+	fwdReq.Header.Add("X-Unrelated", "three")
+	if got := req.Header.Values("X-Unrelated"); !reflect.DeepEqual(got, []string{"one", "two"}) {
+		t.Errorf("inbound multi-value header changed after outbound append = %v", got)
 	}
-	delete(fwdReq.Header, "X-Borrowed-Map")
+	if got := fwdReq.Header.Values("X-Unrelated"); !reflect.DeepEqual(got, []string{"one", "two", "three"}) {
+		t.Errorf("outbound multi-value header = %v, want appended value", got)
+	}
+	fwdReq.Header.Set("X-Borrowed-Map", "visible-only-on-forwarded-request")
+	if got := req.Header.Get("X-Borrowed-Map"); got != "" {
+		t.Errorf("inbound header map changed, got %q", got)
+	}
 
 	if got := fwdReq.Header.Get("X-Amz-Date"); got != "20260211T055514Z" {
 		t.Errorf("X-Amz-Date = %q, want synthesized date", got)
@@ -366,18 +365,8 @@ func TestBuildTransparentRequest_BorrowsAndRestoresHeaders(t *testing.T) {
 			t.Errorf("%s was not overwritten for upstream request", header)
 		}
 	}
-
-	restore()
 	if !reflect.DeepEqual(req.Header, original) {
-		t.Errorf("headers after restore = %#v, want %#v", req.Header, original)
-	}
-
-	// The restore handle is one-shot. A later caller change must not be undone
-	// by a second invocation.
-	req.Header.Set("X-Tigris-Proxy-Access-Key", "changed-after-restore")
-	restore()
-	if got := req.Header.Get("X-Tigris-Proxy-Access-Key"); got != "changed-after-restore" {
-		t.Errorf("second restore changed a later header value to %q", got)
+		t.Errorf("inbound headers changed during build = %#v, want %#v", req.Header, original)
 	}
 }
 
@@ -442,7 +431,7 @@ func newTransparentRequestForTest(t *testing.T) *http.Request {
 	return req
 }
 
-func TestTransparentForwarderDoRequestWithCredsRestoresOnBodyClose(t *testing.T) {
+func TestTransparentForwarderKeepsInboundHeadersPrivateWhileBodyIsOpen(t *testing.T) {
 	closeErr := errors.New("close failed")
 	body := &transparentForwarderTestBody{closeErr: closeErr}
 	fwd := newTransparentForwarderForTest(&transparentForwarderTestTransport{body: body})
@@ -453,11 +442,11 @@ func TestTransparentForwarderDoRequestWithCredsRestoresOnBodyClose(t *testing.T)
 	if err != nil {
 		t.Fatalf("DoRequestWithCreds() error = %v", err)
 	}
-	if got := req.Header.Get("X-Tigris-Proxy-Access-Key"); got == original.Get("X-Tigris-Proxy-Access-Key") {
-		t.Error("proxy header was restored before response body close")
+	if !reflect.DeepEqual(req.Header, original) {
+		t.Errorf("headers changed while response body was open = %#v, want %#v", req.Header, original)
 	}
-	if _, err := resp.Body.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
-		t.Errorf("response Read() error = %v, want EOF", err)
+	if got := body.request.Header.Get("X-Tigris-Proxy-Access-Key"); got == original.Get("X-Tigris-Proxy-Access-Key") {
+		t.Error("outbound request did not overwrite the client proxy header")
 	}
 	if err := resp.Body.Close(); !errors.Is(err, closeErr) {
 		t.Errorf("response Body.Close() error = %v, want %v", err, closeErr)
@@ -465,28 +454,15 @@ func TestTransparentForwarderDoRequestWithCredsRestoresOnBodyClose(t *testing.T)
 	if body.closeCalls != 1 {
 		t.Errorf("underlying body Close calls = %d, want 1", body.closeCalls)
 	}
-	if got := body.headersAtClose.Get("X-Tigris-Proxy-Access-Key"); got == original.Get("X-Tigris-Proxy-Access-Key") {
-		t.Error("underlying body did not observe borrowed proxy header before restore")
-	}
 	if !reflect.DeepEqual(req.Header, original) {
 		t.Errorf("headers after response close = %#v, want %#v", req.Header, original)
 	}
-
-	// Closing again must not close the transport body or restore over a later
-	// caller change.
-	req.Header.Set("X-Tigris-Proxy-Access-Key", "changed-after-close")
-	if err := resp.Body.Close(); !errors.Is(err, closeErr) {
-		t.Errorf("second Body.Close() error = %v, want %v", err, closeErr)
-	}
-	if body.closeCalls != 1 {
-		t.Errorf("underlying body Close calls after second close = %d, want 1", body.closeCalls)
-	}
-	if got := req.Header.Get("X-Tigris-Proxy-Access-Key"); got != "changed-after-close" {
-		t.Errorf("second Body.Close() changed header to %q", got)
+	if got := body.headersAtClose.Get("X-Tigris-Proxy-Access-Key"); got == original.Get("X-Tigris-Proxy-Access-Key") {
+		t.Error("underlying body did not observe the outbound proxy header")
 	}
 }
 
-func TestTransparentForwarderRestoresOnTransportError(t *testing.T) {
+func TestTransparentForwarderLeavesHeadersOnTransportError(t *testing.T) {
 	transportErr := errors.New("transport failed")
 	fwd := newTransparentForwarderForTest(&transparentForwarderTestTransport{err: transportErr})
 	req := newTransparentRequestForTest(t)
@@ -504,7 +480,7 @@ func TestTransparentForwarderRestoresOnTransportError(t *testing.T) {
 	}
 }
 
-func TestTransparentForwarderSynchronousPathsRestoreHeaders(t *testing.T) {
+func TestTransparentForwarderSynchronousPathsKeepHeadersPrivate(t *testing.T) {
 	tests := []struct {
 		name string
 		call func(*transparentForwarder, http.ResponseWriter, *http.Request) error
@@ -539,6 +515,9 @@ func TestTransparentForwarderSynchronousPathsRestoreHeaders(t *testing.T) {
 			}
 			if !reflect.DeepEqual(req.Header, original) {
 				t.Errorf("headers after forwarding = %#v, want %#v", req.Header, original)
+			}
+			if got := body.headersAtClose.Get("X-Tigris-Proxy-Access-Key"); got == original.Get("X-Tigris-Proxy-Access-Key") {
+				t.Error("upstream body did not observe the generated proxy header")
 			}
 		})
 	}

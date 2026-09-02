@@ -27,7 +27,7 @@ const (
 
 // RequestForwarder is the interface for forwarding requests to the upstream Tigris server.
 // Two implementations exist: signingForwarder (validate + re-sign) and
-// transparentForwarder (borrow headers + proxy headers).
+// transparentForwarder (copy the header map, borrow unchanged values + proxy headers).
 type RequestForwarder interface {
 	// Forward forwards a request to Tigris and writes the response to the client.
 	Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error
