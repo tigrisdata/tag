@@ -93,5 +93,4 @@ func BenchmarkServiceHandlePassthroughTransparent(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-
 }

@@ -5,9 +5,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/auth"
@@ -48,14 +50,101 @@ func (f *transparentForwarder) interceptResponse(resp *http.Response, originalRe
 	f.handleAuthzRevocation(resp, originalReq)
 }
 
+type transparentHeaderValue struct {
+	values  []string
+	present bool
+}
+
+type transparentHeaderRestore struct {
+	header http.Header
+
+	forwardedHost    transparentHeaderValue
+	proxyAccessKey   transparentHeaderValue
+	proxyTimestamp   transparentHeaderValue
+	proxySignature   transparentHeaderValue
+	xAmzDate         transparentHeaderValue
+	contentEncoding  transparentHeaderValue
+	xAmzDateCaptured bool
+	contentCaptured  bool
+	once             sync.Once
+}
+
+func snapshotTransparentHeader(header http.Header, key string) transparentHeaderValue {
+	values, present := header[key]
+	return transparentHeaderValue{values: values, present: present}
+}
+
+func restoreTransparentHeader(header http.Header, key string, value transparentHeaderValue) {
+	if value.present {
+		header[key] = value.values
+	} else {
+		delete(header, key)
+	}
+}
+
+func newTransparentHeaderRestore(header http.Header) *transparentHeaderRestore {
+	return &transparentHeaderRestore{
+		header:         header,
+		forwardedHost:  snapshotTransparentHeader(header, "X-Tigris-Forwarded-Host"),
+		proxyAccessKey: snapshotTransparentHeader(header, "X-Tigris-Proxy-Access-Key"),
+		proxyTimestamp: snapshotTransparentHeader(header, "X-Tigris-Proxy-Timestamp"),
+		proxySignature: snapshotTransparentHeader(header, "X-Tigris-Proxy-Signature"),
+	}
+}
+
+func (r *transparentHeaderRestore) captureXAmzDate() {
+	r.xAmzDate = snapshotTransparentHeader(r.header, "X-Amz-Date")
+	r.xAmzDateCaptured = true
+}
+
+func (r *transparentHeaderRestore) captureContentEncoding() {
+	r.contentEncoding = snapshotTransparentHeader(r.header, "Content-Encoding")
+	r.contentCaptured = true
+}
+
+func (r *transparentHeaderRestore) restore() {
+	r.once.Do(func() {
+		restoreTransparentHeader(r.header, "X-Tigris-Forwarded-Host", r.forwardedHost)
+		restoreTransparentHeader(r.header, "X-Tigris-Proxy-Access-Key", r.proxyAccessKey)
+		restoreTransparentHeader(r.header, "X-Tigris-Proxy-Timestamp", r.proxyTimestamp)
+		restoreTransparentHeader(r.header, "X-Tigris-Proxy-Signature", r.proxySignature)
+		if r.xAmzDateCaptured {
+			restoreTransparentHeader(r.header, "X-Amz-Date", r.xAmzDate)
+		}
+		if r.contentCaptured {
+			restoreTransparentHeader(r.header, "Content-Encoding", r.contentEncoding)
+		}
+	})
+}
+
+// restoreOnCloseBody restores the borrowed request headers after the transport
+// response body has been closed. The underlying response body is closed before
+// restoration so a transport that retains the request until Close can finish
+// reading the forwarded headers safely.
+type restoreOnCloseBody struct {
+	io.ReadCloser
+	restore func()
+	once    sync.Once
+	err     error
+}
+
+func (b *restoreOnCloseBody) Close() error {
+	b.once.Do(func() {
+		defer b.restore()
+		b.err = b.ReadCloser.Close()
+	})
+	return b.err
+}
+
 // buildTransparentRequest creates a forwarded request for transparent proxy mode.
-// Copies ALL headers from the original request (including Authorization, X-Amz-Date, etc.)
-// and adds the 4 proxy headers. The body is streamed as-is without decoding.
+// Borrows the original header map and adds the 4 proxy headers. The body is
+// streamed as-is without decoding. The returned restore function must run after
+// the transport no longer uses the forwarded headers.
 //
 // For AWS chunked transfer encoding (streaming SigV4), ensures the required
 // Content-Encoding: aws-chunked header is present per the S3 spec. Some clients
 // (e.g., minio-go) omit this header despite using chunked encoding on the wire.
-func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *http.Request) (*http.Request, error) {
+func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *http.Request) (*http.Request, func(), error) {
 	bucket, _ := ParseBucketKey(r)
 
 	// Use vhost-style addressing only for anonymous requests (no Authorization header).
@@ -78,7 +167,7 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 
 	baseURL, err := url.Parse(endpointURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse endpoint: %w", err)
+		return nil, nil, fmt.Errorf("failed to parse endpoint: %w", err)
 	}
 
 	baseURL.Path = reqPath
@@ -87,12 +176,17 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 
 	fwdReq, err := http.NewRequestWithContext(ctx, r.Method, baseURL.String(), r.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Clone ALL headers from the original request (preserving Authorization, X-Amz-Date, etc.)
-	// Clone avoids mutating the original request headers when adding proxy headers below.
-	fwdReq.Header = r.Header.Clone()
+	// Borrow the original header map. Only the headers changed below are saved so
+	// the original request can be restored after the transport is finished with it.
+	if r.Header == nil {
+		fwdReq.Header = make(http.Header)
+	} else {
+		fwdReq.Header = r.Header
+	}
+	headerRestore := newTransparentHeaderRestore(fwdReq.Header)
 
 	// Ensure X-Amz-Date is present for Tigris's proxy validation path.
 	// Some SDK versions (botocore 1.42+) sign with "date" in SignedHeaders
@@ -103,6 +197,7 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 	if fwdReq.Header.Get("X-Amz-Date") == "" {
 		if dateStr := fwdReq.Header.Get("Date"); dateStr != "" {
 			if t, err := auth.ParseHTTPDate(dateStr); err == nil {
+				headerRestore.captureXAmzDate()
 				fwdReq.Header.Set("X-Amz-Date", t.UTC().Format(auth.TimeFormat))
 			}
 		}
@@ -118,6 +213,7 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 	// Only add the header if content-encoding is NOT in the client's SignedHeaders,
 	// since mutating a signed header would invalidate the Authorization signature.
 	if IsStreamingPayload(fwdReq.Header.Get("X-Amz-Content-Sha256")) && !isContentEncodingSigned(r) {
+		headerRestore.captureContentEncoding()
 		ensureAWSChunkedEncoding(fwdReq)
 	}
 
@@ -131,7 +227,7 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 	fwdReq.Header.Set("X-Tigris-Proxy-Timestamp", proxyHeaders.ProxyTimestamp)
 	fwdReq.Header.Set("X-Tigris-Proxy-Signature", proxyHeaders.ProxySignature)
 
-	return fwdReq, nil
+	return fwdReq, headerRestore.restore, nil
 }
 
 // Forward forwards a request to Tigris in transparent proxy mode.
@@ -139,10 +235,11 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 // Response interception (signing key learning, header stripping, authZ revocation)
 // is handled by the base forwarder's response interceptor.
 func (f *transparentForwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
-	fwdReq, err := f.buildTransparentRequest(ctx, r)
+	fwdReq, restore, err := f.buildTransparentRequest(ctx, r)
 	if err != nil {
 		return err
 	}
+	defer restore()
 
 	return f.executeAndStream(w, fwdReq, r.ContentLength, r)
 }
@@ -151,10 +248,11 @@ func (f *transparentForwarder) Forward(ctx context.Context, w http.ResponseWrite
 // Response interception (signing key learning, header stripping, authZ revocation)
 // is handled by the base forwarder's response interceptor.
 func (f *transparentForwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
-	fwdReq, err := f.buildTransparentRequest(ctx, r)
+	fwdReq, restore, err := f.buildTransparentRequest(ctx, r)
 	if err != nil {
 		return nil, err
 	}
+	defer restore()
 
 	return f.executeAndCapture(w, fwdReq, r.ContentLength, r)
 }
@@ -251,12 +349,25 @@ func isContentEncodingSigned(r *http.Request) bool {
 // Authorization header is preserved as-is), but are accepted to satisfy the
 // RequestForwarder interface.
 func (f *transparentForwarder) DoRequestWithCreds(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error) {
-	fwdReq, err := f.buildTransparentRequest(ctx, r)
+	fwdReq, restore, err := f.buildTransparentRequest(ctx, r)
 	if err != nil {
 		return nil, err
 	}
 
-	return f.executeRequest(fwdReq, r.ContentLength, r)
+	resp, err := f.executeRequest(fwdReq, r.ContentLength, r)
+	if err != nil {
+		restore()
+		return nil, err
+	}
+	if resp.Body == nil {
+		restore()
+		return resp, nil
+	}
+	resp.Body = &restoreOnCloseBody{
+		ReadCloser: resp.Body,
+		restore:    restore,
+	}
+	return resp, nil
 }
 
 // learnSigningKeys extracts and caches derived signing keys from the Tigris response.
