@@ -277,14 +277,31 @@ func canonicalQueryString(query url.Values) string {
 	return result.String()
 }
 
+// canonicalSigningHeaderName returns a lowercase SigV4 header name, if key is signed.
+func canonicalSigningHeaderName(key string) string {
+	switch len(key) {
+	case len("host"):
+		if strings.EqualFold(key, "host") {
+			return "host"
+		}
+	case len("content-type"):
+		if strings.EqualFold(key, "content-type") {
+			return "content-type"
+		}
+	}
+	if hasPrefixFold(key, "x-amz-") {
+		return strings.ToLower(key)
+	}
+	return ""
+}
+
 // buildCanonicalHeaders builds canonical headers and signed headers string.
 func (s *RequestSigner) buildCanonicalHeaders(req *http.Request) (string, string) {
-	// Get headers to sign
+	// Filter before normalizing keys to avoid lowercase copies for excluded headers.
 	headers := make(map[string][]string)
 	for k, v := range req.Header {
-		lower := strings.ToLower(k)
-		// Sign host and all x-amz-* headers, plus content-type
-		if lower == "host" || strings.HasPrefix(lower, "x-amz-") || lower == "content-type" {
+		// Sign host and all x-amz-* headers, plus content-type.
+		if lower := canonicalSigningHeaderName(k); lower != "" {
 			headers[lower] = v
 		}
 	}
@@ -340,34 +357,80 @@ func (s *RequestSigner) deriveSigningKey(secretKey, dateStr string) []byte {
 	return kSigning
 }
 
-// shouldCopyHeader returns true if the header should be copied to the upstream request.
-func shouldCopyHeader(key string) bool {
-	lower := strings.ToLower(key)
-	switch lower {
-	// Content headers
-	case "content-type", "content-length", "content-encoding",
-		"content-disposition", "content-language", "cache-control",
-		"expires", "content-md5":
-		return true
-	// Range requests
-	case "range":
-		return true
-	// Conditional request headers
-	case "if-match", "if-none-match", "if-modified-since", "if-unmodified-since":
-		return true
-	}
-	// All x-amz-* headers (S3 operations, metadata, etc.)
-	if strings.HasPrefix(lower, "x-amz-") {
-		return true
-	}
-	// All Tigris-specific headers (tigris-* and x-tigris-*), except proxy headers
-	// which must not be forwarded in signing mode to prevent client injection.
-	// The transparent forwarder overwrites these with .Set() so it's unaffected.
-	if strings.HasPrefix(lower, "x-tigris-proxy-") || lower == "x-tigris-forwarded-host" {
+// hasPrefixFold compares an ASCII HTTP header prefix case-insensitively.
+func hasPrefixFold(key, prefix string) bool {
+	if len(key) < len(prefix) {
 		return false
 	}
-	if strings.HasPrefix(lower, "tigris-") || strings.HasPrefix(lower, "x-tigris-") {
-		return true
+	for i := 0; i < len(prefix); i++ {
+		c := key[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// shouldCopyHeader returns true if the header should be copied to the upstream request.
+// It compares case-insensitively without allocating a normalized key.
+func shouldCopyHeader(key string) bool {
+	if key == "" {
+		return false
+	}
+
+	// HTTP header field names are ASCII tokens, so their first byte selects the
+	// small group of case-insensitive comparisons that can match.
+	switch key[0] {
+	case 'c', 'C':
+		// Content headers
+		switch len(key) {
+		case len("content-type"):
+			return strings.EqualFold(key, "content-type")
+		case len("content-length"):
+			return strings.EqualFold(key, "content-length")
+		case len("content-encoding"):
+			return strings.EqualFold(key, "content-encoding") || strings.EqualFold(key, "content-language")
+		case len("content-disposition"):
+			return strings.EqualFold(key, "content-disposition")
+		case len("cache-control"):
+			return strings.EqualFold(key, "cache-control")
+		case len("content-md5"):
+			return strings.EqualFold(key, "content-md5")
+		}
+	case 'e', 'E':
+		return strings.EqualFold(key, "expires")
+	case 'r', 'R':
+		// Range requests
+		return strings.EqualFold(key, "range")
+	case 'i', 'I':
+		// Conditional request headers
+		switch len(key) {
+		case len("if-match"):
+			return strings.EqualFold(key, "if-match")
+		case len("if-none-match"):
+			return strings.EqualFold(key, "if-none-match")
+		case len("if-modified-since"):
+			return strings.EqualFold(key, "if-modified-since")
+		case len("if-unmodified-since"):
+			return strings.EqualFold(key, "if-unmodified-since")
+		}
+	case 'x', 'X':
+		// All x-amz-* headers (S3 operations, metadata, etc.)
+		if hasPrefixFold(key, "x-amz-") {
+			return true
+		}
+		// All x-tigris-* headers, except proxy headers which must not be
+		// forwarded in signing mode to prevent client injection. The transparent
+		// forwarder overwrites these with .Set() so it's unaffected.
+		if hasPrefixFold(key, "x-tigris-proxy-") || strings.EqualFold(key, "x-tigris-forwarded-host") {
+			return false
+		}
+		return hasPrefixFold(key, "x-tigris-")
+	case 't', 'T':
+		return hasPrefixFold(key, "tigris-")
 	}
 	return false
 }
