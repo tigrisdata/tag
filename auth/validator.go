@@ -271,9 +271,10 @@ func (*RequestValidator) buildCanonicalQueryString(query url.Values) string {
 
 // buildCanonicalHeadersFromList builds canonical headers from a list of header names.
 func (v *RequestValidator) buildCanonicalHeadersFromList(r *http.Request, signedHeaders []string) string {
-	var builder strings.Builder
-
-	for _, name := range signedHeaders {
+	// Resolve each value once so the builder can reserve the exact output size.
+	canonicalValues := make([]string, len(signedHeaders))
+	size := 0
+	for i, name := range signedHeaders {
 		var value string
 		if name == "host" {
 			value = r.Host
@@ -283,16 +284,22 @@ func (v *RequestValidator) buildCanonicalHeadersFromList(r *http.Request, signed
 		} else {
 			values := r.Header.Values(name)
 			// Trim and join values
-			for i, val := range values {
-				values[i] = strings.TrimSpace(val)
+			for j, val := range values {
+				values[j] = strings.TrimSpace(val)
 			}
 			value = strings.Join(values, ",")
 		}
+		canonicalValues[i] = value
+		size += len(name) + len(value) + 2
+	}
 
+	var builder strings.Builder
+	builder.Grow(size)
+	for i, name := range signedHeaders {
 		builder.WriteString(name)
-		builder.WriteString(":")
-		builder.WriteString(value)
-		builder.WriteString("\n")
+		builder.WriteByte(':')
+		builder.WriteString(canonicalValues[i])
+		builder.WriteByte('\n')
 	}
 
 	return builder.String()

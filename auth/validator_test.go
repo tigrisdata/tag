@@ -173,3 +173,48 @@ func TestRequestValidator_ValidateRequest_MissingContentHash(t *testing.T) {
 		t.Errorf("ValidateRequest() error = %v, want %v", err, ErrMissingContentHash)
 	}
 }
+
+func TestRequestValidatorBuildCanonicalHeadersFromList(t *testing.T) {
+	validator := NewRequestValidator(NewCredentialStore())
+	tests := []struct {
+		name          string
+		host          string
+		signedHeaders []string
+		headers       http.Header
+		want          string
+	}{
+		{
+			name:          "ordinary signed headers",
+			host:          "client.example.com",
+			signedHeaders: []string{"host", "x-amz-content-sha256", "x-amz-date"},
+			headers: http.Header{
+				"X-Amz-Content-Sha256": {"payload-hash"},
+				"X-Amz-Date":           {"20260828T000000Z"},
+			},
+			want: "host:client.example.com\n" +
+				"x-amz-content-sha256:payload-hash\n" +
+				"x-amz-date:20260828T000000Z\n",
+		},
+		{
+			name:          "repeated values and whitespace",
+			signedHeaders: []string{"host", "x-amz-meta-tags"},
+			headers: http.Header{
+				"X-Amz-Meta-Tags": {" first ", "second\t", "\tthird\n"},
+			},
+			want: "host:url.example.com\n" +
+				"x-amz-meta-tags:first,second,third\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "https://url.example.com/bucket/object", nil)
+			req.Host = tt.host
+			req.Header = tt.headers
+
+			if got := validator.buildCanonicalHeadersFromList(req, tt.signedHeaders); got != tt.want {
+				t.Errorf("buildCanonicalHeadersFromList() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
