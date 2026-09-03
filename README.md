@@ -12,6 +12,7 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 - **Block-Aligned Caching** *(default)*: Caches large objects as fixed-size blocks (RFC 0001) so a small range read fetches and caches only the covering blocks instead of the whole object — ideal for sparse reads of large files (Parquet footers/row-groups, SST blocks). Enabled by default at 1 MiB blocks; size `block_size` to your read granularity, or set `block_caching_enabled: false` to cache whole objects.
 - **Conditional Requests**: Supports If-None-Match and If-Modified-Since for efficient cache validation
 - **AWS SigV4 Authentication**: Full AWS Signature Version 4 validation and re-signing
+- **Presigned URL Caching**: Serves validated presigned GET and HEAD requests from cache
 - **Prometheus Metrics**: Comprehensive metrics for monitoring cache efficiency and performance
 - **Kubernetes Ready**: Includes deployment manifests for production use
 

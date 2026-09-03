@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -164,6 +165,88 @@ func TestParseAuthInfo_PresignedURL(t *testing.T) {
 
 	if info.Signature != "aaaaaaa" {
 		t.Errorf("Signature = %q, want %q", info.Signature, "aaaaaaa")
+	}
+}
+
+func TestParseAuthInfo_MissingAuth(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+
+	_, err := ParseAuthInfo(req)
+	if !errors.Is(err, ErrMissingAuth) {
+		t.Fatalf("ParseAuthInfo() error = %v, want %v", err, ErrMissingAuth)
+	}
+}
+
+func TestParseAuthInfo_RejectsAmbiguousAuthentication(t *testing.T) {
+	tests := []struct {
+		name          string
+		target        string
+		authorization string
+	}{
+		{
+			name:   "incomplete query authentication",
+			target: "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc",
+		},
+		{
+			name:          "header and query authentication",
+			target:        "/bucket/key?X-Amz-Credential=key/20260715/us-east-1/s3/aws4_request",
+			authorization: "AWS4-HMAC-SHA256 Credential=key/20260715/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.target, nil)
+			if tt.authorization != "" {
+				req.Header.Set("Authorization", tt.authorization)
+			}
+
+			_, err := ParseAuthInfo(req)
+			if !errors.Is(err, ErrInvalidAuthFormat) {
+				t.Fatalf("ParseAuthInfo() error = %v, want %v", err, ErrInvalidAuthFormat)
+			}
+		})
+	}
+}
+
+func TestParseAuthInfo_PresignedURL_Invalid(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{
+			name:  "unsupported algorithm",
+			query: "X-Amz-Algorithm=AWS3-HMAC-SHA256&X-Amz-Credential=key/20260714/us-east-1/s3/aws4_request&X-Amz-SignedHeaders=host&X-Amz-Signature=abc",
+		},
+		{
+			name:  "malformed credential scope",
+			query: "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key/20260714/us-east-1/s3&X-Amz-SignedHeaders=host&X-Amz-Signature=abc",
+		},
+		{
+			name:  "wrong service",
+			query: "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key/20260714/us-east-1/ec2/aws4_request&X-Amz-SignedHeaders=host&X-Amz-Signature=abc",
+		},
+		{
+			name:  "missing signed headers",
+			query: "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key/20260714/us-east-1/s3/aws4_request&X-Amz-Signature=abc",
+		},
+		{
+			name:  "host not signed",
+			query: "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key/20260714/us-east-1/s3/aws4_request&X-Amz-SignedHeaders=range&X-Amz-Signature=abc",
+		},
+		{
+			name:  "missing signature",
+			query: "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key/20260714/us-east-1/s3/aws4_request&X-Amz-SignedHeaders=host",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/bucket/key?"+tt.query, nil)
+			if _, err := ParseAuthInfo(req); err == nil {
+				t.Fatal("ParseAuthInfo() error = nil, want error")
+			}
+		})
 	}
 }
 

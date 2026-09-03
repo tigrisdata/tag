@@ -65,6 +65,10 @@ func (m *mockForwarder) DoRequestWithCreds(ctx context.Context, r *http.Request,
 	return nil, nil
 }
 
+func (m *mockForwarder) AuthorizePresignedRequest(ctx context.Context, r *http.Request, accessKey, secretKey string, rangeProbe bool) (*http.Response, error) {
+	return nil, errors.New("mock: AuthorizePresignedRequest not implemented")
+}
+
 func (m *mockForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
 	if m.doFullObjectFunc != nil {
 		return m.doFullObjectFunc(ctx, bucket, key, accessKey, secretKey)

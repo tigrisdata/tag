@@ -596,6 +596,18 @@ func (e *TestEnvironment) GetS3ClientWithCreds(accessKey, secretKey string) *s3.
 	})
 }
 
+// GetS3ClientWithSessionToken returns an AWS SDK S3 client using temporary credentials.
+func (e *TestEnvironment) GetS3ClientWithSessionToken(sessionToken string) *s3.Client {
+	return s3.NewFromConfig(aws.Config{}, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(e.TAGServer.URL)
+		o.Region = TestRegion
+		o.EndpointOptions.DisableHTTPS = true
+		o.UsePathStyle = true
+		o.Credentials = credentials.NewStaticCredentialsProvider(
+			TestAccessKey, TestSecretKey, sessionToken)
+	})
+}
+
 // SignedRequest creates a signed HTTP request for testing.
 func (e *TestEnvironment) SignedRequest(method, path string, body []byte) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -632,6 +644,72 @@ func (e *TestEnvironment) DoSignedRequest(method, path string, body []byte) (*ht
 	}
 
 	return http.DefaultClient.Do(req)
+}
+
+// PresignedGetRequest creates a SigV4 query-presigned GET request using the AWS SDK.
+func (e *TestEnvironment) PresignedGetRequest(
+	ctx context.Context,
+	bucket, key string,
+	optFns ...func(*s3.GetObjectInput),
+) (*http.Request, error) {
+	return presignedGetRequest(ctx, e.GetS3Client(), bucket, key, optFns...)
+}
+
+func presignedGetRequest(
+	ctx context.Context,
+	client *s3.Client,
+	bucket, key string,
+	optFns ...func(*s3.GetObjectInput),
+) (*http.Request, error) {
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	}
+	for _, optFn := range optFns {
+		optFn(input)
+	}
+
+	presigner := s3.NewPresignClient(client, func(options *s3.PresignOptions) {
+		options.Expires = 15 * time.Minute
+	})
+	presigned, err := presigner.PresignGetObject(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return requestFromPresigned(ctx, presigned.Method, presigned.URL, presigned.SignedHeader)
+}
+
+// PresignedHeadRequest creates a SigV4 query-presigned HEAD request using the AWS SDK.
+func (e *TestEnvironment) PresignedHeadRequest(
+	ctx context.Context,
+	bucket, key string,
+	optFns ...func(*s3.HeadObjectInput),
+) (*http.Request, error) {
+	input := &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	}
+	for _, optFn := range optFns {
+		optFn(input)
+	}
+
+	presigner := s3.NewPresignClient(e.GetS3Client(), func(options *s3.PresignOptions) {
+		options.Expires = 15 * time.Minute
+	})
+	presigned, err := presigner.PresignHeadObject(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return requestFromPresigned(ctx, presigned.Method, presigned.URL, presigned.SignedHeader)
+}
+
+func requestFromPresigned(ctx context.Context, method, requestURL string, signedHeader http.Header) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = signedHeader.Clone()
+	return req, nil
 }
 
 // UnsignedRequest creates an unsigned HTTP request for testing auth failures.
@@ -1011,8 +1089,10 @@ func NewTestEnvironmentWithTransparentAuth(t *testing.T, upstreamHandler http.Ha
 
 	upstream := httptest.NewServer(counter(upstreamHandler))
 
-	// Create credential store (empty — transparent mode uses ProxySigner)
+	// Create credential store with TAG's own Tigris credentials. Transparent
+	// mode can use these to validate requests signed by the proxy identity.
 	credStore := auth.NewCredentialStore()
+	credStore.AddCredential(TestProxyAccessKey, TestProxySecretKey)
 
 	// Create proxy signer (TAG's own Tigris credentials)
 	proxySigner := auth.NewProxySigner(TestProxyAccessKey, TestProxySecretKey)

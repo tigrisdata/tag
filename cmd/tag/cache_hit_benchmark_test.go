@@ -40,6 +40,10 @@ func (embeddedCacheHitBenchmarkForwarder) DoRequestWithCreds(context.Context, *h
 	return nil, errors.New("unexpected upstream request")
 }
 
+func (embeddedCacheHitBenchmarkForwarder) AuthorizePresignedRequest(context.Context, *http.Request, string, string, bool) (*http.Response, error) {
+	return nil, errors.New("unexpected presigned authorization request")
+}
+
 func (embeddedCacheHitBenchmarkForwarder) DoFullObjectRequest(context.Context, string, string, string, string) (*http.Response, error) {
 	return nil, errors.New("unexpected upstream full-object request")
 }

@@ -180,6 +180,137 @@ func (s *RequestSigner) SignRequest(ctx context.Context, method, path string,
 	return req, nil
 }
 
+// ResignPresignedRequest creates a query-authenticated request for the signer's
+// upstream endpoint. It preserves the original signing time and expiration so
+// proxying cannot extend the URL's absolute validity deadline.
+func (s *RequestSigner) ResignPresignedRequest(
+	ctx context.Context,
+	source *http.Request,
+	accessKey, secretKey string,
+) (*http.Request, error) {
+	if source.Method != http.MethodGet && source.Method != http.MethodHead {
+		return nil, fmt.Errorf("presigned re-signing only supports GET and HEAD")
+	}
+
+	query := source.URL.Query()
+	dateStr := query.Get("X-Amz-Date")
+	expiresStr := query.Get("X-Amz-Expires")
+	signingTime, err := time.Parse(TimeFormat, dateStr)
+	if err != nil || expiresStr == "" {
+		return nil, ErrInvalidAuthFormat
+	}
+
+	signedHeadersStr := query.Get("X-Amz-SignedHeaders")
+	signedHeaders := strings.Split(signedHeadersStr, ";")
+	if signedHeadersStr == "" || !containsString(signedHeaders, "host") {
+		return nil, ErrInvalidAuthFormat
+	}
+
+	baseURL, err := url.Parse(s.endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse endpoint: %w", err)
+	}
+	baseURL.Path = source.URL.Path
+	baseURL.RawPath = source.URL.RawPath
+
+	req, err := http.NewRequestWithContext(ctx, source.Method, baseURL.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	for key, values := range source.Header {
+		if shouldCopyPresignedHeader(key) {
+			req.Header[key] = append([]string(nil), values...)
+		}
+	}
+
+	for _, name := range signedHeaders {
+		if name == "host" {
+			continue
+		}
+		if isForbiddenPresignedSignedHeader(name) {
+			return nil, fmt.Errorf("%w: forbidden signed header %q", ErrInvalidAuthFormat, name)
+		}
+		values := source.Header.Values(name)
+		if len(values) == 0 {
+			return nil, fmt.Errorf("%w: unsupported signed header %q", ErrInvalidAuthFormat, name)
+		}
+		req.Header[http.CanonicalHeaderKey(name)] = append([]string(nil), values...)
+	}
+
+	RemoveQueryAuthentication(query)
+	credentialScope := fmt.Sprintf(
+		"%s/%s/%s/%s",
+		signingTime.UTC().Format(shortTimeFormat),
+		s.region,
+		service,
+		terminationString,
+	)
+	query.Set("X-Amz-Algorithm", algorithm)
+	query.Set("X-Amz-Credential", accessKey+"/"+credentialScope)
+	query.Set("X-Amz-Date", dateStr)
+	query.Set("X-Amz-Expires", expiresStr)
+	query.Set("X-Amz-SignedHeaders", signedHeadersStr)
+
+	canonicalHeaders := buildCanonicalHeadersFromList(req, signedHeaders)
+	canonicalRequest := strings.Join([]string{
+		req.Method,
+		awsURIEncode(req.URL.Path, false),
+		s.buildCanonicalQueryString(query),
+		canonicalHeaders,
+		signedHeadersStr,
+		unsignedPayload,
+	}, "\n")
+	stringToSign := s.buildStringToSign(signingTime, credentialScope, canonicalRequest)
+	signingKey := s.deriveSigningKey(secretKey, signingTime.UTC().Format(shortTimeFormat))
+	query.Set("X-Amz-Signature", hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign))))
+	req.URL.RawQuery = s.buildCanonicalQueryString(query)
+
+	return req, nil
+}
+
+func shouldCopyPresignedHeader(key string) bool {
+	return strings.EqualFold(key, "Origin") ||
+		strings.EqualFold(key, "If-Range") ||
+		shouldCopyHeader(key)
+}
+
+func isForbiddenPresignedSignedHeader(key string) bool {
+	lowerKey := strings.ToLower(key)
+	return lowerKey == "authorization" ||
+		lowerKey == "connection" ||
+		lowerKey == "proxy-connection" ||
+		lowerKey == "transfer-encoding" ||
+		lowerKey == "upgrade" ||
+		lowerKey == "trailer" ||
+		lowerKey == "x-tigris-forwarded-host" ||
+		strings.HasPrefix(lowerKey, "x-tigris-proxy-")
+}
+
+func buildCanonicalHeadersFromList(req *http.Request, signedHeaders []string) string {
+	var canonicalHeaders strings.Builder
+	for _, name := range signedHeaders {
+		var value string
+		if name == "host" {
+			value = req.URL.Host
+		} else {
+			value = canonicalizeHeaderValues(req.Header.Values(name))
+		}
+		canonicalHeaders.WriteString(name)
+		canonicalHeaders.WriteString(":")
+		canonicalHeaders.WriteString(value)
+		canonicalHeaders.WriteString("\n")
+	}
+	return canonicalHeaders.String()
+}
+
+func canonicalizeHeaderValues(values []string) string {
+	normalized := make([]string, len(values))
+	for i, value := range values {
+		normalized[i] = strings.Join(strings.Fields(value), " ")
+	}
+	return strings.Join(normalized, ",")
+}
+
 // signHTTP signs an HTTP request using AWS SigV4.
 func (s *RequestSigner) signHTTP(req *http.Request, accessKey, secretKey, bodyHash string, signingTime time.Time) error {
 	// Build credential scope
@@ -304,14 +435,9 @@ func (s *RequestSigner) buildCanonicalHeaders(req *http.Request) (string, string
 	// Build canonical headers string
 	var canonicalHeaders strings.Builder
 	for _, name := range headerNames {
-		values := headers[name]
-		// Trim and collapse whitespace
-		for i, v := range values {
-			values[i] = strings.TrimSpace(v)
-		}
 		canonicalHeaders.WriteString(name)
 		canonicalHeaders.WriteString(":")
-		canonicalHeaders.WriteString(strings.Join(values, ","))
+		canonicalHeaders.WriteString(canonicalizeHeaderValues(headers[name]))
 		canonicalHeaders.WriteString("\n")
 	}
 

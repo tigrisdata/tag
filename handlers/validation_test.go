@@ -74,3 +74,18 @@ func TestValidateBucketName(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateBucketName_PresignedVirtualHost(t *testing.T) {
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/org_appstore000000000000000000/Expo-Go.tar.gz?X-Amz-Credential=key%2F20260718%2Fauto%2Fs3%2Faws4_request",
+		nil,
+	)
+	req.Host = "example-bucket.t3.tigrisfiles.io"
+	req = mux.SetURLVars(req, map[string]string{"bucket": "org_appstore000000000000000000"})
+	w := httptest.NewRecorder()
+
+	if !validateBucketName(w, req) {
+		t.Fatalf("virtual-host bucket rejected with status %d", w.Code)
+	}
+}

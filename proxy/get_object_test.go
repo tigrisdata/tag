@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/proxy/broadcast"
 )
 
@@ -88,6 +89,84 @@ func TestWriteChunksToResponse_NormalDataFlow(t *testing.T) {
 	}
 	if got := w.Header().Get("X-Cache"); got != "HIT" {
 		t.Errorf("X-Cache = %q, want %q", got, "HIT")
+	}
+}
+
+func TestProbeMatchesCachedObject(t *testing.T) {
+	meta := &cache.CachedObjectMeta{
+		ETag:          `"etag-v1"`,
+		ContentLength: 100,
+		VersionID:     "version-1",
+	}
+	response := func(etag, contentRange, versionID string) *http.Response {
+		headers := http.Header{}
+		headers.Set("ETag", etag)
+		headers.Set("Content-Range", contentRange)
+		headers.Set("x-amz-version-id", versionID)
+		return &http.Response{
+			StatusCode: http.StatusPartialContent,
+			Header:     headers,
+		}
+	}
+
+	if !probeMatchesCachedObject(response(`"etag-v1"`, "bytes 0-0/100", "version-1"), meta) {
+		t.Error("matching probe was rejected")
+	}
+	if probeMatchesCachedObject(response(`"etag-v2"`, "bytes 0-0/100", "version-1"), meta) {
+		t.Error("ETag mismatch was accepted")
+	}
+	if probeMatchesCachedObject(response(`W/"etag-v1"`, "bytes 0-0/100", "version-1"), meta) {
+		t.Error("weak ETag was accepted as an exact identity match")
+	}
+	if probeMatchesCachedObject(response(`"etag-v1"`, "bytes 0-0/101", "version-1"), meta) {
+		t.Error("size mismatch was accepted")
+	}
+	if probeMatchesCachedObject(response(`"etag-v1"`, "bytes 0-0/100", "version-2"), meta) {
+		t.Error("version mismatch was accepted")
+	}
+	if probeMatchesCachedObject(response(`"etag-v1"`, "", "version-1"), meta) {
+		t.Error("missing Content-Range was accepted")
+	}
+	if probeMatchesCachedObject(response(`"etag-v1"`, "bytes 0-0/100", ""), meta) {
+		t.Error("missing authoritative version was accepted")
+	}
+
+	zeroMeta := &cache.CachedObjectMeta{ETag: `"zero"`, ContentLength: 0}
+	zeroResponse := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Etag": {`"zero"`}},
+		ContentLength: 0,
+	}
+	if !probeMatchesCachedObject(zeroResponse, zeroMeta) {
+		t.Error("matching zero-byte object probe was rejected")
+	}
+}
+
+func TestPresignedCoalescingKeySeparatesCapabilities(t *testing.T) {
+	req1 := httptest.NewRequest(http.MethodGet, "/bucket/key?X-Amz-Signature=one", nil)
+	req1.Host = "bucket.t3.tigrisfiles.io"
+	req2 := httptest.NewRequest(http.MethodGet, "/bucket/key?X-Amz-Signature=two", nil)
+	req2.Host = req1.Host
+	req3 := httptest.NewRequest(http.MethodGet, req1.URL.RequestURI(), nil)
+	req3.Host = "other.t3.tigrisfiles.io"
+	req4 := httptest.NewRequest(
+		http.MethodGet,
+		"/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key%2F20260720%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20260720T120000Z&X-Amz-Expires=3600&X-Amz-Signature=one&X-Amz-SignedHeaders=accept%3Bhost",
+		nil,
+	)
+	req4.Host = req1.Host
+	req4.Header.Set("Accept", "application/zip")
+	req5 := req4.Clone(req4.Context())
+	req5.Header.Set("Accept", "application/octet-stream")
+
+	if presignedCoalescingKey(req1) == presignedCoalescingKey(req2) {
+		t.Error("different signatures share a coalescing key")
+	}
+	if presignedCoalescingKey(req1) == presignedCoalescingKey(req3) {
+		t.Error("different hosts share a coalescing key")
+	}
+	if presignedCoalescingKey(req4) == presignedCoalescingKey(req5) {
+		t.Error("different signed header values share a coalescing key")
 	}
 }
 

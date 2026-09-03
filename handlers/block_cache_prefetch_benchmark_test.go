@@ -271,6 +271,10 @@ func (handlerPrefetchForwarder) DoRequestWithCreds(context.Context, *http.Reques
 	return nil, errors.New("unexpected request with credentials")
 }
 
+func (handlerPrefetchForwarder) AuthorizePresignedRequest(context.Context, *http.Request, string, string, bool) (*http.Response, error) {
+	return nil, errors.New("unexpected presigned authorization request")
+}
+
 func (handlerPrefetchForwarder) DoFullObjectRequest(context.Context, string, string, string, string) (*http.Response, error) {
 	return nil, errors.New("unexpected full object request")
 }

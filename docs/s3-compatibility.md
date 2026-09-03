@@ -73,7 +73,7 @@ TAG adds a caching layer for read operations. The `X-Cache` response header indi
 | ---------- | -------------------------------------------------------- |
 | `HIT`      | Served entirely from cache                               |
 | `MISS`     | Fetched from Tigris and cached                           |
-| `BYPASS`   | Caching skipped (e.g., conditional request returned 304) |
+| `BYPASS`   | Request forwarded without reading or populating cache     |
 | `DISABLED` | Caching is turned off                                    |
 
 Key caching behaviors:
@@ -83,20 +83,31 @@ Key caching behaviors:
 - **Conditional requests** — `If-None-Match` and `If-Modified-Since` are evaluated against cached metadata and can return 304 without hitting Tigris.
 - **Write-through invalidation** — PUT, DELETE, CopyObject, and DeleteObjects invalidate the cache _before_ forwarding to Tigris to prevent stale reads.
 - **Tombstone protection** — A short-lived tombstone is written on DELETE to prevent in-flight background cache writes from resurrecting deleted objects.
+- **Presigned reads** — SigV4 presigned GET and HEAD requests can be served from cache. In transparent mode, a full GET whose signing key is unavailable is authorized with a minimal upstream request on every cache hit; cached bytes are served only when the authoritative ETag, version, and size match. Signing mode uses its configured credential store and generates a new query signature for the upstream host on a miss while preserving the original signing time and absolute expiration deadline.
+- **Temporary credentials** — Presigned requests carrying `X-Amz-Security-Token` bypass cache in transparent mode because token expiration is opaque to TAG. Signing mode does not support presigned temporary credentials.
+- **Presigned request variants** — `X-Amz-Checksum-Mode=ENABLED` GETs are cacheable and preserve checksum response headers. Presigned requests with cache-control directives, conditional headers, `Origin`, other unsupported `x-amz-*` control parameters, or query parameters such as `versionId`, `partNumber`, and `response-*`, bypass cache for authoritative upstream evaluation.
 
 ## Addressing Style
 
-TAG uses **path-style** addressing only (`http://host:port/bucket/key`). Virtual-hosted style (`http://bucket.host:port/key`) is not supported.
+TAG uses path-style addressing (`http://host:port/bucket/key`) for normal S3
+requests. Presigned GET and HEAD requests additionally support Tigris
+virtual-hosted URLs using `<bucket>.t3.tigrisfiles.io`.
+
+Bucket custom domains are not recognised. A host such as `<bucket>.s3.<domain>`
+cannot be told apart from a TAG endpoint served under a similar name, and reading
+a bucket out of the latter would give the request a different object identity.
+Requests on those hosts are treated as path-style; recognising them needs the
+virtual-host domains to be configured explicitly.
 
 ## Authentication
 
-All requests must be signed with AWS Signature Version 4 (header-based).
+Authenticated requests must use AWS Signature Version 4, either with an `Authorization` header or presigned query parameters.
 
 In **transparent proxy mode** (default), TAG forwards the client's original Authorization header as-is and adds proxy headers (`X-Tigris-Forwarded-Host`, etc.) so Tigris validates the signature against the original host. No local credential store is needed.
 
 In **signing mode**, TAG validates the incoming signature against its credential store, then re-signs the request with the same credentials for the Tigris upstream endpoint.
 
-Presigned URL authentication (`X-Amz-Algorithm` query parameter) is supported for request validation.
+Presigned GET and HEAD authentication (`X-Amz-Algorithm` query parameter) is supported for request validation and cache hits. Presigned write operations are forwarded in transparent mode and are not locally cache-authenticated.
 
 ## Not Supported
 

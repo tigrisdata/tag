@@ -3,6 +3,7 @@ package auth
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -44,27 +45,33 @@ type AuthInfo struct {
 // ExtractAccessKey extracts the access key from the Authorization header or query string.
 // Supports both header-based auth and presigned URLs.
 func ExtractAccessKey(r *http.Request) (string, error) {
-	auth := r.Header.Get("Authorization")
-
-	// Check for header-based auth
-	if auth != "" {
-		return extractFromHeader(auth)
+	headerAuth := r.Header.Get("Authorization")
+	queryAuth := HasQueryAuthentication(r)
+	if headerAuth != "" {
+		if queryAuth {
+			return "", ErrInvalidAuthFormat
+		}
+		return extractFromHeader(headerAuth)
 	}
-
-	// Check for query string auth (presigned URLs)
+	if !queryAuth {
+		return "", ErrMissingAuth
+	}
 	return extractFromQuery(r)
 }
 
 // ParseAuthInfo extracts detailed authentication information from a request.
 func ParseAuthInfo(r *http.Request) (*AuthInfo, error) {
-	auth := r.Header.Get("Authorization")
-
-	// Check for header-based auth
-	if auth != "" {
-		return parseFromHeader(auth)
+	headerAuth := r.Header.Get("Authorization")
+	queryAuth := HasQueryAuthentication(r)
+	if headerAuth != "" {
+		if queryAuth {
+			return nil, ErrInvalidAuthFormat
+		}
+		return parseFromHeader(headerAuth)
 	}
-
-	// Check for query string auth (presigned URLs)
+	if !queryAuth {
+		return nil, ErrMissingAuth
+	}
 	return parseFromQuery(r)
 }
 
@@ -87,12 +94,12 @@ func extractFromQuery(r *http.Request) (string, error) {
 	// Check X-Amz-Credential for presigned URLs
 	credential := r.URL.Query().Get("X-Amz-Credential")
 	if credential == "" {
-		return "", ErrMissingAuth
+		return "", ErrInvalidAuthFormat
 	}
 
 	// Format: <access_key>/<date>/<region>/<service>/aws4_request
 	parts := strings.Split(credential, "/")
-	if len(parts) < 1 || parts[0] == "" {
+	if !isValidCredentialScope(parts) {
 		return "", ErrInvalidAuthFormat
 	}
 
@@ -147,7 +154,11 @@ func parseFromQuery(r *http.Request) (*AuthInfo, error) {
 
 	credential := query.Get("X-Amz-Credential")
 	if credential == "" {
-		return nil, ErrMissingAuth
+		return nil, ErrInvalidAuthFormat
+	}
+
+	if query.Get("X-Amz-Algorithm") != algorithm {
+		return nil, ErrUnsupportedAuthScheme
 	}
 
 	info := &AuthInfo{
@@ -156,7 +167,7 @@ func parseFromQuery(r *http.Request) (*AuthInfo, error) {
 
 	// Parse credential: <access_key>/<date>/<region>/<service>/aws4_request
 	parts := strings.Split(credential, "/")
-	if len(parts) < 4 {
+	if !isValidCredentialScope(parts) {
 		return nil, ErrInvalidAuthFormat
 	}
 	info.AccessKey = parts[0]
@@ -165,17 +176,78 @@ func parseFromQuery(r *http.Request) (*AuthInfo, error) {
 
 	// Extract SignedHeaders
 	signedHeaders := query.Get("X-Amz-SignedHeaders")
-	if signedHeaders != "" {
-		info.SignedHeaders = strings.Split(signedHeaders, ";")
+	if signedHeaders == "" {
+		return nil, ErrInvalidAuthFormat
+	}
+	info.SignedHeaders = strings.Split(signedHeaders, ";")
+	if !containsString(info.SignedHeaders, "host") {
+		return nil, ErrInvalidAuthFormat
 	}
 
 	// Extract Signature
 	info.Signature = query.Get("X-Amz-Signature")
+	if info.Signature == "" {
+		return nil, ErrInvalidAuthFormat
+	}
 
 	return info, nil
+}
+
+func isValidCredentialScope(parts []string) bool {
+	return len(parts) == 5 &&
+		parts[0] != "" &&
+		parts[1] != "" &&
+		parts[2] != "" &&
+		parts[3] == service &&
+		parts[4] == terminationString
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 // IsPresignedRequest checks if the request is using presigned URL authentication.
 func IsPresignedRequest(r *http.Request) bool {
 	return r.URL.Query().Get("X-Amz-Credential") != ""
+}
+
+// HasQueryAuthentication reports whether any SigV4 query-auth parameter is present.
+func HasQueryAuthentication(r *http.Request) bool {
+	for key := range r.URL.Query() {
+		if IsQueryAuthenticationParameter(key) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsQueryAuthenticationParameter reports whether key belongs to SigV4 query auth.
+func IsQueryAuthenticationParameter(key string) bool {
+	switch key {
+	case "X-Amz-Algorithm",
+		"X-Amz-Content-Sha256",
+		"X-Amz-Credential",
+		"X-Amz-Date",
+		"X-Amz-Expires",
+		"X-Amz-Security-Token",
+		"X-Amz-Signature",
+		"X-Amz-SignedHeaders":
+		return true
+	default:
+		return false
+	}
+}
+
+// RemoveQueryAuthentication removes all SigV4 query credentials in place.
+func RemoveQueryAuthentication(query url.Values) {
+	for key := range query {
+		if IsQueryAuthenticationParameter(key) {
+			query.Del(key)
+		}
+	}
 }

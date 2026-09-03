@@ -340,6 +340,9 @@ func handleError(w http.ResponseWriter, r *http.Request, err error) {
 
 // getBucketName extracts the bucket name from request path variables.
 func getBucketName(r *http.Request) string {
+	if bucket, ok := proxy.PresignedVirtualHostBucket(r); ok {
+		return bucket
+	}
 	vars := mux.Vars(r)
 	return vars["bucket"]
 }
@@ -483,6 +486,12 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request) {
 
 // handleBucket handles basic bucket operations.
 func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request) {
+	if _, ok := proxy.PresignedVirtualHostBucket(r); ok &&
+		strings.TrimPrefix(r.URL.Path, "/") != "" {
+		s.handleObject(w, r)
+		return
+	}
+
 	if !validateBucketName(w, r) {
 		return
 	}

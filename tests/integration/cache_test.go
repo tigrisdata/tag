@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 )
 
@@ -221,6 +224,141 @@ func TestCache_HeadFromCache(t *testing.T) {
 	env.AssertXCacheHit(t) // HEAD should be served from cache
 	assert.Equal(t, etag, aws.ToString(resp2.ETag), "HEAD should return same ETag as GET")
 	assert.Equal(t, contentLength, aws.ToInt64(resp2.ContentLength), "HEAD should return same Content-Length")
+}
+
+func TestCache_PresignedSigningMode(t *testing.T) {
+	content := []byte("presigned signing mode content")
+	variantContent := []byte("presigned semantic query content")
+	upstreamStore := auth.NewCredentialStore()
+	upstreamStore.AddCredential(TestAccessKey, TestSecretKey)
+	upstreamValidator := auth.NewRequestValidator(upstreamStore)
+	var expectedDate, expectedExpires string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			http.Error(w, "unexpected upstream Authorization header", http.StatusBadRequest)
+			return
+		}
+		if _, err := upstreamValidator.ValidateRequest(r); err != nil {
+			http.Error(w, "invalid upstream query signature: "+err.Error(), http.StatusForbidden)
+			return
+		}
+		if r.URL.Query().Get("X-Amz-Date") != expectedDate ||
+			r.URL.Query().Get("X-Amz-Expires") != expectedExpires {
+			http.Error(w, "presigned deadline changed", http.StatusBadRequest)
+			return
+		}
+
+		switch {
+		case r.Header.Get("If-Match") != "":
+			w.WriteHeader(http.StatusPreconditionFailed)
+		case r.URL.Query().Get("response-content-type") != "":
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Content-Length", strconv.Itoa(len(variantContent)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(variantContent)
+		default:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+			w.Header().Set("ETag", `"default-etag"`)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(content)
+		}
+	})
+
+	env := NewTestEnvironmentWithCacheHandler(handler)
+	defer env.Close()
+
+	bucket := "presigned-signing-bucket"
+	key := "object.txt"
+
+	coldReq, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	expectedDate = coldReq.URL.Query().Get("X-Amz-Date")
+	expectedExpires = coldReq.URL.Query().Get("X-Amz-Expires")
+	coldResp, err := http.DefaultClient.Do(coldReq)
+	require.NoError(t, err)
+	coldBody, err := io.ReadAll(coldResp.Body)
+	coldResp.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, coldResp.StatusCode)
+	require.Equal(t, content, coldBody)
+	require.Equal(t, "MISS", coldResp.Header.Get("X-Cache"))
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second))
+
+	hitReq, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	hitResp, err := http.DefaultClient.Do(hitReq)
+	require.NoError(t, err)
+	hitBody, err := io.ReadAll(hitResp.Body)
+	hitResp.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, content, hitBody)
+	require.Equal(t, "HIT", hitResp.Header.Get("X-Cache"))
+	require.Equal(t, int32(1), env.GetUpstreamRequestCount())
+
+	noCacheReq, err := env.PresignedGetRequest(t.Context(), bucket, key)
+	require.NoError(t, err)
+	noCacheReq.Header.Set("Cache-Control", "Max-Age=3600")
+	expectedDate = noCacheReq.URL.Query().Get("X-Amz-Date")
+	expectedExpires = noCacheReq.URL.Query().Get("X-Amz-Expires")
+	noCacheResp, err := http.DefaultClient.Do(noCacheReq)
+	require.NoError(t, err)
+	noCacheResp.Body.Close()
+	require.Equal(t, http.StatusOK, noCacheResp.StatusCode)
+	require.Equal(t, "BYPASS", noCacheResp.Header.Get("X-Cache"))
+	require.Equal(t, int32(2), env.GetUpstreamRequestCount())
+
+	sessionReq, err := presignedGetRequest(
+		t.Context(),
+		env.GetS3ClientWithSessionToken("temporary-session-token"),
+		bucket,
+		key,
+	)
+	require.NoError(t, err)
+	sessionResp, err := http.DefaultClient.Do(sessionReq)
+	require.NoError(t, err)
+	sessionResp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, sessionResp.StatusCode)
+	require.Equal(t, int32(2), env.GetUpstreamRequestCount())
+
+	variantReq, err := env.PresignedGetRequest(t.Context(), bucket, key, func(input *s3.GetObjectInput) {
+		input.ResponseContentType = aws.String("text/plain")
+	})
+	require.NoError(t, err)
+	expectedDate = variantReq.URL.Query().Get("X-Amz-Date")
+	expectedExpires = variantReq.URL.Query().Get("X-Amz-Expires")
+	variantResp, err := http.DefaultClient.Do(variantReq)
+	require.NoError(t, err)
+	variantBody, err := io.ReadAll(variantResp.Body)
+	variantResp.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, variantContent, variantBody)
+	require.Equal(t, "BYPASS", variantResp.Header.Get("X-Cache"))
+
+	conditionalReq, err := env.PresignedGetRequest(t.Context(), bucket, key, func(input *s3.GetObjectInput) {
+		input.IfMatch = aws.String(`"different-etag"`)
+	})
+	require.NoError(t, err)
+	expectedDate = conditionalReq.URL.Query().Get("X-Amz-Date")
+	expectedExpires = conditionalReq.URL.Query().Get("X-Amz-Expires")
+	conditionalResp, err := http.DefaultClient.Do(conditionalReq)
+	require.NoError(t, err)
+	conditionalResp.Body.Close()
+	require.Equal(t, http.StatusPreconditionFailed, conditionalResp.StatusCode)
+	require.Equal(t, "BYPASS", conditionalResp.Header.Get("X-Cache"))
+
+	countBeforeHeadRange := env.GetUpstreamRequestCount()
+	headRangeReq, err := env.PresignedHeadRequest(t.Context(), bucket, key, func(input *s3.HeadObjectInput) {
+		input.Range = aws.String("bytes=0-3")
+	})
+	require.NoError(t, err)
+	expectedDate = headRangeReq.URL.Query().Get("X-Amz-Date")
+	expectedExpires = headRangeReq.URL.Query().Get("X-Amz-Expires")
+	headRangeResp, err := http.DefaultClient.Do(headRangeReq)
+	require.NoError(t, err)
+	headRangeResp.Body.Close()
+	require.Equal(t, "BYPASS", headRangeResp.Header.Get("X-Cache"))
+	require.Equal(t, countBeforeHeadRange+1, env.GetUpstreamRequestCount())
 }
 
 // TestCache_InvalidateOnPut verifies PUT invalidates the cache for that key.
@@ -1190,4 +1328,248 @@ func TestBlockCache_EmbeddedMissingBlockNotFound(t *testing.T) {
 	var fb bytes.Buffer
 	ferr := env.Cache.GetBlockRangeStream(ctx, bucket, key, etag, blockSize, 0, 0, blockSize-1, &fb)
 	require.ErrorIs(t, ferr, cache.ErrNotFound, "missing block [0,N] read: err=%v bytes=%d (want ErrNotFound)", ferr, fb.Len())
+}
+
+// Checksum mode can be requested with the x-amz-checksum-mode header, not only the
+// presigned query parameter. A cache hit must return the same checksums the miss did;
+// otherwise the response depends on whether the object happened to be cached.
+func TestCache_ChecksumModeHeaderSurvivesCacheHit(t *testing.T) {
+	content := []byte("checksum-mode header content")
+	const checksum = "dGVzdC1jaGVja3N1bQ=="
+	env := NewTestEnvironmentWithCacheHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"checksum-mode-header-etag"`)
+		if strings.EqualFold(r.Header.Get("X-Amz-Checksum-Mode"), "ENABLED") {
+			w.Header().Set("X-Amz-Checksum-Crc32c", checksum)
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
+	})
+	defer env.Close()
+
+	bucket := "checksum-header-bucket"
+	key := "object.bin"
+
+	get := func() *http.Response {
+		t.Helper()
+		req, err := env.Signer.SignRequest(
+			context.Background(),
+			http.MethodGet,
+			"/"+bucket+"/"+key,
+			nil,
+			"",
+			TestAccessKey,
+			TestSecretKey,
+			http.Header{"X-Amz-Checksum-Mode": []string{"ENABLED"}},
+		)
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		require.NoError(t, err)
+		return resp
+	}
+
+	resp1 := get()
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+	require.Equal(t, checksum, resp1.Header.Get("X-Amz-Checksum-Crc32c"),
+		"upstream returns the checksum for a checksum-mode read")
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second))
+
+	resp2 := get()
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+	require.Equal(t, checksum, resp2.Header.Get("X-Amz-Checksum-Crc32c"),
+		"a cache hit must return the checksum the miss returned")
+}
+
+// HeadObject takes a checksum mode too. An entry stored without checksums cannot answer
+// that request, so it must not be served as a hit: the client would never see the
+// x-amz-checksum-* headers it asked for.
+func TestCache_ChecksumModeHeadNotServedFromChecksumlessEntry(t *testing.T) {
+	content := []byte("head checksum-mode content")
+	const checksum = "dGVzdC1jaGVja3N1bQ=="
+	env := NewTestEnvironmentWithCacheHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"head-checksum-etag"`)
+		if strings.EqualFold(r.Header.Get("X-Amz-Checksum-Mode"), "ENABLED") {
+			w.Header().Set("X-Amz-Checksum-Crc32c", checksum)
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(content)
+		}
+	})
+	defer env.Close()
+
+	bucket := "head-checksum-bucket"
+	key := "object.bin"
+
+	do := func(method string, header http.Header) *http.Response {
+		t.Helper()
+		req, err := env.Signer.SignRequest(
+			context.Background(),
+			method,
+			"/"+bucket+"/"+key,
+			nil,
+			"",
+			TestAccessKey,
+			TestSecretKey,
+			header,
+		)
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		require.NoError(t, err)
+		return resp
+	}
+
+	// Populate the entry with a read that did not ask for checksums.
+	resp1 := do(http.MethodGet, http.Header{})
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+	require.Empty(t, resp1.Header.Get("X-Amz-Checksum-Crc32c"))
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second))
+
+	resp2 := do(http.MethodHead, http.Header{"X-Amz-Checksum-Mode": []string{"ENABLED"}})
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+	require.Equal(t, checksum, resp2.Header.Get("X-Amz-Checksum-Crc32c"),
+		"a checksum-mode HEAD must not be answered from an entry stored without checksums")
+}
+
+// Concurrent reads coalesce onto one upstream fetch, so a checksum-mode read must not
+// share that fetch with a plain one: the plain fetch asks S3 for no checksums, and the
+// coalesced client would receive a response missing the headers it asked for.
+func TestCache_ChecksumModeDoesNotCoalesceWithPlainRead(t *testing.T) {
+	content := []byte("coalescing checksum-mode content")
+	const checksum = "dGVzdC1jaGVja3N1bQ=="
+	release := make(chan struct{})
+	arrived := make(chan string, 8)
+
+	env := NewTestEnvironmentWithCacheHandler(func(w http.ResponseWriter, r *http.Request) {
+		mode := r.Header.Get("X-Amz-Checksum-Mode")
+		arrived <- mode
+		if mode == "" {
+			// Hold the plain fetch open so the checksum-mode read arrives while it is
+			// in flight, which is the only moment coalescing can happen.
+			<-release
+		}
+		w.Header().Set("ETag", `"coalescing-etag"`)
+		if strings.EqualFold(mode, "ENABLED") {
+			w.Header().Set("X-Amz-Checksum-Crc32c", checksum)
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
+	})
+	defer env.Close()
+
+	bucket := "coalescing-checksum-bucket"
+	key := "object.bin"
+
+	get := func(header http.Header) *http.Response {
+		req, err := env.Signer.SignRequest(
+			context.Background(),
+			http.MethodGet,
+			"/"+bucket+"/"+key,
+			nil,
+			"",
+			TestAccessKey,
+			TestSecretKey,
+			header,
+		)
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		require.NoError(t, err)
+		return resp
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		get(http.Header{})
+	}()
+
+	select {
+	case mode := <-arrived:
+		require.Empty(t, mode, "the held fetch is the plain one")
+	case <-time.After(5 * time.Second):
+		t.Fatal("plain read never reached upstream")
+	}
+
+	var checksumResp *http.Response
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		checksumResp = get(http.Header{"X-Amz-Checksum-Mode": []string{"ENABLED"}})
+	}()
+
+	// Give the checksum-mode read time to either start its own fetch or coalesce onto
+	// the held one, then let the held fetch finish so both requests can complete.
+	time.Sleep(300 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	require.Equal(t, http.StatusOK, checksumResp.StatusCode)
+	require.Equal(t, checksum, checksumResp.Header.Get("X-Amz-Checksum-Crc32c"),
+		"a checksum-mode read must not be served by a plain read's coalesced fetch")
+}
+
+// HeadObject can be presigned with a checksum mode too. That request must reach the cache
+// rather than bypass it, and must be answered with the checksums it asked for.
+func TestCache_PresignedHeadChecksumModeUsesCache(t *testing.T) {
+	content := []byte("presigned head checksum content")
+	const checksum = "dGVzdC1jaGVja3N1bQ=="
+	var upstreamRequests int32
+	env := NewTestEnvironmentWithCacheHandler(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamRequests, 1)
+		w.Header().Set("ETag", `"presigned-head-etag"`)
+		w.Header().Set("X-Amz-Checksum-Crc32c", checksum)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(content)
+		}
+	})
+	defer env.Close()
+
+	bucket := "presigned-head-checksum-bucket"
+	key := "object.bin"
+
+	// Populate through a checksum-mode GET so the entry carries the checksums.
+	getReq, err := env.PresignedGetRequest(t.Context(), bucket, key, func(input *s3.GetObjectInput) {
+		input.ChecksumMode = types.ChecksumModeEnabled
+	})
+	require.NoError(t, err)
+	getResp, err := http.DefaultClient.Do(getReq)
+	require.NoError(t, err)
+	_, err = io.ReadAll(getResp.Body)
+	getResp.Body.Close()
+	require.NoError(t, err)
+	require.True(t, env.WaitForCached(bucket, key, 2*time.Second))
+
+	headReq, err := env.PresignedHeadRequest(t.Context(), bucket, key, func(input *s3.HeadObjectInput) {
+		input.ChecksumMode = types.ChecksumModeEnabled
+	})
+	require.NoError(t, err)
+	require.Equal(t, "ENABLED", headReq.URL.Query().Get("X-Amz-Checksum-Mode"))
+	before := atomic.LoadInt32(&upstreamRequests)
+	headResp, err := http.DefaultClient.Do(headReq)
+	require.NoError(t, err)
+	headResp.Body.Close()
+
+	require.Equal(t, http.StatusOK, headResp.StatusCode)
+	require.Equal(t, "HIT", headResp.Header.Get("X-Cache"),
+		"a presigned checksum-mode HEAD must be cache eligible, not bypassed")
+	require.Equal(t, checksum, headResp.Header.Get("X-Amz-Checksum-Crc32c"))
+	require.Equal(t, before, atomic.LoadInt32(&upstreamRequests), "cache hit must not reach upstream")
 }

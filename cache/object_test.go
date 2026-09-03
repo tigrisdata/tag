@@ -18,6 +18,7 @@ func TestMetaFromHTTPHeaders(t *testing.T) {
 	headers.Set("X-Amz-Meta-Custom", "custom-value")
 	headers.Set("X-Amz-Storage-Class", "STANDARD")
 	headers.Set("X-Amz-Acl", "public-read")
+	headers.Set("X-Amz-Checksum-Crc32c", "checksum-value")
 
 	obj := MetaFromHTTPHeaders("test-bucket", "test-key", http.StatusOK, headers)
 
@@ -52,6 +53,9 @@ func TestMetaFromHTTPHeaders(t *testing.T) {
 	if obj.ACL != "public-read" {
 		t.Errorf("ACL = %q, want %q", obj.ACL, "public-read")
 	}
+	if obj.ChecksumHeaders["x-amz-checksum-crc32c"] != "checksum-value" {
+		t.Errorf("ChecksumHeaders = %#v, want CRC32C checksum", obj.ChecksumHeaders)
+	}
 
 	if obj.StatusCode != http.StatusOK {
 		t.Errorf("StatusCode = %d, want %d", obj.StatusCode, http.StatusOK)
@@ -73,6 +77,9 @@ func TestCachedObjectMeta_WriteHeaders(t *testing.T) {
 		StorageClass:  "STANDARD",
 		UserMetadata: map[string]string{
 			"X-Amz-Meta-Custom": "custom-value",
+		},
+		ChecksumHeaders: map[string]string{
+			"X-Amz-Checksum-Crc32c": "checksum-value",
 		},
 		StatusCode: http.StatusOK,
 	}
@@ -98,6 +105,35 @@ func TestCachedObjectMeta_WriteHeaders(t *testing.T) {
 
 	if w.Header().Get("X-Amz-Meta-Custom") != "custom-value" {
 		t.Errorf("X-Amz-Meta-Custom header = %q, want %q", w.Header().Get("X-Amz-Meta-Custom"), "custom-value")
+	}
+	if w.Header().Get("X-Amz-Checksum-Crc32c") != "checksum-value" {
+		t.Errorf("X-Amz-Checksum-Crc32c = %q, want checksum-value", w.Header().Get("X-Amz-Checksum-Crc32c"))
+	}
+}
+
+// A stored checksum covers the whole object, so a range response must not carry it.
+func TestCachedObjectMeta_WriteHeaders_RangeDropsChecksums(t *testing.T) {
+	obj := &CachedObjectMeta{
+		ETag:          `"abc123"`,
+		ContentType:   "application/octet-stream",
+		ContentLength: 1024,
+		ChecksumHeaders: map[string]string{
+			"X-Amz-Checksum-Crc32c": "checksum-value",
+		},
+		StatusCode: http.StatusPartialContent,
+	}
+
+	w := httptest.NewRecorder()
+	obj.WriteHeaders(w, WithRangeHeaders(0, 99, 1024))
+
+	if got := w.Header().Get("X-Amz-Checksum-Crc32c"); got != "" {
+		t.Errorf("X-Amz-Checksum-Crc32c = %q, want it dropped on a range response", got)
+	}
+	if got := w.Header().Get("Content-Range"); got != "bytes 0-99/1024" {
+		t.Errorf("Content-Range = %q, want bytes 0-99/1024", got)
+	}
+	if got := w.Header().Get("Content-Length"); got != "100" {
+		t.Errorf("Content-Length = %q, want 100", got)
 	}
 }
 

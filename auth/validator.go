@@ -29,6 +29,9 @@ var (
 const (
 	// maxRequestAge is the maximum age of a request before it's considered expired.
 	maxRequestAge = 15 * time.Minute
+
+	// maxPresignedExpiry is the maximum lifetime S3 permits for a SigV4 presigned URL.
+	maxPresignedExpiry = 7 * 24 * time.Hour
 )
 
 // RequestValidator validates incoming AWS SigV4 signed requests.
@@ -44,20 +47,22 @@ func NewRequestValidator(keyProvider KeyProvider) *RequestValidator {
 }
 
 // ValidateRequest validates the AWS SigV4 signature of an incoming request.
-// This requires the X-Amz-Content-Sha256 header to be present (all AWS SDKs set this).
-// This enables zero-copy streaming of the request body.
+// Header-signed requests require X-Amz-Content-Sha256 so request bodies can be
+// validated without buffering. Presigned GET and HEAD requests use UNSIGNED-PAYLOAD.
 // Returns the access key if validation succeeds, or an error if it fails.
 func (v *RequestValidator) ValidateRequest(r *http.Request) (string, error) {
-	// Require X-Amz-Content-Sha256 header - all AWS SDKs set this
-	bodyHash := r.Header.Get("X-Amz-Content-Sha256")
-	if bodyHash == "" {
-		return "", ErrMissingContentHash
-	}
-
 	// Parse auth info
 	authInfo, err := ParseAuthInfo(r)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse auth: %w", err)
+	}
+
+	bodyHash := r.Header.Get("X-Amz-Content-Sha256")
+	isPresignedRead := authInfo.IsPresigned && (r.Method == http.MethodGet || r.Method == http.MethodHead)
+	if isPresignedRead {
+		bodyHash = unsignedPayload
+	} else if bodyHash == "" {
+		return "", ErrMissingContentHash
 	}
 
 	// Get the date string for signing key lookup
@@ -139,14 +144,25 @@ func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo
 	if err != nil {
 		return ErrInvalidDate
 	}
+	if authInfo.Date != requestTime.UTC().Format(shortTimeFormat) {
+		return ErrInvalidDate
+	}
 
-	// Check expires
+	// Reject timestamps too far in the future before applying the URL lifetime.
+	age := time.Since(requestTime)
+	if age < -maxRequestAge {
+		return ErrExpiredRequest
+	}
+
+	// X-Amz-Expires is required and limited to seven days by the S3 SigV4 protocol.
 	expiresStr := query.Get("X-Amz-Expires")
-	if expiresStr != "" {
-		expires, err := strconv.Atoi(expiresStr)
-		if err == nil && time.Since(requestTime) > time.Duration(expires)*time.Second {
-			return ErrExpiredRequest
-		}
+	expiresSeconds, err := strconv.ParseInt(expiresStr, 10, 64)
+	maxExpiresSeconds := int64(maxPresignedExpiry / time.Second)
+	if err != nil || expiresSeconds < 1 || expiresSeconds > maxExpiresSeconds {
+		return fmt.Errorf("%w: invalid X-Amz-Expires", ErrInvalidAuthFormat)
+	}
+	if age > time.Duration(expiresSeconds)*time.Second {
+		return ErrExpiredRequest
 	}
 
 	// For presigned URLs, body hash is typically UNSIGNED-PAYLOAD
@@ -281,12 +297,7 @@ func (v *RequestValidator) buildCanonicalHeadersFromList(r *http.Request, signed
 				value = r.URL.Host
 			}
 		} else {
-			values := r.Header.Values(name)
-			// Trim and join values
-			for i, val := range values {
-				values[i] = strings.TrimSpace(val)
-			}
-			value = strings.Join(values, ",")
+			value = canonicalizeHeaderValues(r.Header.Values(name))
 		}
 
 		builder.WriteString(name)

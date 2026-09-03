@@ -281,4 +281,6 @@ config = Config(s3={'addressing_style': 'path'})
 s3 = boto3.client('s3', endpoint_url='http://localhost:8080', config=config)
 ```
 
-TAG does not support virtual-hosted style requests (e.g., `bucket.localhost:8080`).
+Normal S3 requests must use path-style addressing. Presigned GET and HEAD
+requests also support Tigris virtual-hosted URLs; see
+[S3 API Compatibility](s3-compatibility.md#addressing-style).

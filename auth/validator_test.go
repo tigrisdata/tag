@@ -4,11 +4,21 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+)
+
+const (
+	testAccessKey = "AKIAIOSFODNN7EXAMPLE"
+	testSecretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	testRegion    = "us-east-1"
 )
 
 func TestRequestValidator_ValidateRequest(t *testing.T) {
@@ -172,4 +182,252 @@ func TestRequestValidator_ValidateRequest_MissingContentHash(t *testing.T) {
 	if err != ErrMissingContentHash {
 		t.Errorf("ValidateRequest() error = %v, want %v", err, ErrMissingContentHash)
 	}
+}
+
+func TestRequestValidator_ValidateRequest_PresignedRead(t *testing.T) {
+	validator := newTestRequestValidator()
+	signingTime := time.Now().UTC().Truncate(time.Second)
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			req := newPresignedTestRequest(t, method, "/test-bucket/test-key", signingTime, 15*time.Minute, nil)
+
+			accessKey, err := validator.ValidateRequest(req)
+			if err != nil {
+				t.Fatalf("ValidateRequest() error = %v, want nil", err)
+			}
+			if accessKey != testAccessKey {
+				t.Errorf("ValidateRequest() accessKey = %q, want %q", accessKey, testAccessKey)
+			}
+			if req.Header.Get("X-Amz-Content-Sha256") != "" {
+				t.Error("presigned request unexpectedly has X-Amz-Content-Sha256 header")
+			}
+		})
+	}
+}
+
+func TestRequestValidator_ValidateRequest_PresignedExtraQuery(t *testing.T) {
+	validator := newTestRequestValidator()
+	extraQuery := url.Values{"response-content-disposition": {`attachment; filename="test.txt"`}}
+	req := newPresignedTestRequest(
+		t,
+		http.MethodGet,
+		"/test-bucket/test-key",
+		time.Now().UTC().Truncate(time.Second),
+		15*time.Minute,
+		extraQuery,
+	)
+
+	if _, err := validator.ValidateRequest(req); err != nil {
+		t.Fatalf("ValidateRequest() error = %v, want nil", err)
+	}
+}
+
+func TestRequestValidator_ValidateRequest_PresignedInvalidSignature(t *testing.T) {
+	validator := newTestRequestValidator()
+	req := newPresignedTestRequest(
+		t,
+		http.MethodGet,
+		"/test-bucket/test-key",
+		time.Now().UTC().Truncate(time.Second),
+		15*time.Minute,
+		nil,
+	)
+	query := req.URL.Query()
+	query.Set("X-Amz-Signature", strings.Repeat("0", 64))
+	req.URL.RawQuery = query.Encode()
+
+	_, err := validator.ValidateRequest(req)
+	if !errors.Is(err, ErrSignatureMismatch) {
+		t.Fatalf("ValidateRequest() error = %v, want %v", err, ErrSignatureMismatch)
+	}
+}
+
+func TestRequestValidator_ValidateRequest_PresignedExpiry(t *testing.T) {
+	tests := []struct {
+		name        string
+		signingTime time.Time
+		expires     time.Duration
+		mutate      func(url.Values)
+		wantErr     error
+	}{
+		{
+			name:        "expired",
+			signingTime: time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Second),
+			expires:     time.Minute,
+			wantErr:     ErrExpiredRequest,
+		},
+		{
+			name:        "future beyond clock skew",
+			signingTime: time.Now().UTC().Add(maxRequestAge + time.Minute).Truncate(time.Second),
+			expires:     15 * time.Minute,
+			wantErr:     ErrExpiredRequest,
+		},
+		{
+			name:        "missing date",
+			signingTime: time.Now().UTC().Truncate(time.Second),
+			expires:     15 * time.Minute,
+			mutate:      func(query url.Values) { query.Del("X-Amz-Date") },
+			wantErr:     ErrInvalidDate,
+		},
+		{
+			name:        "invalid date",
+			signingTime: time.Now().UTC().Truncate(time.Second),
+			expires:     15 * time.Minute,
+			mutate:      func(query url.Values) { query.Set("X-Amz-Date", "invalid") },
+			wantErr:     ErrInvalidDate,
+		},
+		{
+			name:        "credential scope date mismatch",
+			signingTime: time.Now().UTC().Truncate(time.Second),
+			expires:     15 * time.Minute,
+			mutate: func(query url.Values) {
+				scopeDate := time.Now().UTC().AddDate(0, 0, -1).Format(shortTimeFormat)
+				query.Set(
+					"X-Amz-Credential",
+					testAccessKey+"/"+scopeDate+"/"+testRegion+"/"+service+"/"+terminationString,
+				)
+			},
+			wantErr: ErrInvalidDate,
+		},
+		{
+			name:        "missing expires",
+			signingTime: time.Now().UTC().Truncate(time.Second),
+			expires:     15 * time.Minute,
+			mutate:      func(query url.Values) { query.Del("X-Amz-Expires") },
+			wantErr:     ErrInvalidAuthFormat,
+		},
+		{
+			name:        "non-numeric expires",
+			signingTime: time.Now().UTC().Truncate(time.Second),
+			expires:     15 * time.Minute,
+			mutate:      func(query url.Values) { query.Set("X-Amz-Expires", "invalid") },
+			wantErr:     ErrInvalidAuthFormat,
+		},
+		{
+			name:        "zero expires",
+			signingTime: time.Now().UTC().Truncate(time.Second),
+			expires:     15 * time.Minute,
+			mutate:      func(query url.Values) { query.Set("X-Amz-Expires", "0") },
+			wantErr:     ErrInvalidAuthFormat,
+		},
+		{
+			name:        "over seven days",
+			signingTime: time.Now().UTC().Truncate(time.Second),
+			expires:     15 * time.Minute,
+			mutate:      func(query url.Values) { query.Set("X-Amz-Expires", "604801") },
+			wantErr:     ErrInvalidAuthFormat,
+		},
+		{
+			name:        "duration overflow",
+			signingTime: time.Now().UTC().Truncate(time.Second),
+			expires:     15 * time.Minute,
+			mutate:      func(query url.Values) { query.Set("X-Amz-Expires", "18446830473") },
+			wantErr:     ErrInvalidAuthFormat,
+		},
+	}
+
+	validator := newTestRequestValidator()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := newPresignedTestRequest(t, http.MethodGet, "/test-bucket/test-key", tt.signingTime, tt.expires, nil)
+			if tt.mutate != nil {
+				query := req.URL.Query()
+				tt.mutate(query)
+				req.URL.RawQuery = query.Encode()
+			}
+
+			_, err := validator.ValidateRequest(req)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("ValidateRequest() error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestRequestValidator_ValidateRequest_PresignedMaxExpiry(t *testing.T) {
+	validator := newTestRequestValidator()
+	req := newPresignedTestRequest(
+		t,
+		http.MethodGet,
+		"/test-bucket/test-key",
+		time.Now().UTC().Truncate(time.Second),
+		maxPresignedExpiry,
+		nil,
+	)
+
+	if _, err := validator.ValidateRequest(req); err != nil {
+		t.Fatalf("ValidateRequest() error = %v, want nil", err)
+	}
+}
+
+func TestRequestValidator_ValidateRequest_PresignedWriteRequiresContentHash(t *testing.T) {
+	validator := newTestRequestValidator()
+	req := newPresignedTestRequest(
+		t,
+		http.MethodPut,
+		"/test-bucket/test-key",
+		time.Now().UTC().Truncate(time.Second),
+		15*time.Minute,
+		nil,
+	)
+
+	_, err := validator.ValidateRequest(req)
+	if !errors.Is(err, ErrMissingContentHash) {
+		t.Fatalf("ValidateRequest() error = %v, want %v", err, ErrMissingContentHash)
+	}
+}
+
+func newTestRequestValidator() *RequestValidator {
+	credStore := NewCredentialStore()
+	credStore.AddCredential(testAccessKey, testSecretKey)
+	return NewRequestValidator(credStore)
+}
+
+func newPresignedTestRequest(
+	t *testing.T,
+	method, path string,
+	signingTime time.Time,
+	expires time.Duration,
+	extraQuery url.Values,
+) *http.Request {
+	t.Helper()
+
+	req := httptest.NewRequest(method, "https://s3.amazonaws.com"+path, nil)
+	req.Host = req.URL.Host
+	query := req.URL.Query()
+	for key, values := range extraQuery {
+		for _, value := range values {
+			query.Add(key, value)
+		}
+	}
+
+	credentialScope := strings.Join([]string{
+		signingTime.Format(shortTimeFormat),
+		testRegion,
+		service,
+		terminationString,
+	}, "/")
+	query.Set("X-Amz-Algorithm", algorithm)
+	query.Set("X-Amz-Credential", testAccessKey+"/"+credentialScope)
+	query.Set("X-Amz-Date", signingTime.Format(TimeFormat))
+	query.Set("X-Amz-Expires", strconv.FormatInt(int64(expires/time.Second), 10))
+	query.Set("X-Amz-SignedHeaders", "host")
+	req.URL.RawQuery = query.Encode()
+
+	signer := NewRequestSigner("https://s3.amazonaws.com", testRegion)
+	canonicalRequest := strings.Join([]string{
+		method,
+		awsURIEncode(req.URL.Path, false),
+		signer.buildCanonicalQueryString(query),
+		"host:" + req.Host + "\n",
+		"host",
+		unsignedPayload,
+	}, "\n")
+	stringToSign := signer.buildStringToSign(signingTime, credentialScope, canonicalRequest)
+	signingKey := signer.deriveSigningKey(testSecretKey, signingTime.Format(shortTimeFormat))
+	query.Set("X-Amz-Signature", hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign))))
+	req.URL.RawQuery = query.Encode()
+
+	return req
 }

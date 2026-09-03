@@ -5,12 +5,16 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+
+	"github.com/tigrisdata/tag/cache"
 )
 
 func TestParseBucketKey(t *testing.T) {
 	tests := []struct {
 		name       string
 		path       string
+		host       string
+		presigned  bool
 		wantBucket string
 		wantKey    string
 	}{
@@ -56,6 +60,24 @@ func TestParseBucketKey(t *testing.T) {
 			wantBucket: "bucket",
 			wantKey:    "file with spaces.txt",
 		},
+		{
+			name:       "Tigris virtual host",
+			path:       "/tagcheck/small.bin",
+			host:       "example-bucket.t3.tigrisfiles.io",
+			presigned:  true,
+			wantBucket: "example-bucket",
+			wantKey:    "tagcheck/small.bin",
+		},
+		{
+			// A TAG endpoint can be served under a name of this shape, so the host
+			// alone does not identify a bucket: the request stays path-style.
+			name:       "non-Tigris host stays path-style",
+			path:       "/bucket/tagcheck/small.bin",
+			host:       "tag.s3.example.com",
+			presigned:  true,
+			wantBucket: "bucket",
+			wantKey:    "tagcheck/small.bin",
+		},
 	}
 
 	for _, tt := range tests {
@@ -64,6 +86,10 @@ func TestParseBucketKey(t *testing.T) {
 			// httptest.NewRequest has issues with empty URLs and special characters.
 			req := httptest.NewRequest(http.MethodGet, "/", nil)
 			req.URL = &url.URL{Path: tt.path}
+			req.Host = tt.host
+			if tt.presigned {
+				req.URL.RawQuery = "X-Amz-Credential=key%2F20260717%2Fauto%2Fs3%2Faws4_request"
+			}
 
 			bucket, key := ParseBucketKey(req)
 
@@ -186,6 +212,209 @@ func TestShouldBypassCache(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsCacheEligiblePresignedRequest(t *testing.T) {
+	tests := []struct {
+		name    string
+		method  string
+		target  string
+		headers http.Header
+		want    bool
+	}{
+		{
+			name:   "standard GET",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260715T080000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc&x-id=GetObject",
+			want:   true,
+		},
+		{
+			name:   "standard HEAD",
+			method: http.MethodHead,
+			target: "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260715T080000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc&x-id=HeadObject",
+			want:   true,
+		},
+		{
+			name:   "GET with checksum mode",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Checksum-Mode=ENABLED&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260715T080000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc&x-id=GetObject",
+			want:   true,
+		},
+		{
+			name:   "HEAD with checksum mode",
+			method: http.MethodHead,
+			target: "/bucket/key?X-Amz-Checksum-Mode=ENABLED&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			want:   true,
+		},
+		{
+			name:   "PUT with checksum mode",
+			method: http.MethodPut,
+			target: "/bucket/key?X-Amz-Checksum-Mode=ENABLED&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			want:   false,
+		},
+		{
+			name:   "invalid checksum mode",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Checksum-Mode=DISABLED&X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			want:   false,
+		},
+		{
+			name:   "semantic query",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&response-content-type=text%2Fplain",
+			want:   false,
+		},
+		{
+			name:   "version id",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&versionId=abc",
+			want:   false,
+		},
+		{
+			name:   "part number",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&partNumber=1",
+			want:   false,
+		},
+		{
+			name:   "temporary credentials",
+			method: http.MethodGet,
+			target: "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Security-Token=token",
+			want:   false,
+		},
+		{
+			name:    "conditional header",
+			method:  http.MethodGet,
+			target:  "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			headers: http.Header{"If-None-Match": {`"etag"`}},
+			want:    false,
+		},
+		{
+			name:    "forced revalidation",
+			method:  http.MethodGet,
+			target:  "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			headers: http.Header{"Cache-Control": {"no-cache"}},
+			want:    false,
+		},
+		{
+			name:    "no-store",
+			method:  http.MethodGet,
+			target:  "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			headers: http.Header{"Cache-Control": {"no-store"}},
+			want:    false,
+		},
+		{
+			name:    "mixed-case cache control",
+			method:  http.MethodGet,
+			target:  "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			headers: http.Header{"Cache-Control": {"Max-Age=3600"}},
+			want:    false,
+		},
+		{
+			name:    "browser Origin header",
+			method:  http.MethodGet,
+			target:  "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			headers: http.Header{"Origin": {"https://app.example.com"}},
+			want:    false,
+		},
+		{
+			name:    "HEAD range",
+			method:  http.MethodHead,
+			target:  "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			headers: http.Header{"Range": {"bytes=0-9"}},
+			want:    false,
+		},
+		{
+			name:    "S3 control header",
+			method:  http.MethodGet,
+			target:  "/bucket/key?X-Amz-Credential=key%2F20260715%2Fus-east-1%2Fs3%2Faws4_request",
+			headers: http.Header{"X-Amz-Expected-Bucket-Owner": {"owner"}},
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.target, nil)
+			req.Header = tt.headers
+			if got := isCacheEligiblePresignedRequest(req); got != tt.want {
+				t.Errorf("isCacheEligiblePresignedRequest() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCachedMetaSatisfiesChecksumRequest(t *testing.T) {
+	checksumRequest := httptest.NewRequest(
+		http.MethodGet,
+		"/bucket/key?X-Amz-Checksum-Mode=ENABLED",
+		nil,
+	)
+	plainRequest := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	withoutChecksum := &cache.CachedObjectMeta{ETag: `"etag"`}
+	withChecksum := &cache.CachedObjectMeta{
+		ETag: `"etag"`,
+		ChecksumHeaders: map[string]string{
+			"x-amz-checksum-crc32c": "checksum-value",
+		},
+	}
+	fetchedWithChecksumMode := &cache.CachedObjectMeta{
+		ETag:         `"etag"`,
+		ChecksumMode: true,
+	}
+
+	if cachedMetaSatisfiesRequest(checksumRequest, withoutChecksum) {
+		t.Error("checksum request accepted cached metadata without a checksum")
+	}
+	if !cachedMetaSatisfiesRequest(checksumRequest, withChecksum) {
+		t.Error("checksum request rejected cached metadata with a checksum")
+	}
+	if !cachedMetaSatisfiesRequest(checksumRequest, fetchedWithChecksumMode) {
+		t.Error("checksum request rejected metadata fetched in checksum mode")
+	}
+	if !cachedMetaSatisfiesRequest(plainRequest, withoutChecksum) {
+		t.Error("plain request rejected otherwise valid cached metadata")
+	}
+}
+
+func TestHideUnrequestedChecksums(t *testing.T) {
+	checksumRequest := httptest.NewRequest(
+		http.MethodGet,
+		"/bucket/key?X-Amz-Checksum-Mode=ENABLED",
+		nil,
+	)
+	headerRequest := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	headerRequest.Header.Set("X-Amz-Checksum-Mode", "ENABLED")
+	plainRequest := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	newMeta := func() *cache.CachedObjectMeta {
+		return &cache.CachedObjectMeta{
+			ETag: `"etag"`,
+			ChecksumHeaders: map[string]string{
+				"x-amz-checksum-crc32c": "checksum-value",
+			},
+		}
+	}
+
+	kept := newMeta()
+	hideUnrequestedChecksums(checksumRequest, kept)
+	if len(kept.ChecksumHeaders) != 1 {
+		t.Errorf("ChecksumHeaders = %#v, want the checksum kept for a checksum-mode request", kept.ChecksumHeaders)
+	}
+
+	keptForHeader := newMeta()
+	hideUnrequestedChecksums(headerRequest, keptForHeader)
+	if len(keptForHeader.ChecksumHeaders) != 1 {
+		t.Errorf("ChecksumHeaders = %#v, want the checksum kept for a header-signed checksum-mode request",
+			keptForHeader.ChecksumHeaders)
+	}
+
+	dropped := newMeta()
+	hideUnrequestedChecksums(plainRequest, dropped)
+	if len(dropped.ChecksumHeaders) != 0 {
+		t.Errorf("ChecksumHeaders = %#v, want no checksum for a request that did not ask", dropped.ChecksumHeaders)
+	}
+
+	hideUnrequestedChecksums(plainRequest, nil) // must not panic
 }
 
 func TestResponseCapture_ContentLength(t *testing.T) {
