@@ -504,6 +504,23 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 	return nil
 }
 
+// BodyExistsErr reports whether a whole-object body is present, with the same
+// error contract as BlockExistsErr: genuine absence is (false, nil), a transient
+// probe failure is (false, err). Same first-byte probe, on the body key.
+func (c *Cache) BodyExistsErr(ctx context.Context, bucket, key, etag string) (present bool, err error) {
+	if !c.IsEnabled() || etag == "" {
+		return false, nil
+	}
+	e := c.getRangeStreamByKey(ctx, MakeBodyKey(bucket, key, etag), bucket, key, 0, 0, io.Discard)
+	if e == nil {
+		return true, nil
+	}
+	if errors.Is(e, ErrNotFound) {
+		return false, nil // genuinely absent
+	}
+	return false, e // transient failure — not proof of absence
+}
+
 // BlockExists reports whether the given block of a block-mode object is present in cache.
 // It probes the block's first byte (quirk-safe, cheap), so a not-found or any read error
 // returns false — the caller then (re)fetches the block. See RFC 0001.
@@ -826,4 +843,71 @@ func isNotFoundError(err error) bool {
 		errStr == "not found" ||
 		strings.Contains(errStr, "NotFound") ||
 		strings.Contains(errStr, "not found")
+}
+
+// ListedEntry is one object surfaced by ListMeta: its object key and decoded
+// metadata.
+type ListedEntry struct {
+	Key  string
+	Meta *CachedObjectMeta
+}
+
+// ListMeta returns up to limit cached objects in a bucket, in lexicographic key
+// order, starting strictly after startAfter (empty = from the beginning). It
+// scans metadata keys, optionally narrowed by keyPrefix, and decodes each meta
+// value delivered alongside the keys (one round trip; a value the transport
+// omitted for size is fetched individually).
+//
+// In cluster mode the underlying List performs a cluster-wide K-way merge on the
+// serving node, so the result is complete and ordered across all nodes.
+//
+// The listing is ADVISORY: it reflects metadata presence, not full-data
+// servability. An entry mid-eviction can appear here and still answer NoSuchKey
+// to a GET — the read path's completeness gate remains the truth.
+// The second return is the raw scan cursor — the LAST KEY SCANNED, whether or
+// not it survived decoding — so a caller paging the scan always advances even
+// when every entry on a page was skipped. Deriving the cursor from surviving
+// entries instead would loop forever on a page of skips.
+func (c *Cache) ListMeta(ctx context.Context, bucket, keyPrefix, startAfter string, limit int) ([]ListedEntry, string, bool, error) {
+	if !c.IsEnabled() {
+		return nil, "", false, nil
+	}
+	scanPrefix := metaKeyPrefix + bucket + "|" + keyPrefix
+	token := ""
+	if startAfter != "" {
+		// The ocache continuation token is the last raw key of the previous page,
+		// exclusive — exactly S3's marker semantics, translated to key space.
+		token = MakeMetaKey(bucket, startAfter)
+	}
+
+	kvs, _, hasMore, err := c.client.ListPageWithValues(ctx, scanPrefix, limit, token)
+	if err != nil {
+		return nil, "", false, err
+	}
+
+	stripPrefix := metaKeyPrefix + bucket + "|"
+	nextAfter := ""
+	if len(kvs) > 0 {
+		nextAfter = strings.TrimPrefix(kvs[len(kvs)-1].Key, stripPrefix)
+	}
+	entries := make([]ListedEntry, 0, len(kvs))
+	for _, kv := range kvs {
+		objKey := strings.TrimPrefix(kv.Key, stripPrefix)
+		var meta *CachedObjectMeta
+		if kv.ValueOmitted || len(kv.Value) == 0 {
+			m, found, gerr := c.GetMeta(ctx, bucket, objKey)
+			if gerr != nil || !found {
+				continue // raced an eviction; the listing is advisory
+			}
+			meta = m
+		} else {
+			m, derr := DecodeMeta(kv.Value)
+			if derr != nil {
+				continue
+			}
+			meta = m
+		}
+		entries = append(entries, ListedEntry{Key: objKey, Meta: meta})
+	}
+	return entries, nextAfter, hasMore, nil
 }

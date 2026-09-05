@@ -863,3 +863,30 @@ func (s *Service) handleRangeWithBackgroundCache(
 
 	return nil
 }
+
+// writeNotModifiedFromCache answers a conditional request with 304 when the
+// cached entry satisfies the request's validators, preserving the historical
+// precedence: an If-None-Match match wins; otherwise an unexpired
+// If-Modified-Since. Returns true when it wrote the response. Shared by the
+// proxying GET hit path and the origin-less handler so the two cannot drift.
+func (s *Service) writeNotModifiedFromCache(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, operation string, start time.Time) bool {
+	matched := false
+	if inm := r.Header.Get("If-None-Match"); inm != "" && meta.MatchesETag(inm) {
+		matched = true
+	}
+	if !matched {
+		ims := r.Header.Get("If-Modified-Since")
+		if ims == "" {
+			return false
+		}
+		t, parseErr := http.ParseTime(ims)
+		if parseErr != nil || meta.IsModifiedSince(t) {
+			return false
+		}
+	}
+	writeCacheStatus(w, XCacheHit)
+	w.Header().Set("ETag", meta.ETag)
+	w.WriteHeader(http.StatusNotModified)
+	metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+	return true
+}
