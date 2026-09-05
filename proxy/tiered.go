@@ -115,42 +115,43 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 
-	// The prior version's tier decides what an overwrite must clean up, so a
-	// failed lookup cannot be read as "no prior": it would skip required cleanup
-	// or misroute a conditional write. Fail retryably instead.
-	prior, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
-	if cacheErr != nil {
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
-		return cacheErr
-	}
-	if !found {
-		prior = nil
-	}
-
 	declaredSize, sized := originlessPutSize(r)
-	conditional := r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != ""
 
-	// Local tier requires: a validated caller (the engine serves from cache with
-	// no upstream auth check), a plain object PUT, a declared size within the
-	// threshold — and no conditional write against an upstream-tier prior (the
-	// engine can only evaluate preconditions against a local body; upstream owns
-	// that object's version, so upstream evaluates them).
-	local := result == AuthValidated &&
-		originlessPlainObject(r) &&
-		sized && declaredSize <= s.config.Cache.SizeThreshold &&
-		!(conditional && prior != nil && prior.BodyUpstream)
-
-	if local {
-		rec := &statusRecorder{ResponseWriter: w}
-		err := s.HandleOriginlessPut(rec, r)
-		if err == nil && rec.wroteSuccess() && prior != nil && prior.BodyUpstream {
-			// Small write displaced an upstream-tier version: remove the
-			// upstream copy so it doesn't linger as an orphan. Bound to the
-			// displaced ETag so it can never remove a newer object that a
-			// concurrent large write put in its place.
-			s.deleteUpstreamObjectAsync(bucket, key, prior.ETag, accessKey, secretKey)
+	// Local-tier eligibility, before any metadata lookup: a validated caller
+	// (the engine serves from cache with no upstream auth check), a plain
+	// object PUT, and a declared size within the threshold. Everything else
+	// forwards and never needs the prior version — a metadata failure must not
+	// block a PUT that goes upstream anyway (including the unknown-key writes
+	// that bootstrap credential learning).
+	if result == AuthValidated && originlessPlainObject(r) && sized && declaredSize <= s.config.Cache.SizeThreshold {
+		// The prior version's tier decides what an overwrite must clean up and
+		// where a conditional write is evaluated, so a failed lookup cannot be
+		// read as "no prior". Fail retryably instead.
+		prior, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
+		if cacheErr != nil {
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return cacheErr
 		}
-		return err
+		if !found {
+			prior = nil
+		}
+		conditional := r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != ""
+
+		// A conditional write against an upstream-tier prior forwards: the
+		// engine can only evaluate preconditions against a local body, and
+		// upstream owns that object's version.
+		if !(conditional && prior != nil && prior.BodyUpstream) {
+			rec := &statusRecorder{ResponseWriter: w}
+			err := s.HandleOriginlessPut(rec, r)
+			if err == nil && rec.wroteSuccess() && prior != nil && prior.BodyUpstream {
+				// Small write displaced an upstream-tier version: remove the
+				// upstream copy so it doesn't linger as an orphan. Bound to the
+				// displaced ETag so it can never remove a newer object that a
+				// concurrent large write put in its place.
+				s.deleteUpstreamObjectAsync(bucket, key, prior.ETag, accessKey, secretKey)
+			}
+			return err
+		}
 	}
 
 	// Upstream tier: pass the PUT through, then stamp the local metadata marker
@@ -162,14 +163,16 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// the in-flight PUT serve the prior version, which is the atomic-replace
 	// behavior clients expect. There is also no read-populate in this mode, so
 	// the racing-refill hazard that ordering defends against cannot occur.
+	// No post-success invalidation either: the marker overwrites the prior
+	// metadata directly (a displaced local body ages out by TTL, the engine's
+	// own overwrite semantics), which lets the marker be stamped with the
+	// handler's START — see putUpstreamMarker for why that closes the
+	// concurrent-DELETE resurrection race.
 	rec := &statusRecorder{ResponseWriter: w}
 	err = s.forwarder.Forward(ctx, rec, r)
 
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		// Success: free the displaced version (tombstoning racing writers),
-		// then stamp the marker.
-		s.invalidateObject(context.Background(), bucket, key)
-		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key)
+		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, start)
 	}
 
 	status := "success"
@@ -181,13 +184,27 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 }
 
 // putUpstreamMarker stores the metadata-only entry for an object whose body
-// was just written upstream. Headers come from the PUT request (the same
-// mapping as every populate path); the ETag comes from upstream's response —
-// without one the marker is skipped and the object reads as a miss until
-// written again.
-func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string) {
+// was just written upstream, replacing whatever metadata the displaced version
+// left. Headers come from the PUT request (the same mapping as every populate
+// path); the ETag comes from upstream's response.
+//
+// The write stamp is the handler's START, from before the forward began. Any
+// DELETE that runs concurrently with — or after — this PUT writes its
+// tombstone after that instant, so the tombstone-aware write refuses the
+// marker and a deleted object can never be resurrected as metadata. The
+// forward path writes no tombstones of its own between start and here, so
+// only a genuine DELETE can suppress the marker.
+//
+// When the marker cannot be established (no response ETag, store failure, or
+// tombstone suppression), the entry converges on an authoritative miss: any
+// prior metadata is invalidated so a stale local version cannot keep serving,
+// the client's 200 stands (the object IS stored upstream), and the caller's
+// ordinary miss handling re-populates on the next read. Failures log at Warn
+// (flood-safe: only successful 2xx PUTs reach here).
+func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, start time.Time) {
 	if etag == "" {
-		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Upstream PUT response had no ETag - skipping tier marker; object reads as a miss until re-put")
+		s.invalidateObject(context.Background(), bucket, key)
+		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Upstream PUT response had no ETag - no tier marker; object reads as a miss until re-put")
 		return
 	}
 	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, r.Header)
@@ -209,16 +226,8 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string) {
 	ttl := int(s.config.Cache.TTL.Seconds())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	// The write stamp is taken AFTER the post-forward invalidation above wrote
-	// its tombstone — stamped with the handler's start, the marker would always
-	// lose to that tombstone and never be written. With a fresh stamp, only a
-	// DELETE arriving after this point suppresses the marker, which is the
-	// serialization that DELETE deserves to win.
-	// Best-effort by design: the 200 is already committed, and in a cache
-	// "not cached" is an honest answer — a failed marker makes the object read
-	// as a miss, and the caller's ordinary miss handling re-populates it. The
-	// same holds for a marker suppressed by a racing DELETE's tombstone.
-	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, time.Now().UnixNano()); err != nil {
+	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, start.UnixNano()); err != nil {
+		s.invalidateObject(context.Background(), bucket, key)
 		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Failed to write upstream tier marker; object reads as a miss until re-put")
 	}
 }

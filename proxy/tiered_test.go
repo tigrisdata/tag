@@ -337,3 +337,32 @@ func TestTieredFailedLargeOverwriteKeepsLocalCopy(t *testing.T) {
 		t.Fatalf("GET after failed overwrite = %d %q, want the intact prior copy", w.Code, w.Body.String())
 	}
 }
+
+// A DELETE whose tombstone lands while a large PUT is in flight must suppress
+// the marker: the marker is stamped with the handler's start, so the newer
+// tombstone wins and the deleted object is never resurrected as metadata.
+func TestTieredConcurrentDeleteSuppressesMarker(t *testing.T) {
+	mock, _, _ := tieredMock()
+	svc, c := newTieredTestService(mock, 8)
+
+	mock.forwardFunc = func(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+		// The concurrent DELETE completes (tombstone written) while the PUT's
+		// forward is still in flight.
+		if err := c.Delete(context.Background(), "b", "obj"); err != nil {
+			t.Errorf("mid-flight delete: %v", err)
+		}
+		w.Header().Set("ETag", `"upstream-etag"`)
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "way past threshold", nil); w.Code != http.StatusOK {
+		t.Fatalf("large PUT status = %d", w.Code)
+	}
+
+	if _, found, _ := c.GetMeta(context.Background(), "b", "obj"); found {
+		t.Fatal("marker written despite a newer DELETE tombstone - deleted object resurrected")
+	}
+	if w := tieredDo(t, svc, http.MethodHead, "/b/obj", "", nil); w.Code != http.StatusNotFound {
+		t.Fatalf("HEAD after suppressed marker = %d, want 404", w.Code)
+	}
+}
