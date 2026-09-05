@@ -436,7 +436,7 @@ func waitRetierDone(t *testing.T, svc *Service, bucket, key string) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
-		if _, busy := svc.retierInflight.Load(bucket + "|" + key); !busy {
+		if !svc.retierRunning(bucket, key) {
 			return
 		}
 		select {
@@ -567,5 +567,67 @@ func TestTieredPutCancelsInflightRetier(t *testing.T) {
 	w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil)
 	if w.Code != http.StatusOK || w.Body.String() != "newer" {
 		t.Fatalf("GET = %d %q, want the racing PUT's body", w.Code, w.Body.String())
+	}
+}
+
+// A GET arriving while a PUT is in flight sees the old marker but must not
+// start a re-tier against it: the PUT's write claim excludes new re-tiers for
+// the key until the PUT completes.
+func TestTieredWriteClaimExcludesRetier(t *testing.T) {
+	mock, _, _ := tieredMock()
+	svc, c := newTieredTestService(mock, 8)
+
+	// Cold-start marker for a small object (ContentLength 4 ≤ threshold).
+	mock.validateFunc = func(r *http.Request) (AuthResult, string, string, error) {
+		return AuthNotValidated, "", "", nil
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "old!", nil); w.Code != http.StatusOK {
+		t.Fatalf("cold-start PUT status = %d", w.Code)
+	}
+	mock.validateFunc = nil
+
+	var fetches atomic.Int64
+	mock.doFullObjectFunc = func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+		fetches.Add(1)
+		return nil, context.Canceled
+	}
+
+	// A large overwrite blocks mid-forward, holding the write claim.
+	putEntered := make(chan struct{})
+	putRelease := make(chan struct{})
+	base := mock.forwardFunc
+	mock.forwardFunc = func(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+		if r.Method == http.MethodPut {
+			close(putEntered)
+			<-putRelease
+		}
+		return base(ctx, w, r)
+	}
+	putDone := make(chan struct{})
+	go func() {
+		defer close(putDone)
+		req := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader("way past threshold"))
+		if err := svc.HandlePutObject(httptest.NewRecorder(), req); err != nil {
+			t.Errorf("blocked PUT: %v", err)
+		}
+	}()
+	<-putEntered
+
+	// GET mid-PUT: forwards (old marker) but must not register a re-tier.
+	if w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d", w.Code)
+	}
+	if svc.retierRunning("b", "obj") {
+		t.Fatal("re-tier registered while a write held the claim")
+	}
+
+	close(putRelease)
+	<-putDone
+	if n := fetches.Load(); n != 0 {
+		t.Fatalf("re-tier fetches = %d, want 0 (claim must exclude the heal)", n)
+	}
+	meta, found, _ := c.GetMeta(context.Background(), "b", "obj")
+	if !found || meta == nil || !meta.BodyUpstream || meta.ContentLength != 18 {
+		t.Fatalf("completed PUT's marker disturbed: %+v", meta)
 	}
 }

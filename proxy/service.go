@@ -66,15 +66,23 @@ type Service struct {
 	forwarder                   RequestForwarder
 	cache                       *cache.Cache
 	config                      *config.Config
-	cacheSemaphore              chan struct{}               // Count ceiling on concurrent cache-populate ops (nil = unlimited)
-	populateBudget              *byteBudget                 // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
-	perPopulateCap              int64                       // Max bytes a foreground broadcast populate can buffer
-	backgroundPopulateWriterCap int64                       // Bytes reserved for direct writer buffers before response inspection
-	broadcastManager            *broadcast.Manager          // For streaming request coalescing
-	activeBackgroundFetches     sync.Map                    // Dedup for background full-object fetches (range caching)
-	retierInflight              sync.Map                    // Dedup for tiered-mode re-tier-on-read populates
-	blockFetchMu                sync.Mutex                  // Guards blockFetches
-	blockFetches                map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
+	cacheSemaphore              chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
+	populateBudget              *byteBudget        // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
+	perPopulateCap              int64              // Max bytes a foreground broadcast populate can buffer
+	backgroundPopulateWriterCap int64              // Bytes reserved for direct writer buffers before response inspection
+	broadcastManager            *broadcast.Manager // For streaming request coalescing
+	activeBackgroundFetches     sync.Map           // Dedup for background full-object fetches (range caching)
+	// retier coordinates tiered-mode re-tier-on-read populates with writes:
+	// claims[key] counts PUTs in flight (a claim cancels and excludes re-tiers
+	// for the key), inflight[key] is the running re-tier's cancel func. One
+	// mutex serializes claim/registration, so the PUT-vs-re-tier handshake is
+	// ordering-free: a re-tier either registers before the claim (and is
+	// canceled by it) or sees the claim and refuses to start.
+	retierMu       sync.Mutex
+	retierClaims   map[string]int
+	retierInflight map[string]context.CancelFunc
+	blockFetchMu   sync.Mutex                  // Guards blockFetches
+	blockFetches   map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
 	// recentFooterWork suppresses repeat footer scans for an object version that was
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
@@ -163,6 +171,8 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		backgroundPopulateWriterCap: backgroundPopulateWriterCap,
 		broadcastManager:            broadcast.NewManager(channelBuf),
 		blockFetches:                make(map[string]*blockFetchState),
+		retierClaims:                make(map[string]int),
+		retierInflight:              make(map[string]context.CancelFunc),
 	}
 	// Allocated only when the feature that uses it is on.
 	if cfg.Cache.ParquetOptimization {

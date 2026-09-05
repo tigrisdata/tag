@@ -479,7 +479,7 @@ by, e.g., a cold-start PUT forwarded before its key was learned).
 
 | Label     | Description                                                              |
 | --------- | ------------------------------------------------------------------------ |
-| `outcome` | `retiered` (moved into the local tier), `shed` (populate budget refused the buffer), `changed` (object replaced/deleted mid-flight; its newer state wins), `error` (fetch or store failed) |
+| `outcome` | `retiered` (moved into the local tier), `shed` (populate budget refused the buffer), `changed` (object replaced/deleted mid-flight; its newer state wins), `canceled` (a concurrent write claimed the key — normal coordination), `error` (fetch or store failed) |
 
 A sustained `retiered` rate outside restart windows means writes keep landing
 in the wrong tier — check key learning. Per-key dedup skips are not counted.

@@ -122,9 +122,11 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
 
-	// A write claims the key: abort any in-flight re-tier so it cannot commit
-	// an older version over this PUT (see maybeRetierOnRead's guards).
-	s.cancelRetier(bucket, key)
+	// A write claims the key for its whole duration: any in-flight re-tier is
+	// canceled and no new one can start until the claim is released (see
+	// maybeRetierOnRead's guards).
+	s.claimRetierWrite(bucket, key)
+	defer s.releaseRetierWrite(bucket, key)
 
 	result, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil {
@@ -330,14 +332,16 @@ const retierFetchTimeout = 60 * time.Second
 //     a concurrent write replaced the object, whose state must be left alone;
 //   - identity commit: the entry is re-written only if it still IS the marker
 //     (same ETag, still upstream-tier);
-//   - cancellation: PUTs write no tombstones, so a concurrent PUT could land
+//   - write claim: PUTs write no tombstones, so a concurrent PUT could land
 //     between the identity check and the commit and be overwritten by the
 //     older version — a local-tier PUT's ONLY copy, in the worst case. Every
-//     tiered PUT therefore cancels the in-flight re-tier for its key
-//     (cancelRetier) before doing anything else; the re-tier's fetch and
-//     store abort on the canceled context. What remains is two truly
-//     concurrent commits racing in the store — the same unordered outcome S3
-//     itself gives two concurrent writers;
+//     tiered PUT therefore holds a per-key claim for its whole duration
+//     (claimRetierWrite): taking it cancels the running re-tier, and while
+//     held no new re-tier can register — a GET mid-PUT sees the old marker
+//     but cannot start a heal against it. Claim and registration share one
+//     mutex, so every interleaving lands on cancel-or-refuse. What remains is
+//     two truly concurrent commits racing in the store — the same unordered
+//     outcome S3 itself gives two concurrent writers;
 //   - tombstones: the store is stamped from BEFORE the fetch, so a DELETE
 //     racing the re-tier writes a provably newer tombstone and blocks it
 //     (DELETEs need no cancellation — tombstones already order them).
@@ -351,9 +355,8 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 	if accessKey == "" || secretKey == "" || !s.cache.IsEnabled() {
 		return
 	}
-	inflightKey := bucket + "|" + key
 	ctx, cancel := context.WithTimeout(context.Background(), retierFetchTimeout)
-	if _, loaded := s.retierInflight.LoadOrStore(inflightKey, cancel); loaded {
+	if !s.tryRegisterRetier(bucket, key, cancel) {
 		cancel()
 		return
 	}
@@ -361,13 +364,13 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 	bufSize := marker.ContentLength + 1
 	weight := bufSize
 	if s.populateBudget != nil && weight > s.populateBudget.total {
-		s.retierInflight.Delete(inflightKey)
+		s.unregisterRetier(bucket, key)
 		cancel()
 		metrics.RecordTieredRetier("shed")
 		return
 	}
 	if !s.acquireCacheSlot(context.Background(), weight, priorityReadMiss) {
-		s.retierInflight.Delete(inflightKey)
+		s.unregisterRetier(bucket, key)
 		cancel()
 		metrics.RecordTieredRetier("shed")
 		return
@@ -375,7 +378,7 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 
 	etag := marker.ETag
 	go func() {
-		defer s.retierInflight.Delete(inflightKey)
+		defer s.unregisterRetier(bucket, key)
 		defer s.releaseCacheSlot(weight)
 		defer cancel()
 
@@ -385,6 +388,13 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 
 		resp, err := s.forwarder.DoFullObjectRequest(ctx, bucket, key, accessKey, secretKey)
 		if err != nil {
+			// A write's cancellation is normal coordination, not a failure —
+			// counting it as error would let routine PUT traffic drown the
+			// metric's signal.
+			if errors.Is(ctx.Err(), context.Canceled) {
+				metrics.RecordTieredRetier("canceled")
+				return
+			}
 			metrics.RecordTieredRetier("error")
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Re-tier fetch failed")
 			return
@@ -418,7 +428,7 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 			return
 		}
 		if ctx.Err() != nil {
-			metrics.RecordTieredRetier("changed")
+			metrics.RecordTieredRetier("canceled")
 			return
 		}
 
@@ -443,17 +453,56 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 	}()
 }
 
-// cancelRetier aborts any in-flight re-tier for the key. Every tiered PUT
-// calls this before touching the key: PUTs write no tombstones, so without it
-// a re-tier committing an older version could overwrite the PUT — for a
-// local-tier PUT, the only copy. The map entry stays (the re-tier's own defer
-// removes it); canceling an already-finished context is a no-op.
-func (s *Service) cancelRetier(bucket, key string) {
-	if v, ok := s.retierInflight.Load(bucket + "|" + key); ok {
-		if cancel, isCancel := v.(context.CancelFunc); isCancel {
-			cancel()
-		}
+// claimRetierWrite marks a PUT in flight for the key: it cancels any running
+// re-tier and excludes new ones from starting until the matching release.
+// PUTs write no tombstones, so this claim is what stops a re-tier from
+// committing an older version over the PUT — for a local-tier PUT, the only
+// copy. Held for the PUT's whole duration, it also covers re-tiers a GET
+// might otherwise start mid-PUT against the still-visible old marker.
+func (s *Service) claimRetierWrite(bucket, key string) {
+	k := bucket + "|" + key
+	s.retierMu.Lock()
+	s.retierClaims[k]++
+	if cancel := s.retierInflight[k]; cancel != nil {
+		cancel()
 	}
+	s.retierMu.Unlock()
+}
+
+func (s *Service) releaseRetierWrite(bucket, key string) {
+	k := bucket + "|" + key
+	s.retierMu.Lock()
+	if s.retierClaims[k]--; s.retierClaims[k] <= 0 {
+		delete(s.retierClaims, k)
+	}
+	s.retierMu.Unlock()
+}
+
+// tryRegisterRetier registers a re-tier for the key unless one is already
+// running or a write holds the claim. Registration and claim share one mutex,
+// so every interleaving either cancels the re-tier or refuses to start it.
+func (s *Service) tryRegisterRetier(bucket, key string, cancel context.CancelFunc) bool {
+	k := bucket + "|" + key
+	s.retierMu.Lock()
+	defer s.retierMu.Unlock()
+	if s.retierClaims[k] > 0 || s.retierInflight[k] != nil {
+		return false
+	}
+	s.retierInflight[k] = cancel
+	return true
+}
+
+func (s *Service) unregisterRetier(bucket, key string) {
+	s.retierMu.Lock()
+	delete(s.retierInflight, bucket+"|"+key)
+	s.retierMu.Unlock()
+}
+
+// retierRunning reports whether a re-tier is in flight for the key (tests).
+func (s *Service) retierRunning(bucket, key string) bool {
+	s.retierMu.Lock()
+	defer s.retierMu.Unlock()
+	return s.retierInflight[bucket+"|"+key] != nil
 }
 
 // handleTieredDeleteLocal answers a DELETE entirely locally when the object's

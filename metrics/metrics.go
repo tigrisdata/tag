@@ -93,8 +93,9 @@ var (
 	// TieredRetier counts tiered mode's re-tier-on-read attempts by outcome:
 	// retiered (moved into the local tier), shed (populate budget refused the
 	// buffer), changed (the object was replaced, deleted, or no longer the
-	// marker by commit time — its newer state wins), error (fetch or store
-	// failed). Per-key dedup skips are not counted.
+	// marker by commit time — its newer state wins), canceled (a concurrent
+	// write claimed the key — coordination, not failure), error (fetch or
+	// store failed). Per-key dedup and claim-refused skips are not counted.
 	TieredRetier = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "tag_tiered_retier_total",
