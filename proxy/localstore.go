@@ -1,9 +1,8 @@
 package proxy
 
 // The local-store engine: whole-object PUT/GET/HEAD/DELETE served entirely from
-// the cache with authoritative misses. Imported from the origin-less branch
-// (PR #191), minus block-aligned storage, listings, and bucket ceremony — in
-// tiered mode this engine is the small tier, and everything else forwards.
+// the cache with authoritative misses. In tiered mode this engine is the small
+// tier, and everything else forwards.
 
 import (
 	"bytes"
