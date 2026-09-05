@@ -122,6 +122,10 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
 
+	// A write claims the key: abort any in-flight re-tier so it cannot commit
+	// an older version over this PUT (see maybeRetierOnRead's guards).
+	s.cancelRetier(bucket, key)
+
 	result, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil {
 		metrics.RecordRequest("PutObject", "auth_error", time.Since(start).Seconds())
@@ -325,10 +329,18 @@ const retierFetchTimeout = 60 * time.Second
 //   - version: the fetched ETag must match the marker's — anything else means
 //     a concurrent write replaced the object, whose state must be left alone;
 //   - identity commit: the entry is re-written only if it still IS the marker
-//     (same ETag, still upstream-tier) — the same compare-then-write guard as
-//     invalidateDisplacedTieredMeta, with the same documented residual race;
+//     (same ETag, still upstream-tier);
+//   - cancellation: PUTs write no tombstones, so a concurrent PUT could land
+//     between the identity check and the commit and be overwritten by the
+//     older version — a local-tier PUT's ONLY copy, in the worst case. Every
+//     tiered PUT therefore cancels the in-flight re-tier for its key
+//     (cancelRetier) before doing anything else; the re-tier's fetch and
+//     store abort on the canceled context. What remains is two truly
+//     concurrent commits racing in the store — the same unordered outcome S3
+//     itself gives two concurrent writers;
 //   - tombstones: the store is stamped from BEFORE the fetch, so a DELETE
-//     racing the re-tier writes a provably newer tombstone and blocks it.
+//     racing the re-tier writes a provably newer tombstone and blocks it
+//     (DELETEs need no cancellation — tombstones already order them).
 //
 // The upstream copy is left as an orphan for the upstream bucket's expiry —
 // deleting it here could race a concurrent write of the same key.
@@ -340,7 +352,9 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		return
 	}
 	inflightKey := bucket + "|" + key
-	if _, loaded := s.retierInflight.LoadOrStore(inflightKey, struct{}{}); loaded {
+	ctx, cancel := context.WithTimeout(context.Background(), retierFetchTimeout)
+	if _, loaded := s.retierInflight.LoadOrStore(inflightKey, cancel); loaded {
+		cancel()
 		return
 	}
 
@@ -348,11 +362,13 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 	weight := bufSize
 	if s.populateBudget != nil && weight > s.populateBudget.total {
 		s.retierInflight.Delete(inflightKey)
+		cancel()
 		metrics.RecordTieredRetier("shed")
 		return
 	}
 	if !s.acquireCacheSlot(context.Background(), weight, priorityReadMiss) {
 		s.retierInflight.Delete(inflightKey)
+		cancel()
 		metrics.RecordTieredRetier("shed")
 		return
 	}
@@ -361,7 +377,6 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 	go func() {
 		defer s.retierInflight.Delete(inflightKey)
 		defer s.releaseCacheSlot(weight)
-		ctx, cancel := context.WithTimeout(context.Background(), retierFetchTimeout)
 		defer cancel()
 
 		// Stamp BEFORE the fetch: a DELETE racing this populate writes its
@@ -394,9 +409,15 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		body := buf[:marker.ContentLength]
 
 		// Identity-guarded commit: only re-write the entry if it still IS the
-		// marker this re-tier was triggered by.
+		// marker this re-tier was triggered by. The cancellation check comes
+		// after it — a racing PUT cancels before it stores, so an alive
+		// context here means no PUT has entered the store ahead of us.
 		cur, found, gerr := s.cache.GetMeta(ctx, bucket, key)
 		if gerr != nil || !found || cur == nil || cur.ETag != etag || !cur.BodyUpstream {
+			metrics.RecordTieredRetier("changed")
+			return
+		}
+		if ctx.Err() != nil {
 			metrics.RecordTieredRetier("changed")
 			return
 		}
@@ -406,13 +427,33 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		// carries no Content-Length header for MetaFromHTTPHeaders to copy.
 		meta.ContentLength = int64(len(body))
 		ttl := int(s.config.Cache.TTL.Seconds())
-		if _, err := s.cache.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, bytes.NewReader(body), ttl, stamp); err != nil {
+		wrote, werr := s.cache.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, bytes.NewReader(body), ttl, stamp)
+		if werr != nil {
 			metrics.RecordTieredRetier("error")
-			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Re-tier store failed")
+			log.Debug().Err(werr).Str("bucket", bucket).Str("key", key).Msg("Re-tier store failed")
+			return
+		}
+		if !wrote {
+			// A newer tombstone suppressed the commit: the object stays on the
+			// marker (or stays deleted) — not a re-tier.
+			metrics.RecordTieredRetier("changed")
 			return
 		}
 		metrics.RecordTieredRetier("retiered")
 	}()
+}
+
+// cancelRetier aborts any in-flight re-tier for the key. Every tiered PUT
+// calls this before touching the key: PUTs write no tombstones, so without it
+// a re-tier committing an older version could overwrite the PUT — for a
+// local-tier PUT, the only copy. The map entry stays (the re-tier's own defer
+// removes it); canceling an already-finished context is a no-op.
+func (s *Service) cancelRetier(bucket, key string) {
+	if v, ok := s.retierInflight.Load(bucket + "|" + key); ok {
+		if cancel, isCancel := v.(context.CancelFunc); isCancel {
+			cancel()
+		}
+	}
 }
 
 // handleTieredDeleteLocal answers a DELETE entirely locally when the object's

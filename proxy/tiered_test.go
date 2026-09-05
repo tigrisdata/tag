@@ -526,3 +526,46 @@ func TestTieredRetierSkipsReplacedObject(t *testing.T) {
 		t.Fatalf("marker disturbed by a version-mismatched re-tier: %+v", meta)
 	}
 }
+
+// A PUT that lands while a re-tier is in flight must win the key: the PUT
+// cancels the re-tier, and the older upstream version is never committed over
+// the newer write — which, for a local-tier PUT, is the only copy.
+func TestTieredPutCancelsInflightRetier(t *testing.T) {
+	mock, _, _ := tieredMock()
+	svc, c := newTieredTestService(mock, 1024)
+
+	mock.validateFunc = func(r *http.Request) (AuthResult, string, string, error) {
+		return AuthNotValidated, "", "", nil
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "old!", nil); w.Code != http.StatusOK {
+		t.Fatalf("cold-start PUT status = %d", w.Code)
+	}
+	mock.validateFunc = nil
+
+	fetching := make(chan struct{})
+	mock.doFullObjectFunc = func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+		close(fetching)
+		// Block until the racing PUT cancels the re-tier.
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	if w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d", w.Code)
+	}
+	<-fetching
+
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "newer", nil); w.Code != http.StatusOK {
+		t.Fatalf("racing PUT status = %d", w.Code)
+	}
+	waitRetierDone(t, svc, "b", "obj")
+
+	meta, found, _ := c.GetMeta(context.Background(), "b", "obj")
+	if !found || meta == nil || meta.BodyUpstream || meta.ContentLength != 5 {
+		t.Fatalf("newer write lost to the re-tier: %+v", meta)
+	}
+	w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil)
+	if w.Code != http.StatusOK || w.Body.String() != "newer" {
+		t.Fatalf("GET = %d %q, want the racing PUT's body", w.Code, w.Body.String())
+	}
+}
