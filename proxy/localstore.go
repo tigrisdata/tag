@@ -46,8 +46,8 @@ import (
 // Everything else — listings, multipart, copies, tagging, ACLs — answers 501.
 
 // HandleOriginlessObject serves GET and HEAD for a single object from cache
-// alone. A miss is the final answer: NoSuchKey, which the caller (e.g. the Tigris
-// gateway) treats as its cue to fall back to the block owner.
+// alone. A miss is the final answer: NoSuchKey — the caller's cue to fall back
+// to its authoritative store.
 func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()
 	ctx := r.Context()
@@ -543,7 +543,7 @@ func (s *Service) HandleOriginlessDelete(w http.ResponseWriter, r *http.Request)
 // HandleOriginlessUnsupported rejects every operation this mode does not
 // implement — listings, mutations, multipart, tagging, ACLs. Recorded under a
 // distinct status so a client persistently writing to an origin-less tier (a
-// misconfigured gateway, for instance) is visible on the dashboard instead of
+// misconfigured caller, for instance) is visible on the dashboard instead of
 // blending into the success rate.
 func (s *Service) HandleOriginlessUnsupported(w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()

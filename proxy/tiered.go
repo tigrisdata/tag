@@ -7,8 +7,8 @@ package proxy
 // its body lives in (BodyUpstream). That makes the local metadata authoritative
 // for existence: a metadata miss answers NoSuchKey without touching upstream,
 // in both tiers — TAG is a cache, and "not cached" is a complete answer. The
-// caller (e.g. the Tigris gateway) treats it as its cue to fall back to the
-// system of record and re-populate by writing back through TAG.
+// caller treats it as its cue to fall back to the system of record and
+// re-populate by writing back through TAG.
 //
 // Small objects (declared size ≤ cache.size_threshold) are the LOCAL tier:
 // stored whole by the local-store engine (localstore.go), served and deleted
@@ -147,7 +147,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
 		s.invalidateObject(context.Background(), bucket, key)
-		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, start)
+		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key)
 	}
 
 	status := "success"
@@ -163,7 +163,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 // mapping as every populate path); the ETag comes from upstream's response —
 // without one the marker is skipped and the object reads as a miss until
 // written again.
-func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, start time.Time) {
+func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string) {
 	if etag == "" {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Upstream PUT response had no ETag - skipping tier marker")
 		return
@@ -179,7 +179,12 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, s
 	ttl := int(s.config.Cache.TTL.Seconds())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, start.UnixNano()); err != nil {
+	// The write stamp is taken AFTER the post-forward invalidation above wrote
+	// its tombstone — stamped with the handler's start, the marker would always
+	// lose to that tombstone and never be written. With a fresh stamp, only a
+	// DELETE arriving after this point suppresses the marker, which is the
+	// serialization that DELETE deserves to win.
+	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, time.Now().UnixNano()); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Failed to write upstream tier marker")
 	}
 }
