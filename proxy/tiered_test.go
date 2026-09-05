@@ -398,3 +398,32 @@ func TestTieredMarkerFailureSparesNewerLocalWrite(t *testing.T) {
 		t.Fatalf("GET = %d %q, want the surviving newer local write", w.Code, w.Body.String())
 	}
 }
+
+// The other edge of the identity guard: when the marker fails and the current
+// metadata still IS the displaced prior, it must be removed — the failed
+// marker must not leave the old version serving after the client's 200.
+func TestTieredMarkerFailureRemovesDisplacedPrior(t *testing.T) {
+	mock, _, _ := tieredMock()
+	svc, c := newTieredTestService(mock, 8)
+
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "stale", nil); w.Code != http.StatusOK {
+		t.Fatalf("small PUT status = %d", w.Code)
+	}
+
+	mock.forwardFunc = func(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+		// 2xx with no ETag: the marker cannot be established.
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "way past threshold", nil); w.Code != http.StatusOK {
+		t.Fatalf("large PUT status = %d", w.Code)
+	}
+
+	if _, found, _ := c.GetMeta(context.Background(), "b", "obj"); found {
+		t.Fatal("displaced prior metadata still present after marker failure")
+	}
+	mock.forwardFunc = nil
+	if w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); w.Code != http.StatusNotFound {
+		t.Fatalf("GET after failed marker = %d, want authoritative 404 (never the stale prior)", w.Code)
+	}
+}

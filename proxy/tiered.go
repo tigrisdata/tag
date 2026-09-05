@@ -168,11 +168,26 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// own overwrite semantics), which lets the marker be stamped with the
 	// handler's START — see putUpstreamMarker for why that closes the
 	// concurrent-DELETE resurrection race.
+	// Capture the displaced prior before forwarding — tolerated, never blocking:
+	// it only arms the identity guard of the failure sweep in putUpstreamMarker.
+	// A failed lookup leaves the prior unknown, and the sweep then refuses to
+	// delete anything rather than guess.
+	var prior *cache.CachedObjectMeta
+	priorKnown := false
+	if s.cache.IsEnabled() {
+		if m, found, cacheErr := s.cache.GetMeta(ctx, bucket, key); cacheErr == nil {
+			priorKnown = true
+			if found {
+				prior = m
+			}
+		}
+	}
+
 	rec := &statusRecorder{ResponseWriter: w}
 	err = s.forwarder.Forward(ctx, rec, r)
 
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, start)
+		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, start, prior, priorKnown)
 	}
 
 	status := "success"
@@ -197,14 +212,14 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 //
 // When the marker cannot be established (no response ETag, store failure, or
 // tombstone suppression), the entry converges on an authoritative miss via
-// invalidateStaleTieredMeta: the displaced prior is invalidated so a stale
-// version cannot keep serving, while a newer write that raced in keeps the
-// key. The client's 200 stands (the object IS stored upstream), and the
+// invalidateDisplacedTieredMeta: the displaced prior is invalidated so a
+// stale version cannot keep serving, while a newer write that raced in keeps
+// the key. The client's 200 stands (the object IS stored upstream), and the
 // caller's ordinary miss handling re-populates on the next read. Failures log
 // at Warn (flood-safe: only successful 2xx PUTs reach here).
-func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, start time.Time) {
+func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, start time.Time, prior *cache.CachedObjectMeta, priorKnown bool) {
 	if etag == "" {
-		s.invalidateStaleTieredMeta(bucket, key, start)
+		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Upstream PUT response had no ETag - no tier marker; object reads as a miss until re-put")
 		return
 	}
@@ -229,7 +244,7 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, s
 	defer cancel()
 	wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, start.UnixNano())
 	if err != nil {
-		s.invalidateStaleTieredMeta(bucket, key, start)
+		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
 		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Failed to write upstream tier marker; object reads as a miss until re-put")
 		return
 	}
@@ -238,27 +253,43 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, s
 		// invalidation normally removes the prior metadata; the guarded sweep
 		// covers the case where that removal failed after the tombstone landed,
 		// so the stale prior cannot outlive the delete.
-		s.invalidateStaleTieredMeta(bucket, key, start)
+		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
 	}
 }
 
-// invalidateStaleTieredMeta converges a key on an authoritative miss after a
-// marker could not be established, WITHOUT destroying a newer write that raced
-// the forward: metadata stamped at-or-after the PUT began belongs to that
-// newer write and keeps the key (this PUT's upstream copy is left as an
-// orphan for the upstream bucket's expiry — cleanup here would race exactly
-// like the unconditional delete this replaces). Only metadata that predates
-// the PUT — the displaced prior — is invalidated. LastModified has second
-// granularity, so a same-second prior reads as newer and survives until TTL:
-// that trade keeps the destructive edge of the guard pointing at stale data,
-// never at a live write. If the store cannot even be read, invalidate
-// unconditionally — for a cache, a wrong miss (the caller re-fills) beats
-// serving a stale prior version after the client's 200.
-func (s *Service) invalidateStaleTieredMeta(bucket, key string, start time.Time) {
+// invalidateDisplacedTieredMeta converges a key on an authoritative miss
+// after a marker could not be established, without either destroying a newer
+// racing write or deleting blind: the entry is dropped only when it still IS
+// the displaced prior captured before the forward (same ETag, same tier).
+// Anything else present is a newer write and keeps the key — this PUT's
+// upstream copy is left as an orphan for the upstream bucket's expiry.
+//
+// No identity, no delete: when the prior is unknown (its pre-forward lookup
+// failed) or the current entry cannot be read, nothing is removed and the
+// possibly-stale prior serves until TTL. Both cases require the metadata
+// store to be failing already — an unguarded delete there would trade a
+// bounded staleness window for the unbounded loss of a racing local write
+// that has no upstream copy. The compare-then-delete pair is not atomic; the
+// residual race is a write landing between the two, which the store cannot
+// close without a conditional delete primitive.
+func (s *Service) invalidateDisplacedTieredMeta(bucket, key string, prior *cache.CachedObjectMeta, priorKnown bool) {
+	if !priorKnown {
+		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Tier marker failed with unknown prior; possibly-stale metadata serves until TTL")
+		return
+	}
+	if prior == nil {
+		// Nothing predated this PUT: anything present now is a newer write.
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	meta, found, err := s.cache.GetMeta(ctx, bucket, key)
-	if err == nil && (!found || meta == nil || meta.LastModified >= start.Unix()) {
+	cur, found, err := s.cache.GetMeta(ctx, bucket, key)
+	if err != nil {
+		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Tier marker failed and prior could not be re-read; possibly-stale metadata serves until TTL")
+		return
+	}
+	if !found || cur == nil || cur.ETag != prior.ETag || cur.BodyUpstream != prior.BodyUpstream {
+		// Already gone, or replaced by a newer write.
 		return
 	}
 	s.invalidateObject(ctx, bucket, key)
