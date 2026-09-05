@@ -366,3 +366,35 @@ func TestTieredConcurrentDeleteSuppressesMarker(t *testing.T) {
 		t.Fatalf("HEAD after suppressed marker = %d, want 404", w.Code)
 	}
 }
+
+// When the marker cannot be established, the convergence sweep must not
+// destroy a newer local write that raced the forward — it has no upstream
+// copy. Here the upstream PUT response carries no ETag (marker skipped) and a
+// small write lands mid-flight: the newer local object must keep the key.
+func TestTieredMarkerFailureSparesNewerLocalWrite(t *testing.T) {
+	mock, _, _ := tieredMock()
+	svc, _ := newTieredTestService(mock, 8)
+
+	mock.forwardFunc = func(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+		// A newer small write completes while the large PUT's forward is in
+		// flight. The mock is restored first so the inner PUT takes the plain
+		// small-tier path.
+		inner := mock.forwardFunc
+		mock.forwardFunc = nil
+		if w2 := tieredDo(t, svc, http.MethodPut, "/b/obj", "newer", nil); w2.Code != http.StatusOK {
+			t.Errorf("mid-flight small PUT status = %d", w2.Code)
+		}
+		mock.forwardFunc = inner
+		// No ETag header: the marker cannot be established.
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "way past threshold", nil); w.Code != http.StatusOK {
+		t.Fatalf("large PUT status = %d", w.Code)
+	}
+
+	w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil)
+	if w.Code != http.StatusOK || w.Body.String() != "newer" {
+		t.Fatalf("GET = %d %q, want the surviving newer local write", w.Code, w.Body.String())
+	}
+}

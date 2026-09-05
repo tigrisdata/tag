@@ -196,14 +196,15 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 // only a genuine DELETE can suppress the marker.
 //
 // When the marker cannot be established (no response ETag, store failure, or
-// tombstone suppression), the entry converges on an authoritative miss: any
-// prior metadata is invalidated so a stale local version cannot keep serving,
-// the client's 200 stands (the object IS stored upstream), and the caller's
-// ordinary miss handling re-populates on the next read. Failures log at Warn
-// (flood-safe: only successful 2xx PUTs reach here).
+// tombstone suppression), the entry converges on an authoritative miss via
+// invalidateStaleTieredMeta: the displaced prior is invalidated so a stale
+// version cannot keep serving, while a newer write that raced in keeps the
+// key. The client's 200 stands (the object IS stored upstream), and the
+// caller's ordinary miss handling re-populates on the next read. Failures log
+// at Warn (flood-safe: only successful 2xx PUTs reach here).
 func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, start time.Time) {
 	if etag == "" {
-		s.invalidateObject(context.Background(), bucket, key)
+		s.invalidateStaleTieredMeta(bucket, key, start)
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Upstream PUT response had no ETag - no tier marker; object reads as a miss until re-put")
 		return
 	}
@@ -226,10 +227,41 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, s
 	ttl := int(s.config.Cache.TTL.Seconds())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, start.UnixNano()); err != nil {
-		s.invalidateObject(context.Background(), bucket, key)
+	wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, start.UnixNano())
+	if err != nil {
+		s.invalidateStaleTieredMeta(bucket, key, start)
 		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Failed to write upstream tier marker; object reads as a miss until re-put")
+		return
 	}
+	if !wrote {
+		// Suppressed by a newer tombstone: a DELETE won the key. Its own
+		// invalidation normally removes the prior metadata; the guarded sweep
+		// covers the case where that removal failed after the tombstone landed,
+		// so the stale prior cannot outlive the delete.
+		s.invalidateStaleTieredMeta(bucket, key, start)
+	}
+}
+
+// invalidateStaleTieredMeta converges a key on an authoritative miss after a
+// marker could not be established, WITHOUT destroying a newer write that raced
+// the forward: metadata stamped at-or-after the PUT began belongs to that
+// newer write and keeps the key (this PUT's upstream copy is left as an
+// orphan for the upstream bucket's expiry — cleanup here would race exactly
+// like the unconditional delete this replaces). Only metadata that predates
+// the PUT — the displaced prior — is invalidated. LastModified has second
+// granularity, so a same-second prior reads as newer and survives until TTL:
+// that trade keeps the destructive edge of the guard pointing at stale data,
+// never at a live write. If the store cannot even be read, invalidate
+// unconditionally — for a cache, a wrong miss (the caller re-fills) beats
+// serving a stale prior version after the client's 200.
+func (s *Service) invalidateStaleTieredMeta(bucket, key string, start time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	meta, found, err := s.cache.GetMeta(ctx, bucket, key)
+	if err == nil && (!found || meta == nil || meta.LastModified >= start.Unix()) {
+		return
+	}
+	s.invalidateObject(ctx, bucket, key)
 }
 
 // handleTieredDeleteLocal answers a DELETE entirely locally when the object's
@@ -273,7 +305,7 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 	if etag == "" {
 		// No ETag to bind the delete to — an unconditional delete could remove
 		// a newer object, so the orphan is left for upstream expiry instead.
-		metrics.TieredCleanup.WithLabelValues("no_etag").Inc()
+		metrics.RecordTieredCleanupSkipped("no_etag")
 		return
 	}
 	go func() {
@@ -282,26 +314,19 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 		resp, err := s.forwarder.DoObjectDeleteRequest(ctx, bucket, key, etag, accessKey, secretKey)
 		if err != nil {
 			// Debug, not Info: per-request error logs flood under an upstream
-			// outage; tag_tiered_cleanup_total{outcome} is the visibility signal.
-			metrics.TieredCleanup.WithLabelValues("error").Inc()
+			// outage; tag_tiered_cleanup_total{outcome} is the visibility signal,
+			// with outcome classification owned by the metrics layer.
+			metrics.RecordTieredCleanup(0, err)
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cross-tier cleanup delete failed")
 			return
 		}
 		defer resp.Body.Close()
 		_, _ = io.Copy(io.Discard, resp.Body)
-		// 404: already gone. 412: the If-Match lost — a newer version replaced
-		// the displaced one, and it must be left alone. Both are done, not
-		// failures.
-		switch {
-		case resp.StatusCode == http.StatusNotFound:
-			metrics.TieredCleanup.WithLabelValues("already_gone").Inc()
-		case resp.StatusCode == http.StatusPreconditionFailed:
-			metrics.TieredCleanup.WithLabelValues("replaced").Inc()
-		case resp.StatusCode >= 300:
-			metrics.TieredCleanup.WithLabelValues("rejected").Inc()
+		metrics.RecordTieredCleanup(resp.StatusCode, nil)
+		// 404 (already gone) and 412 (If-Match lost to a newer version, which
+		// must be left alone) are completed outcomes, not failures.
+		if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusPreconditionFailed {
 			log.Debug().Int("status", resp.StatusCode).Str("bucket", bucket).Str("key", key).Msg("Cross-tier cleanup delete rejected")
-		default:
-			metrics.TieredCleanup.WithLabelValues("deleted").Inc()
 		}
 	}()
 }

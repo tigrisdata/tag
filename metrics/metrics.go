@@ -584,3 +584,29 @@ func SampleCacheSize(ctx context.Context, interval time.Duration, size func() in
 		}
 	}
 }
+
+// RecordTieredCleanup classifies a cross-tier cleanup delete's outcome from
+// its transport error or HTTP status and records it — classification lives
+// here, not at call sites. 404 means the displaced copy was already gone; 412
+// means the If-Match lost because a newer version took the key (left alone);
+// both are completed outcomes, not failures.
+func RecordTieredCleanup(status int, err error) {
+	outcome := "deleted"
+	switch {
+	case err != nil:
+		outcome = "error"
+	case status == 404:
+		outcome = "already_gone"
+	case status == 412:
+		outcome = "replaced"
+	case status >= 300:
+		outcome = "rejected"
+	}
+	TieredCleanup.WithLabelValues(outcome).Inc()
+}
+
+// RecordTieredCleanupSkipped records a cleanup that was never attempted
+// (e.g. no displaced ETag to bind the delete to).
+func RecordTieredCleanupSkipped(reason string) {
+	TieredCleanup.WithLabelValues(reason).Inc()
+}
