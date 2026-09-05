@@ -427,8 +427,14 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 			metrics.RecordTieredRetier("changed")
 			return
 		}
-		if ctx.Err() != nil {
-			metrics.RecordTieredRetier("canceled")
+		if cerr := ctx.Err(); cerr != nil {
+			// Distinguish a write's cancellation (coordination) from the
+			// 60-second deadline expiring (a genuine failure).
+			if errors.Is(cerr, context.Canceled) {
+				metrics.RecordTieredRetier("canceled")
+			} else {
+				metrics.RecordTieredRetier("error")
+			}
 			return
 		}
 
