@@ -66,14 +66,23 @@ type Service struct {
 	forwarder                   RequestForwarder
 	cache                       *cache.Cache
 	config                      *config.Config
-	cacheSemaphore              chan struct{}               // Count ceiling on concurrent cache-populate ops (nil = unlimited)
-	populateBudget              *byteBudget                 // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
-	perPopulateCap              int64                       // Max bytes a foreground broadcast populate can buffer
-	backgroundPopulateWriterCap int64                       // Bytes reserved for direct writer buffers before response inspection
-	broadcastManager            *broadcast.Manager          // For streaming request coalescing
-	activeBackgroundFetches     sync.Map                    // Dedup for background full-object fetches (range caching)
-	blockFetchMu                sync.Mutex                  // Guards blockFetches
-	blockFetches                map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
+	cacheSemaphore              chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
+	populateBudget              *byteBudget        // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
+	perPopulateCap              int64              // Max bytes a foreground broadcast populate can buffer
+	backgroundPopulateWriterCap int64              // Bytes reserved for direct writer buffers before response inspection
+	broadcastManager            *broadcast.Manager // For streaming request coalescing
+	activeBackgroundFetches     sync.Map           // Dedup for background full-object fetches (range caching)
+	// retier coordinates tiered-mode re-tier-on-read populates with writes:
+	// claims[key] counts PUTs in flight (a claim cancels and excludes re-tiers
+	// for the key), inflight[key] is the running re-tier's cancel func. One
+	// mutex serializes claim/registration, so the PUT-vs-re-tier handshake is
+	// ordering-free: a re-tier either registers before the claim (and is
+	// canceled by it) or sees the claim and refuses to start.
+	retierMu       sync.Mutex
+	retierClaims   map[string]int
+	retierInflight map[string]context.CancelFunc
+	blockFetchMu   sync.Mutex                  // Guards blockFetches
+	blockFetches   map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
 	// recentFooterWork suppresses repeat footer scans for an object version that was
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
@@ -162,6 +171,8 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		backgroundPopulateWriterCap: backgroundPopulateWriterCap,
 		broadcastManager:            broadcast.NewManager(channelBuf),
 		blockFetches:                make(map[string]*blockFetchState),
+		retierClaims:                make(map[string]int),
+		retierInflight:              make(map[string]context.CancelFunc),
 	}
 	// Allocated only when the feature that uses it is on.
 	if cfg.Cache.ParquetOptimization {
@@ -612,6 +623,9 @@ func (rec *statusRecorder) wroteSuccess() bool {
 // HandlePutObject handles PUT requests for objects.
 // Invalidates cache BEFORE forwarding to ensure consistency.
 func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error {
+	if s.config.IsTiered() {
+		return s.handleTieredPut(w, r)
+	}
 	start := time.Now()
 	bucket, key := ParseBucketKey(r)
 
@@ -671,6 +685,15 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 // HandleDeleteObject handles DELETE requests for objects.
 // Invalidates cache BEFORE forwarding to ensure consistency.
 func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) error {
+	// Tiered mode: a local-tier object is deleted without touching upstream.
+	// Anything else (upstream tier, no metadata, unvalidated caller) falls
+	// through to the ordinary invalidate-and-forward below, which also clears
+	// the local metadata marker.
+	if s.config.IsTiered() {
+		if handled, err := s.handleTieredDeleteLocal(w, r); handled {
+			return err
+		}
+	}
 	start := time.Now()
 	bucket, key := ParseBucketKey(r)
 
@@ -709,6 +732,9 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 // Serves from cached metadata when available (no body fetch needed).
 // Supports cache revalidation via Cache-Control: no-cache/max-age=0.
 func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error {
+	if s.config.IsTiered() {
+		return s.handleTieredObject(w, r)
+	}
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
@@ -832,16 +858,21 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 // as an error rather than success: a false-green delete metric would hide the very
 // read-after-write hazard the invalidation exists to prevent, since the stale entry
 // is still in place. It is a no-op when the cache is disabled.
-func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
+// The error return matters only to origin-less callers, where the cache is the
+// only store and an acked-but-failed delete keeps serving until TTL. Proxy-mode
+// callers ignore it: there the origin is authoritative and the upstream DELETE
+// already succeeded, so a failed local invalidation is a stale-cache blip.
+func (s *Service) invalidateObject(ctx context.Context, bucket, key string) error {
 	if !s.cache.IsEnabled() {
-		return
+		return nil
 	}
 	if err := s.cache.Delete(ctx, bucket, key); err != nil {
 		metrics.RecordCacheOperation("delete", "error")
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache invalidation failed")
-		return
+		return err
 	}
 	metrics.RecordCacheOperation("delete", "success")
+	return nil
 }
 
 // warmOnWrite repopulates the cache after a successful write by triggering a

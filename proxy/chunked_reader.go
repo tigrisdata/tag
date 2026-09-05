@@ -17,10 +17,24 @@ const StreamingPayloadHash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
 // AWS SDK v2 for unsigned chunked encoding with trailing checksums.
 const StreamingUnsignedTrailerHash = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
 
+// streamingPayloadHashes is the full set of X-Amz-Content-Sha256 markers AWS
+// SDKs use for aws-chunked bodies: SigV4 and SigV4A (ECDSA) signed chunks, each
+// with and without trailing checksums, plus unsigned chunks with trailers. All
+// share the same chunk framing; missing one here would store the framing as
+// object bytes.
+var streamingPayloadHashes = map[string]bool{
+	StreamingPayloadHash:                               true,
+	StreamingPayloadHash + "-TRAILER":                  true,
+	StreamingUnsignedTrailerHash:                       true,
+	"STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD":         true,
+	"STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER": true,
+}
+
 // IsStreamingPayload returns true if the given body hash indicates
-// AWS chunked transfer encoding (either signed or unsigned variant).
+// AWS chunked transfer encoding (signed, signed-with-trailer, ECDSA,
+// or unsigned-with-trailer variants).
 func IsStreamingPayload(bodyHash string) bool {
-	return bodyHash == StreamingPayloadHash || bodyHash == StreamingUnsignedTrailerHash
+	return streamingPayloadHashes[bodyHash]
 }
 
 // awsChunkedReader decodes AWS S3 chunked transfer encoding.
@@ -48,9 +62,14 @@ type awsChunkedReader struct {
 	done      bool
 }
 
+// awsChunkedReaderBufSize is the decoder's internal bufio buffer. Named so
+// budget accounting (origin-less PUT admission) can reserve exactly what the
+// decoder allocates.
+const awsChunkedReaderBufSize = 64 * 1024
+
 func newAWSChunkedReader(r io.Reader) *awsChunkedReader {
 	return &awsChunkedReader{
-		reader: bufio.NewReaderSize(r, 64*1024),
+		reader: bufio.NewReaderSize(r, awsChunkedReaderBufSize),
 	}
 }
 
@@ -178,4 +197,19 @@ func decodeChunkedIfNeeded(r *http.Request) (body io.ReadCloser, bodyHash string
 
 	decoded := newAWSChunkedReader(r.Body)
 	return io.NopCloser(decoded), "UNSIGNED-PAYLOAD", contentLength, true
+}
+
+// stripAWSChunkedToken removes the aws-chunked token from a Content-Encoding
+// value, preserving any remaining encodings ("aws-chunked,gzip" → "gzip").
+// Content-coding tokens are case-insensitive (RFC 9110), and chunked decoding
+// keys off the streaming SHA-256 marker rather than this header's spelling, so
+// any casing of the token must be stripped once the framing is decoded.
+func stripAWSChunkedToken(ce string) string {
+	var remaining []string
+	for _, part := range strings.Split(ce, ",") {
+		if p := strings.TrimSpace(part); p != "" && !strings.EqualFold(p, "aws-chunked") {
+			remaining = append(remaining, p)
+		}
+	}
+	return strings.Join(remaining, ",")
 }

@@ -303,6 +303,10 @@ run: build
 run-verbose: build
 	TAG_LOG_LEVEL=debug ./$(BINARY_NAME)
 
+.PHONY: run-tiered
+run-tiered: build
+	TAG_MODE=tiered ./$(BINARY_NAME)
+
 # Clean targets
 .PHONY: clean
 clean:
@@ -359,6 +363,7 @@ help:
 	@echo "Run targets:"
 	@echo "  run           - Run TAG with default options (use --help for CLI flags)"
 	@echo "  run-verbose   - Run TAG with debug logging (use --version for version info)"
+	@echo "  run-tiered    - Run TAG in tiered store mode (TAG_MODE=tiered)"
 	@echo ""
 	@echo "S3 compatibility test targets:"
 	@echo "  s3-test-local          - Start TAG locally with embedded cache"

@@ -20,6 +20,8 @@ const (
 	ErrBucketAlreadyOwnedByYou      ErrorCode = "BucketAlreadyOwnedByYou"
 	ErrNoSuchBucket                 ErrorCode = "NoSuchBucket"
 	ErrNoSuchKey                    ErrorCode = "NoSuchKey"
+	ErrEntityTooLarge               ErrorCode = "EntityTooLarge"
+	ErrPreconditionFailed           ErrorCode = "PreconditionFailed"
 	ErrNoSuchUpload                 ErrorCode = "NoSuchUpload"
 	ErrInvalidAccessKeyId           ErrorCode = "InvalidAccessKeyId"
 	ErrSignatureDoesNotMatch        ErrorCode = "SignatureDoesNotMatch"
@@ -68,6 +70,8 @@ var errorMap = map[ErrorCode]errorInfo{
 	ErrBucketAlreadyOwnedByYou:      {http.StatusConflict, ErrBucketAlreadyOwnedByYou, "Your previous request to create the named bucket succeeded"},
 	ErrNoSuchBucket:                 {http.StatusNotFound, ErrNoSuchBucket, "The specified bucket does not exist"},
 	ErrNoSuchKey:                    {http.StatusNotFound, ErrNoSuchKey, "The specified key does not exist"},
+	ErrEntityTooLarge:               {http.StatusBadRequest, ErrEntityTooLarge, "Your proposed upload exceeds the maximum allowed size"},
+	ErrPreconditionFailed:           {http.StatusPreconditionFailed, ErrPreconditionFailed, "At least one of the pre-conditions you specified did not hold"},
 	ErrNoSuchUpload:                 {http.StatusNotFound, ErrNoSuchUpload, "The specified multipart upload does not exist"},
 	ErrInvalidAccessKeyId:           {http.StatusForbidden, ErrInvalidAccessKeyId, "The AWS access key ID you provided does not exist in our records"},
 	ErrSignatureDoesNotMatch:        {http.StatusForbidden, ErrSignatureDoesNotMatch, "The request signature we calculated does not match the signature you provided"},
@@ -109,11 +113,19 @@ func WriteErrorWithMessage(w http.ResponseWriter, r *http.Request, code ErrorCod
 		info = errorInfo{http.StatusInternalServerError, ErrInternalError, message}
 	}
 
+	// The response's x-amz-request-id header (set by middleware) is the request's
+	// identity; the XML body must echo the SAME value, since clients cross-check
+	// them. The old X-Request-ID request-header read predates that middleware and
+	// never matched anything a client compared against.
+	requestID := w.Header().Get("x-amz-request-id")
+	if requestID == "" {
+		requestID = r.Header.Get("X-Request-ID")
+	}
 	resp := ErrorResponse{
 		Code:      code,
 		Message:   message,
 		Resource:  r.URL.Path,
-		RequestID: r.Header.Get("X-Request-ID"),
+		RequestID: requestID,
 	}
 
 	log.Debug().

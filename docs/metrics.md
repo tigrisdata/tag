@@ -449,6 +449,42 @@ rate(tag_cache_populate_skipped_total{source="warm_on_write"}[5m])
 sum(rate(tag_cache_populate_skipped_total[5m]))
 ```
 
+#### tag_tiered_cleanup_total
+
+**Type:** Counter
+
+Tiered mode's cross-tier cleanup deletes (issued when a small local write
+displaces an upstream-tier version), by outcome. Cleanup is best-effort:
+anything other than `deleted` / `already_gone` / `replaced` leaves an orphan
+for the upstream bucket's own expiry — failures are Debug-logged, so this
+counter is the rollout-visibility signal.
+
+| Label     | Description                                                              |
+| --------- | ------------------------------------------------------------------------ |
+| `outcome` | `deleted`, `already_gone` (404), `replaced` (412 — a newer version took the key, left alone), `rejected` (other upstream refusal), `error` (request failed), `no_etag` (no displaced ETag to bind to; skipped) |
+
+```promql
+# Orphan-producing cleanup rate (should be ~0)
+sum(rate(tag_tiered_cleanup_total{outcome=~"rejected|error|no_etag"}[5m]))
+```
+
+#### tag_tiered_retier_total
+
+**Type:** Counter
+
+Tiered mode's re-tier-on-read attempts: a validated GET that hits an
+upstream-tier marker whose size fits the local tier triggers a one-shot
+background move of the body into the local tier (healing objects mis-placed
+by, e.g., a cold-start PUT forwarded before its key was learned).
+
+| Label     | Description                                                              |
+| --------- | ------------------------------------------------------------------------ |
+| `outcome` | `retiered` (moved into the local tier), `shed` (populate budget refused the buffer), `changed` (object replaced/deleted mid-flight; its newer state wins), `canceled` (a concurrent write claimed the key — normal coordination), `error` (fetch or store failed) |
+
+A sustained `retiered` rate outside restart windows means writes keep landing
+in the wrong tier — check key learning. Per-key dedup skips are not counted.
+
+
 ### Revalidation Metrics
 
 #### tag_revalidations_triggered_total

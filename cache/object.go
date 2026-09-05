@@ -43,6 +43,10 @@ type CachedObjectMeta struct {
 	PartsCount           string            `json:"parts_count,omitempty"`            // x-amz-mp-parts-count
 	UserMetadata         map[string]string `json:"user_metadata,omitempty"`          // x-amz-meta-*
 	StatusCode           int               `json:"status_code"`                      // Original HTTP status (200, etc.)
+	// BodyUpstream marks a tiered-mode entry whose body lives upstream (the large
+	// tier): this metadata is authoritative for existence, HEAD, and conditionals,
+	// while GET bodies are forwarded. False means the body is stored locally.
+	BodyUpstream bool `json:"body_upstream,omitempty"`
 	// BlockSize records the block granularity for a block-mode entry (RFC 0001). 0 means
 	// the body is stored as a single whole blob (MakeBodyKey); >0 means the body is stored
 	// as fixed-size blocks (MakeBlockKey) of this size. Captured at populate time so an
@@ -133,7 +137,9 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter, opts ...WriteHead
 	if m.ContentType != "" {
 		w.Header().Set("Content-Type", m.ContentType)
 	}
-	if m.ContentLength > 0 {
+	if m.ContentLength >= 0 {
+		// Zero included: S3 sends Content-Length: 0 for an empty object, and a HEAD
+		// without it makes clients read the length as unknown rather than zero.
 		w.Header().Set("Content-Length", strconv.FormatInt(m.ContentLength, 10))
 	}
 	if m.LastModified > 0 {
@@ -172,8 +178,12 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter, opts ...WriteHead
 	}
 	// Write user metadata with lowercase keys per S3 convention
 	for k, v := range m.UserMetadata {
+		// Written via the map directly so the wire name stays lowercase, as S3
+		// sends it. Header.Set would canonicalize to X-Amz-Meta-..., and botocore
+		// derives its Metadata keys from the case-preserved wire name — canonical
+		// casing turns the user's key "meta1" into "Meta1" on the client.
 		lk := strings.ToLower(k)
-		w.Header().Set(lk, v)
+		w.Header()[lk] = []string{v}
 	}
 
 	// Apply options (may override headers like Content-Length for range responses)

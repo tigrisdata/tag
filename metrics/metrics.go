@@ -76,6 +76,34 @@ var (
 		[]string{"method"},
 	)
 
+	// TieredCleanup counts tiered mode's cross-tier cleanup deletes by outcome:
+	// deleted, already_gone (404), replaced (412 — a newer version took the key),
+	// rejected (any other upstream refusal), error (request failed), and
+	// no_etag (marker had no ETag to bind the delete to, cleanup skipped).
+	// Failures are Debug-logged per the repo's log policy, so this counter is
+	// the rollout-visibility signal for orphaned upstream copies.
+	TieredCleanup = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_tiered_cleanup_total",
+			Help: "Tiered-mode cross-tier cleanup deletes by outcome",
+		},
+		[]string{"outcome"},
+	)
+
+	// TieredRetier counts tiered mode's re-tier-on-read attempts by outcome:
+	// retiered (moved into the local tier), shed (populate budget refused the
+	// buffer), changed (the object was replaced, deleted, or no longer the
+	// marker by commit time — its newer state wins), canceled (a concurrent
+	// write claimed the key — coordination, not failure), error (fetch or
+	// store failed). Per-key dedup and claim-refused skips are not counted.
+	TieredRetier = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_tiered_retier_total",
+			Help: "Tiered-mode re-tier-on-read attempts by outcome",
+		},
+		[]string{"outcome"},
+	)
+
 	// AuthFailures counts authentication/signature validation failures.
 	AuthFailures = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -569,4 +597,35 @@ func SampleCacheSize(ctx context.Context, interval time.Duration, size func() in
 			CacheSizeBytes.Set(float64(size()))
 		}
 	}
+}
+
+// RecordTieredCleanup classifies a cross-tier cleanup delete's outcome from
+// its transport error or HTTP status and records it — classification lives
+// here, not at call sites. 404 means the displaced copy was already gone; 412
+// means the If-Match lost because a newer version took the key (left alone);
+// both are completed outcomes, not failures.
+func RecordTieredCleanup(status int, err error) {
+	outcome := "deleted"
+	switch {
+	case err != nil:
+		outcome = "error"
+	case status == 404:
+		outcome = "already_gone"
+	case status == 412:
+		outcome = "replaced"
+	case status >= 300:
+		outcome = "rejected"
+	}
+	TieredCleanup.WithLabelValues(outcome).Inc()
+}
+
+// RecordTieredCleanupSkipped records a cleanup that was never attempted
+// (e.g. no displaced ETag to bind the delete to).
+func RecordTieredCleanupSkipped(reason string) {
+	TieredCleanup.WithLabelValues(reason).Inc()
+}
+
+// RecordTieredRetier records a re-tier-on-read attempt's outcome.
+func RecordTieredRetier(outcome string) {
+	TieredRetier.WithLabelValues(outcome).Inc()
 }

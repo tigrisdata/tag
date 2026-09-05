@@ -38,7 +38,8 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_HTTP_PORT`                   | Port for the S3 API                                                             | `8080`                   |
 | `TAG_LOG_LEVEL`                   | Log level: `debug`, `info`, `warn`, `error`                                     | `info`                   |
 | `TAG_LOG_FORMAT`                  | Log format: `json` or `console`                                                 | `json`                   |
-| `TAG_TRANSPARENT_PROXY`           | Disable transparent proxy mode (`false` or `0`)                                 | `true`                   |
+| `TAG_MODE`                        | Operating mode: `transparent`, `signing`, or `tiered` (see [tiered-mode.md](tiered-mode.md)) | `transparent`            |
+| `TAG_TRANSPARENT_PROXY`           | **Deprecated** — use `TAG_MODE`. Disable transparent proxy mode (`false` or `0`); conflicts with an explicit `TAG_MODE` are startup-fatal | `true`                   |
 | `TAG_TLS_CERT_FILE`               | Path to TLS certificate file (PEM format)                                       | (none)                   |
 | `TAG_TLS_KEY_FILE`                | Path to TLS private key file (PEM format)                                       | (none)                   |
 | `TAG_PPROF_ENABLED`               | Enable pprof endpoints (`true` or `1`)                                          | `false`                  |
@@ -54,6 +55,13 @@ The configuration file uses YAML format. Specify the path with the `--config` fl
 ### Full Configuration Reference
 
 ```yaml
+# Operating mode: transparent (default), signing, or tiered.
+# transparent forwards client signatures as-is with proxy headers; signing
+# validates client signatures and re-signs for upstream; tiered serves small
+# objects entirely from the local cache with authoritative misses (see
+# tiered-mode.md). Supersedes upstream.transparent_proxy.
+mode: transparent
+
 # Server configuration
 server:
   # HTTP port for the S3 API
@@ -100,9 +108,10 @@ upstream:
   # Default: 100
   max_idle_conns_per_host: 100
 
-  # Enable transparent proxy mode
+  # Deprecated: use the top-level `mode` instead.
   # When true (default), client requests are forwarded as-is with proxy headers.
   # When false, TAG validates and re-signs requests (signing mode).
+  # Setting both this and `mode` inconsistently is a startup-fatal error.
   # Default: true
   transparent_proxy: true
 
@@ -312,7 +321,7 @@ Configures the connection to upstream Tigris storage.
 | `endpoint`                | string | `"https://t3.storage.dev"` | Tigris S3 endpoint URL                           |
 | `region`                  | string | `"auto"`                   | AWS region for request signing                   |
 | `max_idle_conns_per_host` | int    | `100`                      | HTTP connection pool size per host               |
-| `transparent_proxy`       | bool   | `true`                     | Forward client requests as-is with proxy headers |
+| `transparent_proxy`       | bool   | `true`                     | **Deprecated** — use top-level `mode`. Forward client requests as-is with proxy headers |
 
 **Endpoint Validation:**
 

@@ -148,7 +148,7 @@ func main() {
 			Str("endpoint", cfg.Upstream.Endpoint).
 			Str("region", cfg.Upstream.Region).
 			Int("max_idle_conns_per_host", cfg.Upstream.MaxIdleConnsPerHost).
-			Bool("transparent_proxy", cfg.Upstream.IsTransparentProxy()),
+			Str("mode", cfg.ResolvedMode()),
 		).
 		Dict("cache", zerolog.Dict().
 			Bool("enabled", cfg.Cache.IsEnabled()).
@@ -188,16 +188,17 @@ func main() {
 		log.Warn().Err(err).Msg("Failed to load credentials from environment")
 	}
 
-	// Initialize proxy signer if transparent proxy is enabled
+	// Initialize proxy signer unless running in signing mode. Transparent and
+	// tiered modes both forward with proxy headers and need TAG's own creds.
 	var proxySigner *auth.ProxySigner
-	if cfg.Upstream.IsTransparentProxy() {
+	if cfg.ResolvedMode() != config.ModeSigning {
 		accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
 		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 		if accessKey == "" || secretKey == "" {
-			log.Fatal().Msg("Transparent proxy requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+			log.Fatal().Str("mode", cfg.ResolvedMode()).Msg("This mode requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
 		}
 		proxySigner = auth.NewProxySigner(accessKey, secretKey)
-		log.Info().Msg("Transparent proxy mode enabled")
+		log.Info().Str("mode", cfg.ResolvedMode()).Msg("Proxy mode enabled")
 	} else {
 		log.Info().Str("endpoint", cfg.Upstream.Endpoint).Msg("Signing mode enabled")
 		if !config.IsTigrisEndpoint(cfg.Upstream.Endpoint) {
@@ -206,7 +207,7 @@ func main() {
 		}
 	}
 
-	if credStore.Count() == 0 && !cfg.Upstream.IsTransparentProxy() {
+	if credStore.Count() == 0 && cfg.ResolvedMode() == config.ModeSigning {
 		log.Warn().Msg("No credentials loaded - TAG will reject all requests")
 	}
 
@@ -306,9 +307,9 @@ func main() {
 		objectCache = cache.NewDisabledCache()
 	}
 
-	// 3. Initialize local auth for transparent proxy
+	// 3. Initialize local auth (transparent and tiered modes)
 	var localAuth *proxy.LocalAuthConfig
-	if cfg.Upstream.IsTransparentProxy() {
+	if cfg.ResolvedMode() != config.ModeSigning {
 		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 		derivedKeyStore := auth.NewDerivedKeyStore(auth.DefaultDerivedKeyTTL)
 		keyUnwrapper, err := auth.NewKeyUnwrapper(secretKey)
