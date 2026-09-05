@@ -501,6 +501,10 @@ func (*benchmarkRangeForwarder) DoFullObjectRequest(context.Context, string, str
 	return nil, errors.New("unexpected full object request")
 }
 
+func (*benchmarkRangeForwarder) DoObjectDeleteRequest(context.Context, string, string, string, string) (*http.Response, error) {
+	return nil, errors.New("unexpected object delete request")
+}
+
 func (*benchmarkRangeForwarder) DoAnonymousFullObjectRequest(context.Context, string, string) (*http.Response, error) {
 	return nil, errors.New("unexpected anonymous full object request")
 }

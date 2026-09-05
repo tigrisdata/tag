@@ -44,6 +44,10 @@ func (embeddedCacheHitBenchmarkForwarder) DoFullObjectRequest(context.Context, s
 	return nil, errors.New("unexpected upstream full-object request")
 }
 
+func (embeddedCacheHitBenchmarkForwarder) DoObjectDeleteRequest(context.Context, string, string, string, string) (*http.Response, error) {
+	return nil, errors.New("unexpected upstream delete request")
+}
+
 func (embeddedCacheHitBenchmarkForwarder) DoAnonymousFullObjectRequest(context.Context, string, string) (*http.Response, error) {
 	return nil, errors.New("unexpected upstream anonymous request")
 }

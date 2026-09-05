@@ -612,6 +612,9 @@ func (rec *statusRecorder) wroteSuccess() bool {
 // HandlePutObject handles PUT requests for objects.
 // Invalidates cache BEFORE forwarding to ensure consistency.
 func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error {
+	if s.config.IsTiered() {
+		return s.handleTieredPut(w, r)
+	}
 	start := time.Now()
 	bucket, key := ParseBucketKey(r)
 
@@ -671,6 +674,15 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 // HandleDeleteObject handles DELETE requests for objects.
 // Invalidates cache BEFORE forwarding to ensure consistency.
 func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) error {
+	// Tiered mode: a local-tier object is deleted without touching upstream.
+	// Anything else (upstream tier, no metadata, unvalidated caller) falls
+	// through to the ordinary invalidate-and-forward below, which also clears
+	// the local metadata marker.
+	if s.config.IsTiered() {
+		if handled, err := s.handleTieredDeleteLocal(w, r); handled {
+			return err
+		}
+	}
 	start := time.Now()
 	bucket, key := ParseBucketKey(r)
 
@@ -709,6 +721,9 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 // Serves from cached metadata when available (no body fetch needed).
 // Supports cache revalidation via Cache-Control: no-cache/max-age=0.
 func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error {
+	if s.config.IsTiered() {
+		return s.handleTieredObject(w, r)
+	}
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)

@@ -43,6 +43,10 @@ type CachedObjectMeta struct {
 	PartsCount           string            `json:"parts_count,omitempty"`            // x-amz-mp-parts-count
 	UserMetadata         map[string]string `json:"user_metadata,omitempty"`          // x-amz-meta-*
 	StatusCode           int               `json:"status_code"`                      // Original HTTP status (200, etc.)
+	// BodyUpstream marks a tiered-mode entry whose body lives upstream (the large
+	// tier): this metadata is authoritative for existence, HEAD, and conditionals,
+	// while GET bodies are forwarded. False means the body is stored locally.
+	BodyUpstream bool `json:"body_upstream,omitempty"`
 	// BlockSize records the block granularity for a block-mode entry (RFC 0001). 0 means
 	// the body is stored as a single whole blob (MakeBodyKey); >0 means the body is stored
 	// as fixed-size blocks (MakeBlockKey) of this size. Captured at populate time so an

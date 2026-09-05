@@ -540,8 +540,6 @@ func (s *Service) HandleOriginlessDelete(w http.ResponseWriter, r *http.Request)
 	return nil
 }
 
-// multiDeleteError is a per-key failure in the DeleteResult — S3's channel for
-// partial multi-delete failure, reported even in Quiet mode.
 // HandleOriginlessUnsupported rejects every operation this mode does not
 // implement — listings, mutations, multipart, tagging, ACLs. Recorded under a
 // distinct status so a client persistently writing to an origin-less tier (a

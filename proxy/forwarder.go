@@ -58,6 +58,12 @@ type RequestForwarder interface {
 	// Caller is responsible for closing the response body.
 	DoAnonymousFullObjectRequest(ctx context.Context, bucket, key string) (*http.Response, error)
 
+	// DoObjectDeleteRequest executes a synthetic DELETE for one object, signed with
+	// the given credentials. Used by tiered mode's cross-tier cleanup when a small
+	// (local) write replaces an object whose prior version lives upstream.
+	// Caller is responsible for closing the response body.
+	DoObjectDeleteRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error)
+
 	// DoConditionalGetRequest executes a conditional GET for cache revalidation.
 	// Sends If-None-Match and/or If-Modified-Since headers.
 	// If rangeHeader is non-empty, includes a Range header (for range+revalidation).
@@ -367,6 +373,27 @@ func (b *baseForwarder) DoAnonymousFullObjectRequest(ctx context.Context, bucket
 	metrics.RecordUpstreamRequest("GET", time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Anonymous background fetch failed")
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// DoObjectDeleteRequest executes a synthetic DELETE for one object. Standard
+// SigV4 signing, like every TAG-initiated request.
+func (b *baseForwarder) DoObjectDeleteRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+	path := "/" + bucket + "/" + key
+
+	fwdReq, err := b.signer.SignRequest(ctx, http.MethodDelete, path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	upstreamStart := time.Now()
+	resp, err := b.httpClient.Do(fwdReq)
+	metrics.RecordUpstreamRequest(http.MethodDelete, time.Since(upstreamStart).Seconds(), err)
+	if err != nil {
+		log.Error().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cross-tier delete failed")
 		return nil, err
 	}
 

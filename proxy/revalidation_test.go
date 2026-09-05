@@ -32,6 +32,7 @@ type mockForwarder struct {
 	doFullObjectFunc func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error)
 	// Optional DoAnonymousFullObjectRequest implementation for anonymous-warm tests
 	doAnonymousFullObjectFunc func(ctx context.Context, bucket, key string) (*http.Response, error)
+	doObjectDeleteFunc        func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error)
 	// Optional ValidateAndGetCredentials implementation (e.g. to simulate an
 	// anonymous/unvalidated request that yields no credentials).
 	validateFunc func(r *http.Request) (AuthResult, string, string, error)
@@ -70,6 +71,13 @@ func (m *mockForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, ac
 		return m.doFullObjectFunc(ctx, bucket, key, accessKey, secretKey)
 	}
 	return nil, errors.New("mock: DoFullObjectRequest not implemented")
+}
+
+func (m *mockForwarder) DoObjectDeleteRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+	if m.doObjectDeleteFunc != nil {
+		return m.doObjectDeleteFunc(ctx, bucket, key, accessKey, secretKey)
+	}
+	return nil, errors.New("mock: DoObjectDeleteRequest not implemented")
 }
 
 func (m *mockForwarder) DoAnonymousFullObjectRequest(ctx context.Context, bucket, key string) (*http.Response, error) {
