@@ -90,6 +90,19 @@ var (
 		[]string{"outcome"},
 	)
 
+	// TieredRetier counts tiered mode's re-tier-on-read attempts by outcome:
+	// retiered (moved into the local tier), shed (populate budget refused the
+	// buffer), changed (the object was replaced, deleted, or no longer the
+	// marker by commit time — its newer state wins), error (fetch or store
+	// failed). Per-key dedup skips are not counted.
+	TieredRetier = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_tiered_retier_total",
+			Help: "Tiered-mode re-tier-on-read attempts by outcome",
+		},
+		[]string{"outcome"},
+	)
+
 	// AuthFailures counts authentication/signature validation failures.
 	AuthFailures = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -609,4 +622,9 @@ func RecordTieredCleanup(status int, err error) {
 // (e.g. no displaced ETag to bind the delete to).
 func RecordTieredCleanupSkipped(reason string) {
 	TieredCleanup.WithLabelValues(reason).Inc()
+}
+
+// RecordTieredRetier records a re-tier-on-read attempt's outcome.
+func RecordTieredRetier(outcome string) {
+	TieredRetier.WithLabelValues(outcome).Inc()
 }

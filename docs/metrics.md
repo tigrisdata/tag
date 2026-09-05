@@ -468,6 +468,23 @@ counter is the rollout-visibility signal.
 sum(rate(tag_tiered_cleanup_total{outcome=~"rejected|error|no_etag"}[5m]))
 ```
 
+#### tag_tiered_retier_total
+
+**Type:** Counter
+
+Tiered mode's re-tier-on-read attempts: a validated GET that hits an
+upstream-tier marker whose size fits the local tier triggers a one-shot
+background move of the body into the local tier (healing objects mis-placed
+by, e.g., a cold-start PUT forwarded before its key was learned).
+
+| Label     | Description                                                              |
+| --------- | ------------------------------------------------------------------------ |
+| `outcome` | `retiered` (moved into the local tier), `shed` (populate budget refused the buffer), `changed` (object replaced/deleted mid-flight; its newer state wins), `error` (fetch or store failed) |
+
+A sustained `retiered` rate outside restart windows means writes keep landing
+in the wrong tier — check key learning. Per-key dedup skips are not counted.
+
+
 ### Revalidation Metrics
 
 #### tag_revalidations_triggered_total

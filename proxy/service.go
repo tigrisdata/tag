@@ -72,6 +72,7 @@ type Service struct {
 	backgroundPopulateWriterCap int64                       // Bytes reserved for direct writer buffers before response inspection
 	broadcastManager            *broadcast.Manager          // For streaming request coalescing
 	activeBackgroundFetches     sync.Map                    // Dedup for background full-object fetches (range caching)
+	retierInflight              sync.Map                    // Dedup for tiered-mode re-tier-on-read populates
 	blockFetchMu                sync.Mutex                  // Guards blockFetches
 	blockFetches                map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
 	// recentFooterWork suppresses repeat footer scans for an object version that was

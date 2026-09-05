@@ -28,17 +28,26 @@ a failure leaves an orphan for the upstream bucket's own expiry to collect).
 A large write over a local-tier object frees the local copy. With no prior
 metadata, nothing is cached and nothing is cleaned.
 
-**Population is by writes alone.** There is no read-populate and no
-write-through of large bodies: every unique read costs at most one upstream
-GET, and never an upstream write.
+**Population is by writes, plus one healing read-populate.** There is no
+write-through of large bodies and no general read-populate: every unique read
+costs at most one upstream GET, and never an upstream write. The one
+exception is **re-tier-on-read**: a validated GET that hits an upstream-tier
+marker whose size fits the local tier triggers a one-shot background move of
+the body into the local tier. This heals objects mis-placed by the cold-start
+window below, capping the damage at one extra upstream fetch per object
+instead of one body forward per read until TTL. The displaced upstream copy
+is left for the upstream bucket's own expiry.
 
 ## Authentication
 
 The transparent-proxy flow, unchanged. Tiered semantics apply only to requests
 whose SigV4 signature TAG validated locally; a request it cannot validate yet
 (unknown key, anonymous) forwards to upstream exactly as in transparent mode,
-and keys are learned from those responses. Until keys are learned, requests
-behave like cache misses.
+and keys are learned from those responses. Until keys are learned, reads
+behave like cache misses, and small writes land in the upstream tier (with a
+marker, so they stay readable) — the first such write's 2xx is itself what
+teaches the keys, and re-tier-on-read moves those objects into the local tier
+on their first validated read.
 
 ## Configuration
 

@@ -17,6 +17,13 @@ package proxy
 // the PUT passes through, a metadata marker is stored locally, HEADs answer
 // from the marker, and a GET body forward is the mode's only body traffic.
 //
+// The tier boundary is enforced on reads as well as writes: a validated GET
+// that hits an upstream-tier marker whose size fits the local tier triggers a
+// one-shot background re-tier (maybeRetierOnRead), healing objects that were
+// mis-placed — e.g. a small PUT forwarded before its key was learned. Damage
+// from mis-placement is thereby capped at one extra upstream fetch per object
+// instead of one body forward per read until TTL.
+//
 // Cross-tier overwrites clean up the displaced version: a small write over an
 // upstream-tier object deletes the upstream copy asynchronously; a large write
 // over a local-tier object frees the local copy via the ordinary
@@ -35,7 +42,9 @@ package proxy
 // metadata and therefore read as misses through TAG until written again.
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -60,7 +69,7 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 		operation = "HeadObject"
 	}
 
-	result, _, _, err := s.forwarder.ValidateAndGetCredentials(r)
+	result, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil {
 		metrics.RecordRequest(operation, "auth_error", time.Since(start).Seconds())
 		return err
@@ -93,8 +102,12 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 			metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
 			return nil
 		}
-		// The mode's one body forward. Plain Forward: no read-populate — the
-		// large tier is populated by writes alone.
+		// The mode's one body forward. The forward itself never populates;
+		// a mis-tiered small object is healed by the background re-tier, which
+		// carries its own guards (see maybeRetierOnRead).
+		if r.Method == http.MethodGet {
+			s.maybeRetierOnRead(bucket, key, accessKey, secretKey, meta)
+		}
 		return s.forwarder.Forward(ctx, w, r)
 	}
 
@@ -161,8 +174,10 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// prior the cache holds the ONLY copy, and a failed forward must leave it
 	// intact — S3 semantics say a rejected PUT changes nothing. Reads racing
 	// the in-flight PUT serve the prior version, which is the atomic-replace
-	// behavior clients expect. There is also no read-populate in this mode, so
-	// the racing-refill hazard that ordering defends against cannot occur.
+	// behavior clients expect. The one read-triggered populate in this mode —
+	// the re-tier — cannot be blocked by tombstone ordering here (this path
+	// writes none); it defends itself with an identity-guarded commit instead
+	// (see maybeRetierOnRead).
 	// No post-success invalidation either: the marker overwrites the prior
 	// metadata directly (a displaced local body ages out by TTL, the engine's
 	// own overwrite semantics), which lets the marker be stamped with the
@@ -293,6 +308,111 @@ func (s *Service) invalidateDisplacedTieredMeta(bucket, key string, prior *cache
 		return
 	}
 	s.invalidateObject(ctx, bucket, key)
+}
+
+// retierFetchTimeout bounds the background re-tier fetch and store.
+const retierFetchTimeout = 60 * time.Second
+
+// maybeRetierOnRead heals a mis-tiered object: a validated GET hit an
+// upstream-tier marker whose size fits the local tier — typically a small PUT
+// that was forwarded before its key was learned. A background fetch moves the
+// body into the local tier so subsequent reads stop paying a body forward.
+//
+// Guards, in order:
+//   - dedup: one re-tier in flight per key, others ride the existing marker;
+//   - budget: the buffer mirrors the engine's PUT (the allocation IS the
+//     reservation, size+1 to detect an overlong body), shed non-blocking;
+//   - version: the fetched ETag must match the marker's — anything else means
+//     a concurrent write replaced the object, whose state must be left alone;
+//   - identity commit: the entry is re-written only if it still IS the marker
+//     (same ETag, still upstream-tier) — the same compare-then-write guard as
+//     invalidateDisplacedTieredMeta, with the same documented residual race;
+//   - tombstones: the store is stamped from BEFORE the fetch, so a DELETE
+//     racing the re-tier writes a provably newer tombstone and blocks it.
+//
+// The upstream copy is left as an orphan for the upstream bucket's expiry —
+// deleting it here could race a concurrent write of the same key.
+func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, marker *cache.CachedObjectMeta) {
+	if marker.ContentLength < 0 || marker.ContentLength > s.config.Cache.SizeThreshold {
+		return
+	}
+	if accessKey == "" || secretKey == "" || !s.cache.IsEnabled() {
+		return
+	}
+	inflightKey := bucket + "|" + key
+	if _, loaded := s.retierInflight.LoadOrStore(inflightKey, struct{}{}); loaded {
+		return
+	}
+
+	bufSize := marker.ContentLength + 1
+	weight := bufSize
+	if s.populateBudget != nil && weight > s.populateBudget.total {
+		s.retierInflight.Delete(inflightKey)
+		metrics.RecordTieredRetier("shed")
+		return
+	}
+	if !s.acquireCacheSlot(context.Background(), weight, priorityReadMiss) {
+		s.retierInflight.Delete(inflightKey)
+		metrics.RecordTieredRetier("shed")
+		return
+	}
+
+	etag := marker.ETag
+	go func() {
+		defer s.retierInflight.Delete(inflightKey)
+		defer s.releaseCacheSlot(weight)
+		ctx, cancel := context.WithTimeout(context.Background(), retierFetchTimeout)
+		defer cancel()
+
+		// Stamp BEFORE the fetch: a DELETE racing this populate writes its
+		// tombstone after this instant and provably blocks the commit below.
+		stamp := time.Now().UnixNano()
+
+		resp, err := s.forwarder.DoFullObjectRequest(ctx, bucket, key, accessKey, secretKey)
+		if err != nil {
+			metrics.RecordTieredRetier("error")
+			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Re-tier fetch failed")
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != etag {
+			// Gone or replaced by a concurrent write; its state wins the key.
+			_, _ = io.Copy(io.Discard, resp.Body)
+			metrics.RecordTieredRetier("changed")
+			return
+		}
+
+		buf := make([]byte, bufSize)
+		n, err := io.ReadFull(resp.Body, buf)
+		if err == nil || (!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF)) || int64(n) != marker.ContentLength {
+			// Longer than the marker declared, shorter (truncated read), or a
+			// transport failure: nothing safe to store.
+			metrics.RecordTieredRetier("error")
+			log.Debug().Err(err).Int("read", n).Str("bucket", bucket).Str("key", key).Msg("Re-tier body mismatch")
+			return
+		}
+		body := buf[:marker.ContentLength]
+
+		// Identity-guarded commit: only re-write the entry if it still IS the
+		// marker this re-tier was triggered by.
+		cur, found, gerr := s.cache.GetMeta(ctx, bucket, key)
+		if gerr != nil || !found || cur == nil || cur.ETag != etag || !cur.BodyUpstream {
+			metrics.RecordTieredRetier("changed")
+			return
+		}
+
+		meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
+		// The stored body is authoritative for length — a chunked response
+		// carries no Content-Length header for MetaFromHTTPHeaders to copy.
+		meta.ContentLength = int64(len(body))
+		ttl := int(s.config.Cache.TTL.Seconds())
+		if _, err := s.cache.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, bytes.NewReader(body), ttl, stamp); err != nil {
+			metrics.RecordTieredRetier("error")
+			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Re-tier store failed")
+			return
+		}
+		metrics.RecordTieredRetier("retiered")
+	}()
 }
 
 // handleTieredDeleteLocal answers a DELETE entirely locally when the object's

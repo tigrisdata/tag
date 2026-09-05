@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -425,5 +426,103 @@ func TestTieredMarkerFailureRemovesDisplacedPrior(t *testing.T) {
 	mock.forwardFunc = nil
 	if w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); w.Code != http.StatusNotFound {
 		t.Fatalf("GET after failed marker = %d, want authoritative 404 (never the stale prior)", w.Code)
+	}
+}
+
+// waitRetierDone polls until no re-tier is in flight for the key. The
+// LoadOrStore happens synchronously before the read returns, so absence
+// afterwards means the background attempt ran to completion.
+func waitRetierDone(t *testing.T, svc *Service, bucket, key string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if _, busy := svc.retierInflight.Load(bucket + "|" + key); !busy {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("re-tier still in flight after 2s")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// A small object that landed upstream-tier (a cold-start PUT forwarded before
+// its key was learned) is healed by the first validated read: the body moves
+// into the local tier and subsequent reads stop forwarding.
+func TestTieredRetierOnReadHealsMisplacedObject(t *testing.T) {
+	mock, forwards, _ := tieredMock()
+	svc, c := newTieredTestService(mock, 1024)
+
+	// Cold start: the key is not learned yet, so the small PUT forwards and
+	// gets an upstream-tier marker.
+	mock.validateFunc = func(r *http.Request) (AuthResult, string, string, error) {
+		return AuthNotValidated, "", "", nil
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "tiny", nil); w.Code != http.StatusOK {
+		t.Fatalf("cold-start PUT status = %d", w.Code)
+	}
+	meta, found, _ := c.GetMeta(context.Background(), "b", "obj")
+	if !found || meta == nil || !meta.BodyUpstream {
+		t.Fatal("cold-start PUT did not stamp an upstream-tier marker")
+	}
+
+	// Keys learned: reads validate locally now.
+	mock.validateFunc = nil
+	mock.doFullObjectFunc = func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+		h := http.Header{}
+		h.Set("ETag", `"upstream-etag"`)
+		h.Set("Content-Type", "text/plain")
+		return &http.Response{StatusCode: http.StatusOK, Header: h, ContentLength: 4, Body: io.NopCloser(strings.NewReader("tiny"))}, nil
+	}
+
+	// This read still forwards (the marker is upstream-tier) and triggers the heal.
+	if w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d", w.Code)
+	}
+	waitRetierDone(t, svc, "b", "obj")
+
+	meta, found, _ = c.GetMeta(context.Background(), "b", "obj")
+	if !found || meta == nil || meta.BodyUpstream {
+		t.Fatalf("object not re-tiered: found=%v meta=%+v", found, meta)
+	}
+	base := forwards.Load()
+	w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil)
+	if w.Code != http.StatusOK || w.Body.String() != "tiny" {
+		t.Fatalf("GET after re-tier = %d %q, want the local body", w.Code, w.Body.String())
+	}
+	if n := forwards.Load(); n != base {
+		t.Fatalf("forwards = %d, want %d (re-tiered object must serve locally)", n, base)
+	}
+}
+
+// The re-tier must refuse to commit when the object was replaced mid-flight:
+// a fetched ETag that no longer matches the marker means a concurrent write
+// owns the key, and its state is left alone.
+func TestTieredRetierSkipsReplacedObject(t *testing.T) {
+	mock, _, _ := tieredMock()
+	svc, c := newTieredTestService(mock, 1024)
+
+	mock.validateFunc = func(r *http.Request) (AuthResult, string, string, error) {
+		return AuthNotValidated, "", "", nil
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "tiny", nil); w.Code != http.StatusOK {
+		t.Fatalf("cold-start PUT status = %d", w.Code)
+	}
+	mock.validateFunc = nil
+	mock.doFullObjectFunc = func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+		h := http.Header{}
+		h.Set("ETag", `"a-newer-version"`)
+		return &http.Response{StatusCode: http.StatusOK, Header: h, ContentLength: 5, Body: io.NopCloser(strings.NewReader("newer"))}, nil
+	}
+
+	if w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d", w.Code)
+	}
+	waitRetierDone(t, svc, "b", "obj")
+
+	meta, found, _ := c.GetMeta(context.Background(), "b", "obj")
+	if !found || meta == nil || !meta.BodyUpstream || meta.ETag != `"upstream-etag"` {
+		t.Fatalf("marker disturbed by a version-mismatched re-tier: %+v", meta)
 	}
 }
