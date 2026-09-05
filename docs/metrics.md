@@ -449,6 +449,25 @@ rate(tag_cache_populate_skipped_total{source="warm_on_write"}[5m])
 sum(rate(tag_cache_populate_skipped_total[5m]))
 ```
 
+#### tag_tiered_cleanup_total
+
+**Type:** Counter
+
+Tiered mode's cross-tier cleanup deletes (issued when a small local write
+displaces an upstream-tier version), by outcome. Cleanup is best-effort:
+anything other than `deleted` / `already_gone` / `replaced` leaves an orphan
+for the upstream bucket's own expiry — failures are Debug-logged, so this
+counter is the rollout-visibility signal.
+
+| Label     | Description                                                              |
+| --------- | ------------------------------------------------------------------------ |
+| `outcome` | `deleted`, `already_gone` (404), `replaced` (412 — a newer version took the key, left alone), `rejected` (other upstream refusal), `error` (request failed), `no_etag` (no displaced ETag to bind to; skipped) |
+
+```promql
+# Orphan-producing cleanup rate (should be ~0)
+sum(rate(tag_tiered_cleanup_total{outcome=~"rejected|error|no_etag"}[5m]))
+```
+
 ### Revalidation Metrics
 
 #### tag_revalidations_triggered_total

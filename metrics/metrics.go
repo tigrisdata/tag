@@ -76,6 +76,20 @@ var (
 		[]string{"method"},
 	)
 
+	// TieredCleanup counts tiered mode's cross-tier cleanup deletes by outcome:
+	// deleted, already_gone (404), replaced (412 — a newer version took the key),
+	// rejected (any other upstream refusal), error (request failed), and
+	// no_etag (marker had no ETag to bind the delete to, cleanup skipped).
+	// Failures are Debug-logged per the repo's log policy, so this counter is
+	// the rollout-visibility signal for orphaned upstream copies.
+	TieredCleanup = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_tiered_cleanup_total",
+			Help: "Tiered-mode cross-tier cleanup deletes by outcome",
+		},
+		[]string{"outcome"},
+	)
+
 	// AuthFailures counts authentication/signature validation failures.
 	AuthFailures = promauto.NewCounterVec(
 		prometheus.CounterOpts{

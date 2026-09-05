@@ -187,7 +187,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 // written again.
 func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string) {
 	if etag == "" {
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Upstream PUT response had no ETag - skipping tier marker")
+		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Upstream PUT response had no ETag - skipping tier marker; object reads as a miss until re-put")
 		return
 	}
 	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, r.Header)
@@ -261,11 +261,20 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 	if accessKey == "" || secretKey == "" {
 		return
 	}
+	if etag == "" {
+		// No ETag to bind the delete to — an unconditional delete could remove
+		// a newer object, so the orphan is left for upstream expiry instead.
+		metrics.TieredCleanup.WithLabelValues("no_etag").Inc()
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), tieredCleanupTimeout)
 		defer cancel()
 		resp, err := s.forwarder.DoObjectDeleteRequest(ctx, bucket, key, etag, accessKey, secretKey)
 		if err != nil {
+			// Debug, not Info: per-request error logs flood under an upstream
+			// outage; tag_tiered_cleanup_total{outcome} is the visibility signal.
+			metrics.TieredCleanup.WithLabelValues("error").Inc()
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cross-tier cleanup delete failed")
 			return
 		}
@@ -274,8 +283,16 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 		// 404: already gone. 412: the If-Match lost — a newer version replaced
 		// the displaced one, and it must be left alone. Both are done, not
 		// failures.
-		if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusPreconditionFailed {
+		switch {
+		case resp.StatusCode == http.StatusNotFound:
+			metrics.TieredCleanup.WithLabelValues("already_gone").Inc()
+		case resp.StatusCode == http.StatusPreconditionFailed:
+			metrics.TieredCleanup.WithLabelValues("replaced").Inc()
+		case resp.StatusCode >= 300:
+			metrics.TieredCleanup.WithLabelValues("rejected").Inc()
 			log.Debug().Int("status", resp.StatusCode).Str("bucket", bucket).Str("key", key).Msg("Cross-tier cleanup delete rejected")
+		default:
+			metrics.TieredCleanup.WithLabelValues("deleted").Inc()
 		}
 	}()
 }
