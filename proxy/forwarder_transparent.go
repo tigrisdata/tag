@@ -48,9 +48,33 @@ func (f *transparentForwarder) interceptResponse(resp *http.Response, originalRe
 	f.handleAuthzRevocation(resp, originalReq)
 }
 
+// shallowHeaderCopy gives the forwarded request its own header map while
+// reusing the immutable value slices owned by the client request. Header.Set
+// and Header.Del replace or remove entries, so the values for headers changed
+// by this forwarder do not alias the inbound map. The unchanged slices are
+// read-only for the lifetime of the outbound request, as required by the
+// net/http RoundTripper contract.
+func shallowHeaderCopy(header http.Header) http.Header {
+	if header == nil {
+		return make(http.Header)
+	}
+
+	copied := make(http.Header, len(header)+4)
+	for key, values := range header {
+		if values != nil {
+			// Keep the data borrowed but prevent an append on the forwarded
+			// entry from reusing the inbound slice's spare capacity.
+			values = values[:len(values):len(values)]
+		}
+		copied[key] = values
+	}
+	return copied
+}
+
 // buildTransparentRequest creates a forwarded request for transparent proxy mode.
-// Copies ALL headers from the original request (including Authorization, X-Amz-Date, etc.)
-// and adds the 4 proxy headers. The body is streamed as-is without decoding.
+// Copies the header map while borrowing unchanged header-value slices. The body
+// is streamed as-is without decoding. Headers changed for the upstream request
+// remain private to the forwarded request.
 //
 // For AWS chunked transfer encoding (streaming SigV4), ensures the required
 // Content-Encoding: aws-chunked header is present per the S3 spec. Some clients
@@ -90,9 +114,10 @@ func (f *transparentForwarder) buildTransparentRequest(ctx context.Context, r *h
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Clone ALL headers from the original request (preserving Authorization, X-Amz-Date, etc.)
-	// Clone avoids mutating the original request headers when adding proxy headers below.
-	fwdReq.Header = r.Header.Clone()
+	// Keep the map itself private so proxy credentials and any synthesized
+	// headers are never visible through the inbound request. Unchanged value
+	// slices are borrowed and must not be mutated by the transport.
+	fwdReq.Header = shallowHeaderCopy(r.Header)
 
 	// Ensure X-Amz-Date is present for Tigris's proxy validation path.
 	// Some SDK versions (botocore 1.42+) sign with "date" in SignedHeaders

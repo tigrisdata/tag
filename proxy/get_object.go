@@ -28,9 +28,8 @@ var bufferPool = sync.Pool{
 }
 
 // smallObjectThreshold defines the max size for direct buffered serving.
-// Objects at or below this size buffer the body directly instead of using
-// io.Pipe + goroutine. This eliminates per-request goroutine spawn, io.Pipe
-// allocation, and synchronization overhead for small objects.
+// Objects at or below this size buffer the body directly so they can be served
+// from one pooled buffer without a streaming writer.
 const smallObjectThreshold = 64 * 1024 // 64KB
 
 // putBuffer returns a buffer to the pool only if it hasn't grown too large.
@@ -50,6 +49,32 @@ type countingWriter struct {
 }
 
 func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.written += int64(n)
+	return n, err
+}
+
+// lazyCommitWriter counts a cache body stream and commits the response when
+// the first nonempty chunk arrives. Empty and failed streams can therefore be
+// handled by the cache-miss fallback without sending cache headers first.
+type lazyCommitWriter struct {
+	w         http.ResponseWriter
+	meta      *cache.CachedObjectMeta
+	written   int64
+	committed bool
+}
+
+func (cw *lazyCommitWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if !cw.committed {
+		cw.meta.WriteHeaders(cw.w)
+		writeCacheStatus(cw.w, XCacheHit)
+		cw.w.WriteHeader(cw.meta.StatusCode)
+		cw.committed = true
+	}
+
 	n, err := cw.w.Write(p)
 	cw.written += int64(n)
 	return n, err

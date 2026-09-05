@@ -253,11 +253,15 @@ type CacheConfig struct {
 	MaxConcurrentWrites int `yaml:"max_concurrent_writes"`
 	// MaxPopulateMemoryBytes bounds the aggregate memory buffered by ALL cache buffering —
 	// cache-populate and block-serve staging together — as one honest total: buffering never
-	// exceeds this value. Each populate reserves its object size, capped at the per-populate
-	// buffer ceiling (~(channel_buffer + max(channel_buffer/4, 64)) × chunk_size); when it can't
-	// fit, the object is served from upstream uncached. Small objects reserve little (high
-	// concurrency) while a burst of large objects is throttled — this is what actually bounds
-	// populate memory, since a byte-unaware count can pin many GB under large-object fan-out.
+	// exceeds this value. Foreground coalesced populates reserve their object size, capped at
+	// the broadcast listener plus relay-queue ceiling (~(channel_buffer + max(channel_buffer/4,
+	// 64)) × chunk_size). Direct background full-object populates reserve the clustered
+	// cache client's retained 1 MiB sender buffer and destination gRPC first-chunk buffer,
+	// the embedded storage writer's retained 1 MiB first-read buffer and 1 MiB file-copy
+	// buffer, plus one configured block scratch buffer when block mode can select it.
+	// When a populate cannot fit,
+	// the object is served from upstream uncached. This is what actually
+	// bounds populate memory, since a byte-unaware count can pin many GB under large-object fan-out.
 	// Applied independently of MaxConcurrentWrites (both limits apply). 0 or unset uses
 	// DefaultCacheMaxPopulateMemoryBytes; a negative value disables the budget (count-only).
 	//
@@ -665,7 +669,8 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Cache.EvictionPolicy = val
 		}
 		// Override concurrent cache-write limit from environment
-		if n, ok := envInt("TAG_CACHE_MAX_CONCURRENT_WRITES"); ok && n > 0 {
+		// n != 0 for the same 0-default / negative-disables contract as above.
+		if n, ok := envInt("TAG_CACHE_MAX_CONCURRENT_WRITES"); ok && n != 0 {
 			cfg.Cache.MaxConcurrentWrites = n
 		}
 		// Override cache-populate memory budget from environment (negative disables)
@@ -683,6 +688,10 @@ func applyEnvOverrides(cfg *Config) {
 		// Override the block granularity from environment (0/unset keeps the default).
 		if n, ok := envInt64("TAG_CACHE_BLOCK_SIZE"); ok && n > 0 {
 			cfg.Cache.BlockSize = n
+		}
+		// Override the max cacheable object size from environment (0/unset keeps the default).
+		if n, ok := envInt64("TAG_CACHE_SIZE_THRESHOLD"); ok && n > 0 {
+			cfg.Cache.SizeThreshold = n
 		}
 		// Override the warm-on-write populate reservation fraction from environment.
 		// f != 0 mirrors the sibling budget overrides: an env "0" means "use the
@@ -723,8 +732,10 @@ func applyEnvOverrides(cfg *Config) {
 	}
 
 	// Override the ingress in-flight request limit from environment
+	// n != 0, not n > 0: the documented contract is 0/unset = default and
+	// NEGATIVE = disabled, matching the yaml field and the populate-memory override.
 	if val := os.Getenv("TAG_MAX_INFLIGHT_REQUESTS"); val != "" {
-		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+		if n, err := strconv.Atoi(val); err == nil && n != 0 {
 			cfg.Server.MaxInflightRequests = n
 		}
 	}

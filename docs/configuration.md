@@ -22,6 +22,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_WARM_ON_WRITE_RESERVED_FRACTION` | Fraction of the populate memory budget reserved (elastically) for warm-on-write so it isn't starved by read-miss warms (only when `warm_on_write` is on; negative disables) | `0.5` |
 | `TAG_CACHE_BLOCK_CACHING_ENABLED`  | Enable block-aligned caching for large objects (RFC 0001): a read miss for an object at/above `block_size` is cached at block granularity (`true`/`false`) | `true`                   |
 | `TAG_CACHE_BLOCK_SIZE`             | Block granularity **and** the read-side whole-vs-block boundary (bytes): a read miss below this is whole-cached, at/above it is block-cached; must stay below ocache's 64 MB compaction threshold | `1048576` (1 MiB)        |
+| `TAG_CACHE_SIZE_THRESHOLD`         | Max object size to cache (bytes); larger bodies pass through uncached                                                                                                                          | `1073741824` (1 GiB)     |
 | `TAG_CACHE_META_ON_WRITE`          | Cache an object's metadata (not its body) when TAG proxies its write, so the first read resolves it from cache instead of a round trip. Closes the multipart gap, where write-through cannot tee a body TAG never sees (`true`/`1`; any other value leaves it off). **Requires block caching**; silently does nothing when `block_caching_enabled` is false or `block_size` is not positive | `false`                  |
 | `TAG_CACHE_PARQUET_OPTIMIZATION`   | Cache a parquet object's metadata blocks ahead of the reader that needs them, so opening the file does not discover them as serial misses. Two triggers: a read reaching the object's tail (helps second and later opens) and a write through TAG (helps the first). Only fires when the metadata spans more than the tail block (`true`/`1`; any other value leaves it off). **Requires block caching**; silently does nothing when `block_caching_enabled` is false or `block_size` is not positive | `false`                  |
 | `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
@@ -258,12 +259,17 @@ cache:
 
   # Aggregate memory budget for ALL cache buffering — cache-populate and block-serve
   # staging share this one pool, so the value is an honest total (buffering never
-  # exceeds it). Each populate reserves its object size (capped at the per-populate
-  # buffer ceiling, ~(channel_buffer + max(channel_buffer/4, 64)) x chunk_size); when
-  # it can't fit, the object is served from upstream uncached. Block-serve staging
-  # draws from the same budget, capped at half of it so it can't starve populates.
-  # Applied independently of max_concurrent_writes (both limits apply). This is what
-  # actually bounds populate memory — a byte-unaware count can pin many GB.
+  # exceeds it). Foreground coalesced populates reserve their object size, capped at
+  # the broadcast listener plus relay queue, ~(channel_buffer + max(channel_buffer/4,
+  # 64)) x chunk_size. Direct background full-object populates reserve the clustered cache
+  # client's retained 1 MiB sender buffer and destination gRPC first-chunk buffer, the
+  # embedded storage writer's retained 1 MiB first-read buffer and 1 MiB file-copy buffer,
+  # plus one configured block scratch buffer when block mode can select it. When a populate cannot fit,
+  # the object is served from upstream uncached.
+  # Block-serve staging draws from the same budget, capped at half of it so it can't
+  # starve populates. Applied independently of max_concurrent_writes (both limits
+  # apply). This is what actually bounds populate memory — a byte-unaware count can
+  # pin many GB.
   # Default: 2147483648 (2 GiB) (0 or unset = default; negative = budget disabled)
   # Override with TAG_CACHE_MAX_POPULATE_MEMORY env var
   max_populate_memory_bytes: 2147483648
@@ -404,7 +410,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `delete_batch_size`     | int      | `1000`           | File deletions processed per deletion-queue batch                                   |
 | `recovery_workers`      | int      | `16`             | Parallel workers for startup file recovery                                          |
 | `max_concurrent_writes` | int      | `256`            | Max concurrent cache-populate operations (`0`/unset = default, negative = disabled) |
-| `max_populate_memory_bytes` | int  | `2147483648`     | Aggregate memory budget for ALL cache buffering — cache-populate and block-serve staging share this one pool, so it is an honest total (buffering never exceeds it). Each populate reserves its size (capped at the buffer ceiling); block-serve staging draws from the same budget capped at half of it, so it can't starve populates. Applied independently of `max_concurrent_writes` (`0`/unset = default 2 GiB, negative = disables the budget) |
+| `max_populate_memory_bytes` | int  | `2147483648`     | Aggregate memory budget for ALL cache buffering — foreground relay populates and direct background populates use path-specific ceilings, while block-serve staging shares the same pool and is capped at half. Direct reservations include clustered sender and destination buffers, embedded storage buffers, and block scratch where applicable. Applied independently of `max_concurrent_writes` (`0`/unset = default 2 GiB, negative = disables the budget) |
 
 **TTL Format:**
 
@@ -440,6 +446,10 @@ Controls request coalescing behavior for concurrent requests.
 ```text
 Memory per broadcast = chunk_size × channel_buffer × num_listeners
 ```
+
+Foreground cache listeners also retain a bounded relay queue. Background full-object
+fetches do not create a broadcast; they retain the cache client's stream buffer and,
+when block caching is selected, one block-sized scratch buffer.
 
 With defaults (64KB chunks, 32 buffer):
 

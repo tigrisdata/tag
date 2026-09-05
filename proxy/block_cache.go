@@ -256,6 +256,19 @@ func getBlockBuf(n int64) *[]byte {
 	return &b
 }
 
+// getExactBlockBuf returns a scratch buffer whose capacity is exactly n. The direct
+// full-object writer reserves the configured block size; it must not activate a larger
+// process-wide pooled buffer that another service caused to be retained.
+func getExactBlockBuf(n int64) *[]byte {
+	bp := getBlockBuf(n)
+	if int64(cap(*bp)) == n {
+		return bp
+	}
+	putBlockBuf(bp)
+	b := make([]byte, n)
+	return &b
+}
+
 func putBlockBuf(bp *[]byte) {
 	if int64(cap(*bp)) <= maxPooledBlockBufBytes.Load() {
 		blockBufPool.Put(bp)
@@ -1452,7 +1465,7 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 	}()
 	// Pooled and safely returned on exit: each PutBlockStream consumes its reader fully
 	// before returning, so no block write outlives the loop iteration that staged it.
-	bufp := getBlockBuf(meta.BlockSize)
+	bufp := getExactBlockBuf(meta.BlockSize)
 	defer putBlockBuf(bufp)
 	buf := (*bufp)[:meta.BlockSize]
 	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
