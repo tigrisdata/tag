@@ -90,6 +90,12 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	bucket, key := ParseBucketKey(r)
 	forceRevalidate := shouldForceRevalidate(r)
 	bypassCache := shouldBypassCache(r)
+	onlyIfCached := requestsOnlyIfCached(r)
+	if onlyIfCached {
+		// Origin contact is forbidden: a stored response is served without
+		// revalidation, and anything else becomes a local 504 below.
+		forceRevalidate = false
+	}
 	rangeHeader := r.Header.Get("Range")
 
 	// Conditional request headers
@@ -245,6 +251,15 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 				}
 			}
 		}
+	}
+
+	// Cache-Control: only-if-cached — nothing served above means nothing can
+	// be served without the origin: answer 504 locally (RFC 7234 §5.2.1.7).
+	if onlyIfCached {
+		writeCacheStatus(w, XCacheMiss)
+		w.WriteHeader(http.StatusGatewayTimeout)
+		metrics.RecordRequest("GetObject", "only_if_cached", time.Since(start).Seconds())
+		return nil
 	}
 
 	// 3. Cache miss — determine the X-Cache status once (DISABLED / BYPASS / MISS);

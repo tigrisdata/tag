@@ -38,6 +38,17 @@ Send `Cache-Control: no-store` to skip the cache entirely. TAG forwards the requ
 curl -H "Cache-Control: no-store" http://localhost:8080/my-bucket/my-key
 ```
 
+## Cache-Only Reads
+
+Send `Cache-Control: only-if-cached` (RFC 7234 §5.2.1.7) on a GET or HEAD to forbid origin contact entirely: TAG serves the stored response, or answers `504 Gateway Timeout` locally without touching upstream. Combined with `no-cache`, the stored response is served as-is — with the origin off-limits there is nothing to revalidate against.
+
+This makes cheap, authoritative "is it cached?" probes possible for clients that maintain their own fallback path.
+
+```bash
+# Serve from cache or fail fast — never contact upstream
+curl -H "Cache-Control: only-if-cached" http://localhost:8080/my-bucket/my-key
+```
+
 ## Automatic Cache Invalidation
 
 TAG automatically invalidates cached objects when they are modified through TAG:

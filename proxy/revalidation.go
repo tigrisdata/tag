@@ -473,3 +473,13 @@ func shouldBypassCache(r *http.Request) bool {
 	cc := r.Header.Get("Cache-Control")
 	return strings.Contains(cc, "no-store")
 }
+
+// requestsOnlyIfCached reports whether the client forbade origin contact.
+// Per RFC 7234 §5.2.1.7, Cache-Control: only-if-cached means "serve a stored
+// response or answer 504 Gateway Timeout — never forward". It also overrides
+// no-cache/max-age=0: with origin contact forbidden, there is nothing to
+// revalidate against, so a stored response is served as-is.
+func requestsOnlyIfCached(r *http.Request) bool {
+	cc := r.Header.Get("Cache-Control")
+	return strings.Contains(strings.ToLower(cc), "only-if-cached")
+}

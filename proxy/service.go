@@ -714,6 +714,12 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	bucket, key := ParseBucketKey(r)
 	forceRevalidate := shouldForceRevalidate(r)
 	bypassCache := shouldBypassCache(r)
+	onlyIfCached := requestsOnlyIfCached(r)
+	if onlyIfCached {
+		// Origin contact is forbidden: serve stored metadata without
+		// revalidation, or answer 504 locally below.
+		forceRevalidate = false
+	}
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleHeadObject")
 
@@ -752,6 +758,15 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 			}
 			// forceRevalidate but no ETag — fall through to upstream
 		}
+	}
+
+	// Cache-Control: only-if-cached — nothing served above means nothing can
+	// be served without the origin: answer 504 locally (RFC 7234 §5.2.1.7).
+	if onlyIfCached {
+		writeCacheStatus(w, XCacheMiss)
+		w.WriteHeader(http.StatusGatewayTimeout)
+		metrics.RecordRequest("HeadObject", "only_if_cached", time.Since(start).Seconds())
+		return nil
 	}
 
 	// Cache miss - forward to upstream. Set the X-Cache header (and the matching
