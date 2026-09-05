@@ -48,7 +48,7 @@ func tieredMock() (*mockForwarder, *atomic.Int64, *atomic.Int64) {
 			}
 			return nil
 		},
-		doObjectDeleteFunc: func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+		doObjectDeleteFunc: func(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error) {
 			deletes.Add(1)
 			return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
 		},
@@ -187,8 +187,8 @@ func TestTieredLargePutStampsMarker(t *testing.T) {
 func TestTieredSmallOverUpstreamCleansUp(t *testing.T) {
 	mock, _, _ := tieredMock()
 	deleted := make(chan string, 1)
-	mock.doObjectDeleteFunc = func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
-		deleted <- bucket + "/" + key
+	mock.doObjectDeleteFunc = func(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error) {
+		deleted <- bucket + "/" + key + " " + etag
 		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
 	}
 	svc, c := newTieredTestService(mock, 8)
@@ -202,8 +202,8 @@ func TestTieredSmallOverUpstreamCleansUp(t *testing.T) {
 
 	select {
 	case got := <-deleted:
-		if got != "b/obj" {
-			t.Fatalf("cross-tier delete for %q, want b/obj", got)
+		if got != `b/obj "upstream-etag"` {
+			t.Fatalf("cross-tier delete = %q, want key b/obj bound to the displaced ETag", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("cross-tier upstream delete never issued")
@@ -310,5 +310,30 @@ func TestTieredConditionalPutOverUpstreamForwards(t *testing.T) {
 	meta, found, _ := c.GetMeta(context.Background(), "b", "obj")
 	if !found || meta == nil || !meta.BodyUpstream {
 		t.Fatal("expected a refreshed upstream marker after forwarded conditional PUT")
+	}
+}
+
+// A failed large overwrite must leave the prior local-tier copy intact: the
+// local tier holds the only copy, and a rejected PUT changes nothing.
+func TestTieredFailedLargeOverwriteKeepsLocalCopy(t *testing.T) {
+	mock, _, _ := tieredMock()
+	svc, _ := newTieredTestService(mock, 8)
+
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "tiny", nil); w.Code != http.StatusOK {
+		t.Fatalf("small PUT status = %d", w.Code)
+	}
+
+	mock.forwardFunc = func(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return nil
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "way past threshold", nil); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("failed large PUT status = %d, want 503", w.Code)
+	}
+
+	mock.forwardFunc = nil
+	w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil)
+	if w.Code != http.StatusOK || w.Body.String() != "tiny" {
+		t.Fatalf("GET after failed overwrite = %d %q, want the intact prior copy", w.Code, w.Body.String())
 	}
 }

@@ -38,6 +38,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -68,7 +69,15 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 		return s.forwarder.Forward(ctx, w, r)
 	}
 
-	if meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key); cacheErr == nil && found && meta != nil && meta.BodyUpstream {
+	meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
+	if cacheErr != nil {
+		// A transient metadata failure is not absence. The miss below is
+		// authoritative — served for an existing object it would make the caller
+		// drop its cached copy — so this must surface as a retryable error.
+		metrics.RecordRequest(operation, "error", time.Since(start).Seconds())
+		return cacheErr
+	}
+	if found && meta != nil && meta.BodyUpstream {
 		// Upstream tier: the local metadata answers everything except a GET body.
 		if r.Method == http.MethodHead && originlessPlainObject(r) {
 			if writePreconditionFailed(w, r, meta) {
@@ -106,10 +115,16 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 
-	// The prior version's tier decides what an overwrite must clean up.
-	var prior *cache.CachedObjectMeta
-	if meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key); cacheErr == nil && found {
-		prior = meta
+	// The prior version's tier decides what an overwrite must clean up, so a
+	// failed lookup cannot be read as "no prior": it would skip required cleanup
+	// or misroute a conditional write. Fail retryably instead.
+	prior, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
+	if cacheErr != nil {
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return cacheErr
+	}
+	if !found {
+		prior = nil
 	}
 
 	declaredSize, sized := originlessPutSize(r)
@@ -130,22 +145,29 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 		err := s.HandleOriginlessPut(rec, r)
 		if err == nil && rec.wroteSuccess() && prior != nil && prior.BodyUpstream {
 			// Small write displaced an upstream-tier version: remove the
-			// upstream copy so it doesn't linger as an orphan.
-			s.deleteUpstreamObjectAsync(bucket, key, accessKey, secretKey)
+			// upstream copy so it doesn't linger as an orphan. Bound to the
+			// displaced ETag so it can never remove a newer object that a
+			// concurrent large write put in its place.
+			s.deleteUpstreamObjectAsync(bucket, key, prior.ETag, accessKey, secretKey)
 		}
 		return err
 	}
 
 	// Upstream tier: pass the PUT through, then stamp the local metadata marker
-	// that makes this object exist in TAG's authoritative view. The
-	// invalidate-before/after ordering mirrors HandlePutObject; the pre-forward
-	// invalidation also frees a displaced local-tier body.
-	s.invalidateObject(context.Background(), bucket, key)
-
+	// that makes this object exist in TAG's authoritative view.
+	//
+	// No pre-forward invalidation, unlike HandlePutObject: for a local-tier
+	// prior the cache holds the ONLY copy, and a failed forward must leave it
+	// intact — S3 semantics say a rejected PUT changes nothing. Reads racing
+	// the in-flight PUT serve the prior version, which is the atomic-replace
+	// behavior clients expect. There is also no read-populate in this mode, so
+	// the racing-refill hazard that ordering defends against cannot occur.
 	rec := &statusRecorder{ResponseWriter: w}
 	err = s.forwarder.Forward(ctx, rec, r)
 
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
+		// Success: free the displaced version (tombstoning racing writers),
+		// then stamp the marker.
 		s.invalidateObject(context.Background(), bucket, key)
 		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key)
 	}
@@ -175,6 +197,14 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string) {
 	if declaredSize, ok := originlessPutSize(r); ok {
 		meta.ContentLength = declaredSize
 	}
+	// Mirror the engine's PUT: upstream stores the decoded object, so a
+	// streaming-signed upload's aws-chunked token is wire framing, not the
+	// stored object's encoding — a HEAD advertising it would mislabel the
+	// bytes a forwarded GET returns.
+	meta.ContentEncoding = strings.Join(r.Header.Values("Content-Encoding"), ",")
+	if IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) {
+		meta.ContentEncoding = stripAWSChunkedToken(meta.ContentEncoding)
+	}
 
 	ttl := int(s.config.Cache.TTL.Seconds())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -184,8 +214,12 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string) {
 	// lose to that tombstone and never be written. With a fresh stamp, only a
 	// DELETE arriving after this point suppresses the marker, which is the
 	// serialization that DELETE deserves to win.
+	// Best-effort by design: the 200 is already committed, and in a cache
+	// "not cached" is an honest answer — a failed marker makes the object read
+	// as a miss, and the caller's ordinary miss handling re-populates it. The
+	// same holds for a marker suppressed by a racing DELETE's tombstone.
 	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, time.Now().UnixNano()); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Failed to write upstream tier marker")
+		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Failed to write upstream tier marker; object reads as a miss until re-put")
 	}
 }
 
@@ -208,7 +242,13 @@ func (s *Service) handleTieredDeleteLocal(w http.ResponseWriter, r *http.Request
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
 	meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
-	if cacheErr != nil || !found || meta == nil || meta.BodyUpstream {
+	if cacheErr != nil {
+		// Falling through would forward the DELETE, ack 204 upstream, and leave
+		// a possibly local-tier copy being served. Fail retryably instead.
+		metrics.RecordRequest("DeleteObject", "error", time.Since(start).Seconds())
+		return true, cacheErr
+	}
+	if !found || meta == nil || meta.BodyUpstream {
 		return false, nil
 	}
 	return true, s.HandleOriginlessDelete(w, r)
@@ -217,21 +257,24 @@ func (s *Service) handleTieredDeleteLocal(w http.ResponseWriter, r *http.Request
 // deleteUpstreamObjectAsync issues the cross-tier cleanup DELETE in the
 // background, signed with the (validated) caller's credentials. Best-effort:
 // a failure leaves an orphan that the cache bucket's own expiry collects.
-func (s *Service) deleteUpstreamObjectAsync(bucket, key, accessKey, secretKey string) {
+func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secretKey string) {
 	if accessKey == "" || secretKey == "" {
 		return
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), tieredCleanupTimeout)
 		defer cancel()
-		resp, err := s.forwarder.DoObjectDeleteRequest(ctx, bucket, key, accessKey, secretKey)
+		resp, err := s.forwarder.DoObjectDeleteRequest(ctx, bucket, key, etag, accessKey, secretKey)
 		if err != nil {
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cross-tier cleanup delete failed")
 			return
 		}
 		defer resp.Body.Close()
 		_, _ = io.Copy(io.Discard, resp.Body)
-		if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
+		// 404: already gone. 412: the If-Match lost — a newer version replaced
+		// the displaced one, and it must be left alone. Both are done, not
+		// failures.
+		if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusPreconditionFailed {
 			log.Debug().Int("status", resp.StatusCode).Str("bucket", bucket).Str("key", key).Msg("Cross-tier cleanup delete rejected")
 		}
 	}()

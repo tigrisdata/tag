@@ -75,7 +75,14 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	}
 
 	meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
-	if cacheErr != nil || !found || meta == nil {
+	if cacheErr != nil {
+		// A transient metadata failure is not absence: the miss below is
+		// authoritative, so it must never be minted from an error. 500-retry,
+		// matching the body-probe path below.
+		metrics.RecordRequest(operation, "error", time.Since(start).Seconds())
+		return cacheErr
+	}
+	if !found || meta == nil {
 		return s.originlessMiss(w, r, operation, start)
 	}
 

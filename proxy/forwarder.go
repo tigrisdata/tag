@@ -60,9 +60,11 @@ type RequestForwarder interface {
 
 	// DoObjectDeleteRequest executes a synthetic DELETE for one object, signed with
 	// the given credentials. Used by tiered mode's cross-tier cleanup when a small
-	// (local) write replaces an object whose prior version lives upstream.
+	// (local) write replaces an object whose prior version lives upstream. A
+	// non-empty etag is sent as If-Match so the delete only removes the displaced
+	// version — never a newer object a concurrent write put in its place.
 	// Caller is responsible for closing the response body.
-	DoObjectDeleteRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error)
+	DoObjectDeleteRequest(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error)
 
 	// DoConditionalGetRequest executes a conditional GET for cache revalidation.
 	// Sends If-None-Match and/or If-Modified-Since headers.
@@ -380,11 +382,18 @@ func (b *baseForwarder) DoAnonymousFullObjectRequest(ctx context.Context, bucket
 }
 
 // DoObjectDeleteRequest executes a synthetic DELETE for one object. Standard
-// SigV4 signing, like every TAG-initiated request.
-func (b *baseForwarder) DoObjectDeleteRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+// SigV4 signing, like every TAG-initiated request. A non-empty etag becomes an
+// If-Match precondition: a 412 means the object was already replaced and must
+// be left alone.
+func (b *baseForwarder) DoObjectDeleteRequest(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error) {
 	path := "/" + bucket + "/" + key
 
-	fwdReq, err := b.signer.SignRequest(ctx, http.MethodDelete, path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, nil)
+	var extraHeaders http.Header
+	if etag != "" {
+		extraHeaders = http.Header{}
+		extraHeaders.Set("If-Match", etag)
+	}
+	fwdReq, err := b.signer.SignRequest(ctx, http.MethodDelete, path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
 	if err != nil {
 		return nil, err
 	}
