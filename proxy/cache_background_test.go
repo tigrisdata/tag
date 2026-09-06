@@ -30,6 +30,25 @@ func newBackgroundCacheService(t *testing.T, cfg *config.Config, response func()
 	return NewService(forwarder, cacheStore, cfg), cacheStore
 }
 
+type blockingTombstoneGetClient struct {
+	cacheclient.CacheClient
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingTombstoneGetClient) Get(ctx context.Context, key string) ([]byte, error) {
+	if strings.HasPrefix(key, "tomb|") {
+		c.once.Do(func() { close(c.started) })
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return c.CacheClient.Get(ctx, key)
+}
+
 type countingReadCloser struct {
 	io.Reader
 	readBytes int
@@ -56,6 +75,51 @@ func (c *partialFailStreamClient) PutStream(_ context.Context, _ string, r io.Re
 	buf := make([]byte, c.readBytes)
 	_, _ = io.ReadFull(r, buf)
 	return errors.New("injected stream write failure")
+}
+
+func TestTriggerBackgroundWarm_DoesNotWaitForTombstoneRead(t *testing.T) {
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(false)
+	client := &blockingTombstoneGetClient{
+		CacheClient: cacheclient.NewMemoryCache(),
+		started:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	cacheStore := cache.NewCacheWithClient(client, &cfg.Cache)
+	fetchDone := make(chan struct{})
+	forwarder := &mockForwarder{
+		doFullObjectFunc: func(_ context.Context, _, _, _, _ string) (*http.Response, error) {
+			close(fetchDone)
+			return cacheableGetResponse("body", `"etag"`), nil
+		},
+	}
+	svc := NewService(forwarder, cacheStore, cfg)
+
+	triggerDone := make(chan struct{})
+	go func() {
+		svc.triggerBackgroundCacheFetchAfterInvalidation(
+			"background-bucket", "blocked-tombstone-read", "access", "secret", false,
+			priorityWarmWrite, invalidationEpoch{at: 1, order: 1},
+		)
+		close(triggerDone)
+	}()
+
+	select {
+	case <-client.started:
+	case <-time.After(time.Second):
+		t.Fatal("detached warm did not reach the tombstone read")
+	}
+	select {
+	case <-triggerDone:
+	case <-time.After(time.Second):
+		t.Fatal("warm trigger waited for the tombstone read")
+	}
+	close(client.release)
+	select {
+	case <-fetchDone:
+	case <-time.After(time.Second):
+		t.Fatal("detached warm did not continue after the tombstone read")
+	}
 }
 
 func TestFetchFullObjectToCache_DrainsUncacheableBody(t *testing.T) {

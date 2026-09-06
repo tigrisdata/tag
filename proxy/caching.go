@@ -702,34 +702,38 @@ func (s *Service) backgroundWarmSuperseded(bucket, key string, request backgroun
 }
 
 // startUnstartedBackgroundFetch performs the final durable-fence check after
-// the state is published. If a newer warm arrived while that check ran, it is
-// promoted into the reserved state so the marker never strands a pending warm.
+// the state is published. It runs detached because the tombstone check can be a
+// backend read; the trigger must not add that round trip to the foreground write.
+// If a newer warm arrived while the check ran, it is promoted into the reserved
+// state so the marker never strands a pending warm.
 func (s *Service) startUnstartedBackgroundFetch(
 	bcastKey, bucket, key string, state *backgroundFetchState, request backgroundFetchRequest,
-) bool {
-	for {
-		if !s.backgroundWarmSuperseded(bucket, key, request) {
-			metrics.RecordBackgroundFetchTriggered()
-			metrics.ActiveBackgroundFetches.Inc()
-			go s.runBackgroundCacheFetch(bcastKey, bucket, key, state, request)
-			return true
-		}
+) {
+	go func() {
+		for {
+			if !s.backgroundWarmSuperseded(bucket, key, request) {
+				metrics.RecordBackgroundFetchTriggered()
+				metrics.ActiveBackgroundFetches.Inc()
+				s.runBackgroundCacheFetch(bcastKey, bucket, key, state, request)
+				return
+			}
 
-		state.mu.Lock()
-		if state.pending == nil {
-			state.closed = true
+			state.mu.Lock()
+			if state.pending == nil {
+				state.closed = true
+				state.mu.Unlock()
+				s.activeBackgroundFetches.CompareAndDelete(bcastKey, state)
+				return
+			}
+			request = *state.pending
+			state.pending = nil
+			state.startedAt = time.Now().UnixNano()
+			request.startedAt = state.startedAt
+			state.activeInvalidatedAt = request.invalidatedAt
+			state.activeInvalidationOrder = request.invalidationOrder
 			state.mu.Unlock()
-			s.activeBackgroundFetches.CompareAndDelete(bcastKey, state)
-			return false
 		}
-		request = *state.pending
-		state.pending = nil
-		state.startedAt = time.Now().UnixNano()
-		request.startedAt = state.startedAt
-		state.activeInvalidatedAt = request.invalidatedAt
-		state.activeInvalidationOrder = request.invalidationOrder
-		state.mu.Unlock()
-	}
+	}()
 }
 
 func (s *Service) triggerBackgroundCacheFetchAt(
@@ -744,10 +748,6 @@ func (s *Service) triggerBackgroundCacheFetchAt(
 		invalidatedAt:     invalidatedAt.at,
 		invalidationOrder: invalidatedAt.order,
 	}
-	if s.backgroundWarmSuperseded(bucket, key, request) {
-		return
-	}
-
 	for {
 		// Publish the fetch epoch with the marker. A write can arrive before the
 		// goroutine is scheduled, and must still be able to retain its warm rather
