@@ -67,13 +67,15 @@ type Service struct {
 	forwarder                   RequestForwarder
 	cache                       *cache.Cache
 	config                      *config.Config
-	cacheSemaphore              chan struct{}               // Count ceiling on concurrent cache-populate ops (nil = unlimited)
-	populateBudget              *byteBudget                 // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
-	perPopulateCap              int64                       // Max bytes a foreground broadcast populate can buffer
-	backgroundPopulateWriterCap int64                       // Bytes reserved for direct writer buffers before response inspection
-	broadcastManager            *broadcast.Manager          // For streaming request coalescing
-	activeBackgroundFetches     sync.Map                    // Dedup for background full-object fetches (range caching)
-	invalidationOrder           atomic.Uint64               // Strict ordering for same-key write warms
+	cacheSemaphore              chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
+	populateBudget              *byteBudget        // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
+	perPopulateCap              int64              // Max bytes a foreground broadcast populate can buffer
+	backgroundPopulateWriterCap int64              // Bytes reserved for direct writer buffers before response inspection
+	broadcastManager            *broadcast.Manager // For streaming request coalescing
+	activeBackgroundFetches     sync.Map           // Dedup for background full-object fetches (range caching)
+	invalidationOrder           atomic.Uint64      // Strict ordering for same-key write warms
+	backgroundWarmOrderMu       sync.Mutex         // Guards completed warm-order memory
+	backgroundWarmOrders        *expirable.LRU[string, uint64]
 	blockFetchMu                sync.Mutex                  // Guards blockFetches
 	blockFetches                map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
 	// recentFooterWork suppresses repeat footer scans for an object version that was
@@ -273,6 +275,14 @@ func (s *Service) clampPopulateWeight(w int64) int64 {
 const (
 	// maxFooterWorkTracking bounds the set of recently scanned object versions.
 	maxFooterWorkTracking = 65536
+
+	// maxBackgroundWarmOrderTracking bounds completed write epochs retained to reject
+	// a delayed detached trigger after the active state has been removed.
+	maxBackgroundWarmOrderTracking = 65536
+
+	// backgroundWarmOrderCooldown bounds how long a completed write epoch rejects a
+	// delayed trigger; this is a safety net for detached goroutines, not a cache TTL.
+	backgroundWarmOrderCooldown = 5 * time.Minute
 
 	// footerWorkCooldown is how long a footer scan is suppressed for one object
 	// version after it completes. Short enough that an evicted footer is re-warmed

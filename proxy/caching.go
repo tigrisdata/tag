@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
@@ -620,6 +621,27 @@ func (r backgroundFetchRequest) isAtOrAfter(other backgroundFetchRequest) bool {
 	return r.invalidatedAt >= other.invalidatedAt
 }
 
+// observeBackgroundWarmOrder remembers the newest production write order for a
+// key after a trigger has been admitted. The bounded memory closes the lifetime
+// gap after a serialized worker removes its active marker but before a delayed
+// older tee fallback reaches the dedup map.
+func (s *Service) observeBackgroundWarmOrder(bcastKey string, order uint64) bool {
+	if order == 0 {
+		return false
+	}
+	s.backgroundWarmOrderMu.Lock()
+	defer s.backgroundWarmOrderMu.Unlock()
+	if s.backgroundWarmOrders == nil {
+		s.backgroundWarmOrders = expirable.NewLRU[string, uint64](maxBackgroundWarmOrderTracking, nil, backgroundWarmOrderCooldown)
+	}
+	latest, found := s.backgroundWarmOrders.Get(bcastKey)
+	if found && order <= latest {
+		return true
+	}
+	s.backgroundWarmOrders.Add(bcastKey, order)
+	return false
+}
+
 // backgroundFetchState is stored only for bg: entries in activeBackgroundFetches.
 // Other prefixes in that map use their existing struct{} markers. The state keeps
 // one replaceable pending write warm without allowing two full-object fetches for
@@ -685,6 +707,10 @@ func (s *Service) triggerBackgroundCacheFetchAt(
 		prio:              prio,
 		invalidatedAt:     invalidatedAt.at,
 		invalidationOrder: invalidatedAt.order,
+	}
+	if s.observeBackgroundWarmOrder(bcastKey, request.invalidationOrder) {
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Coalesced delayed background warm from an older write")
+		return
 	}
 
 	for {
