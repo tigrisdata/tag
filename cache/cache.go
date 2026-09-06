@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/rs/zerolog/log"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/ocache/coordinator"
@@ -57,15 +58,27 @@ func newTombstoneOwner() uint64 {
 	return atomic.AddUint64(&tombstoneOwnerSequence, 1)
 }
 
+// tombstoneKeyLock serializes tombstone writes for one key. refs lets the registry
+// discard idle locks without losing the order retained in tombstoneOrders.
+type tombstoneKeyLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
 // Cache wraps ocache client for TAG.
 type Cache struct {
-	client         cacheclient.CacheClient
-	defaultTTL     int64 // seconds
-	tombstoneTTL   int64 // seconds; must outlive the longest racing cache-populate
-	enabled        bool
-	closed         bool
-	tombstoneMu    sync.Mutex // Serializes timestamp/order fences for same-process writers.
-	tombstoneOwner uint64     // Identifies this process-local invalidation order space.
+	client           cacheclient.CacheClient
+	defaultTTL       int64 // seconds
+	tombstoneTTL     int64 // seconds; must outlive the longest racing cache-populate
+	enabled          bool
+	closed           bool
+	tombstoneLocksMu sync.Mutex
+	tombstoneLocks   map[string]*tombstoneKeyLock
+	// tombstoneOrders retains local invalidation order for at least as long as the
+	// durable tombstone. A zero-sized expirable LRU is bounded by tombstone TTL,
+	// not by an arbitrary key-count eviction that could forget a live fence.
+	tombstoneOrders *expirable.LRU[string, uint64]
+	tombstoneOwner  uint64 // Identifies this process-local invalidation order space.
 }
 
 // NewCacheWithClient creates a cache with an injected client.
@@ -81,12 +94,15 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 		enabled = cfg.IsEnabled()
 		sizeThreshold = cfg.SizeThreshold
 	}
+	tombstoneTTL := TombstoneTTLSeconds(sizeThreshold)
 	return &Cache{
-		client:         client,
-		defaultTTL:     ttl,
-		tombstoneTTL:   TombstoneTTLSeconds(sizeThreshold),
-		enabled:        enabled,
-		tombstoneOwner: newTombstoneOwner(),
+		client:          client,
+		defaultTTL:      ttl,
+		tombstoneTTL:    tombstoneTTL,
+		enabled:         enabled,
+		tombstoneLocks:  make(map[string]*tombstoneKeyLock),
+		tombstoneOrders: expirable.NewLRU[string, uint64](0, nil, time.Duration(tombstoneTTL)*time.Second+time.Minute),
+		tombstoneOwner:  newTombstoneOwner(),
 	}
 }
 
@@ -103,6 +119,31 @@ func NewDisabledCache() *Cache {
 // IsEnabled returns true if the cache is enabled.
 func (c *Cache) IsEnabled() bool {
 	return c.enabled && !c.closed
+}
+
+// acquireTombstoneKeyLock serializes the read/choose/write decision for one
+// tombstone key without making unrelated keys wait on backend I/O. The order
+// itself lives in tombstoneOrders, so an idle lock can be discarded safely.
+func (c *Cache) acquireTombstoneKeyLock(key string) func() {
+	c.tombstoneLocksMu.Lock()
+	lock := c.tombstoneLocks[key]
+	if lock == nil {
+		lock = &tombstoneKeyLock{}
+		c.tombstoneLocks[key] = lock
+	}
+	lock.refs++
+	c.tombstoneLocksMu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		c.tombstoneLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 && c.tombstoneLocks[key] == lock {
+			delete(c.tombstoneLocks, key)
+		}
+		c.tombstoneLocksMu.Unlock()
+	}
 }
 
 // ============================================================================
@@ -760,39 +801,33 @@ func (c *Cache) WriteTombstone(ctx context.Context, bucket, key string) error {
 }
 
 // WriteTombstoneWithOrder writes an invalidation marker and retains the greatest
-// order already present in this Cache instance's owner namespace. The short
-// read/choose/write section is serialized so overlapping writes in one proxy
-// cannot replace a newer order with an older post-forward invalidation. Orders
-// from another proxy are ignored; their timestamp fence is still shared.
+// order already issued by this Cache instance for the key. The local order table
+// avoids a backend read on ordinary invalidations; a per-key lock keeps concurrent
+// writes from replacing a newer order with an older post-forward invalidation.
+// Orders from another Cache instance are ignored; their timestamp fence is still
+// shared.
 func (c *Cache) WriteTombstoneWithOrder(ctx context.Context, bucket, key string, order uint64) error {
 	if !c.IsEnabled() {
 		return nil
 	}
-	c.tombstoneMu.Lock()
-	defer c.tombstoneMu.Unlock()
 
 	tombKey := MakeTombstoneKey(bucket, key)
-	if previous, err := c.client.Get(ctx, tombKey); err == nil {
-		if len(previous) >= 24 && binary.BigEndian.Uint64(previous[8:16]) == c.tombstoneOwner {
-			previousOrder := binary.BigEndian.Uint64(previous[16:24])
-			if previousOrder > order {
-				order = previousOrder
-			}
-		}
-	} else if !isNotFoundError(err) {
-		// The existing order is unknown, but the invalidation still needs a
-		// durable fence before DeleteWithOrder removes metadata. Use the maximum
-		// order so an older local warm cannot pass the conservative replacement.
-		// A successful write preserves correctness; a failed write is returned
-		// below and the caller still reports an incomplete invalidation.
-		order = ^uint64(0)
+	unlock := c.acquireTombstoneKeyLock(tombKey)
+	defer unlock()
+
+	if previousOrder, ok := c.tombstoneOrders.Get(tombKey); ok && previousOrder > order {
+		order = previousOrder
 	}
 
 	data := make([]byte, 24)
 	binary.BigEndian.PutUint64(data[:8], uint64(time.Now().UnixNano()))
 	binary.BigEndian.PutUint64(data[8:16], c.tombstoneOwner)
 	binary.BigEndian.PutUint64(data[16:], order)
-	return c.client.Put(ctx, tombKey, data, c.tombstoneTTL)
+	if err := c.client.Put(ctx, tombKey, data, c.tombstoneTTL); err != nil {
+		return err
+	}
+	c.tombstoneOrders.Add(tombKey, order)
+	return nil
 }
 
 // GetTombstoneTimestamp retrieves the tombstone timestamp for a key.

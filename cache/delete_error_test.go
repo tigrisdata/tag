@@ -86,10 +86,10 @@ func TestDeleteWithMeta_SuccessReturnsNil(t *testing.T) {
 	}
 }
 
-// A transient read failure while retaining the prior order must not leave the
-// metadata deletion without a tombstone fence. The conservative replacement
-// order blocks a stale writer even though the old order was unavailable.
-func TestDeleteWithOrder_ReadFailureStillWritesFence(t *testing.T) {
+// A tombstone order already issued by this Cache must remain the fence without
+// another backend read. This keeps invalidations for unrelated keys independent
+// of tombstone-read latency or failure.
+func TestDeleteWithOrder_RetainsLocalFenceWithoutTombstoneRead(t *testing.T) {
 	ctx := context.Background()
 	backendDown := errors.New("tombstone read unavailable")
 	client := &flakyClient{CacheClient: cacheclient.NewMemoryCache()}
@@ -108,11 +108,14 @@ func TestDeleteWithOrder_ReadFailureStillWritesFence(t *testing.T) {
 	if err := c.DeleteWithOrder(ctx, "b", "k", 3); err != nil {
 		t.Fatalf("DeleteWithOrder: %v", err)
 	}
+	// The injected read failure is still armed because WriteTombstoneWithOrder
+	// uses the local order table. Clear it before the read-side assertions.
+	client.getErr = nil
 	if _, found, err := c.GetMeta(ctx, "b", "k"); err != nil || found {
 		t.Fatalf("metadata after invalidation: found=%v err=%v", found, err)
 	}
-	if got := c.GetTombstoneOrder(ctx, "b", "k"); got != ^uint64(0) {
-		t.Fatalf("replacement tombstone order = %d, want %d", got, ^uint64(0))
+	if got := c.GetTombstoneOrder(ctx, "b", "k"); got != 9 {
+		t.Fatalf("replacement tombstone order = %d, want 9", got)
 	}
 
 	wrote, err := c.PutWithMetaStreamTombstoneAware(
