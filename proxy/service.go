@@ -620,8 +620,9 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandlePutObject")
 
 	// Invalidate cache BEFORE forwarding to ensure consistency
-	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
-	s.invalidateObject(context.Background(), bucket, key)
+	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails.
+	// Retain this epoch's write order so an older overlapping PUT cannot replace a newer warm.
+	writeOrder := s.invalidateObjectWithOrder(context.Background(), bucket, key, s.nextInvalidationOrder())
 
 	// Forward to Tigris, recording the upstream status. When eligible, forwardPutMaybeTee
 	// tees the decoded body so we can populate the cache directly (write-through) instead of
@@ -642,6 +643,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
 		invalidatedAt := s.invalidateObject(context.Background(), bucket, key)
+		invalidatedAt.order = writeOrder.order
 		teeHandled := requestRejectsCache
 		if teed != nil {
 			// writeThroughCache takes ownership of the reserved populate budget.
@@ -783,9 +785,11 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleCopyObject")
 
 	// Invalidate cache for destination object BEFORE forwarding to ensure consistency
-	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
+	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails.
+	// Retain this epoch's write order so an older overlapping copy cannot replace a newer warm.
+	var writeOrder invalidationEpoch
 	if s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		writeOrder = s.invalidateObjectWithOrder(context.Background(), bucket, key, s.nextInvalidationOrder())
 	}
 
 	// Forward to upstream, capturing the response so we can confirm the copy
@@ -802,6 +806,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// unchanged, so re-invalidating would only discard a valid racing refill.
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
 		invalidatedAt := s.invalidateObject(context.Background(), bucket, key)
+		invalidatedAt.order = writeOrder.order
 		s.warmOnWrite(r, bucket, key, invalidatedAt)
 		s.warmParquetFooterOnWrite(r, bucket, key)
 	}
@@ -846,10 +851,16 @@ func (s *Service) nextInvalidationOrder() uint64 {
 // carries the post-delete timestamp for fetch-order checks and the pre-delete order
 // for concurrent write-warm ordering.
 func (s *Service) invalidateObject(ctx context.Context, bucket, key string) invalidationEpoch {
+	return s.invalidateObjectWithOrder(ctx, bucket, key, 0)
+}
+
+func (s *Service) invalidateObjectWithOrder(ctx context.Context, bucket, key string, order uint64) invalidationEpoch {
 	if !s.cache.IsEnabled() {
 		return invalidationEpoch{}
 	}
-	order := s.nextInvalidationOrder()
+	if order == 0 {
+		order = s.nextInvalidationOrder()
+	}
 	if err := s.cache.Delete(ctx, bucket, key); err != nil {
 		metrics.RecordCacheOperation("delete", "error")
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache invalidation failed")
@@ -951,7 +962,9 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// upload overwrites the object, so any previously cached version is now stale;
 	// like PutObject/DeleteObject/CopyObject, invalidate up front so a forward that
 	// succeeds but whose post-invalidation fails can't leave stale data served.
-	s.invalidateObject(context.Background(), bucket, key)
+	// Retain this epoch's write order so an older overlapping completion cannot replace
+	// a newer warm.
+	writeOrder := s.invalidateObjectWithOrder(context.Background(), bucket, key, s.nextInvalidationOrder())
 
 	// Forward to upstream with response capture
 	capture, err := s.forwarder.ForwardWithCapture(ctx, w, r)
@@ -968,6 +981,7 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	completed := s3WriteSucceeded(capture)
 	if completed && s.cache.IsEnabled() {
 		invalidatedAt := s.invalidateObject(context.Background(), bucket, key)
+		invalidatedAt.order = writeOrder.order
 		// Warm-on-write is the only way to make a multipart-completed object hot:
 		// TAG never sees its assembled body, so a write-through tee is impossible.
 		s.warmOnWrite(r, bucket, key, invalidatedAt)
