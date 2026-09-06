@@ -780,7 +780,12 @@ func (c *Cache) WriteTombstoneWithOrder(ctx context.Context, bucket, key string,
 			}
 		}
 	} else if !isNotFoundError(err) {
-		return err
+		// The existing order is unknown, but the invalidation still needs a
+		// durable fence before DeleteWithOrder removes metadata. Use the maximum
+		// order so an older local warm cannot pass the conservative replacement.
+		// A successful write preserves correctness; a failed write is returned
+		// below and the caller still reports an incomplete invalidation.
+		order = ^uint64(0)
 	}
 
 	data := make([]byte, 24)
