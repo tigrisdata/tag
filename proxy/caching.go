@@ -756,6 +756,9 @@ func (s *Service) nextBackgroundFetch(
 		if state.pending != nil {
 			candidate = state.pending
 			state.pending = nil
+			// Keep the candidate's write epoch visible while the metadata
+			// recheck runs, so an older detached trigger cannot replace it.
+			state.activeInvalidatedAt = candidate.invalidatedAt
 		}
 		if candidate == nil {
 			state.closed = true
@@ -776,6 +779,7 @@ func (s *Service) nextBackgroundFetch(
 			// supersedes the candidate, and must get its own visibility check.
 			candidate = state.pending
 			state.pending = nil
+			state.activeInvalidatedAt = candidate.invalidatedAt
 			state.mu.Unlock()
 			continue
 		}
