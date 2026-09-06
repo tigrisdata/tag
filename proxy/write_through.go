@@ -194,6 +194,11 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 		// the slot, which the warm's (separate) blocking acquire then observes.
 		metrics.WarmOnWriteTriggered.Inc()
 		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite)
+		// The optional observer is test-only proof support. It lets a deterministic
+		// benchmark join the detached trigger without changing production behavior.
+		if observer, ok := s.forwarder.(interface{ backgroundWarmTriggerComplete() }); ok {
+			observer.backgroundWarmTriggerComplete()
+		}
 	}()
 	return true
 }

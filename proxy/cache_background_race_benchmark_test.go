@@ -37,19 +37,16 @@ func (b *benchmarkRaceBody) Read(p []byte) (int, error) {
 
 func (b *benchmarkRaceBody) Close() error { return nil }
 
-// waitBenchmarkBackgroundFetchGone waits for the entire serialized bg worker,
-// including a pending replacement on Candidate, to finish before the post-write
-// read in the measured write-to-read lifecycle.
-func waitBenchmarkTriggerWindow(b *testing.B) {
+// waitBenchmarkWarmTrigger waits until the detached tee-fallback goroutine has
+// completed its dedup call. The observer fires after the call returns on both the
+// old marker implementation and the Candidate state machine, so releasing the
+// gated stale fetch cannot race the trigger itself.
+func waitBenchmarkWarmTrigger(b *testing.B, done <-chan struct{}) {
 	b.Helper()
-	deadline := time.After(5 * time.Millisecond)
-	for {
-		select {
-		case <-deadline:
-			return
-		default:
-			runtime.Gosched()
-		}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		b.Fatal("tee fallback trigger did not join the background fetch")
 	}
 }
 
@@ -93,6 +90,7 @@ func BenchmarkPostWriteCacheWarmAfterStaleBackgroundFetch(b *testing.B) {
 		releaseOld := make(chan struct{})
 		oldBodyStarted := make(chan struct{})
 		headDone := make(chan struct{})
+		warmTriggerDone := make(chan struct{})
 		fullCalls := atomic.Int32{}
 		puts := atomic.Int32{}
 
@@ -122,8 +120,9 @@ func BenchmarkPostWriteCacheWarmAfterStaleBackgroundFetch(b *testing.B) {
 					return nil, errors.New("unexpected background fetch")
 				},
 			},
-			teeFunc:  teeUpstream(&puts, `"put-etag"`),
-			headHook: func() { close(headDone) },
+			teeFunc:         teeUpstream(&puts, `"put-etag"`),
+			headHook:        func() { close(headDone) },
+			warmTriggerDone: warmTriggerDone,
 		}
 		cfg := newTestConfigForBenchmark()
 		cacheStore := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
@@ -145,9 +144,9 @@ func BenchmarkPostWriteCacheWarmAfterStaleBackgroundFetch(b *testing.B) {
 		case <-time.After(time.Second):
 			b.Fatal("tee fallback did not issue HEAD")
 		}
-		// The fallback trigger is detached from HandlePutObject. Poll through a
-		// bounded channel window so it observes the active marker on both arms.
-		waitBenchmarkTriggerWindow(b)
+		// The fallback trigger is detached from HandlePutObject. Join its dedup call
+		// before releasing the stale owner so the comparison cannot miss the race.
+		waitBenchmarkWarmTrigger(b, warmTriggerDone)
 		close(releaseOld)
 		waitBenchmarkBackgroundFetchGone(b, svc, bucket, key)
 
