@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
@@ -72,6 +73,7 @@ type Service struct {
 	backgroundPopulateWriterCap int64                       // Bytes reserved for direct writer buffers before response inspection
 	broadcastManager            *broadcast.Manager          // For streaming request coalescing
 	activeBackgroundFetches     sync.Map                    // Dedup for background full-object fetches (range caching)
+	invalidationEpoch           atomic.Int64                // Strict ordering for same-key write warms
 	blockFetchMu                sync.Mutex                  // Guards blockFetches
 	blockFetches                map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
 	// recentFooterWork suppresses repeat footer scans for an object version that was
@@ -827,13 +829,30 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 	return !isS3ErrorBody(capture.Body)
 }
 
+// nextInvalidationEpoch returns a process-local, strictly increasing epoch. Wall-clock
+// calls can share a nanosecond, but the pending warm slot must still distinguish two
+// concurrent writes so a delayed older trigger cannot replace newer credentials.
+// The epoch is local to Service because activeBackgroundFetches is local to Service.
+func (s *Service) nextInvalidationEpoch() int64 {
+	for {
+		now := time.Now().UnixNano()
+		previous := s.invalidationEpoch.Load()
+		if now <= previous {
+			now = previous + 1
+		}
+		if s.invalidationEpoch.CompareAndSwap(previous, now) {
+			return now
+		}
+	}
+}
+
 // invalidateObject removes an object's cached metadata (writing a tombstone) and
 // records the true outcome of the attempt. A failed backend invalidation is recorded
 // as an error rather than success: a false-green delete metric would hide the very
 // read-after-write hazard the invalidation exists to prevent, since the stale entry
 // is still in place. It is a no-op when the cache is disabled. The returned timestamp
-// is the invalidation epoch used to retain a write warm behind an older background
-// fetch without adding another cache read to the write path.
+// is the strictly ordered invalidation epoch used to retain a write warm behind an
+// older background fetch without adding another cache read to the write path.
 func (s *Service) invalidateObject(ctx context.Context, bucket, key string) int64 {
 	if !s.cache.IsEnabled() {
 		return 0
@@ -841,14 +860,14 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) int6
 	if err := s.cache.Delete(ctx, bucket, key); err != nil {
 		metrics.RecordCacheOperation("delete", "error")
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache invalidation failed")
-		return time.Now().UnixNano()
+		return s.nextInvalidationEpoch()
 	}
 	metrics.RecordCacheOperation("delete", "success")
 	// This timestamp is taken after the tombstone write and metadata delete. A
 	// background fetch that started before it may have read the old object and is
 	// therefore the fetch that a following write-origin warm must not be allowed
-	// to suppress.
-	return time.Now().UnixNano()
+	// to suppress. nextInvalidationEpoch also makes concurrent calls distinct.
+	return s.nextInvalidationEpoch()
 }
 
 // warmOnWrite repopulates the cache after a successful write by triggering a
