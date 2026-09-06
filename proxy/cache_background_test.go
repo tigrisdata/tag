@@ -619,6 +619,50 @@ func TestBackgroundFetch_QueuesLatestWarmAfterWriteInvalidation(t *testing.T) {
 	}
 }
 
+func TestNextBackgroundFetch_AnonymousWarmRequiresPublicMetadata(t *testing.T) {
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(false)
+	const (
+		bucket = "background-bucket"
+		key    = "anonymous-visibility"
+	)
+
+	svc, cacheStore := newBackgroundCacheService(t, cfg, func() *http.Response {
+		return cacheableGetResponse("replacement", `"replacement-etag"`)
+	})
+	if err := cacheStore.PutWithMeta(
+		context.Background(),
+		bucket,
+		key,
+		&cache.CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"signed-etag"`, ACL: "private"},
+		[]byte("signed-body"),
+		0,
+	); err != nil {
+		t.Fatalf("seed private metadata: %v", err)
+	}
+
+	bcastKey := "bg:" + bucket + "/" + key
+	state := &backgroundFetchState{
+		pending: &backgroundFetchRequest{
+			anonymous:     true,
+			prio:          priorityWarmWrite,
+			invalidatedAt: 1,
+		},
+	}
+	svc.activeBackgroundFetches.Store(bcastKey, state)
+	request, ok := svc.nextBackgroundFetch(bcastKey, bucket, key, state)
+	if !ok {
+		t.Fatal("anonymous warm was suppressed by private metadata")
+	}
+	if !request.anonymous {
+		t.Fatal("replacement request lost anonymous authorization")
+	}
+	state.mu.Lock()
+	state.closed = true
+	state.mu.Unlock()
+	svc.activeBackgroundFetches.CompareAndDelete(bcastKey, state)
+}
+
 func closedSignal() <-chan struct{} {
 	ch := make(chan struct{})
 	close(ch)

@@ -743,10 +743,12 @@ func (s *Service) recordBackgroundFetchResult(bucket, key string, err error) {
 }
 
 // nextBackgroundFetch takes the latest pending warm and checks the visibility
-// gate after the active owner exits. A visible entry means the active fetch or
-// another writer already supplied the current object, so no replacement GET is
-// needed. A metadata error is logged but treated as absent so a transient cache
-// read failure does not silently strand the promised write warm.
+// gate after the active owner exits. A visible entry that the pending request can
+// read means the active fetch or another writer already supplied the current
+// object, so no replacement GET is needed. A signed entry is not visible to an
+// anonymous warm unless its ACL proves public read. A metadata error is logged
+// but treated as absent so a transient cache read failure does not silently strand
+// the promised write warm.
 func (s *Service) nextBackgroundFetch(
 	bcastKey, bucket, key string, state *backgroundFetchState,
 ) (backgroundFetchRequest, bool) {
@@ -768,10 +770,11 @@ func (s *Service) nextBackgroundFetch(
 		}
 		state.mu.Unlock()
 
-		_, found, err := s.cache.GetMeta(context.Background(), bucket, key)
+		meta, found, err := s.cache.GetMeta(context.Background(), bucket, key)
 		if err != nil {
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Pending background warm metadata check failed; retrying")
 		}
+		visibleToCandidate := found && (!candidate.anonymous || (meta != nil && meta.IsPublicRead()))
 
 		state.mu.Lock()
 		if state.pending != nil {
@@ -783,7 +786,7 @@ func (s *Service) nextBackgroundFetch(
 			state.mu.Unlock()
 			continue
 		}
-		if found {
+		if visibleToCandidate {
 			state.closed = true
 			state.mu.Unlock()
 			s.activeBackgroundFetches.CompareAndDelete(bcastKey, state)
