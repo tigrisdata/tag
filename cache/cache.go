@@ -3,11 +3,14 @@ package cache
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -39,13 +42,30 @@ var ErrNotFound = errors.New("not found in cache")
 // ErrCacheDisabled indicates the cache is disabled.
 var ErrCacheDisabled = errors.New("cache is disabled")
 
+// Seeded by wall time so independently started proxy processes do not reuse the
+// same local invalidation-order namespace. The order itself remains comparable
+// only inside one Cache instance; the timestamp fence remains the shared guard.
+var tombstoneOwnerSequence = uint64(time.Now().UnixNano())
+
+func newTombstoneOwner() uint64 {
+	var random [8]byte
+	if _, err := cryptorand.Read(random[:]); err == nil {
+		if owner := binary.BigEndian.Uint64(random[:]); owner != 0 {
+			return owner
+		}
+	}
+	return atomic.AddUint64(&tombstoneOwnerSequence, 1)
+}
+
 // Cache wraps ocache client for TAG.
 type Cache struct {
-	client       cacheclient.CacheClient
-	defaultTTL   int64 // seconds
-	tombstoneTTL int64 // seconds; must outlive the longest racing cache-populate
-	enabled      bool
-	closed       bool
+	client         cacheclient.CacheClient
+	defaultTTL     int64 // seconds
+	tombstoneTTL   int64 // seconds; must outlive the longest racing cache-populate
+	enabled        bool
+	closed         bool
+	tombstoneMu    sync.Mutex // Serializes timestamp/order fences for same-process writers.
+	tombstoneOwner uint64     // Identifies this process-local invalidation order space.
 }
 
 // NewCacheWithClient creates a cache with an injected client.
@@ -62,10 +82,11 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 		sizeThreshold = cfg.SizeThreshold
 	}
 	return &Cache{
-		client:       client,
-		defaultTTL:   ttl,
-		tombstoneTTL: TombstoneTTLSeconds(sizeThreshold),
-		enabled:      enabled,
+		client:         client,
+		defaultTTL:     ttl,
+		tombstoneTTL:   TombstoneTTLSeconds(sizeThreshold),
+		enabled:        enabled,
+		tombstoneOwner: newTombstoneOwner(),
 	}
 }
 
@@ -73,8 +94,9 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 // All operations return successfully with "not found" or nil results.
 func NewDisabledCache() *Cache {
 	return &Cache{
-		enabled:      false,
-		tombstoneTTL: MinTombstoneTTLSeconds,
+		enabled:        false,
+		tombstoneTTL:   MinTombstoneTTLSeconds,
+		tombstoneOwner: newTombstoneOwner(),
 	}
 }
 
@@ -320,6 +342,14 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w i
 // invalidation while stale metadata is still readable. A not-found metadata delete is
 // success — the entry is already gone.
 func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
+	return c.DeleteWithOrder(ctx, bucket, key, 0)
+}
+
+// DeleteWithOrder removes an object's metadata and records the write order in
+// its tombstone. A non-zero order lets a delayed local warm prove that a later
+// invalidation has already superseded it, even after the in-process dedup state
+// is gone.
+func (c *Cache) DeleteWithOrder(ctx context.Context, bucket, key string, order uint64) error {
 	if !c.IsEnabled() {
 		return nil
 	}
@@ -329,7 +359,7 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	// Write tombstone FIRST - prevents in-flight writes from completing. A failure
 	// here leaves the invalidation incomplete (an in-flight populate could resurrect
 	// the entry), so it is a real failure — but still continue to the meta delete.
-	if err := c.WriteTombstone(ctx, bucket, key); err != nil {
+	if err := c.WriteTombstoneWithOrder(ctx, bucket, key, order); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).
 			Msg("Failed to write tombstone (continuing with delete)")
 		errs = append(errs, fmt.Errorf("write tombstone: %w", err))
@@ -358,11 +388,7 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 
 // Delete removes an object from the cache.
 func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
-	if !c.IsEnabled() {
-		return nil
-	}
-
-	return c.DeleteWithMeta(ctx, bucket, key)
+	return c.DeleteWithOrder(ctx, bucket, key, 0)
 }
 
 // recordServeLocality records whether a successful body read for bodyKey was
@@ -726,16 +752,41 @@ func TombstoneTTLSeconds(sizeThreshold int64) int64 {
 }
 
 // WriteTombstone writes an invalidation marker for a key.
-// The value is the timestamp as 8 bytes (int64 big-endian).
-// This is used to prevent stale cache writes from completing after invalidation.
+// The value starts with the timestamp as 8 bytes (int64 big-endian). Newer
+// writers append a process-local owner and invalidation order so delayed warm
+// triggers can be rejected after the in-process dedup state is removed.
 func (c *Cache) WriteTombstone(ctx context.Context, bucket, key string) error {
+	return c.WriteTombstoneWithOrder(ctx, bucket, key, 0)
+}
+
+// WriteTombstoneWithOrder writes an invalidation marker and retains the greatest
+// order already present in this Cache instance's owner namespace. The short
+// read/choose/write section is serialized so overlapping writes in one proxy
+// cannot replace a newer order with an older post-forward invalidation. Orders
+// from another proxy are ignored; their timestamp fence is still shared.
+func (c *Cache) WriteTombstoneWithOrder(ctx context.Context, bucket, key string, order uint64) error {
 	if !c.IsEnabled() {
 		return nil
 	}
+	c.tombstoneMu.Lock()
+	defer c.tombstoneMu.Unlock()
+
 	tombKey := MakeTombstoneKey(bucket, key)
-	ts := time.Now().UnixNano()
-	data := make([]byte, 8)
-	binary.BigEndian.PutUint64(data, uint64(ts))
+	if previous, err := c.client.Get(ctx, tombKey); err == nil {
+		if len(previous) >= 24 && binary.BigEndian.Uint64(previous[8:16]) == c.tombstoneOwner {
+			previousOrder := binary.BigEndian.Uint64(previous[16:24])
+			if previousOrder > order {
+				order = previousOrder
+			}
+		}
+	} else if !isNotFoundError(err) {
+		return err
+	}
+
+	data := make([]byte, 24)
+	binary.BigEndian.PutUint64(data[:8], uint64(time.Now().UnixNano()))
+	binary.BigEndian.PutUint64(data[8:16], c.tombstoneOwner)
+	binary.BigEndian.PutUint64(data[16:], order)
 	return c.client.Put(ctx, tombKey, data, c.tombstoneTTL)
 }
 
@@ -747,10 +798,24 @@ func (c *Cache) GetTombstoneTimestamp(ctx context.Context, bucket, key string) i
 	}
 	tombKey := MakeTombstoneKey(bucket, key)
 	data, err := c.client.Get(ctx, tombKey)
-	if err != nil || len(data) != 8 {
+	if err != nil || len(data) < 8 {
 		return 0 // No tombstone or invalid data
 	}
-	return int64(binary.BigEndian.Uint64(data))
+	return int64(binary.BigEndian.Uint64(data[:8]))
+}
+
+// GetTombstoneOrder retrieves the optional process-local invalidation order for
+// a key. Legacy tombstones and markers from another Cache instance return zero.
+func (c *Cache) GetTombstoneOrder(ctx context.Context, bucket, key string) uint64 {
+	if !c.IsEnabled() {
+		return 0
+	}
+	tombKey := MakeTombstoneKey(bucket, key)
+	data, err := c.client.Get(ctx, tombKey)
+	if err != nil || len(data) < 24 || binary.BigEndian.Uint64(data[8:16]) != c.tombstoneOwner {
+		return 0
+	}
+	return binary.BigEndian.Uint64(data[16:24])
 }
 
 // ============================================================================

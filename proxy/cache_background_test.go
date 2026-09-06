@@ -619,6 +619,35 @@ func TestBackgroundFetch_QueuesLatestWarmAfterWriteInvalidation(t *testing.T) {
 	}
 }
 
+func TestBackgroundFetch_DelayedOlderWarmBlockedByTombstoneOrder(t *testing.T) {
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(false)
+	var calls atomic.Int32
+	svc, cacheStore := newBackgroundCacheService(t, cfg, func() *http.Response {
+		calls.Add(1)
+		return cacheableGetResponse("body", `"etag"`)
+	})
+	ctx := context.Background()
+	const bucket, key = "background-order-bucket", "background-order-key"
+	if err := cacheStore.WriteTombstoneWithOrder(ctx, bucket, key, 2); err != nil {
+		t.Fatalf("WriteTombstoneWithOrder: %v", err)
+	}
+
+	// The marker is deliberately absent. The durable tombstone fence, rather than
+	// the in-process active map, must reject an older trigger after state removal.
+	svc.triggerBackgroundCacheFetchAfterInvalidation(
+		bucket, key, "old-access", "old-secret", false, priorityWarmWrite,
+		invalidationEpoch{at: time.Now().UnixNano(), order: 1},
+	)
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("delayed older warm started %d fetches, want 0", got)
+	}
+	if _, loaded := svc.activeBackgroundFetches.Load("bg:" + bucket + "/" + key); loaded {
+		t.Fatal("delayed older warm installed an active marker")
+	}
+}
+
 func TestNextBackgroundFetch_AnonymousWarmRequiresPublicMetadata(t *testing.T) {
 	cfg := config.NewDefault()
 	cfg.Cache.SetBlockCachingEnabled(false)

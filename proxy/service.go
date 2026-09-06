@@ -67,15 +67,13 @@ type Service struct {
 	forwarder                   RequestForwarder
 	cache                       *cache.Cache
 	config                      *config.Config
-	cacheSemaphore              chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
-	populateBudget              *byteBudget        // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
-	perPopulateCap              int64              // Max bytes a foreground broadcast populate can buffer
-	backgroundPopulateWriterCap int64              // Bytes reserved for direct writer buffers before response inspection
-	broadcastManager            *broadcast.Manager // For streaming request coalescing
-	activeBackgroundFetches     sync.Map           // Dedup for background full-object fetches (range caching)
-	invalidationOrder           atomic.Uint64      // Strict ordering for same-key write warms
-	backgroundWarmOrderMu       sync.Mutex         // Guards completed warm-order memory
-	backgroundWarmOrders        *expirable.LRU[string, uint64]
+	cacheSemaphore              chan struct{}               // Count ceiling on concurrent cache-populate ops (nil = unlimited)
+	populateBudget              *byteBudget                 // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
+	perPopulateCap              int64                       // Max bytes a foreground broadcast populate can buffer
+	backgroundPopulateWriterCap int64                       // Bytes reserved for direct writer buffers before response inspection
+	broadcastManager            *broadcast.Manager          // For streaming request coalescing
+	activeBackgroundFetches     sync.Map                    // Dedup for background full-object fetches (range caching)
+	invalidationOrder           atomic.Uint64               // Strict ordering for same-key write warms
 	blockFetchMu                sync.Mutex                  // Guards blockFetches
 	blockFetches                map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
 	// recentFooterWork suppresses repeat footer scans for an object version that was
@@ -275,14 +273,6 @@ func (s *Service) clampPopulateWeight(w int64) int64 {
 const (
 	// maxFooterWorkTracking bounds the set of recently scanned object versions.
 	maxFooterWorkTracking = 65536
-
-	// maxBackgroundWarmOrderTracking bounds completed write epochs retained to reject
-	// a delayed detached trigger after the active state has been removed.
-	maxBackgroundWarmOrderTracking = 65536
-
-	// backgroundWarmOrderCooldown bounds how long a completed write epoch rejects a
-	// delayed trigger; this is a safety net for detached goroutines, not a cache TTL.
-	backgroundWarmOrderCooldown = 5 * time.Minute
 
 	// footerWorkCooldown is how long a footer scan is suppressed for one object
 	// version after it completes. Short enough that an evicted footer is re-warmed
@@ -632,7 +622,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// Invalidate cache BEFORE forwarding to ensure consistency
 	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails.
 	// Retain this epoch's write order so an older overlapping PUT cannot replace a newer warm.
-	writeOrder := s.invalidateObjectWithOrder(context.Background(), bucket, key, s.nextInvalidationOrder())
+	writeOrder := s.invalidateObjectBeforeWrite(context.Background(), bucket, key)
 
 	// Forward to Tigris, recording the upstream status. When eligible, forwardPutMaybeTee
 	// tees the decoded body so we can populate the cache directly (write-through) instead of
@@ -652,8 +642,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// Routed through invalidateObject (like the pre-forward call) so a failure of this
 	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		invalidatedAt := s.invalidateObject(context.Background(), bucket, key)
-		invalidatedAt.order = writeOrder.order
+		invalidatedAt := s.invalidateObjectWithOrder(context.Background(), bucket, key, writeOrder.order)
 		teeHandled := requestRejectsCache
 		if teed != nil {
 			// writeThroughCache takes ownership of the reserved populate budget.
@@ -799,7 +788,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// Retain this epoch's write order so an older overlapping copy cannot replace a newer warm.
 	var writeOrder invalidationEpoch
 	if s.cache.IsEnabled() {
-		writeOrder = s.invalidateObjectWithOrder(context.Background(), bucket, key, s.nextInvalidationOrder())
+		writeOrder = s.invalidateObjectBeforeWrite(context.Background(), bucket, key)
 	}
 
 	// Forward to upstream, capturing the response so we can confirm the copy
@@ -815,8 +804,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
 	// unchanged, so re-invalidating would only discard a valid racing refill.
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
-		invalidatedAt := s.invalidateObject(context.Background(), bucket, key)
-		invalidatedAt.order = writeOrder.order
+		invalidatedAt := s.invalidateObjectWithOrder(context.Background(), bucket, key, writeOrder.order)
 		s.warmOnWrite(r, bucket, key, invalidatedAt)
 		s.warmParquetFooterOnWrite(r, bucket, key)
 	}
@@ -861,20 +849,36 @@ func (s *Service) nextInvalidationOrder() uint64 {
 // carries the post-delete timestamp for fetch-order checks and the pre-delete order
 // for concurrent write-warm ordering.
 func (s *Service) invalidateObject(ctx context.Context, bucket, key string) invalidationEpoch {
-	return s.invalidateObjectWithOrder(ctx, bucket, key, 0)
+	return s.invalidateObjectEpoch(ctx, bucket, key, 0, false)
+}
+
+// invalidateObjectBeforeWrite allocates the write order before forwarding, but
+// does not persist it as a warm-generation fence until the write succeeds.
+// A failed write must not suppress an older successful write's warm.
+func (s *Service) invalidateObjectBeforeWrite(ctx context.Context, bucket, key string) invalidationEpoch {
+	return s.invalidateObjectEpoch(ctx, bucket, key, s.nextInvalidationOrder(), false)
 }
 
 func (s *Service) invalidateObjectWithOrder(ctx context.Context, bucket, key string, order uint64) invalidationEpoch {
+	return s.invalidateObjectEpoch(ctx, bucket, key, order, true)
+}
+
+func (s *Service) invalidateObjectEpoch(ctx context.Context, bucket, key string, order uint64, persistWarmOrder bool) invalidationEpoch {
 	if !s.cache.IsEnabled() {
 		return invalidationEpoch{}
 	}
-	if order == 0 {
-		order = s.nextInvalidationOrder()
+	epochOrder := order
+	if epochOrder == 0 {
+		epochOrder = s.nextInvalidationOrder()
 	}
-	if err := s.cache.Delete(ctx, bucket, key); err != nil {
+	cacheOrder := uint64(0)
+	if persistWarmOrder {
+		cacheOrder = order
+	}
+	if err := s.cache.DeleteWithOrder(ctx, bucket, key, cacheOrder); err != nil {
 		metrics.RecordCacheOperation("delete", "error")
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache invalidation failed")
-		return invalidationEpoch{at: time.Now().UnixNano(), order: order}
+		return invalidationEpoch{at: time.Now().UnixNano(), order: epochOrder}
 	}
 	metrics.RecordCacheOperation("delete", "success")
 	// This timestamp is taken after the tombstone write and metadata delete. A
@@ -882,7 +886,7 @@ func (s *Service) invalidateObjectWithOrder(ctx context.Context, bucket, key str
 	// therefore the fetch that a following write-origin warm must not be allowed
 	// to suppress. The separate order preserves write order if deletes complete
 	// out of order.
-	return invalidationEpoch{at: time.Now().UnixNano(), order: order}
+	return invalidationEpoch{at: time.Now().UnixNano(), order: epochOrder}
 }
 
 // warmOnWrite repopulates the cache after a successful write by triggering a
@@ -974,7 +978,7 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// succeeds but whose post-invalidation fails can't leave stale data served.
 	// Retain this epoch's write order so an older overlapping completion cannot replace
 	// a newer warm.
-	writeOrder := s.invalidateObjectWithOrder(context.Background(), bucket, key, s.nextInvalidationOrder())
+	writeOrder := s.invalidateObjectBeforeWrite(context.Background(), bucket, key)
 
 	// Forward to upstream with response capture
 	capture, err := s.forwarder.ForwardWithCapture(ctx, w, r)
@@ -990,8 +994,7 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// object unchanged, doesn't discard a valid racing refill.
 	completed := s3WriteSucceeded(capture)
 	if completed && s.cache.IsEnabled() {
-		invalidatedAt := s.invalidateObject(context.Background(), bucket, key)
-		invalidatedAt.order = writeOrder.order
+		invalidatedAt := s.invalidateObjectWithOrder(context.Background(), bucket, key, writeOrder.order)
 		// Warm-on-write is the only way to make a multipart-completed object hot:
 		// TAG never sees its assembled body, so a write-through tee is impossible.
 		s.warmOnWrite(r, bucket, key, invalidatedAt)

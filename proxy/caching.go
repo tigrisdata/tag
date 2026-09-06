@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
@@ -621,27 +620,6 @@ func (r backgroundFetchRequest) isAtOrAfter(other backgroundFetchRequest) bool {
 	return r.invalidatedAt >= other.invalidatedAt
 }
 
-// observeBackgroundWarmOrder remembers the newest production write order for a
-// key after a trigger has been admitted. The bounded memory closes the lifetime
-// gap after a serialized worker removes its active marker but before a delayed
-// older tee fallback reaches the dedup map.
-func (s *Service) observeBackgroundWarmOrder(bcastKey string, order uint64) bool {
-	if order == 0 {
-		return false
-	}
-	s.backgroundWarmOrderMu.Lock()
-	defer s.backgroundWarmOrderMu.Unlock()
-	if s.backgroundWarmOrders == nil {
-		s.backgroundWarmOrders = expirable.NewLRU[string, uint64](maxBackgroundWarmOrderTracking, nil, backgroundWarmOrderCooldown)
-	}
-	latest, found := s.backgroundWarmOrders.Get(bcastKey)
-	if found && order <= latest {
-		return true
-	}
-	s.backgroundWarmOrders.Add(bcastKey, order)
-	return false
-}
-
 // backgroundFetchState is stored only for bg: entries in activeBackgroundFetches.
 // Other prefixes in that map use their existing struct{} markers. The state keeps
 // one replaceable pending write warm without allowing two full-object fetches for
@@ -688,8 +666,9 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 
 // triggerBackgroundCacheFetchAfterInvalidation retains a write-origin warm when
 // an existing bg fetch started before the successful write's invalidation. The
-// timestamp is supplied by the mutation handler after its tombstone write, so
-// this check does not add a cache read to the client write path.
+// timestamp and order are supplied by the mutation handler after its tombstone
+// write. The durable order check runs in the detached trigger, not on the client
+// write path.
 func (s *Service) triggerBackgroundCacheFetchAfterInvalidation(
 	bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, invalidatedAt invalidationEpoch,
 ) {
@@ -708,9 +687,15 @@ func (s *Service) triggerBackgroundCacheFetchAt(
 		invalidatedAt:     invalidatedAt.at,
 		invalidationOrder: invalidatedAt.order,
 	}
-	if s.observeBackgroundWarmOrder(bcastKey, request.invalidationOrder) {
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Coalesced delayed background warm from an older write")
-		return
+	if request.invalidationOrder > 0 {
+		tombstoneOrder := s.cache.GetTombstoneOrder(context.Background(), bucket, key)
+		if tombstoneOrder > request.invalidationOrder {
+			log.Debug().Str("bucket", bucket).Str("key", key).
+				Uint64("warm_order", request.invalidationOrder).
+				Uint64("tombstone_order", tombstoneOrder).
+				Msg("Coalesced delayed background warm superseded by a newer invalidation")
+			return
+		}
 	}
 
 	for {
