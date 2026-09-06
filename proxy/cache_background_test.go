@@ -554,10 +554,10 @@ func TestBackgroundFetch_QueuesLatestWarmAfterWriteInvalidation(t *testing.T) {
 	newestInvalidatedAt := pendingInvalidatedAt + 2
 	olderInvalidatedAt := pendingInvalidatedAt + 1
 	svc.triggerBackgroundCacheFetchAfterInvalidation(
-		bucket, key, "latest-access", "latest-secret", false, priorityWarmWrite, newestInvalidatedAt,
+		bucket, key, "latest-access", "latest-secret", false, priorityWarmWrite, invalidationEpoch{at: newestInvalidatedAt},
 	)
 	svc.triggerBackgroundCacheFetchAfterInvalidation(
-		bucket, key, "older-access", "older-secret", false, priorityWarmWrite, olderInvalidatedAt,
+		bucket, key, "older-access", "older-secret", false, priorityWarmWrite, invalidationEpoch{at: olderInvalidatedAt},
 	)
 	select {
 	case <-replacement:

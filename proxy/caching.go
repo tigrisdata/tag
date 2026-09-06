@@ -576,16 +576,31 @@ func (s *Service) fetchFullObjectToCache(
 	return cacheErr
 }
 
+// invalidationEpoch separates the post-delete timestamp used to identify stale
+// read fetches from the pre-delete order used to order concurrent write warms.
+type invalidationEpoch struct {
+	at    int64
+	order uint64
+}
+
 // backgroundFetchRequest is the immutable input for one full-object populate.
 // It is copied into a pending slot when a write-origin warm supersedes an older
 // read-origin fetch, so the replacement uses the credentials and authorization
 // mode from the latest write rather than the old fetch.
 type backgroundFetchRequest struct {
-	accessKey     string
-	secretKey     string
-	anonymous     bool
-	prio          populatePriority
-	invalidatedAt int64 // zero for read-origin triggers; otherwise orders write warms
+	accessKey         string
+	secretKey         string
+	anonymous         bool
+	prio              populatePriority
+	invalidatedAt     int64  // zero for read-origin triggers; otherwise post-delete timestamp
+	invalidationOrder uint64 // zero for direct/test triggers; otherwise write order
+}
+
+func (r backgroundFetchRequest) isAtOrAfter(other backgroundFetchRequest) bool {
+	if r.invalidationOrder != 0 && other.invalidationOrder != 0 {
+		return r.invalidationOrder >= other.invalidationOrder
+	}
+	return r.invalidatedAt >= other.invalidatedAt
 }
 
 // backgroundFetchState is stored only for bg: entries in activeBackgroundFetches.
@@ -600,20 +615,22 @@ type backgroundFetchState struct {
 	// activeInvalidatedAt orders a write-origin fetch independently of when its
 	// worker was scheduled. A newer write must supersede an older pending warm
 	// even when the older worker has not reached the origin yet.
-	activeInvalidatedAt int64
-	pending             *backgroundFetchRequest
-	closed              bool
+	activeInvalidatedAt     int64
+	activeInvalidationOrder uint64
+	pending                 *backgroundFetchRequest
+	closed                  bool
 }
 
 // predates reports whether the active request belongs to an earlier
 // invalidation epoch. Write-origin requests use their write epoch rather than
 // the worker's scheduling timestamp, so a newer write cannot be lost in the
 // handoff gap before the older request reaches the origin.
-func (s *backgroundFetchState) predates(invalidatedAt int64) bool {
-	if s.activeInvalidatedAt > 0 {
-		return s.activeInvalidatedAt <= invalidatedAt
+func (s *backgroundFetchState) predates(invalidatedAt int64, invalidationOrder uint64) bool {
+	if s.activeInvalidationOrder > 0 && invalidationOrder > 0 {
+		return s.activeInvalidationOrder <= invalidationOrder
 	}
-	return s.startedAt > 0 && s.startedAt <= invalidatedAt
+	return s.activeInvalidatedAt > 0 && s.activeInvalidatedAt <= invalidatedAt ||
+		s.activeInvalidatedAt == 0 && s.startedAt > 0 && s.startedAt <= invalidatedAt
 }
 
 // triggerBackgroundCacheFetch starts a background fetch of the full object.
@@ -627,7 +644,7 @@ func (s *backgroundFetchState) predates(invalidatedAt int64) bool {
 // ignored. Pass anonymous=true exactly when the triggering request was anonymous, so
 // public-read is only ever inferred from a confirmed anonymous read.
 func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority) {
-	s.triggerBackgroundCacheFetchAt(bucket, key, accessKey, secretKey, anonymous, prio, 0)
+	s.triggerBackgroundCacheFetchAt(bucket, key, accessKey, secretKey, anonymous, prio, invalidationEpoch{})
 }
 
 // triggerBackgroundCacheFetchAfterInvalidation retains a write-origin warm when
@@ -635,21 +652,22 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 // timestamp is supplied by the mutation handler after its tombstone write, so
 // this check does not add a cache read to the client write path.
 func (s *Service) triggerBackgroundCacheFetchAfterInvalidation(
-	bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, invalidatedAt int64,
+	bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, invalidatedAt invalidationEpoch,
 ) {
 	s.triggerBackgroundCacheFetchAt(bucket, key, accessKey, secretKey, anonymous, prio, invalidatedAt)
 }
 
 func (s *Service) triggerBackgroundCacheFetchAt(
-	bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, invalidatedAt int64,
+	bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, invalidatedAt invalidationEpoch,
 ) {
 	bcastKey := "bg:" + bucket + "/" + key
 	request := backgroundFetchRequest{
-		accessKey:     accessKey,
-		secretKey:     secretKey,
-		anonymous:     anonymous,
-		prio:          prio,
-		invalidatedAt: invalidatedAt,
+		accessKey:         accessKey,
+		secretKey:         secretKey,
+		anonymous:         anonymous,
+		prio:              prio,
+		invalidatedAt:     invalidatedAt.at,
+		invalidationOrder: invalidatedAt.order,
 	}
 
 	for {
@@ -657,8 +675,9 @@ func (s *Service) triggerBackgroundCacheFetchAt(
 		// goroutine is scheduled, and must still be able to retain its warm rather
 		// than observing a zero start time and coalescing it away.
 		state := &backgroundFetchState{
-			startedAt:           time.Now().UnixNano(),
-			activeInvalidatedAt: request.invalidatedAt,
+			startedAt:               time.Now().UnixNano(),
+			activeInvalidatedAt:     request.invalidatedAt,
+			activeInvalidationOrder: request.invalidationOrder,
 		}
 		actual, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, state)
 		if !loaded {
@@ -683,8 +702,8 @@ func (s *Service) triggerBackgroundCacheFetchAt(
 			// trigger arriving at that boundary cannot be stranded.
 			continue
 		}
-		if prio == priorityWarmWrite && invalidatedAt > 0 && active.predates(invalidatedAt) {
-			if active.pending == nil || invalidatedAt >= active.pending.invalidatedAt {
+		if prio == priorityWarmWrite && invalidatedAt.at > 0 && active.predates(invalidatedAt.at, invalidatedAt.order) {
+			if active.pending == nil || request.isAtOrAfter(*active.pending) {
 				pending := request
 				active.pending = &pending // latest invalidation's credentials and priority win
 				active.mu.Unlock()
@@ -761,6 +780,7 @@ func (s *Service) nextBackgroundFetch(
 			// Keep the candidate's write epoch visible while the metadata
 			// recheck runs, so an older detached trigger cannot replace it.
 			state.activeInvalidatedAt = candidate.invalidatedAt
+			state.activeInvalidationOrder = candidate.invalidationOrder
 		}
 		if candidate == nil {
 			state.closed = true
@@ -783,6 +803,7 @@ func (s *Service) nextBackgroundFetch(
 			candidate = state.pending
 			state.pending = nil
 			state.activeInvalidatedAt = candidate.invalidatedAt
+			state.activeInvalidationOrder = candidate.invalidationOrder
 			state.mu.Unlock()
 			continue
 		}
@@ -797,6 +818,7 @@ func (s *Service) nextBackgroundFetch(
 		request := *candidate
 		state.startedAt = time.Now().UnixNano()
 		state.activeInvalidatedAt = request.invalidatedAt
+		state.activeInvalidationOrder = request.invalidationOrder
 		state.mu.Unlock()
 		return request, true
 	}

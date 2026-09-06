@@ -156,7 +156,7 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 // caller warms.
 // The reserved populate budget is always released: synchronously on decline, or when the
 // async work completes.
-func (s *Service) writeThroughCache(bucket, key string, ts *teeState, invalidatedAt int64) bool {
+func (s *Service) writeThroughCache(bucket, key string, ts *teeState, invalidatedAt invalidationEpoch) bool {
 	putETag := ts.respHeaders.Get("ETag")
 	// Credentials were validated and derived by ForwardTeeingBody (no re-validation here). The
 	// async goroutine uses only these captured values — never r, which the server may recycle

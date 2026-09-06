@@ -73,7 +73,7 @@ type Service struct {
 	backgroundPopulateWriterCap int64                       // Bytes reserved for direct writer buffers before response inspection
 	broadcastManager            *broadcast.Manager          // For streaming request coalescing
 	activeBackgroundFetches     sync.Map                    // Dedup for background full-object fetches (range caching)
-	invalidationEpoch           atomic.Int64                // Strict ordering for same-key write warms
+	invalidationOrder           atomic.Uint64               // Strict ordering for same-key write warms
 	blockFetchMu                sync.Mutex                  // Guards blockFetches
 	blockFetches                map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
 	// recentFooterWork suppresses repeat footer scans for an object version that was
@@ -829,45 +829,39 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 	return !isS3ErrorBody(capture.Body)
 }
 
-// nextInvalidationEpoch returns a process-local, strictly increasing epoch. Wall-clock
-// calls can share a nanosecond, but the pending warm slot must still distinguish two
-// concurrent writes so a delayed older trigger cannot replace newer credentials.
-// The epoch is local to Service because activeBackgroundFetches is local to Service.
-func (s *Service) nextInvalidationEpoch() int64 {
-	for {
-		now := time.Now().UnixNano()
-		previous := s.invalidationEpoch.Load()
-		if now <= previous {
-			now = previous + 1
-		}
-		if s.invalidationEpoch.CompareAndSwap(previous, now) {
-			return now
-		}
-	}
+// nextInvalidationOrder returns a process-local, strictly increasing write order.
+// It is allocated when invalidation begins, before cache deletion can block, so an
+// older same-key write cannot receive a larger order merely because its delete was
+// delayed. The order is local to Service because activeBackgroundFetches is local
+// to Service.
+func (s *Service) nextInvalidationOrder() uint64 {
+	return s.invalidationOrder.Add(1)
 }
 
 // invalidateObject removes an object's cached metadata (writing a tombstone) and
 // records the true outcome of the attempt. A failed backend invalidation is recorded
 // as an error rather than success: a false-green delete metric would hide the very
 // read-after-write hazard the invalidation exists to prevent, since the stale entry
-// is still in place. It is a no-op when the cache is disabled. The returned timestamp
-// is the strictly ordered invalidation epoch used to retain a write warm behind an
-// older background fetch without adding another cache read to the write path.
-func (s *Service) invalidateObject(ctx context.Context, bucket, key string) int64 {
+// is still in place. It is a no-op when the cache is disabled. The returned epoch
+// carries the post-delete timestamp for fetch-order checks and the pre-delete order
+// for concurrent write-warm ordering.
+func (s *Service) invalidateObject(ctx context.Context, bucket, key string) invalidationEpoch {
 	if !s.cache.IsEnabled() {
-		return 0
+		return invalidationEpoch{}
 	}
+	order := s.nextInvalidationOrder()
 	if err := s.cache.Delete(ctx, bucket, key); err != nil {
 		metrics.RecordCacheOperation("delete", "error")
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache invalidation failed")
-		return s.nextInvalidationEpoch()
+		return invalidationEpoch{at: time.Now().UnixNano(), order: order}
 	}
 	metrics.RecordCacheOperation("delete", "success")
 	// This timestamp is taken after the tombstone write and metadata delete. A
 	// background fetch that started before it may have read the old object and is
 	// therefore the fetch that a following write-origin warm must not be allowed
-	// to suppress. nextInvalidationEpoch also makes concurrent calls distinct.
-	return s.nextInvalidationEpoch()
+	// to suppress. The separate order preserves write order if deletes complete
+	// out of order.
+	return invalidationEpoch{at: time.Now().UnixNano(), order: order}
 }
 
 // warmOnWrite repopulates the cache after a successful write by triggering a
@@ -900,7 +894,7 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) int6
 // A warm that collides with a fetch started after this write's invalidation remains
 // coalesced into that fetch, because that fetch already belongs to the current
 // invalidation epoch.
-func (s *Service) warmOnWrite(r *http.Request, bucket, key string, invalidatedAt int64) {
+func (s *Service) warmOnWrite(r *http.Request, bucket, key string, invalidatedAt invalidationEpoch) {
 	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
 		return
 	}
