@@ -675,6 +675,63 @@ func (s *Service) triggerBackgroundCacheFetchAfterInvalidation(
 	s.triggerBackgroundCacheFetchAt(bucket, key, accessKey, secretKey, anonymous, prio, invalidatedAt)
 }
 
+func (s *Service) backgroundWarmSuperseded(bucket, key string, request backgroundFetchRequest) bool {
+	if request.invalidationOrder == 0 {
+		return false
+	}
+	ctx := context.Background()
+	tombstoneOrder := s.cache.GetTombstoneOrder(ctx, bucket, key)
+	// The order is owner-scoped because invalidationOrder is process-local. A
+	// foreign/legacy tombstone still has a shared timestamp fence, which closes
+	// the same delayed-trigger gap across proxy instances.
+	tombstoneAt := int64(0)
+	if tombstoneOrder == 0 {
+		tombstoneAt = s.cache.GetTombstoneTimestamp(ctx, bucket, key)
+	}
+	if tombstoneOrder > request.invalidationOrder ||
+		(tombstoneOrder == 0 && tombstoneAt > request.invalidatedAt) {
+		log.Debug().Str("bucket", bucket).Str("key", key).
+			Int64("warm_invalidated_at", request.invalidatedAt).
+			Int64("tombstone_at", tombstoneAt).
+			Uint64("warm_order", request.invalidationOrder).
+			Uint64("tombstone_order", tombstoneOrder).
+			Msg("Coalesced delayed background warm superseded by a newer invalidation")
+		return true
+	}
+	return false
+}
+
+// startUnstartedBackgroundFetch performs the final durable-fence check after
+// the state is published. If a newer warm arrived while that check ran, it is
+// promoted into the reserved state so the marker never strands a pending warm.
+func (s *Service) startUnstartedBackgroundFetch(
+	bcastKey, bucket, key string, state *backgroundFetchState, request backgroundFetchRequest,
+) bool {
+	for {
+		if !s.backgroundWarmSuperseded(bucket, key, request) {
+			metrics.RecordBackgroundFetchTriggered()
+			metrics.ActiveBackgroundFetches.Inc()
+			go s.runBackgroundCacheFetch(bcastKey, bucket, key, state, request)
+			return true
+		}
+
+		state.mu.Lock()
+		if state.pending == nil {
+			state.closed = true
+			state.mu.Unlock()
+			s.activeBackgroundFetches.CompareAndDelete(bcastKey, state)
+			return false
+		}
+		request = *state.pending
+		state.pending = nil
+		state.startedAt = time.Now().UnixNano()
+		request.startedAt = state.startedAt
+		state.activeInvalidatedAt = request.invalidatedAt
+		state.activeInvalidationOrder = request.invalidationOrder
+		state.mu.Unlock()
+	}
+}
+
 func (s *Service) triggerBackgroundCacheFetchAt(
 	bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, invalidatedAt invalidationEpoch,
 ) {
@@ -687,26 +744,8 @@ func (s *Service) triggerBackgroundCacheFetchAt(
 		invalidatedAt:     invalidatedAt.at,
 		invalidationOrder: invalidatedAt.order,
 	}
-	if request.invalidationOrder > 0 {
-		ctx := context.Background()
-		tombstoneOrder := s.cache.GetTombstoneOrder(ctx, bucket, key)
-		// The order is owner-scoped because invalidationOrder is process-local. A
-		// foreign/legacy tombstone still has a shared timestamp fence, which closes
-		// the same delayed-trigger gap across proxy instances.
-		tombstoneAt := int64(0)
-		if tombstoneOrder == 0 {
-			tombstoneAt = s.cache.GetTombstoneTimestamp(ctx, bucket, key)
-		}
-		if tombstoneOrder > request.invalidationOrder ||
-			(tombstoneOrder == 0 && tombstoneAt > request.invalidatedAt) {
-			log.Debug().Str("bucket", bucket).Str("key", key).
-				Int64("warm_invalidated_at", request.invalidatedAt).
-				Int64("tombstone_at", tombstoneAt).
-				Uint64("warm_order", request.invalidationOrder).
-				Uint64("tombstone_order", tombstoneOrder).
-				Msg("Coalesced delayed background warm superseded by a newer invalidation")
-			return
-		}
+	if s.backgroundWarmSuperseded(bucket, key, request) {
+		return
 	}
 
 	for {
@@ -721,9 +760,7 @@ func (s *Service) triggerBackgroundCacheFetchAt(
 		request.startedAt = state.startedAt
 		actual, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, state)
 		if !loaded {
-			metrics.RecordBackgroundFetchTriggered()
-			metrics.ActiveBackgroundFetches.Inc()
-			go s.runBackgroundCacheFetch(bcastKey, bucket, key, state, request)
+			s.startUnstartedBackgroundFetch(bcastKey, bucket, key, state, request)
 			return
 		}
 
