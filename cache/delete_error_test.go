@@ -139,6 +139,52 @@ func TestDeleteWithOrder_RetainsLocalFenceWithoutTombstoneRead(t *testing.T) {
 	}
 }
 
+func TestWriteTombstoneWithOrder_EvictedReadFailureLeavesTimestampFence(t *testing.T) {
+	ctx := context.Background()
+	backendDown := errors.New("evicted tombstone read unavailable")
+	client := &flakyClient{CacheClient: cacheclient.NewMemoryCache()}
+	c := newCacheWithClientForTest(t, client)
+	const bucket, key = "eviction-failure-bucket", "retained"
+
+	if err := c.WriteTombstoneWithOrder(ctx, bucket, key, 9); err != nil {
+		t.Fatalf("seed tombstone: %v", err)
+	}
+	for i := 0; i < tombstoneOrderCacheCapacity; i++ {
+		if err := c.WriteTombstoneWithOrder(ctx, bucket, "other-"+strconv.Itoa(i), uint64(i+1)); err != nil {
+			t.Fatalf("fill tombstone order cache at %d: %v", i, err)
+		}
+	}
+
+	writeStart := time.Now().UnixNano()
+	client.getErr = backendDown
+	if err := c.DeleteWithOrder(ctx, bucket, key, 3); err == nil {
+		t.Fatal("evicted tombstone read failure was not reported")
+	}
+	client.getErr = nil
+	if got := c.GetTombstoneOrder(ctx, bucket, key); got != 0 {
+		t.Fatalf("fallback tombstone order = %d, want unknown order 0", got)
+	}
+	if c.GetTombstoneTimestamp(ctx, bucket, key) <= writeStart {
+		t.Fatal("fallback tombstone did not preserve a newer timestamp fence")
+	}
+
+	wrote, err := c.PutWithMetaStreamTombstoneAware(
+		ctx,
+		bucket,
+		key,
+		&CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"stale"`, ContentLength: 3, StatusCode: 200},
+		bytes.NewReader([]byte("old")),
+		60,
+		writeStart,
+	)
+	if err != nil {
+		t.Fatalf("stale populate: %v", err)
+	}
+	if wrote {
+		t.Fatal("stale populate bypassed fallback timestamp fence")
+	}
+}
+
 func TestWriteTombstoneWithOrder_EvictedOrderReadsDurableFence(t *testing.T) {
 	ctx := context.Background()
 	client := cacheclient.NewMemoryCache()

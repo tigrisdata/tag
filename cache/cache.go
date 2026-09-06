@@ -904,8 +904,14 @@ func (c *Cache) WriteTombstoneWithOrder(ctx context.Context, bucket, key string,
 			// The local order was evicted but the durable fence has expired or
 			// was never written. The caller's order is safe to use.
 		default:
-			// Do not overwrite an unknown durable order after eviction. The
-			// caller still invalidates metadata, but reports the marker failure.
+			// Preserve the timestamp fence even though the order is unknown. A
+			// later warm can use the timestamp path, while returning the read
+			// error tells the caller the ordered invalidation was incomplete.
+			fallback := make([]byte, 8)
+			binary.BigEndian.PutUint64(fallback, uint64(time.Now().UnixNano()))
+			if putErr := c.client.Put(ctx, tombKey, fallback, c.tombstoneTTL); putErr != nil {
+				return errors.Join(err, putErr)
+			}
 			return err
 		}
 	}
