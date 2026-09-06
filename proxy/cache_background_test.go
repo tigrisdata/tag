@@ -633,18 +633,29 @@ func TestBackgroundFetch_DelayedOlderWarmBlockedByTombstoneOrder(t *testing.T) {
 		t.Fatalf("WriteTombstoneWithOrder: %v", err)
 	}
 
-	// The marker is deliberately absent. The durable tombstone fence, rather than
-	// the in-process active map, must reject an older trigger after state removal.
-	svc.triggerBackgroundCacheFetchAfterInvalidation(
-		bucket, key, "old-access", "old-secret", false, priorityWarmWrite,
-		invalidationEpoch{at: time.Now().UnixNano(), order: 1},
-	)
-	time.Sleep(50 * time.Millisecond)
+	// Model a warm retained by an active owner before a newer write invalidated the
+	// key. The handoff must recheck the durable order; checking only metadata would
+	// start this old-credential request after the newer write.
+	bcastKey := "bg:" + bucket + "/" + key
+	state := &backgroundFetchState{
+		pending: &backgroundFetchRequest{
+			accessKey:         "old-access",
+			secretKey:         "old-secret",
+			prio:              priorityWarmWrite,
+			invalidatedAt:     time.Now().UnixNano(),
+			invalidationOrder: 1,
+		},
+	}
+	svc.activeBackgroundFetches.Store(bcastKey, state)
+	request, ok := svc.nextBackgroundFetch(bcastKey, bucket, key, state)
+	if ok {
+		t.Fatalf("stale pending warm was promoted with credentials %q/%q", request.accessKey, request.secretKey)
+	}
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("delayed older warm started %d fetches, want 0", got)
 	}
-	if _, loaded := svc.activeBackgroundFetches.Load("bg:" + bucket + "/" + key); loaded {
-		t.Fatal("delayed older warm installed an active marker")
+	if _, loaded := svc.activeBackgroundFetches.Load(bcastKey); loaded {
+		t.Fatal("delayed older warm left an active marker")
 	}
 }
 

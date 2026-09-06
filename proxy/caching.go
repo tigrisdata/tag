@@ -838,26 +838,29 @@ func (s *Service) recordBackgroundFetchResult(bucket, key string, err error) {
 	}
 }
 
-// nextBackgroundFetch takes the latest pending warm and checks the visibility
-// gate after the active owner exits. A visible entry that the pending request can
-// read means the active fetch or another writer already supplied the current
-// object, so no replacement GET is needed. A signed entry is not visible to an
-// anonymous warm unless its ACL proves public read. A metadata error is logged
-// but treated as absent so a transient cache read failure does not silently strand
-// the promised write warm.
+// nextBackgroundFetch takes the latest pending warm and checks both the visibility
+// gate and the durable invalidation fence after the active owner exits. A visible
+// entry that the pending request can read means the active fetch or another writer
+// already supplied the current object, so no replacement GET is needed. A signed
+// entry is not visible to an anonymous warm unless its ACL proves public read. A
+// metadata error is logged but treated as absent so a transient cache read failure
+// does not silently strand the promised write warm.
+//
+// The replacement's startedAt is assigned before either check. If a newer
+// invalidation lands after the checks but before the origin request starts, the
+// tombstone-aware cache write still sees that invalidation as newer and cannot
+// publish the stale response.
 func (s *Service) nextBackgroundFetch(
 	bcastKey, bucket, key string, state *backgroundFetchState,
 ) (backgroundFetchRequest, bool) {
 	var candidate *backgroundFetchRequest
 	for {
 		state.mu.Lock()
-		if state.pending != nil {
-			candidate = state.pending
-			state.pending = nil
-			// Keep the candidate's write epoch visible while the metadata
-			// recheck runs, so an older detached trigger cannot replace it.
-			state.activeInvalidatedAt = candidate.invalidatedAt
-			state.activeInvalidationOrder = candidate.invalidationOrder
+		if candidate == nil {
+			if state.pending != nil {
+				candidate = state.pending
+				state.pending = nil
+			}
 		}
 		if candidate == nil {
 			state.closed = true
@@ -865,6 +868,14 @@ func (s *Service) nextBackgroundFetch(
 			s.activeBackgroundFetches.CompareAndDelete(bcastKey, state)
 			return backgroundFetchRequest{}, false
 		}
+
+		// Establish the replacement's cache-write fence before reading metadata or
+		// the durable invalidation order. A tombstone that lands after this point
+		// blocks the replacement even if it arrives in the handoff window.
+		state.startedAt = time.Now().UnixNano()
+		candidate.startedAt = state.startedAt
+		state.activeInvalidatedAt = candidate.invalidatedAt
+		state.activeInvalidationOrder = candidate.invalidationOrder
 		state.mu.Unlock()
 
 		meta, found, err := s.cache.GetMeta(context.Background(), bucket, key)
@@ -872,31 +883,28 @@ func (s *Service) nextBackgroundFetch(
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Pending background warm metadata check failed; retrying")
 		}
 		visibleToCandidate := found && (!candidate.anonymous || (meta != nil && meta.IsPublicRead()))
+		superseded := s.backgroundWarmSuperseded(bucket, key, *candidate)
 
 		state.mu.Lock()
 		if state.pending != nil {
-			// A newer write arrived while the metadata check was in flight. It
-			// supersedes the candidate, and must get its own visibility check.
+			// A newer write arrived while the metadata or fence check was in
+			// flight. It supersedes the candidate, and must get its own checks.
 			candidate = state.pending
 			state.pending = nil
-			state.activeInvalidatedAt = candidate.invalidatedAt
-			state.activeInvalidationOrder = candidate.invalidationOrder
 			state.mu.Unlock()
 			continue
 		}
-		if visibleToCandidate {
+		if visibleToCandidate || superseded {
 			state.closed = true
 			state.mu.Unlock()
 			s.activeBackgroundFetches.CompareAndDelete(bcastKey, state)
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Pending background warm suppressed by visible metadata")
+			if visibleToCandidate {
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Pending background warm suppressed by visible metadata")
+			}
 			return backgroundFetchRequest{}, false
 		}
 
 		request := *candidate
-		state.startedAt = time.Now().UnixNano()
-		request.startedAt = state.startedAt
-		state.activeInvalidatedAt = request.invalidatedAt
-		state.activeInvalidationOrder = request.invalidationOrder
 		state.mu.Unlock()
 		return request, true
 	}
