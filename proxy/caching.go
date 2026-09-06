@@ -595,10 +595,25 @@ type backgroundFetchRequest struct {
 type backgroundFetchState struct {
 	mu sync.Mutex
 	// startedAt is assigned before the dedup marker is published, so no trigger
-	// can observe an active state without an invalidation epoch.
+	// can observe an active state without an execution epoch.
 	startedAt int64
-	pending   *backgroundFetchRequest
-	closed    bool
+	// activeInvalidatedAt orders a write-origin fetch independently of when its
+	// worker was scheduled. A newer write must supersede an older pending warm
+	// even when the older worker has not reached the origin yet.
+	activeInvalidatedAt int64
+	pending             *backgroundFetchRequest
+	closed              bool
+}
+
+// predates reports whether the active request belongs to an earlier
+// invalidation epoch. Write-origin requests use their write epoch rather than
+// the worker's scheduling timestamp, so a newer write cannot be lost in the
+// handoff gap before the older request reaches the origin.
+func (s *backgroundFetchState) predates(invalidatedAt int64) bool {
+	if s.activeInvalidatedAt > 0 {
+		return s.activeInvalidatedAt <= invalidatedAt
+	}
+	return s.startedAt > 0 && s.startedAt <= invalidatedAt
 }
 
 // triggerBackgroundCacheFetch starts a background fetch of the full object.
@@ -641,7 +656,10 @@ func (s *Service) triggerBackgroundCacheFetchAt(
 		// Publish the fetch epoch with the marker. A write can arrive before the
 		// goroutine is scheduled, and must still be able to retain its warm rather
 		// than observing a zero start time and coalescing it away.
-		state := &backgroundFetchState{startedAt: time.Now().UnixNano()}
+		state := &backgroundFetchState{
+			startedAt:           time.Now().UnixNano(),
+			activeInvalidatedAt: request.invalidatedAt,
+		}
 		actual, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, state)
 		if !loaded {
 			metrics.RecordBackgroundFetchTriggered()
@@ -665,7 +683,7 @@ func (s *Service) triggerBackgroundCacheFetchAt(
 			// trigger arriving at that boundary cannot be stranded.
 			continue
 		}
-		if prio == priorityWarmWrite && invalidatedAt > 0 && active.startedAt > 0 && active.startedAt <= invalidatedAt {
+		if prio == priorityWarmWrite && invalidatedAt > 0 && active.predates(invalidatedAt) {
 			if active.pending == nil || invalidatedAt >= active.pending.invalidatedAt {
 				pending := request
 				active.pending = &pending // latest invalidation's credentials and priority win
@@ -771,6 +789,7 @@ func (s *Service) nextBackgroundFetch(
 
 		request := *candidate
 		state.startedAt = time.Now().UnixNano()
+		state.activeInvalidatedAt = request.invalidatedAt
 		state.mu.Unlock()
 		return request, true
 	}
