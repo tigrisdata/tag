@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -135,6 +136,28 @@ func TestDeleteWithOrder_RetainsLocalFenceWithoutTombstoneRead(t *testing.T) {
 	}
 	if _, found, _ := c.GetMeta(ctx, "b", "k"); found {
 		t.Fatal("stale populate published metadata after invalidation")
+	}
+}
+
+func TestWriteTombstoneWithOrder_EvictedOrderReadsDurableFence(t *testing.T) {
+	ctx := context.Background()
+	client := cacheclient.NewMemoryCache()
+	c := newCacheWithClientForTest(t, client)
+	const bucket = "eviction-bucket"
+
+	if err := c.WriteTombstoneWithOrder(ctx, bucket, "retained", 9); err != nil {
+		t.Fatalf("seed tombstone: %v", err)
+	}
+	for i := 0; i < tombstoneOrderCacheCapacity; i++ {
+		if err := c.WriteTombstoneWithOrder(ctx, bucket, "other-"+strconv.Itoa(i), uint64(i+1)); err != nil {
+			t.Fatalf("fill tombstone order cache at %d: %v", i, err)
+		}
+	}
+	if err := c.WriteTombstoneWithOrder(ctx, bucket, "retained", 3); err != nil {
+		t.Fatalf("rewrite evicted tombstone: %v", err)
+	}
+	if got := c.GetTombstoneOrder(ctx, bucket, "retained"); got != 9 {
+		t.Fatalf("evicted tombstone order = %d, want 9", got)
 	}
 }
 

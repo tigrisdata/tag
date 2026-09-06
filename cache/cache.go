@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"strings"
 	"sync"
@@ -48,6 +49,16 @@ var ErrCacheDisabled = errors.New("cache is disabled")
 // only inside one Cache instance; the timestamp fence remains the shared guard.
 var tombstoneOwnerSequence = uint64(time.Now().UnixNano())
 
+const (
+	// Keep the fast path bounded while retaining enough recent keys to avoid a
+	// durable-order read for ordinary low-cardinality traffic. Evicted keys are
+	// tracked by a no-false-negative Bloom filter and use the durable marker as
+	// the correctness-preserving fallback.
+	tombstoneOrderCacheCapacity = 16 * 1024
+	tombstoneEvictionFilterBits = 1 << 22
+	tombstoneEvictionHashCount  = 4
+)
+
 func newTombstoneOwner() uint64 {
 	var random [8]byte
 	if _, err := cryptorand.Read(random[:]); err == nil {
@@ -65,6 +76,65 @@ type tombstoneKeyLock struct {
 	refs int
 }
 
+// tombstoneEvictionFilter remembers keys whose local order was evicted. It is a
+// Bloom filter rather than another key map: false positives cause an extra
+// durable read, but there are no false negatives that could permit an order
+// downgrade. The bitset never grows and is scoped to one Cache owner.
+type tombstoneEvictionFilter struct {
+	mu      sync.RWMutex
+	seed    maphash.Seed
+	bits    []uint64
+	evicted atomic.Bool
+}
+
+func newTombstoneEvictionFilter() *tombstoneEvictionFilter {
+	return &tombstoneEvictionFilter{
+		seed: maphash.MakeSeed(),
+		bits: make([]uint64, tombstoneEvictionFilterBits/64),
+	}
+}
+
+func (f *tombstoneEvictionFilter) positions(key string) [tombstoneEvictionHashCount]uint64 {
+	var h maphash.Hash
+	h.SetSeed(f.seed)
+	_, _ = h.WriteString(key)
+	x := h.Sum64()
+	var positions [tombstoneEvictionHashCount]uint64
+	for i := range positions {
+		x += 0x9e3779b97f4a7c15
+		z := x
+		z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+		z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+		positions[i] = (z ^ (z >> 31)) & (tombstoneEvictionFilterBits - 1)
+	}
+	return positions
+}
+
+func (f *tombstoneEvictionFilter) add(key string) {
+	positions := f.positions(key)
+	f.mu.Lock()
+	for _, position := range positions {
+		f.bits[position/64] |= uint64(1) << (position % 64)
+	}
+	f.mu.Unlock()
+	f.evicted.Store(true)
+}
+
+func (f *tombstoneEvictionFilter) mayContain(key string) bool {
+	if !f.evicted.Load() {
+		return false
+	}
+	positions := f.positions(key)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, position := range positions {
+		if f.bits[position/64]&(uint64(1)<<(position%64)) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // Cache wraps ocache client for TAG.
 type Cache struct {
 	client           cacheclient.CacheClient
@@ -74,11 +144,12 @@ type Cache struct {
 	closed           bool
 	tombstoneLocksMu sync.Mutex
 	tombstoneLocks   map[string]*tombstoneKeyLock
-	// tombstoneOrders retains local invalidation order for at least as long as the
-	// durable tombstone. A zero-sized expirable LRU is bounded by tombstone TTL,
-	// not by an arbitrary key-count eviction that could forget a live fence.
-	tombstoneOrders *expirable.LRU[string, uint64]
-	tombstoneOwner  uint64 // Identifies this process-local invalidation order space.
+	// tombstoneOrders retains recent local invalidation order for at least as long
+	// as the durable tombstone. When capacity evicts a live key, the eviction filter
+	// directs later writes to the durable marker instead of permitting a downgrade.
+	tombstoneOrders         *expirable.LRU[string, uint64]
+	tombstoneEvictionFilter *tombstoneEvictionFilter
+	tombstoneOwner          uint64 // Identifies this process-local invalidation order space.
 }
 
 // NewCacheWithClient creates a cache with an injected client.
@@ -95,14 +166,20 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 		sizeThreshold = cfg.SizeThreshold
 	}
 	tombstoneTTL := TombstoneTTLSeconds(sizeThreshold)
+	evictionFilter := newTombstoneEvictionFilter()
 	return &Cache{
-		client:          client,
-		defaultTTL:      ttl,
-		tombstoneTTL:    tombstoneTTL,
-		enabled:         enabled,
-		tombstoneLocks:  make(map[string]*tombstoneKeyLock),
-		tombstoneOrders: expirable.NewLRU[string, uint64](0, nil, time.Duration(tombstoneTTL)*time.Second+time.Minute),
-		tombstoneOwner:  newTombstoneOwner(),
+		client:         client,
+		defaultTTL:     ttl,
+		tombstoneTTL:   tombstoneTTL,
+		enabled:        enabled,
+		tombstoneLocks: make(map[string]*tombstoneKeyLock),
+		tombstoneOrders: expirable.NewLRU(
+			tombstoneOrderCacheCapacity,
+			func(key string, _ uint64) { evictionFilter.add(key) },
+			time.Duration(tombstoneTTL)*time.Second+time.Minute,
+		),
+		tombstoneEvictionFilter: evictionFilter,
+		tombstoneOwner:          newTombstoneOwner(),
 	}
 }
 
@@ -815,7 +892,24 @@ func (c *Cache) WriteTombstoneWithOrder(ctx context.Context, bucket, key string,
 	unlock := c.acquireTombstoneKeyLock(tombKey)
 	defer unlock()
 
-	if previousOrder, ok := c.tombstoneOrders.Get(tombKey); ok && previousOrder > order {
+	previousOrder, foundLocal := c.tombstoneOrders.Get(tombKey)
+	if !foundLocal && c.tombstoneEvictionFilter != nil && c.tombstoneEvictionFilter.mayContain(tombKey) {
+		previous, err := c.client.Get(ctx, tombKey)
+		switch {
+		case err == nil:
+			if len(previous) >= 24 && binary.BigEndian.Uint64(previous[8:16]) == c.tombstoneOwner {
+				previousOrder = binary.BigEndian.Uint64(previous[16:24])
+			}
+		case isNotFoundError(err):
+			// The local order was evicted but the durable fence has expired or
+			// was never written. The caller's order is safe to use.
+		default:
+			// Do not overwrite an unknown durable order after eviction. The
+			// caller still invalidates metadata, but reports the marker failure.
+			return err
+		}
+	}
+	if previousOrder > order {
 		order = previousOrder
 	}
 
