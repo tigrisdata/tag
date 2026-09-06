@@ -679,9 +679,10 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleDeleteObject")
 
-	// Invalidate cache BEFORE forwarding to ensure consistency
-	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
-	s.invalidateObject(context.Background(), bucket, key)
+	// Invalidate cache BEFORE forwarding to ensure consistency. Retain the
+	// operation order so a successful delete can publish its completed mutation
+	// fence without treating an unsuccessful delete as a newer warm generation.
+	deleteOrder := s.invalidateObjectBeforeWrite(context.Background(), bucket, key)
 
 	// Forward to upstream, recording the upstream status.
 	rec := &statusRecorder{ResponseWriter: w}
@@ -693,10 +694,10 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// tombstone blocks that stale repopulation.
 	// Gated on a 2xx: a rejected DELETE leaves the object present, so re-invalidating
 	// would only discard a valid racing refill and cause an unnecessary later miss.
-	// Routed through invalidateObject (like the pre-forward call) so a failure of this
+	// Routed through the ordered invalidation helper so a failure of this
 	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		s.invalidateObjectWithOrder(context.Background(), bucket, key, deleteOrder.order)
 	}
 
 	status := "success"
@@ -849,10 +850,10 @@ func (s *Service) nextInvalidationOrder() uint64 {
 // carries the post-delete timestamp for fetch-order checks and the pre-delete order
 // for concurrent write-warm ordering.
 func (s *Service) invalidateObject(ctx context.Context, bucket, key string) invalidationEpoch {
-	// Ordinary invalidations also need a durable order. Otherwise a DELETE
-	// following a write can reuse the write's order and let that write's delayed
-	// warm pass the tombstone recheck.
-	return s.invalidateObjectEpoch(ctx, bucket, key, 0, true)
+	// This is the pre-mutation/cache-only form. A mutation handler that confirms
+	// success must follow it with invalidateObjectWithOrder so a failed operation
+	// does not publish a durable warm-supersession order.
+	return s.invalidateObjectEpoch(ctx, bucket, key, 0, false)
 }
 
 // invalidateObjectBeforeWrite allocates the write order before forwarding, but

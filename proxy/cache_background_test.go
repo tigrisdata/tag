@@ -619,28 +619,30 @@ func TestBackgroundFetch_QueuesLatestWarmAfterWriteInvalidation(t *testing.T) {
 	}
 }
 
-func TestInvalidateObject_OrdinaryInvalidationAdvancesWarmOrder(t *testing.T) {
+func TestDeleteInvalidationPublishesWarmOrderOnlyAfterSuccess(t *testing.T) {
 	cfg := config.NewDefault()
 	cfg.Cache.SetBlockCachingEnabled(false)
 	svc, cacheStore := newBackgroundCacheService(t, cfg, func() *http.Response {
 		return cacheableGetResponse("body", `"etag"`)
 	})
 	ctx := context.Background()
-	const bucket, key = "ordinary-order-bucket", "ordinary-order-key"
+	const bucket, key = "delete-order-bucket", "delete-order-key"
 
 	write := svc.invalidateObjectBeforeWrite(ctx, bucket, key)
-	if got := cacheStore.GetTombstoneOrder(ctx, bucket, key); got != 0 {
-		t.Fatalf("pre-write tombstone order = %d, want 0", got)
+	write = svc.invalidateObjectWithOrder(ctx, bucket, key, write.order)
+	warm := backgroundFetchRequest{invalidatedAt: write.at, invalidationOrder: write.order}
+
+	deleteOrder := svc.invalidateObjectBeforeWrite(ctx, bucket, key)
+	if svc.backgroundWarmSuperseded(bucket, key, warm) {
+		t.Fatal("pre-successful delete superseded the prior warm")
 	}
-	if got := svc.invalidateObjectWithOrder(ctx, bucket, key, write.order); got.order != write.order {
-		t.Fatalf("successful write order = %d, want %d", got.order, write.order)
+	if got := cacheStore.GetTombstoneOrder(ctx, bucket, key); got != write.order {
+		t.Fatalf("pre-successful delete tombstone order = %d, want %d", got, write.order)
 	}
-	ordinary := svc.invalidateObject(ctx, bucket, key)
-	if ordinary.order <= write.order {
-		t.Fatalf("ordinary invalidation order = %d, want greater than write order %d", ordinary.order, write.order)
-	}
-	if got := cacheStore.GetTombstoneOrder(ctx, bucket, key); got != ordinary.order {
-		t.Fatalf("ordinary tombstone order = %d, want %d", got, ordinary.order)
+
+	svc.invalidateObjectWithOrder(ctx, bucket, key, deleteOrder.order)
+	if !svc.backgroundWarmSuperseded(bucket, key, warm) {
+		t.Fatal("successful delete did not supersede the prior warm")
 	}
 }
 
