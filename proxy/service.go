@@ -849,7 +849,10 @@ func (s *Service) nextInvalidationOrder() uint64 {
 // carries the post-delete timestamp for fetch-order checks and the pre-delete order
 // for concurrent write-warm ordering.
 func (s *Service) invalidateObject(ctx context.Context, bucket, key string) invalidationEpoch {
-	return s.invalidateObjectEpoch(ctx, bucket, key, 0, false)
+	// Ordinary invalidations also need a durable order. Otherwise a DELETE
+	// following a write can reuse the write's order and let that write's delayed
+	// warm pass the tombstone recheck.
+	return s.invalidateObjectEpoch(ctx, bucket, key, 0, true)
 }
 
 // invalidateObjectBeforeWrite allocates the write order before forwarding, but
@@ -863,7 +866,7 @@ func (s *Service) invalidateObjectWithOrder(ctx context.Context, bucket, key str
 	return s.invalidateObjectEpoch(ctx, bucket, key, order, true)
 }
 
-func (s *Service) invalidateObjectEpoch(ctx context.Context, bucket, key string, order uint64, persistWarmOrder bool) invalidationEpoch {
+func (s *Service) invalidateObjectEpoch(ctx context.Context, bucket, key string, order uint64, persistTombstoneOrder bool) invalidationEpoch {
 	if !s.cache.IsEnabled() {
 		return invalidationEpoch{}
 	}
@@ -872,8 +875,8 @@ func (s *Service) invalidateObjectEpoch(ctx context.Context, bucket, key string,
 		epochOrder = s.nextInvalidationOrder()
 	}
 	cacheOrder := uint64(0)
-	if persistWarmOrder {
-		cacheOrder = order
+	if persistTombstoneOrder {
+		cacheOrder = epochOrder
 	}
 	if err := s.cache.DeleteWithOrder(ctx, bucket, key, cacheOrder); err != nil {
 		metrics.RecordCacheOperation("delete", "error")
