@@ -639,15 +639,15 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// Routed through invalidateObject (like the pre-forward call) so a failure of this
 	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		invalidatedAt := s.invalidateObject(context.Background(), bucket, key)
 		teeHandled := requestRejectsCache
 		if teed != nil {
 			// writeThroughCache takes ownership of the reserved populate budget.
-			teeHandled = s.writeThroughCache(bucket, key, teed)
+			teeHandled = s.writeThroughCache(bucket, key, teed, invalidatedAt)
 			teed = nil
 		}
 		if !teeHandled {
-			s.warmOnWrite(r, bucket, key)
+			s.warmOnWrite(r, bucket, key, invalidatedAt)
 		}
 		// Independent of warmOnWrite: that caches whole objects and is off here,
 		// while this caches only the metadata region (RFC 0002).
@@ -799,8 +799,8 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
 	// unchanged, so re-invalidating would only discard a valid racing refill.
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
-		s.warmOnWrite(r, bucket, key)
+		invalidatedAt := s.invalidateObject(context.Background(), bucket, key)
+		s.warmOnWrite(r, bucket, key, invalidatedAt)
 		s.warmParquetFooterOnWrite(r, bucket, key)
 	}
 
@@ -831,17 +831,24 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 // records the true outcome of the attempt. A failed backend invalidation is recorded
 // as an error rather than success: a false-green delete metric would hide the very
 // read-after-write hazard the invalidation exists to prevent, since the stale entry
-// is still in place. It is a no-op when the cache is disabled.
-func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
+// is still in place. It is a no-op when the cache is disabled. The returned timestamp
+// is the invalidation epoch used to retain a write warm behind an older background
+// fetch without adding another cache read to the write path.
+func (s *Service) invalidateObject(ctx context.Context, bucket, key string) int64 {
 	if !s.cache.IsEnabled() {
-		return
+		return 0
 	}
 	if err := s.cache.Delete(ctx, bucket, key); err != nil {
 		metrics.RecordCacheOperation("delete", "error")
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache invalidation failed")
-		return
+		return time.Now().UnixNano()
 	}
 	metrics.RecordCacheOperation("delete", "success")
+	// This timestamp is taken after the tombstone write and metadata delete. A
+	// background fetch that started before it may have read the old object and is
+	// therefore the fetch that a following write-origin warm must not be allowed
+	// to suppress.
+	return time.Now().UnixNano()
 }
 
 // warmOnWrite repopulates the cache after a successful write by triggering a
@@ -868,16 +875,13 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
 //     a public-write bucket is never exposed). This mirrors the read path, which
 //     likewise caches public-read only after a successful anonymous read.
 //
-// Best-effort caveat: warms are keyed by bucket/key for dedup, so if any fetch for
-// this key is already in flight — a concurrent read-path warm, or the warm from a
-// rapid prior write to the same key — this warm coalesces into that one and is
-// dropped. When it coalesces into a fetch that predates this write, that fetch's own
-// populate is tombstone-blocked (its writeStartTime is older than this write's
-// invalidation), so it writes nothing either: the key is simply left absent, not
-// left stale. The next read then misses and inline-populates the current object.
-// This can never serve a stale object — the same tombstone that blocks the racing
-// populate is the read-after-write guard.
-func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
+// Best-effort caveat: warms are keyed by bucket/key for dedup. A write-origin warm
+// that collides with an older read-path fetch is retained as one latest pending
+// request; it runs after the older fetch finishes only if metadata is still absent.
+// A warm that collides with a fetch started after this write's invalidation remains
+// coalesced into that fetch, because that fetch already belongs to the current
+// invalidation epoch.
+func (s *Service) warmOnWrite(r *http.Request, bucket, key string, invalidatedAt int64) {
 	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
 		return
 	}
@@ -886,7 +890,7 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	// probe). See the doc comment: never infer public-read from a public write.
 	if hasNoAuthCredentials(r) {
 		metrics.WarmOnWriteTriggered.Inc()
-		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*anonymous*/, priorityWarmWrite)
+		s.triggerBackgroundCacheFetchAfterInvalidation(bucket, key, "", "", true /*anonymous*/, priorityWarmWrite, invalidatedAt)
 		return
 	}
 
@@ -895,7 +899,7 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 		return
 	}
 	metrics.WarmOnWriteTriggered.Inc()
-	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite)
+	s.triggerBackgroundCacheFetchAfterInvalidation(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, invalidatedAt)
 }
 
 // HandlePassthrough handles requests that are passed through without caching.
@@ -950,10 +954,10 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// object unchanged, doesn't discard a valid racing refill.
 	completed := s3WriteSucceeded(capture)
 	if completed && s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		invalidatedAt := s.invalidateObject(context.Background(), bucket, key)
 		// Warm-on-write is the only way to make a multipart-completed object hot:
 		// TAG never sees its assembled body, so a write-through tee is impossible.
-		s.warmOnWrite(r, bucket, key)
+		s.warmOnWrite(r, bucket, key, invalidatedAt)
 		// The path that matters for parquet: ingestors write via multipart, so this
 		// is where a freshly written file's metadata gets warmed (RFC 0002).
 		s.warmParquetFooterOnWrite(r, bucket, key)

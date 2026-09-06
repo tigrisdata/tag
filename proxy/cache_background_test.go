@@ -6,7 +6,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -273,7 +276,7 @@ func TestFetchFullObjectToCache_WarmWaitsForBlockScratchWithoutHoldingCountSlot(
 		if time.Now().After(deadline) {
 			t.Fatal("warm did not wait for its combined block reservation")
 		}
-		time.Sleep(time.Millisecond)
+		<-time.After(time.Millisecond)
 	}
 
 	// Let the pressure reservation go. The warm's pending combined reservation should
@@ -386,4 +389,238 @@ func TestFetchFullObjectToCache_TombstoneBlocksDirectWrite(t *testing.T) {
 	} else if found {
 		t.Fatal("direct cache write bypassed a newer tombstone")
 	}
+}
+
+// gatedBackgroundBody holds the first background response in the cache writer so a
+// successful write can invalidate it before its tombstone-aware metadata commit.
+type gatedBackgroundBody struct {
+	io.Reader
+	release  <-chan struct{}
+	started  chan<- struct{}
+	startOne sync.Once
+	closeOne sync.Once
+	onClose  func()
+}
+
+func (b *gatedBackgroundBody) Read(p []byte) (int, error) {
+	b.startOne.Do(func() { close(b.started) })
+	<-b.release
+	return b.Reader.Read(p)
+}
+
+func (b *gatedBackgroundBody) Close() error {
+	b.closeOne.Do(b.onClose)
+	return nil
+}
+
+// A read-miss background fetch that began before a successful PUT must not consume
+// the PUT's tee fallback. The old fetch is tombstone-skipped, then exactly one
+// latest warm runs serially and publishes the current ETag/body with its credentials.
+func TestBackgroundFetch_QueuesLatestWarmAfterWriteInvalidation(t *testing.T) {
+	const (
+		bucket  = "background-race-bucket"
+		key     = "background-race-key"
+		oldBody = "old-body"
+		newBody = "new-body"
+	)
+
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(false)
+	var (
+		calls         atomic.Int32
+		originGets    atomic.Int32
+		concurrent    atomic.Int32
+		maxConcurrent atomic.Int32
+		puts          atomic.Int32
+		firstRead     = make(chan struct{})
+		releaseOld    = make(chan struct{})
+		replacement   = make(chan struct{})
+		headDone      = make(chan struct{})
+		headOnce      sync.Once
+	)
+	var (
+		credsMu       sync.Mutex
+		replacementAK string
+		replacementSK string
+	)
+	updateMax := func(now int32) {
+		for {
+			old := maxConcurrent.Load()
+			if now <= old || maxConcurrent.CompareAndSwap(old, now) {
+				return
+			}
+		}
+	}
+
+	mock := &teeMockForwarder{
+		mockForwarder: &mockForwarder{
+			conditionalResp: headResp(`"head-etag"`, "text/plain", int64(len("put-body"))),
+			doRequestFunc: func(_ context.Context, _ *http.Request, _, _ string) (*http.Response, error) {
+				originGets.Add(1)
+				return cacheableGetResponse(newBody, `"new-etag"`), nil
+			},
+			doFullObjectFunc: func(_ context.Context, _, _, accessKey, secretKey string) (*http.Response, error) {
+				call := calls.Add(1)
+				now := concurrent.Add(1)
+				updateMax(now)
+				onClose := func() { concurrent.Add(-1) }
+				if call == 1 {
+					resp := cacheableGetResponse(oldBody, `"old-etag"`)
+					resp.Body = &gatedBackgroundBody{
+						Reader:  resp.Body,
+						release: releaseOld,
+						started: firstRead,
+						onClose: onClose,
+					}
+					return resp, nil
+				}
+				if call == 2 {
+					close(replacement)
+					credsMu.Lock()
+					replacementAK, replacementSK = accessKey, secretKey
+					credsMu.Unlock()
+					resp := cacheableGetResponse(newBody, `"new-etag"`)
+					resp.Body = &gatedBackgroundBody{
+						Reader:  resp.Body,
+						release: closedSignal(),
+						started: make(chan struct{}),
+						onClose: onClose,
+					}
+					return resp, nil
+				}
+				return nil, errors.New("unexpected replacement fetch")
+			},
+		},
+		teeFunc:  teeUpstream(&puts, `"put-etag"`),
+		headHook: func() { headOnce.Do(func() { close(headDone) }) },
+	}
+	cacheStore := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	svc := NewService(mock, cacheStore, cfg)
+	svc.config.Cache.WarmOnWrite = true
+	svc.config.Cache.SizeThreshold = 1 << 20
+	svc.config.Cache.BlockSize = 1 << 20
+
+	svc.triggerBackgroundCacheFetch(bucket, key, "old-access", "old-secret", false, priorityReadMiss)
+	select {
+	case <-firstRead:
+	case <-time.After(time.Second):
+		t.Fatal("old background fetch did not reach the cache body")
+	}
+
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, authedPut(bucket, key, "put-body")); err != nil {
+		t.Fatalf("HandlePutObject: %v", err)
+	}
+	select {
+	case <-headDone:
+	case <-time.After(time.Second):
+		t.Fatal("tee fallback did not issue its HEAD")
+	}
+
+	bcastKey := "bg:" + bucket + "/" + key
+	var state *backgroundFetchState
+	deadline := time.Now().Add(time.Second)
+	for {
+		actual, loaded := svc.activeBackgroundFetches.Load(bcastKey)
+		if loaded {
+			if candidate, ok := actual.(*backgroundFetchState); ok {
+				candidate.mu.Lock()
+				pending := candidate.pending != nil
+				candidate.mu.Unlock()
+				if pending {
+					state = candidate
+					break
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("write fallback did not become the pending background warm")
+		}
+		<-time.After(time.Millisecond)
+	}
+	if state == nil {
+		t.Fatal("pending background warm state was not retained")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("background fetches before releasing stale owner = %d, want 1", got)
+	}
+
+	// The newest write can reach the detached trigger before an older write whose
+	// fallback goroutine was delayed. The pending slot follows invalidation order,
+	// not trigger arrival order, so the older credentials cannot replace it.
+	state.mu.Lock()
+	pendingInvalidatedAt := state.pending.invalidatedAt
+	state.mu.Unlock()
+	newestInvalidatedAt := pendingInvalidatedAt + 2
+	olderInvalidatedAt := pendingInvalidatedAt + 1
+	svc.triggerBackgroundCacheFetchAfterInvalidation(
+		bucket, key, "latest-access", "latest-secret", false, priorityWarmWrite, newestInvalidatedAt,
+	)
+	svc.triggerBackgroundCacheFetchAfterInvalidation(
+		bucket, key, "older-access", "older-secret", false, priorityWarmWrite, olderInvalidatedAt,
+	)
+	select {
+	case <-replacement:
+		t.Fatal("replacement warm started while the stale owner was still active")
+	default:
+	}
+	close(releaseOld)
+
+	select {
+	case <-replacement:
+	case <-time.After(time.Second):
+		t.Fatal("latest replacement warm did not start")
+	}
+	if !metaCached(cacheStore, bucket, key, time.Second) {
+		t.Fatal("replacement warm did not publish metadata")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("background fetches = %d, want one stale owner plus one replacement", got)
+	}
+	if got := maxConcurrent.Load(); got != 1 {
+		t.Fatalf("concurrent background fetches = %d, want 1", got)
+	}
+	credsMu.Lock()
+	gotAK, gotSK := replacementAK, replacementSK
+	credsMu.Unlock()
+	if gotAK != "latest-access" || gotSK != "latest-secret" {
+		t.Fatalf("replacement credentials = %q/%q, want latest-access/latest-secret", gotAK, gotSK)
+	}
+
+	meta, found, err := cacheStore.GetMeta(context.Background(), bucket, key)
+	if err != nil || !found {
+		t.Fatalf("final metadata found=%v err=%v", found, err)
+	}
+	if meta.ETag != `"new-etag"` {
+		t.Fatalf("final ETag = %q, want %q", meta.ETag, `"new-etag"`)
+	}
+	var body bytes.Buffer
+	if err := cacheStore.GetBodyStream(context.Background(), bucket, key, meta.ETag, &body); err != nil {
+		t.Fatalf("final body: %v", err)
+	}
+	if body.String() != newBody {
+		t.Fatalf("final body = %q, want %q", body.String(), newBody)
+	}
+
+	readReq := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
+	readReq.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/s3/aws4_request, Signature=deadbeef")
+	readW := httptest.NewRecorder()
+	if err := svc.HandleGetObject(readW, readReq); err != nil {
+		t.Fatalf("post-write HandleGetObject: %v", err)
+	}
+	if got := readW.Header().Get(XCacheHeader); got != XCacheHit {
+		t.Fatalf("post-write X-Cache = %q, want %q", got, XCacheHit)
+	}
+	if got := readW.Body.String(); got != newBody {
+		t.Fatalf("post-write GET body = %q, want %q", got, newBody)
+	}
+	if got := originGets.Load(); got != 0 {
+		t.Fatalf("post-write origin GETs = %d, want 0", got)
+	}
+}
+
+func closedSignal() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
 }
