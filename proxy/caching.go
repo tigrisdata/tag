@@ -384,6 +384,20 @@ func (s *Service) fetchFullObjectToCache(
 	anonymous bool,
 	prio populatePriority,
 ) error {
+	return s.fetchFullObjectToCacheAt(ctx, bucket, key, accessKey, secretKey, anonymous, prio, 0)
+}
+
+// fetchFullObjectToCacheAt uses startedAt as the tombstone epoch for the detached
+// fetch. The epoch is captured before the dedup marker is published, so a worker
+// delayed on scheduling or admission cannot make a stale response look newer than
+// an intervening invalidation. A zero startedAt is reserved for direct callers.
+func (s *Service) fetchFullObjectToCacheAt(
+	ctx context.Context,
+	bucket, key, accessKey, secretKey string,
+	anonymous bool,
+	prio populatePriority,
+	startedAt int64,
+) error {
 	// This is a background fetch whose only purpose is to populate the cache, so
 	// reserve a cache-populate slot up front. If the concurrent-write limit is
 	// saturated, skip the whole operation — including the upstream request —
@@ -420,8 +434,12 @@ func (s *Service) fetchFullObjectToCache(
 	// Stamp the cache-write start BEFORE the upstream request, for the same reason
 	// as the inline path: a timestamp taken after the response leaves the whole
 	// round-trip unguarded, letting an invalidation that landed mid-fetch look older
-	// than our write and pass the tombstone check.
-	writeStartTime := time.Now().UnixNano()
+	// than our write and pass the tombstone check. The detached path supplies the
+	// marker's epoch; direct test callers use the local timestamp fallback.
+	if startedAt == 0 {
+		startedAt = time.Now().UnixNano()
+	}
+	writeStartTime := startedAt
 
 	// Execute full object request (no Range header). An anonymous warm uses an
 	// unsigned request so upstream applies anonymous authorization — 200 only if the
@@ -590,6 +608,7 @@ type backgroundFetchRequest struct {
 	secretKey         string
 	anonymous         bool
 	prio              populatePriority
+	startedAt         int64  // dedup marker epoch used by the tombstone gate
 	invalidatedAt     int64  // zero for read-origin triggers; otherwise post-delete timestamp
 	invalidationOrder uint64 // zero for direct/test triggers; otherwise write order
 }
@@ -677,6 +696,7 @@ func (s *Service) triggerBackgroundCacheFetchAt(
 			activeInvalidatedAt:     request.invalidatedAt,
 			activeInvalidationOrder: request.invalidationOrder,
 		}
+		request.startedAt = state.startedAt
 		actual, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, state)
 		if !loaded {
 			metrics.RecordBackgroundFetchTriggered()
@@ -729,7 +749,7 @@ func (s *Service) runBackgroundCacheFetch(
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
-		err := s.fetchFullObjectToCache(ctx, bucket, key, current.accessKey, current.secretKey, current.anonymous, current.prio)
+		err := s.fetchFullObjectToCacheAt(ctx, bucket, key, current.accessKey, current.secretKey, current.anonymous, current.prio, current.startedAt)
 		cancel()
 		s.recordBackgroundFetchResult(bucket, key, err)
 
@@ -815,6 +835,7 @@ func (s *Service) nextBackgroundFetch(
 
 		request := *candidate
 		state.startedAt = time.Now().UnixNano()
+		request.startedAt = state.startedAt
 		state.activeInvalidatedAt = request.invalidatedAt
 		state.activeInvalidationOrder = request.invalidationOrder
 		state.mu.Unlock()
