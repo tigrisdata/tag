@@ -533,9 +533,9 @@ func (s *Service) fetchFullObjectToCache(
 	ttl := int(s.config.Cache.TTL.Seconds())
 
 	// Keep the direct write asynchronous only for deadline handling. On timeout the
-	// fetch returns like the former listener path, but the reservation stays owned by
-	// the writer until it actually exits; releasing it while an uncooperative cache
-	// client still holds buffers would break the aggregate memory bound.
+	// caller must still wait for the writer to exit before a serialized replacement
+	// can start; releasing the handoff while an uncooperative cache client still
+	// holds buffers would break the one-active and aggregate memory bounds.
 	cacheErrCh := make(chan error, 1)
 	go func() {
 		var cacheErr error
@@ -560,10 +560,8 @@ func (s *Service) fetchFullObjectToCache(
 		_ = resp.Body.Close()
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Background cache write timeout")
 		slotOwned = false
-		go func() {
-			<-cacheErrCh
-			s.releaseCacheSlot(weight)
-		}()
+		<-cacheErrCh
+		s.releaseCacheSlot(weight)
 		return errors.New("cache write timeout")
 	}
 	if cacheErr != nil {
