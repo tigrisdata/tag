@@ -688,9 +688,20 @@ func (s *Service) triggerBackgroundCacheFetchAt(
 		invalidationOrder: invalidatedAt.order,
 	}
 	if request.invalidationOrder > 0 {
-		tombstoneOrder := s.cache.GetTombstoneOrder(context.Background(), bucket, key)
-		if tombstoneOrder > request.invalidationOrder {
+		ctx := context.Background()
+		tombstoneOrder := s.cache.GetTombstoneOrder(ctx, bucket, key)
+		// The order is owner-scoped because invalidationOrder is process-local. A
+		// foreign/legacy tombstone still has a shared timestamp fence, which closes
+		// the same delayed-trigger gap across proxy instances.
+		tombstoneAt := int64(0)
+		if tombstoneOrder == 0 {
+			tombstoneAt = s.cache.GetTombstoneTimestamp(ctx, bucket, key)
+		}
+		if tombstoneOrder > request.invalidationOrder ||
+			(tombstoneOrder == 0 && tombstoneAt > request.invalidatedAt) {
 			log.Debug().Str("bucket", bucket).Str("key", key).
+				Int64("warm_invalidated_at", request.invalidatedAt).
+				Int64("tombstone_at", tombstoneAt).
 				Uint64("warm_order", request.invalidationOrder).
 				Uint64("tombstone_order", tombstoneOrder).
 				Msg("Coalesced delayed background warm superseded by a newer invalidation")
