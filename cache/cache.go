@@ -823,11 +823,11 @@ func (c *Cache) WriteTombstoneWithOrder(ctx context.Context, bucket, key string,
 	binary.BigEndian.PutUint64(data[:8], uint64(time.Now().UnixNano()))
 	binary.BigEndian.PutUint64(data[8:16], c.tombstoneOwner)
 	binary.BigEndian.PutUint64(data[16:], order)
-	if err := c.client.Put(ctx, tombKey, data, c.tombstoneTTL); err != nil {
-		return err
-	}
+	// Retain the attempted maximum even when Put reports an error. The backend
+	// may have accepted an ambiguous write, and a later lower order must not
+	// downgrade it; a later successful invalidation will rewrite the fence.
 	c.tombstoneOrders.Add(tombKey, order)
-	return nil
+	return c.client.Put(ctx, tombKey, data, c.tombstoneTTL)
 }
 
 // GetTombstoneTimestamp retrieves the tombstone timestamp for a key.
