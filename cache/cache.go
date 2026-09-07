@@ -367,11 +367,17 @@ func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
 
 // DeleteIfETag invalidates the object's metadata only while it still carries
 // the given ETag, using the store's per-key CAS (ocache #254): the version is
-// read together with the metadata, and the delete is conditioned on it, so the
-// GetMeta→Delete window of a plain compare-then-delete cannot remove a newer
-// entry a concurrent write established. Returns (false, nil) when the entry is
-// already gone, carries a different ETag, or was replaced between the read and
-// the delete — the newer entry wins in every case.
+// read together with the metadata, and the delete is conditioned on it.
+// Returns (false, nil) when the entry is already gone, carries a different
+// ETag, or was replaced by a VERSION-STAMPED write between the read and the
+// delete — the newer entry wins in each case.
+//
+// Scope of the guard: exact against version-stamped writers (CAS deletes, and
+// populates once they carry version preconditions). A plain Put resets a row
+// to the legacy version (storage EffectiveRowVersion semantics), so between
+// today's plain-put populates the version adds nothing and the protection
+// equals the previous compare-then-delete — the same read→delete window as
+// before, never wider. Versioning the populate paths closes it.
 //
 // The tombstone is still written on the match path (same rationale as
 // DeleteWithMeta: it blocks in-flight stamp-based populates, which CAS on this

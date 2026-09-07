@@ -1355,8 +1355,9 @@ func (s *Service) runBlockFetch(state *blockFetchState, blockKey, bucket, key, a
 // version X must not wipe a newer entry that another request re-established
 // after an out-of-band overwrite (X' != X): deleting that fresh entry would
 // force needless re-population and churn under concurrency. The guard is CAS
-// (cache.DeleteIfETag), so the old GetMeta→Delete race window is closed, not
-// merely narrowed.
+// (cache.DeleteIfETag): exact against version-stamped writers, and equal to
+// the old narrowed GetMeta→Delete window against today's plain-put populates
+// (see DeleteIfETag's scope note) — never wider than before.
 func (s *Service) invalidateStaleMeta(bucket, key, staleETag string) {
 	deleted, err := s.cache.DeleteIfETag(context.Background(), bucket, key, staleETag)
 	if err != nil {
