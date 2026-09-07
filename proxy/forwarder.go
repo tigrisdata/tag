@@ -558,11 +558,12 @@ func (r *ResponseCapture) ContentLength() int64 {
 // For x-amz-meta-* headers, the key is lowercased to match S3 convention,
 // since Go's http.Header canonicalizes keys (e.g., x-amz-meta-foo → X-Amz-Meta-Foo).
 func copyHeaders(dst, src http.Header) {
+	const metadataPrefix = "x-amz-meta-"
+
 	for k, v := range src {
-		lower := strings.ToLower(k)
-		if strings.HasPrefix(lower, "x-amz-meta-") {
+		if len(k) >= len(metadataPrefix) && strings.EqualFold(k[:len(metadataPrefix)], metadataPrefix) {
 			// Use lowercase for metadata headers per S3 convention
-			dst[lower] = v
+			dst[strings.ToLower(k)] = v
 		} else {
 			dst[k] = v
 		}
