@@ -467,7 +467,7 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 			return out, rerr
 		}
 		if errors.Is(err, errBlocksMostlyAbsent) {
-			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+			s.invalidateStaleMeta(bucket, key, meta.ETag)
 		}
 		out.remainder = true
 		return out, nil
@@ -717,7 +717,7 @@ func (s *Service) streamRemainderFromUpstream(ctx context.Context, cw *countingW
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		s.invalidateStaleMeta(bucket, key, meta.ETag)
 		return errBlockUpstreamGone
 	}
 	if resp.StatusCode != http.StatusPartialContent {
@@ -728,7 +728,7 @@ func (s *Service) streamRemainderFromUpstream(ctx context.Context, cw *countingW
 		return fmt.Errorf("remainder fetch: response missing ETag, cannot verify version")
 	}
 	if respETag != meta.ETag {
-		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		s.invalidateStaleMeta(bucket, key, meta.ETag)
 		return errBlockETagMismatch
 	}
 	if rs, re, _, ok := parseContentRange(resp.Header.Get("Content-Range")); !ok || rs != absStart || re != absEnd {
@@ -810,7 +810,7 @@ func (s *Service) serveFullObjectFromBlockCache(
 			// later reads would reuse — but that traded a correctness property for a performance
 			// one. Losing the entry costs one discovery round trip on the next read; keeping a
 			// stale one answers wrongly for up to the TTL.
-			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+			s.invalidateStaleMeta(bucket, key, meta.ETag)
 			return false, nil
 		}
 		log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Full-object block assembly failed - falling through to upstream")
@@ -978,10 +978,10 @@ func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey
 		// A definitive stale signal means the cached meta describes a version upstream no
 		// longer serves. Invalidate HERE — every block fetch flows through this point — so no
 		// caller can forget it and leave the stale meta to fail again until TTL.
-		// invalidateStaleBlockMeta is ETag-guarded and idempotent, so central invocation is
+		// invalidateStaleMeta is ETag-guarded and idempotent, so central invocation is
 		// safe for every caller.
 		log.Debug().Err(stale).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
-		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		s.invalidateStaleMeta(bucket, key, meta.ETag)
 		return stale
 	}
 	return transient
@@ -1208,7 +1208,7 @@ func (s *Service) fetchBlocksForAssembly(ctx context.Context, bucket, key, acces
 			lease.release()
 		}
 		log.Debug().Err(stale).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
-		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		s.invalidateStaleMeta(bucket, key, meta.ETag)
 		return nil, stale
 	}
 	if transient != nil {
@@ -1350,28 +1350,28 @@ func (s *Service) runBlockFetch(state *blockFetchState, blockKey, bucket, key, a
 	}()
 }
 
-// invalidateStaleBlockMeta deletes the object's cache entry only if the stored meta still carries
-// the given (stale) ETag. A request that detected staleness for version X must not wipe a newer
-// entry that another request re-established after an out-of-band overwrite (X' != X): deleting that
-// fresh entry would force needless re-population and churn under concurrency. There is a small
-// GetMeta→Delete window, but this narrows it from "always deletes whatever is stored" to "deletes
-// only the version we just observed as stale".
-func (s *Service) invalidateStaleBlockMeta(bucket, key, staleETag string) {
-	ctx := context.Background()
-	if m, found, err := s.cache.GetMeta(ctx, bucket, key); err != nil || !found || m == nil || m.ETag != staleETag {
-		return // already gone, or replaced by a newer version — leave it
-	}
-	if err := s.cache.Delete(ctx, bucket, key); err != nil {
+// invalidateStaleMeta deletes the object's cache entry only if the stored meta
+// still carries the given (stale) ETag. A request that detected staleness for
+// version X must not wipe a newer entry that another request re-established
+// after an out-of-band overwrite (X' != X): deleting that fresh entry would
+// force needless re-population and churn under concurrency. The guard is CAS
+// (cache.DeleteIfETag), so the old GetMeta→Delete race window is closed, not
+// merely narrowed.
+func (s *Service) invalidateStaleMeta(bucket, key, staleETag string) {
+	deleted, err := s.cache.DeleteIfETag(context.Background(), bucket, key, staleETag)
+	if err != nil {
 		// Record the failure rather than discarding it. This delete is what stops a
 		// stale entry answering later reads, so a silent failure leaves exactly the
 		// hazard it exists to prevent — and a delete metric that only ever reports
 		// success would hide it. invalidateObject treats its own failures the same way.
 		metrics.RecordCacheOperation("delete", "error")
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).
-			Msg("Stale block-mode meta not invalidated - entry may serve stale metadata until TTL")
+			Msg("Stale meta not invalidated - entry may serve stale metadata until TTL")
 		return
 	}
-	metrics.RecordCacheOperation("delete", "success")
+	if deleted {
+		metrics.RecordCacheOperation("delete", "success")
+	}
 }
 
 // ensureBlocksCached makes covering blocks [b0,bK] present in cache: it probes the range once,

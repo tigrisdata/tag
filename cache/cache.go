@@ -365,6 +365,67 @@ func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
 	return c.DeleteWithMeta(ctx, bucket, key)
 }
 
+// DeleteIfETag invalidates the object's metadata only while it still carries
+// the given ETag, using the store's per-key CAS (ocache #254): the version is
+// read together with the metadata, and the delete is conditioned on it, so the
+// GetMeta→Delete window of a plain compare-then-delete cannot remove a newer
+// entry a concurrent write established. Returns (false, nil) when the entry is
+// already gone, carries a different ETag, or was replaced between the read and
+// the delete — the newer entry wins in every case.
+//
+// The tombstone is still written on the match path (same rationale as
+// DeleteWithMeta: it blocks in-flight stamp-based populates, which CAS on this
+// key does not order). On a lost CAS the tombstone may have been written
+// spuriously; that can suppress one racing populate — churn, bounded by the
+// tombstone TTL — but never removes data, which is strictly milder than the
+// unguarded delete this replaces.
+func (c *Cache) DeleteIfETag(ctx context.Context, bucket, key, staleETag string) (bool, error) {
+	if !c.IsEnabled() {
+		return false, nil
+	}
+	metaKey := MakeMetaKey(bucket, key)
+
+	metaBytes, version, found, err := c.client.GetWithVersion(ctx, metaKey)
+	if err != nil {
+		if isNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !found || metaBytes == nil {
+		return false, nil
+	}
+	meta, err := DecodeMeta(metaBytes)
+	if err != nil {
+		// Undecodable metadata is not the version the caller observed; leave it
+		// for the read path's own decode-error handling.
+		return false, err
+	}
+	if meta.ETag != staleETag {
+		return false, nil
+	}
+
+	var errs []error
+	if terr := c.WriteTombstone(ctx, bucket, key); terr != nil {
+		log.Debug().Err(terr).Str("bucket", bucket).Str("key", key).
+			Msg("Failed to write tombstone (continuing with guarded delete)")
+		errs = append(errs, fmt.Errorf("write tombstone: %w", terr))
+	}
+	if derr := c.client.DeleteIfVersion(ctx, metaKey, version); derr != nil {
+		if _, mismatch := cacheclient.IsVersionMismatch(derr); mismatch {
+			// Replaced (or removed) between the read and the delete: the newer
+			// state wins, exactly what the guard exists for.
+			return false, nil
+		}
+		errs = append(errs, fmt.Errorf("guarded meta delete: %w", derr))
+		return false, errors.Join(errs...)
+	}
+	// The versioned body is intentionally left to age out via TTL, as in
+	// DeleteWithMeta.
+	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidated cache metadata (ETag-guarded)")
+	return true, errors.Join(errs...)
+}
+
 // recordServeLocality records whether a successful body read for bodyKey was
 // satisfied from local storage or pulled from a peer over gRPC. It is a no-op
 // when the underlying client cannot report key ownership (e.g. non-cluster
