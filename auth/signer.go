@@ -53,10 +53,11 @@ func ParseHTTPDate(dateStr string) (time.Time, error) {
 
 // RequestSigner signs HTTP requests using AWS SigV4.
 type RequestSigner struct {
-	endpoint    string
-	endpointURL *url.URL
-	endpointErr error
-	region      string
+	endpoint        string
+	endpointURL     *url.URL
+	endpointErr     error
+	region          string
+	signingKeyCache *signingKeyCache
 }
 
 // NewRequestSigner creates a new request signer.
@@ -72,10 +73,11 @@ func NewRequestSigner(endpoint, region string) *RequestSigner {
 	}
 
 	return &RequestSigner{
-		endpoint:    endpoint,
-		endpointURL: endpointURL,
-		endpointErr: err,
-		region:      region,
+		endpoint:        endpoint,
+		endpointURL:     endpointURL,
+		endpointErr:     err,
+		region:          region,
+		signingKeyCache: newSigningKeyCache(),
 	}
 }
 
@@ -193,8 +195,8 @@ func (s *RequestSigner) signHTTP(req *http.Request, accessKey, secretKey, bodyHa
 	stringToSign := s.buildStringToSign(signingTime, credentialScope, canonicalRequest)
 
 	// Calculate signature
-	signingKey := s.deriveSigningKey(secretKey, dateStr)
-	signature := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
+	signingKey := s.deriveSigningKey(accessKey, secretKey, dateStr)
+	signature := hex.EncodeToString(hmacSHA256(signingKey[:], []byte(stringToSign)))
 
 	// Build Authorization header
 	authHeader := fmt.Sprintf("%s Credential=%s/%s, SignedHeaders=%s, Signature=%s",
@@ -332,12 +334,14 @@ func (s *RequestSigner) buildStringToSign(signingTime time.Time, credentialScope
 }
 
 // deriveSigningKey derives the signing key from the secret key.
-func (s *RequestSigner) deriveSigningKey(secretKey, dateStr string) []byte {
-	kDate := hmacSHA256([]byte("AWS4"+secretKey), []byte(dateStr))
-	kRegion := hmacSHA256(kDate, []byte(s.region))
-	kService := hmacSHA256(kRegion, []byte(service))
-	kSigning := hmacSHA256(kService, []byte(terminationString))
-	return kSigning
+func (s *RequestSigner) deriveSigningKey(accessKey, secretKey, dateStr string) signingKey {
+	return s.signingKeyCache.getOrDerive(signingKeyCacheKey{
+		accessKey: accessKey,
+		secretKey: secretKey,
+		date:      dateStr,
+		region:    s.region,
+		service:   service,
+	}, secretKey, dateStr, s.region)
 }
 
 // shouldCopyHeader returns true if the header should be copied to the upstream request.
