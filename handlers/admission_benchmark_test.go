@@ -33,7 +33,9 @@ func (w *admissionBenchmarkResponseWriter) Write(p []byte) (int, error) {
 // reused so the benchmark focuses on routing, admission, and SlowDown response
 // work rather than request parsing or test-writer allocation.
 func BenchmarkAdmissionShed(b *testing.B) {
+	previousLogLevel := zerolog.GlobalLevel()
 	zerolog.SetGlobalLevel(zerolog.Disabled)
+	b.Cleanup(func() { zerolog.SetGlobalLevel(previousLogLevel) })
 	cases := []struct {
 		name   string
 		method string

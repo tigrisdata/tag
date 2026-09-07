@@ -4,14 +4,12 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/http/pprof"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy"
@@ -20,13 +18,14 @@ import (
 
 // Server is the HTTP server for S3-compatible API.
 type Server struct {
-	service      *proxy.Service
-	router       *mux.Router
-	httpServer   *http.Server
-	bindAddr     string
-	pprofEnabled bool
-	tlsCertFile  string
-	tlsKeyFile   string
+	service          *proxy.Service
+	router           *mux.Router
+	admissionHandler http.Handler
+	httpServer       *http.Server
+	bindAddr         string
+	pprofEnabled     bool
+	tlsCertFile      string
+	tlsKeyFile       string
 	// admissionSem bounds concurrently-served S3 requests. nil disables admission
 	// control (unlimited).
 	admissionSem chan struct{}
@@ -45,6 +44,7 @@ func NewServer(service *proxy.Service, bindIP string, port int, pprofEnabled boo
 	}
 
 	s.router = s.setupRouter()
+	s.admissionHandler = s.admissionFastPath(s.router)
 	return s
 }
 
@@ -85,8 +85,7 @@ func (s *Server) admissionMiddleware(next http.Handler) http.Handler {
 			}()
 			next.ServeHTTP(w, r)
 		default:
-			metrics.AdmissionShed.Inc()
-			s3err.WriteError(w, r, s3err.ErrSlowDown)
+			s.shedAdmission(w, r)
 		}
 	})
 }
@@ -111,7 +110,7 @@ func isExemptFromAdmission(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	return tmpl == "/health" || tmpl == "/metrics" || strings.HasPrefix(tmpl, "/debug/pprof/")
+	return isOperationalRouteTemplate(tmpl)
 }
 
 // setupRouter configures the S3-compatible routes.
@@ -125,121 +124,12 @@ func (s *Server) setupRouter() *mux.Router {
 	// Bound concurrently-served S3 requests (sheds with 503 SlowDown when full)
 	r.Use(s.admissionMiddleware)
 
-	// Health check endpoint
-	r.HandleFunc("/health", s.handleHealth).Methods("GET")
-
-	// Metrics endpoint for Prometheus
-	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
-
-	// pprof endpoints for profiling (if enabled)
+	for _, route := range admissionRouteDefinitions(s.pprofEnabled) {
+		registerAdmissionRoute(r, route, route.handler(s))
+	}
 	if s.pprofEnabled {
-		r.HandleFunc("/debug/pprof/", pprof.Index)
-		r.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-		r.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		r.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		r.HandleFunc("/debug/pprof/trace", pprof.Trace)
-		r.Handle("/debug/pprof/heap", pprof.Handler("heap"))
-		r.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
-		r.Handle("/debug/pprof/allocs", pprof.Handler("allocs"))
-		r.Handle("/debug/pprof/block", pprof.Handler("block"))
-		r.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
-		r.Handle("/debug/pprof/threadcreate", pprof.Handler("threadcreate"))
 		log.Info().Msg("pprof endpoints enabled at /debug/pprof/")
 	}
-
-	// S3 API routes - path style
-	// The order matters - more specific routes should come first
-
-	// CompleteMultipartUpload - POST with uploadId but no partNumber
-	// Must be registered before generic handleObjectWithQuery to cache completion responses
-	r.HandleFunc("/{bucket}/{object:.+}", s.handleCompleteMultipartUpload).
-		Queries("uploadId", "{uploadId}").
-		Methods("POST").
-		MatcherFunc(func(r *http.Request, rm *mux.RouteMatch) bool {
-			// Only match if partNumber is NOT present (CompleteMultipartUpload)
-			// UploadPart has both uploadId and partNumber
-			return r.URL.Query().Get("partNumber") == ""
-		})
-
-	// Object operations with query parameters (UploadPart, ListParts, AbortMultipartUpload, etc.)
-	r.HandleFunc("/{bucket}/{object:.+}", s.handleObjectWithQuery).
-		Queries("uploadId", "{uploadId}").
-		Methods("PUT", "POST", "DELETE", "GET")
-
-	// Multipart upload initiation
-	r.HandleFunc("/{bucket}/{object:.+}", s.handleInitiateMultipart).
-		Queries("uploads", "").
-		Methods("POST")
-
-	// Object tagging
-	r.HandleFunc("/{bucket}/{object:.+}", s.handleObjectTagging).
-		Queries("tagging", "").
-		Methods("GET", "PUT", "DELETE")
-
-	// Object ACL
-	r.HandleFunc("/{bucket}/{object:.+}", s.handleObjectACL).
-		Queries("acl", "").
-		Methods("GET", "PUT")
-
-	// Basic object operations
-	r.HandleFunc("/{bucket}/{object:.+}", s.handleObject).Methods("GET", "HEAD", "PUT", "DELETE")
-
-	// Copy object (PUT with X-Amz-Copy-Source header)
-	// Handled in handleObject based on header presence
-
-	// Bucket operations with query parameters
-	// Each route is registered for both /{bucket} and /{bucket}/ because S3 clients
-	// like warp send bucket-level requests with trailing slashes. We cannot strip
-	// trailing slashes via middleware because that would break SigV4 signature
-	// validation (the client signs the request with the original path).
-	for _, prefix := range []string{"/{bucket}", "/{bucket}/"} {
-		r.HandleFunc(prefix, s.handleBucketMultipartUploads).
-			Queries("uploads", "").
-			Methods("GET")
-
-		r.HandleFunc(prefix, s.handleListObjectsV2).
-			Queries("list-type", "2").
-			Methods("GET")
-
-		r.HandleFunc(prefix, s.handleBucketVersioning).
-			Queries("versioning", "").
-			Methods("GET", "PUT")
-
-		r.HandleFunc(prefix, s.handleBucketACL).
-			Queries("acl", "").
-			Methods("GET", "PUT")
-
-		r.HandleFunc(prefix, s.handleBucketLifecycle).
-			Queries("lifecycle", "").
-			Methods("GET", "PUT", "DELETE")
-
-		r.HandleFunc(prefix, s.handleBucketPolicy).
-			Queries("policy", "").
-			Methods("GET", "PUT", "DELETE")
-
-		r.HandleFunc(prefix, s.handleBucketCORS).
-			Queries("cors", "").
-			Methods("GET", "PUT", "DELETE")
-
-		r.HandleFunc(prefix, s.handleBucketTagging).
-			Queries("tagging", "").
-			Methods("GET", "PUT", "DELETE")
-
-		r.HandleFunc(prefix, s.handleBucketLocation).
-			Queries("location", "").
-			Methods("GET")
-
-		// DeleteObjects (multi-object delete)
-		r.HandleFunc(prefix, s.handleDeleteObjects).
-			Queries("delete", "").
-			Methods("POST")
-
-		// Basic bucket operations (ListObjects V1, CreateBucket, DeleteBucket, HeadBucket)
-		r.HandleFunc(prefix, s.handleBucket).Methods("GET", "HEAD", "PUT", "DELETE")
-	}
-
-	// List buckets (service level)
-	r.HandleFunc("/", s.handleListBuckets).Methods("GET")
 
 	return r
 }
@@ -249,7 +139,7 @@ func (s *Server) setupRouter() *mux.Router {
 func (s *Server) Start() error {
 	s.httpServer = &http.Server{
 		Addr:         s.bindAddr,
-		Handler:      s.router,
+		Handler:      s.Router(),
 		ReadTimeout:  5 * time.Minute,
 		WriteTimeout: 5 * time.Minute,
 		IdleTimeout:  120 * time.Second,
@@ -264,8 +154,11 @@ func (s *Server) Start() error {
 	return s.httpServer.ListenAndServe()
 }
 
-// Router returns the HTTP router for testing.
+// Router returns the server HTTP handler for testing.
 func (s *Server) Router() http.Handler {
+	if s.admissionHandler != nil {
+		return s.admissionHandler
+	}
 	return s.router
 }
 
