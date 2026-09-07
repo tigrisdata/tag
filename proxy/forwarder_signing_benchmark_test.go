@@ -55,6 +55,7 @@ const (
 type signingForwarderBenchmarkTransport struct {
 	expectedBody     string
 	expectedBodyHash string
+	responseHeaders  http.Header
 }
 
 type signingForwarderBenchmarkBodyValidator struct {
@@ -115,7 +116,7 @@ func (t signingForwarderBenchmarkTransport) RoundTrip(request *http.Request) (*h
 
 	return &http.Response{
 		StatusCode: http.StatusOK,
-		Header:     make(http.Header),
+		Header:     t.responseHeaders,
 		Body:       http.NoBody,
 	}, nil
 }
@@ -158,6 +159,14 @@ func (b *signingForwarderBenchmarkBody) Reset(body string) {
 }
 
 func newSigningPassthroughBenchmark(b testing.TB, method, path, body string, headers http.Header) (*Service, *http.Request) {
+	return newSigningPassthroughBenchmarkWithResponseHeaders(b, method, path, body, headers, nil)
+}
+
+func newSigningPassthroughBenchmarkWithResponseHeaders(
+	b testing.TB,
+	method, path, body string,
+	headers, responseHeaders http.Header,
+) (*Service, *http.Request) {
 	b.Helper()
 
 	oldLogger := log.Logger
@@ -194,6 +203,7 @@ func newSigningPassthroughBenchmark(b testing.TB, method, path, body string, hea
 	base.httpClient = &http.Client{Transport: signingForwarderBenchmarkTransport{
 		expectedBody:     body,
 		expectedBodyHash: bodyHash,
+		responseHeaders:  responseHeaders,
 	}}
 	forwarder := &signingForwarder{
 		baseForwarder: base,
