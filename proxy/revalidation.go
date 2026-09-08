@@ -406,8 +406,12 @@ func (s *Service) handleRevalidation206Range(
 		totalSize <= s.config.Cache.SizeThreshold &&
 		s.cache.IsEnabled() &&
 		accessKey != "" && secretKey != "" {
-		// Revalidation re-warm is a read-triggered populate.
-		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss)
+		// Revalidation re-warm is a read-triggered populate. Its precondition
+		// comes from the same picker as the 200 path: the guarded delete above
+		// is best-effort, and if it failed the fetch must overwrite exactly
+		// the surviving known-stale row rather than being refused by
+		// put-if-absent.
+		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, s.revalidationExpectedVersion(bucket, key, staleETag))
 	}
 
 	return copyErr

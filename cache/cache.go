@@ -104,6 +104,12 @@ func (c *Cache) putMetaVersioned(ctx context.Context, bucket, key, metaKey strin
 	if expected != VersionAny {
 		if _, err := c.client.PutIfVersion(ctx, metaKey, metaBytes, ttl, expected); err != nil {
 			if _, mismatch := cacheclient.IsVersionMismatch(err); mismatch {
+				// Debug + metric, per the repo's log policy: the counter is the
+				// rollout-visibility signal — a lost precondition replaces what
+				// was previously a SILENT lost update, so a low rate here is
+				// the feature working, and growth means a precondition was
+				// chosen wrong for its path.
+				metrics.RecordCacheOperation("meta_put", "precondition_lost")
 				log.Debug().Str("bucket", bucket).Str("key", key).Uint64("expected", expected).
 					Msg("Skipping meta write - version precondition lost to a newer write")
 				return false, nil

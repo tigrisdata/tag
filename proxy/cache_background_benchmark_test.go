@@ -30,6 +30,16 @@ func (c *benchmarkCompletionClient) Put(ctx context.Context, key string, data []
 	return err
 }
 
+// Metadata is committed through PutIfVersion since the populate paths became
+// version-preconditioned; the completion signal must observe it too.
+func (c *benchmarkCompletionClient) PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (uint64, error) {
+	version, err := c.CacheClient.PutIfVersion(ctx, key, data, ttlSeconds, expected)
+	if err == nil && strings.HasPrefix(key, c.metadataPrefix) {
+		c.completed <- struct{}{}
+	}
+	return version, err
+}
+
 type benchmarkWarmForwarder struct {
 	*mockForwarder
 	body []byte
@@ -123,7 +133,7 @@ func benchmarkBackgroundCachePopulate(b *testing.B, blockMode bool) {
 		started := make(chan struct{}, concurrency)
 		forwarder.setBatch(gate, started)
 		for _, key := range keys {
-			svc.triggerBackgroundCacheFetch(bucket, key, "access", "secret", false, priorityReadMiss)
+			svc.triggerBackgroundCacheFetch(bucket, key, "access", "secret", false, priorityReadMiss, 0)
 		}
 
 		for range keys {

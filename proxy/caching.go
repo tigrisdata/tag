@@ -388,6 +388,7 @@ func (s *Service) fetchFullObjectToCache(
 	bucket, key, accessKey, secretKey string,
 	anonymous bool,
 	prio populatePriority,
+	expected uint64, // meta-write precondition (see putMetaVersioned)
 ) error {
 	// This is a background fetch whose only purpose is to populate the cache, so
 	// reserve a cache-populate slot up front. If the concurrent-write limit is
@@ -547,15 +548,17 @@ func (s *Service) fetchFullObjectToCache(
 		// Block-eligible full fetches retain the size-based representation used by the
 		// foreground miss path: blocks are written first and tombstone-aware metadata is
 		// published last. Smaller objects use the whole-body stream writer.
-		// Put-if-absent: background populates are triggered on a metadata miss,
-		// so their precondition is absence — a racer that re-established the
-		// entry first fetched the same-or-newer upstream state and wins.
+		// The precondition comes from the trigger's context: 0 for the
+		// absent-gated re-warms, the stale row's version for a revalidation
+		// re-warm (so a FAILED guarded delete cannot leave known-stale state
+		// that put-if-absent then refuses to repair), VersionAny for the
+		// warm-after-write paths whose displaced version is unknown.
 		if blockMode {
 			meta.BlockSize = s.config.Cache.BlockSize
-			cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, writeStartTime, 0)
+			cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, writeStartTime, expected)
 		} else {
 			_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(
-				cacheCtx, bucket, key, meta, body, ttl, writeStartTime, 0,
+				cacheCtx, bucket, key, meta, body, ttl, writeStartTime, expected,
 			)
 		}
 		cacheErrCh <- cacheErr
@@ -593,7 +596,7 @@ func (s *Service) fetchFullObjectToCache(
 // cached as public-read (see fetchFullObjectToCache); accessKey/secretKey are then
 // ignored. Pass anonymous=true exactly when the triggering request was anonymous, so
 // public-read is only ever inferred from a confirmed anonymous read.
-func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority) {
+func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, expected uint64) {
 	bcastKey := "bg:" + bucket + "/" + key
 
 	// Atomic check-and-set: if key exists, a fetch is already in progress
@@ -612,7 +615,7 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
 
-		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, prio)
+		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, prio, expected)
 
 		switch {
 		case errors.Is(err, errCachePopulateDeclined):

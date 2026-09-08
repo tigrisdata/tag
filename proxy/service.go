@@ -886,7 +886,11 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	// probe). See the doc comment: never infer public-read from a public write.
 	if hasNoAuthCredentials(r) {
 		metrics.WarmOnWriteTriggered.Inc()
-		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*anonymous*/, priorityWarmWrite)
+		// VersionAny: the warm follows this write's best-effort invalidation,
+		// and the displaced version's identity is unknown — the warm fetches
+		// the just-written current state, so last-write-wins is correct even
+		// over a survivor of a failed invalidation.
+		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*anonymous*/, priorityWarmWrite, cache.VersionAny)
 		return
 	}
 
@@ -895,7 +899,7 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 		return
 	}
 	metrics.WarmOnWriteTriggered.Inc()
-	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite)
+	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, cache.VersionAny)
 }
 
 // HandlePassthrough handles requests that are passed through without caching.
