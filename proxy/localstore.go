@@ -322,16 +322,19 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		return nil
 	}
 
-	// Conditional writes. Check-then-store, not atomic — acceptable for a cache
-	// tier, and it gives callers the idiom that matters: If-None-Match: * turns
-	// put-if-absent into one request instead of an exists-probe plus a racy PUT.
+	// Conditional writes. The precondition is evaluated here and then ENFORCED
+	// at the store: the observed row's version becomes the meta write's CAS
+	// expectation, so a concurrent write between check and store surfaces as a
+	// refused store (answered 412) instead of a silent lost update — the
+	// check-then-store race the pre-CAS engine documented as accepted.
 	// Semantics follow the ceph suite: If-Match against a MISSING object answers
 	// NoSuchKey (there is nothing to match), a present-but-different ETag is the
 	// 412; If-None-Match refuses when the object exists.
+	expected := cache.VersionAny // plain PUT: overwrite, version-stamped
 	ifMatch := r.Header.Get("If-Match")
 	ifNoneMatch := r.Header.Get("If-None-Match")
 	if ifMatch != "" || ifNoneMatch != "" {
-		existing, found, merr := s.cache.GetMeta(ctx, bucket, key)
+		existing, existingVersion, found, merr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 		if merr != nil {
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return merr
@@ -350,6 +353,16 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 				metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 				return servErr
 			}
+		}
+		// The store must apply against exactly the state this evaluation saw:
+		// the observed version when a row was (servably) present, put-if-absent
+		// when not. An unservable row still occupies the meta key though, so
+		// "absent" here still expects ITS version — the healing overwrite must
+		// replace that exact orphan, not race whatever appears meanwhile.
+		if found && existing != nil {
+			expected = existingVersion
+		} else {
+			expected = 0
 		}
 		switch {
 		case ifMatch != "" && !exists:
@@ -510,13 +523,25 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	ttl := int(s.config.Cache.TTL.Seconds())
 	if blockBound {
 		meta.BlockSize = s.config.Cache.BlockSize
-		if err := s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano()); err != nil {
+		if err := s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano(), expected); err != nil {
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return err
 		}
-	} else if _, err := s.cache.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano()); err != nil {
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
-		return err
+	} else {
+		wrote, err := s.cache.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano(), expected)
+		if err != nil {
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return err
+		}
+		if !wrote && expected != cache.VersionAny {
+			// The conditional's precondition raced away between evaluation and
+			// store: the honest answer is the 412 the client would have gotten
+			// had the racer arrived a moment earlier. (A tombstone-suppressed
+			// unconditional store keeps the legal PUT-then-DELETE 200 below.)
+			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return nil
+		}
 	}
 
 	w.Header().Set("ETag", etag)

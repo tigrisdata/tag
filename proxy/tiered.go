@@ -194,10 +194,12 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// A failed lookup leaves the prior unknown, and the sweep then refuses to
 	// delete anything rather than guess.
 	var prior *cache.CachedObjectMeta
+	var priorVersion uint64
 	priorKnown := false
 	if s.cache.IsEnabled() {
-		if m, found, cacheErr := s.cache.GetMeta(ctx, bucket, key); cacheErr == nil {
+		if m, version, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key); cacheErr == nil {
 			priorKnown = true
+			priorVersion = version
 			if found {
 				prior = m
 			}
@@ -208,7 +210,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	err = s.forwarder.Forward(ctx, rec, r)
 
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, start, prior, priorKnown)
+		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, start, prior, priorVersion, priorKnown)
 	}
 
 	status := "success"
@@ -238,7 +240,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 // the key. The client's 200 stands (the object IS stored upstream), and the
 // caller's ordinary miss handling re-populates on the next read. Failures log
 // at Warn (flood-safe: only successful 2xx PUTs reach here).
-func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, start time.Time, prior *cache.CachedObjectMeta, priorKnown bool) {
+func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, start time.Time, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
 	if etag == "" {
 		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Upstream PUT response had no ETag - no tier marker; object reads as a miss until re-put")
@@ -263,7 +265,17 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, s
 	ttl := int(s.config.Cache.TTL.Seconds())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, start.UnixNano())
+	// The marker replaces exactly the displaced prior: its version (0 when
+	// nothing predated this PUT) is the CAS expectation, so a write that raced
+	// in during the forward wins the key and the marker is refused into the
+	// convergence sweep below — the same treatment as a tombstone suppression.
+	// With the prior unknown (its lookup failed), VersionAny preserves the
+	// overwrite semantics rather than guessing a precondition.
+	expected := priorVersion
+	if !priorKnown {
+		expected = cache.VersionAny
+	}
+	wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, start.UnixNano(), expected)
 	if err != nil {
 		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
 		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Failed to write upstream tier marker; object reads as a miss until re-put")
@@ -280,19 +292,17 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, s
 
 // invalidateDisplacedTieredMeta converges a key on an authoritative miss
 // after a marker could not be established, without either destroying a newer
-// racing write or deleting blind: the entry is dropped only when it still IS
-// the displaced prior captured before the forward (same ETag, same tier).
-// Anything else present is a newer write and keeps the key — this PUT's
+// racing write or deleting blind: cache.DeleteIfETag removes the entry only
+// while it still IS the displaced prior — the compare and the delete are one
+// CAS, so the compare-then-delete window the pre-CAS helper documented is
+// gone. Anything else present is a newer write and keeps the key; this PUT's
 // upstream copy is left as an orphan for the upstream bucket's expiry.
 //
 // No identity, no delete: when the prior is unknown (its pre-forward lookup
-// failed) or the current entry cannot be read, nothing is removed and the
-// possibly-stale prior serves until TTL. Both cases require the metadata
-// store to be failing already — an unguarded delete there would trade a
-// bounded staleness window for the unbounded loss of a racing local write
-// that has no upstream copy. The compare-then-delete pair is not atomic; the
-// residual race is a write landing between the two, which the store cannot
-// close without a conditional delete primitive.
+// failed) nothing is removed and the possibly-stale prior serves until TTL —
+// that path requires the metadata store to be failing already, and an
+// unguarded delete there would trade a bounded staleness window for the
+// unbounded loss of a racing local write that has no upstream copy.
 func (s *Service) invalidateDisplacedTieredMeta(bucket, key string, prior *cache.CachedObjectMeta, priorKnown bool) {
 	if !priorKnown {
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Tier marker failed with unknown prior; possibly-stale metadata serves until TTL")
@@ -304,16 +314,9 @@ func (s *Service) invalidateDisplacedTieredMeta(bucket, key string, prior *cache
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cur, found, err := s.cache.GetMeta(ctx, bucket, key)
-	if err != nil {
-		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Tier marker failed and prior could not be re-read; possibly-stale metadata serves until TTL")
-		return
+	if _, err := s.cache.DeleteIfETag(ctx, bucket, key, prior.ETag); err != nil {
+		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Tier marker failed and displaced prior could not be invalidated; possibly-stale metadata serves until TTL")
 	}
-	if !found || cur == nil || cur.ETag != prior.ETag || cur.BodyUpstream != prior.BodyUpstream {
-		// Already gone, or replaced by a newer write.
-		return
-	}
-	s.invalidateObject(ctx, bucket, key)
 }
 
 // retierFetchTimeout bounds the background re-tier fetch and store.
@@ -419,10 +422,14 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		body := buf[:marker.ContentLength]
 
 		// Identity-guarded commit: only re-write the entry if it still IS the
-		// marker this re-tier was triggered by. The cancellation check comes
-		// after it — a racing PUT cancels before it stores, so an alive
-		// context here means no PUT has entered the store ahead of us.
-		cur, found, gerr := s.cache.GetMeta(ctx, bucket, key)
+		// marker this re-tier was triggered by — and the observed version
+		// becomes the store's CAS expectation, so anything landing between
+		// this check and the commit refuses the commit atomically. The
+		// cancellation check comes after it — a racing PUT cancels before it
+		// stores, so an alive context here means no PUT has entered the store
+		// ahead of us; the version precondition then holds the line for
+		// whatever the claim window cannot see.
+		cur, curVersion, found, gerr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 		if gerr != nil || !found || cur == nil || cur.ETag != etag || !cur.BodyUpstream {
 			metrics.RecordTieredRetier("changed")
 			return
@@ -443,7 +450,7 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		// carries no Content-Length header for MetaFromHTTPHeaders to copy.
 		meta.ContentLength = int64(len(body))
 		ttl := int(s.config.Cache.TTL.Seconds())
-		wrote, werr := s.cache.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, bytes.NewReader(body), ttl, stamp)
+		wrote, werr := s.cache.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, bytes.NewReader(body), ttl, stamp, curVersion)
 		if werr != nil {
 			metrics.RecordTieredRetier("error")
 			log.Debug().Err(werr).Str("bucket", bucket).Str("key", key).Msg("Re-tier store failed")
