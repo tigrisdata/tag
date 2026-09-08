@@ -991,13 +991,13 @@ func TestBlockCache_InvalidateStaleBlockMetaOnlyMatchingETag(t *testing.T) {
 	}
 
 	// A lagging request that saw v1 as stale must NOT wipe the newer v2 entry.
-	svc.invalidateStaleBlockMeta(wowBucket, wowKey, `"v1"`)
+	svc.invalidateStaleMeta(wowBucket, wowKey, `"v1"`)
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
 		t.Error("v2 entry wrongly deleted by a stale-v1 invalidation")
 	}
 
 	// Invalidating the matching (current) version does delete it.
-	svc.invalidateStaleBlockMeta(wowBucket, wowKey, `"v2"`)
+	svc.invalidateStaleMeta(wowBucket, wowKey, `"v2"`)
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
 		t.Error("v2 entry not deleted by a matching-version invalidation")
 	}
