@@ -250,11 +250,16 @@ func (s *Service) setupCacheListener(
 			// read-back. The whole-vs-block boundary is size, not access pattern (RFC 0001): both
 			// full and range paths converge on one representation per size class. Sub-block objects
 			// keep the single whole-body write.
+			// VersionAny: the miss path can legitimately run while metadata
+			// still exists (a forced-revalidation fall-through, an anonymous
+			// read of a non-public entry), and this populate IS the refresh —
+			// last-write-wins is the contract, version-stamped so the row
+			// stays CAS-meaningful.
 			if s.isBlockEligibleSize(meta.ContentLength) {
 				meta.BlockSize = s.config.Cache.BlockSize
-				cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+				cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime, cache.VersionAny)
 			} else {
-				_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+				_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime, cache.VersionAny)
 			}
 			if cacheErr != nil {
 				log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")
@@ -542,12 +547,15 @@ func (s *Service) fetchFullObjectToCache(
 		// Block-eligible full fetches retain the size-based representation used by the
 		// foreground miss path: blocks are written first and tombstone-aware metadata is
 		// published last. Smaller objects use the whole-body stream writer.
+		// Put-if-absent: background populates are triggered on a metadata miss,
+		// so their precondition is absence — a racer that re-established the
+		// entry first fetched the same-or-newer upstream state and wins.
 		if blockMode {
 			meta.BlockSize = s.config.Cache.BlockSize
-			cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, writeStartTime)
+			cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, writeStartTime, 0)
 		} else {
 			_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(
-				cacheCtx, bucket, key, meta, body, ttl, writeStartTime,
+				cacheCtx, bucket, key, meta, body, ttl, writeStartTime, 0,
 			)
 		}
 		cacheErrCh <- cacheErr
