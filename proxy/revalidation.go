@@ -221,10 +221,12 @@ func (s *Service) handleRevalidation200(
 		var cacheErr error
 		if s.isBlockEligibleSize(newMeta.ContentLength) {
 			newMeta.BlockSize = s.config.Cache.BlockSize
-			cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime)
+			// Put-if-absent: the guarded delete above cleared the stale entry;
+			// if a racer re-established one, it holds the fresh version and wins.
+			cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime, 0)
 		} else {
 			_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(
-				context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime,
+				context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime, 0,
 			)
 		}
 		if cacheErr != nil {

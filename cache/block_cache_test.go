@@ -385,7 +385,7 @@ func TestPutMetaTombstoneAware(t *testing.T) {
 	meta := &CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"v1"`, ContentLength: 100, StatusCode: 200, BlockSize: 4}
 
 	// No tombstone → meta is written.
-	wrote, err := c.PutMetaTombstoneAware(ctx, bucket, key, meta, 60, time.Now().UnixNano())
+	wrote, err := c.PutMetaTombstoneAware(ctx, bucket, key, meta, 60, time.Now().UnixNano(), VersionAny)
 	if err != nil || !wrote {
 		t.Fatalf("PutMetaTombstoneAware = (%v, %v), want (true, nil)", wrote, err)
 	}
@@ -401,7 +401,7 @@ func TestPutMetaTombstoneAware(t *testing.T) {
 	writeStart := time.Now().UnixNano()
 	time.Sleep(time.Millisecond)
 	c.WriteTombstone(ctx, bucket, key)
-	wrote, err = c.PutMetaTombstoneAware(ctx, bucket, key, meta, 60, writeStart)
+	wrote, err = c.PutMetaTombstoneAware(ctx, bucket, key, meta, 60, writeStart, VersionAny)
 	if err != nil {
 		t.Fatalf("PutMetaTombstoneAware (tombstoned) err = %v", err)
 	}

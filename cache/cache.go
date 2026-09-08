@@ -87,6 +87,54 @@ func (c *Cache) IsEnabled() bool {
 // Two-Key Pattern: Metadata and Body stored separately
 // ============================================================================
 
+// VersionAny requests a version-BUMPING unconditional meta write: last-write-
+// wins like a plain Put, but implemented as a CAS loop so the row stays
+// version-stamped. This upholds the package invariant that NO meta key is ever
+// written with a plain Put — a plain Put resets the row to the storage layer's
+// legacy version, which blinds DeleteIfETag's version guard for every
+// subsequent conditional operation on the key.
+const VersionAny = ^uint64(0)
+
+// putMetaVersioned writes metaBytes to metaKey under a version precondition.
+// expected == VersionAny preserves plain-Put semantics (unconditional,
+// last-write-wins) via a bounded read-CAS loop; any other value — including 0,
+// put-if-absent — is a strict precondition, and a lost race returns
+// (false, nil): the newer entry wins.
+func (c *Cache) putMetaVersioned(ctx context.Context, bucket, key, metaKey string, metaBytes []byte, ttl int64, expected uint64) (bool, error) {
+	if expected != VersionAny {
+		if _, err := c.client.PutIfVersion(ctx, metaKey, metaBytes, ttl, expected); err != nil {
+			if _, mismatch := cacheclient.IsVersionMismatch(err); mismatch {
+				log.Debug().Str("bucket", bucket).Str("key", key).Uint64("expected", expected).
+					Msg("Skipping meta write - version precondition lost to a newer write")
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	}
+	// Unconditional: retry the CAS against whatever is current. Contention on a
+	// single object's metadata is bounded by the populate paths racing it, so
+	// the loop terminating early is a pathology worth surfacing, not masking.
+	const maxAttempts = 8
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		_, version, found, err := c.client.GetWithVersion(ctx, metaKey)
+		if err != nil && !isNotFoundError(err) {
+			return false, err
+		}
+		if !found {
+			version = 0
+		}
+		_, err = c.client.PutIfVersion(ctx, metaKey, metaBytes, ttl, version)
+		if err == nil {
+			return true, nil
+		}
+		if _, mismatch := cacheclient.IsVersionMismatch(err); !mismatch {
+			return false, err
+		}
+	}
+	return false, fmt.Errorf("meta write for %s/%s lost %d consecutive version races", bucket, key, 8)
+}
+
 // PutWithMeta stores object metadata and body in separate cache entries.
 // This follows the gateway's LiteCache pattern for proper S3 caching.
 // IMPORTANT: Body is written BEFORE metadata to ensure metadata presence
@@ -132,8 +180,9 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 		return err
 	}
 
-	// Store metadata AFTER body is complete
-	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
+	// Store metadata AFTER body is complete. Version-bumping unconditional:
+	// same last-write-wins semantics as before, but the row stays stamped.
+	if _, err := c.putMetaVersioned(ctx, bucket, key, metaKey, metaBytes, int64(ttl), VersionAny); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
 		// Leave the versioned body to age out via TTL rather than deleting it
 		// synchronously: a concurrent populate of the same ETag could have a reader
@@ -163,6 +212,12 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 // visible). It is false when the write was skipped without error — the object was not
 // cacheable (no ETag) or a newer tombstone superseded it — so callers can distinguish a
 // no-op from a real write (e.g. for metrics or a fallback).
+// The expected version is the precondition of the meta write (see
+// putMetaVersioned): 0 for a populate decided while the entry was absent,
+// the observed version for a read-modify-write, VersionAny to preserve
+// last-write-wins. The tombstone check is retained alongside it — tombstones
+// still order writers that carry no useful precondition (VersionAny), and
+// belt-and-braces costs one point read.
 func (c *Cache) PutWithMetaStreamTombstoneAware(
 	ctx context.Context,
 	bucket, key string,
@@ -170,6 +225,7 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 	body io.Reader,
 	ttl int,
 	writeStartTime int64, // Unix nano timestamp when write started
+	expected uint64, // version precondition for the meta write
 ) (wrote bool, err error) {
 	if !c.IsEnabled() {
 		return false, nil
@@ -225,12 +281,18 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		return false, nil
 	}
 
-	// Write metadata AFTER body (makes entry visible)
-	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
+	// Write metadata AFTER body (makes entry visible), under the version
+	// precondition. A lost precondition leaves the newer entry in place and the
+	// just-written body to TTL, like the tombstone branch.
+	wrote, err = c.putMetaVersioned(ctx, bucket, key, metaKey, metaBytes, int64(ttl), expected)
+	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
 		// Same rationale as the tombstone branch: leave the versioned body to TTL
 		// rather than risk truncating a concurrent same-version reader.
 		return false, err
+	}
+	if !wrote {
+		return false, nil
 	}
 
 	log.Debug().
@@ -240,6 +302,29 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		Int("meta_size", len(metaBytes)).
 		Msg("Cached object with metadata (streamed, tombstone-aware)")
 	return true, nil
+}
+
+// GetMetaWithVersion is GetMeta plus the meta row's CAS version — the value a
+// read-modify-write passes back as its precondition. Version 0 means absent.
+func (c *Cache) GetMetaWithVersion(ctx context.Context, bucket, key string) (*CachedObjectMeta, uint64, bool, error) {
+	if !c.IsEnabled() {
+		return nil, 0, false, nil
+	}
+	metaBytes, version, found, err := c.client.GetWithVersion(ctx, MakeMetaKey(bucket, key))
+	if err != nil {
+		if isNotFoundError(err) {
+			return nil, 0, false, nil
+		}
+		return nil, 0, false, err
+	}
+	if !found || metaBytes == nil {
+		return nil, 0, false, nil
+	}
+	meta, err := DecodeMeta(metaBytes)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return meta, version, true, nil
 }
 
 // GetMeta retrieves only object metadata from cache (no body).
@@ -695,12 +780,14 @@ func (c *Cache) PutBlockStream(ctx context.Context, bucket, key, etag string, bl
 // like PutWithMetaStreamTombstoneAware: if an invalidation landed at or after writeStartTime
 // the write is skipped and wrote=false is returned. It is the visibility gate for a block-
 // mode entry — callers write the touched blocks first, then this meta last. See RFC 0001.
+// The expected version is the meta write's precondition (see putMetaVersioned).
 func (c *Cache) PutMetaTombstoneAware(
 	ctx context.Context,
 	bucket, key string,
 	meta *CachedObjectMeta,
 	ttl int,
 	writeStartTime int64,
+	expected uint64,
 ) (wrote bool, err error) {
 	if !c.IsEnabled() {
 		return false, nil
@@ -726,11 +813,7 @@ func (c *Cache) PutMetaTombstoneAware(
 			Msg("Skipping block-mode meta write - tombstone detected")
 		return false, nil
 	}
-	if err := c.client.Put(ctx, metaKey, metaBytes, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
-		return false, err
-	}
-	return true, nil
+	return c.putMetaVersioned(ctx, bucket, key, metaKey, metaBytes, int64(ttl), expected)
 }
 
 // ============================================================================

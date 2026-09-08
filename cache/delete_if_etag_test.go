@@ -95,7 +95,7 @@ func TestDeleteIfETag_WritesTombstoneOnMatch(t *testing.T) {
 
 	// ...and its tombstone-aware meta write must now be refused.
 	meta := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"v1"`, StatusCode: 200}
-	wrote, err := c.PutMetaTombstoneAware(ctx, "b", "k", meta, 60, populateStart)
+	wrote, err := c.PutMetaTombstoneAware(ctx, "b", "k", meta, 60, populateStart, VersionAny)
 	if err != nil {
 		t.Fatalf("PutMetaTombstoneAware: %v", err)
 	}
@@ -136,16 +136,17 @@ func TestDeleteIfETag_VersionedReplacementInsideWindowSurvives(t *testing.T) {
 
 	seedEntry(t, c, "b", "k", `"v1"`, "body-v1")
 	wrapper.replace = func() {
-		// A CAS writer replaces the entry: the version bumps past the snapshot
-		// the delete is holding. Plain-written rows read as the legacy version
-		// (1), so that is the expectation the racer swaps against.
+		// A CAS writer replaces the entry: it reads the current version (via
+		// the raw client, not the wrapper, so the injection doesn't recurse)
+		// and swaps against it, bumping past the snapshot the delete holds.
 		v2 := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"v2"`, StatusCode: 200}
 		encoded, err := v2.Encode()
 		if err != nil {
 			t.Errorf("encode v2: %v", err)
 			return
 		}
-		if _, err := mem.PutIfVersion(ctx, MakeMetaKey("b", "k"), encoded, 0, 1); err != nil {
+		_, cur, _, _ := mem.GetWithVersion(ctx, MakeMetaKey("b", "k"))
+		if _, err := mem.PutIfVersion(ctx, MakeMetaKey("b", "k"), encoded, 0, cur); err != nil {
 			t.Errorf("versioned replacement: %v", err)
 		}
 	}
@@ -166,15 +167,13 @@ func TestDeleteIfETag_VersionedReplacementInsideWindowSurvives(t *testing.T) {
 	}
 }
 
-// KNOWN LIMITATION, pinned as a tripwire: a PLAIN-put replacement inside the
-// window is still deleted, because a plain Put resets the row to the legacy
-// version (storage EffectiveRowVersion semantics) — version equality carries
-// no information between plain writes. Today every populate path writes meta
-// with a plain Put, so for those racers this guard equals the previous
-// compare-then-delete: the same window as before, never wider. Moving the
-// populate paths to version-stamped writes closes it; when that lands, this
-// test MUST flip to assert the replacement survives.
-func TestDeleteIfETag_PlainReplacementInsideWindowIsStillDeleted(t *testing.T) {
+// The tripwire, flipped: every meta write in this package is now
+// version-stamped (putMetaVersioned — strict preconditions or the VersionAny
+// bumping loop), so an ordinary populate replacing the entry inside the window
+// bumps the version and the guarded delete loses. This is the state the
+// original limitation test existed to force: the guard is now exact against
+// ALL of this package's writers, not only conditional ones.
+func TestDeleteIfETag_PopulateReplacementInsideWindowSurvives(t *testing.T) {
 	wrapper := &raceOnReadClient{CacheClient: cacheclient.NewMemoryCache()}
 	cfg := config.NewDefault()
 	c := NewCacheWithClient(wrapper, &cfg.Cache)
@@ -192,8 +191,11 @@ func TestDeleteIfETag_PlainReplacementInsideWindowIsStillDeleted(t *testing.T) {
 	if !wrapper.raced {
 		t.Fatal("test wiring: the replacement was never injected")
 	}
-	if !deleted {
-		t.Fatal("plain-put replacement survived the window: the populate paths " +
-			"now stamp versions - flip this test to assert survival")
+	if deleted {
+		t.Fatal("deleted = true: the guarded delete claimed a win over a populate's replacement")
+	}
+	meta, found, _ := c.GetMeta(ctx, "b", "k")
+	if !found || meta == nil || meta.ETag != `"v2"` {
+		t.Fatalf("populate replacement inside the CAS window was deleted: found=%v meta=%+v", found, meta)
 	}
 }

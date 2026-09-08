@@ -827,12 +827,22 @@ func (s *Service) serveFullObjectFromBlockCache(
 	// probes again.
 	if !meta.BlocksComplete {
 		if remaining := s.remainingMetaTTL(meta); remaining > 0 {
-			promoted := *meta
-			promoted.BlocksComplete = true
+			expectETag := meta.ETag
 			go func() {
 				pctx, cancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
 				defer cancel()
-				if _, perr := s.cache.PutMetaTombstoneAware(pctx, bucket, key, &promoted, remaining, writeStartTime); perr != nil {
+				// A promotion is a read-modify-write of live metadata, so it
+				// re-reads with the version and promotes THAT snapshot under a
+				// strict precondition: a concurrent overwrite's fresh entry can
+				// never be clobbered by a promoted copy of the old one. Any
+				// skip just means the next full GET probes again.
+				cur, version, found, gerr := s.cache.GetMetaWithVersion(pctx, bucket, key)
+				if gerr != nil || !found || cur == nil || cur.ETag != expectETag || cur.BlocksComplete {
+					return
+				}
+				promoted := *cur
+				promoted.BlocksComplete = true
+				if _, perr := s.cache.PutMetaTombstoneAware(pctx, bucket, key, &promoted, remaining, writeStartTime, version); perr != nil {
 					log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Blocks-complete promotion failed")
 				}
 			}()
@@ -1453,7 +1463,7 @@ func (s *Service) buildBlockMeta(bucket, key string, respHeader http.Header, tot
 // truncated bytes under a committed length (and poison a later range-path populate that trusts
 // existing blocks). fetchOneBlock validates block length the same way; this keeps the two block
 // writers consistent. A body longer than Content-Length is likewise rejected before the meta.
-func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, writeStartTime int64) (err error) {
+func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, writeStartTime int64, expected uint64) (err error) {
 	// On any early return, drain the rest of r. setupCacheListener feeds this from an io.Pipe; if
 	// we stop reading with bytes still queued (a mid-object PutBlockStream error, or an oversize
 	// body), the pipe writer goroutine blocks forever on Write, leaking it and never releasing the
@@ -1491,7 +1501,7 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 	// Every block was just written, so stamp the meta complete: full-object serves can skip
 	// the per-block probe pass and stream optimistically.
 	meta.BlocksComplete = true
-	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime); err != nil {
+	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime, expected); err != nil {
 		return err
 	}
 	return nil
@@ -1544,7 +1554,11 @@ func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string,
 		return
 	}
 	ttl := int(s.config.Cache.TTL.Seconds())
-	wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime)
+	// Put-if-absent: this establishment was decided right after the write's own
+	// invalidation cleared the entry. If a racer (a warm, another establish)
+	// repopulated first, its entry describes the same or a newer version — the
+	// lost precondition leaves it in place.
+	wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime, 0)
 	if err != nil || !wrote {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (tombstone or error)")
 		return

@@ -123,7 +123,7 @@ func TestMeasure_FirstOpenUpstreamRoundTrips(t *testing.T) {
 // of this measurement produced "no improvement".
 func mustPrimeMeta(t *testing.T, c *cache.Cache, bucket, key string, meta *cache.CachedObjectMeta) {
 	t.Helper()
-	wrote, err := c.PutMetaTombstoneAware(context.Background(), bucket, key, meta, 3600, time.Now().UnixNano())
+	wrote, err := c.PutMetaTombstoneAware(context.Background(), bucket, key, meta, 3600, time.Now().UnixNano(), cache.VersionAny)
 	if err != nil || !wrote {
 		t.Fatalf("prime meta: wrote=%v err=%v", wrote, err)
 	}
