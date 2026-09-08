@@ -156,7 +156,7 @@ func (s *Service) forwardPutMaybeTee(ctx context.Context, w http.ResponseWriter,
 // caller warms.
 // The reserved populate budget is always released: synchronously on decline, or when the
 // async work completes.
-func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
+func (s *Service) writeThroughCache(bucket, key string, ts *teeState, invalidatedAt invalidationEpoch) bool {
 	putETag := ts.respHeaders.Get("ETag")
 	// Credentials were validated and derived by ForwardTeeingBody (no re-validation here). The
 	// async goroutine uses only these captured values — never r, which the server may recycle
@@ -193,7 +193,12 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 		// only SPAWNS the fetch and returns, so this goroutine returns and its deferred release frees
 		// the slot, which the warm's (separate) blocking acquire then observes.
 		metrics.WarmOnWriteTriggered.Inc()
-		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite)
+		s.triggerBackgroundCacheFetchAfterInvalidation(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, invalidatedAt)
+		// The optional observer is test-only proof support. It lets a deterministic
+		// benchmark join the detached trigger without changing production behavior.
+		if observer, ok := s.forwarder.(interface{ backgroundWarmTriggerComplete() }); ok {
+			observer.backgroundWarmTriggerComplete()
+		}
 	}()
 	return true
 }

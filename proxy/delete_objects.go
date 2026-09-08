@@ -96,12 +96,15 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	// requestedCounts tracks how many entries each key was requested under (the same
 	// key may appear multiple times with different version IDs).
 	var requestedCounts map[string]int
+	deleteOrders := make(map[string]invalidationEpoch)
 	if s.cache.IsEnabled() {
 		var deleteReq deleteObjectsRequest
 		if xmlErr := xml.Unmarshal(bodyBytes, &deleteReq); xmlErr == nil {
 			requestedCounts = make(map[string]int)
 			for _, obj := range deleteReq.Objects {
-				s.invalidateObject(context.Background(), bucket, obj.Key)
+				if _, seen := deleteOrders[obj.Key]; !seen {
+					deleteOrders[obj.Key] = s.invalidateObjectBeforeWrite(context.Background(), bucket, obj.Key)
+				}
 				requestedCounts[obj.Key]++
 				log.Debug().
 					Str("bucket", bucket).
@@ -125,7 +128,7 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	// IDs) is robust to VersionId representation differences and to Quiet mode, and
 	// can never leave a truly-deleted object cached (a success is never an <Error>).
 	// A key whose entries ALL errored keeps its refill (it's still upstream).
-	// Routed through invalidateObject so a failed re-invalidation is recorded/logged.
+	// Routed through the ordered invalidation helper so a failed re-invalidation is recorded/logged.
 	if err == nil && capture != nil && capture.StatusCode >= 200 && capture.StatusCode < 300 && s.cache.IsEnabled() {
 		erroredCounts, parsed := erroredDeleteKeyCounts(capture.Body)
 		for key, reqN := range requestedCounts {
@@ -133,7 +136,13 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 			if parsed && reqN <= erroredCounts[key] {
 				continue // every requested entry for this key errored — object still present
 			}
-			s.invalidateObject(context.Background(), bucket, key)
+			if order, ok := deleteOrders[key]; ok {
+				s.invalidateObjectWithOrder(context.Background(), bucket, key, order.order)
+			} else {
+				// This only occurs when the request was parsed after cache state changed;
+				// preserve the existing safe over-invalidation fallback.
+				s.invalidateObject(context.Background(), bucket, key)
+			}
 		}
 	}
 

@@ -23,7 +23,8 @@ type teeMockForwarder struct {
 	teeFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, string, string, error)
 	// headHook, if set, runs when the tee issues its authoritative HEAD — used to simulate a
 	// competing write landing during the HEAD window.
-	headHook func()
+	headHook        func()
+	warmTriggerDone chan struct{} // proof hook for detached fallback benchmarks
 }
 
 func (m *teeMockForwarder) ForwardTeeingBody(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, string, string, error) {
@@ -35,6 +36,12 @@ func (m *teeMockForwarder) DoConditionalHeadRequest(ctx context.Context, bucket,
 		m.headHook()
 	}
 	return m.mockForwarder.DoConditionalHeadRequest(ctx, bucket, key, accessKey, secretKey, etag, lastModified)
+}
+
+func (m *teeMockForwarder) backgroundWarmTriggerComplete() {
+	if m.warmTriggerDone != nil {
+		close(m.warmTriggerDone)
+	}
 }
 
 // teeUpstream returns a teeFunc that tees the whole body, responds 200 with the given

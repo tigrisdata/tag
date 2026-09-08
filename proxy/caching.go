@@ -384,6 +384,20 @@ func (s *Service) fetchFullObjectToCache(
 	anonymous bool,
 	prio populatePriority,
 ) error {
+	return s.fetchFullObjectToCacheAt(ctx, bucket, key, accessKey, secretKey, anonymous, prio, 0)
+}
+
+// fetchFullObjectToCacheAt uses startedAt as the tombstone epoch for the detached
+// fetch. The epoch is captured before the dedup marker is published, so a worker
+// delayed on scheduling or admission cannot make a stale response look newer than
+// an intervening invalidation. A zero startedAt is reserved for direct callers.
+func (s *Service) fetchFullObjectToCacheAt(
+	ctx context.Context,
+	bucket, key, accessKey, secretKey string,
+	anonymous bool,
+	prio populatePriority,
+	startedAt int64,
+) error {
 	// This is a background fetch whose only purpose is to populate the cache, so
 	// reserve a cache-populate slot up front. If the concurrent-write limit is
 	// saturated, skip the whole operation — including the upstream request —
@@ -420,8 +434,12 @@ func (s *Service) fetchFullObjectToCache(
 	// Stamp the cache-write start BEFORE the upstream request, for the same reason
 	// as the inline path: a timestamp taken after the response leaves the whole
 	// round-trip unguarded, letting an invalidation that landed mid-fetch look older
-	// than our write and pass the tombstone check.
-	writeStartTime := time.Now().UnixNano()
+	// than our write and pass the tombstone check. The detached path supplies the
+	// marker's epoch; direct test callers use the local timestamp fallback.
+	if startedAt == 0 {
+		startedAt = time.Now().UnixNano()
+	}
+	writeStartTime := startedAt
 
 	// Execute full object request (no Range header). An anonymous warm uses an
 	// unsigned request so upstream applies anonymous authorization — 200 only if the
@@ -533,9 +551,9 @@ func (s *Service) fetchFullObjectToCache(
 	ttl := int(s.config.Cache.TTL.Seconds())
 
 	// Keep the direct write asynchronous only for deadline handling. On timeout the
-	// fetch returns like the former listener path, but the reservation stays owned by
-	// the writer until it actually exits; releasing it while an uncooperative cache
-	// client still holds buffers would break the aggregate memory bound.
+	// caller must still wait for the writer to exit before a serialized replacement
+	// can start; releasing the handoff while an uncooperative cache client still
+	// holds buffers would break the one-active and aggregate memory bounds.
 	cacheErrCh := make(chan error, 1)
 	go func() {
 		var cacheErr error
@@ -560,10 +578,8 @@ func (s *Service) fetchFullObjectToCache(
 		_ = resp.Body.Close()
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Background cache write timeout")
 		slotOwned = false
-		go func() {
-			<-cacheErrCh
-			s.releaseCacheSlot(weight)
-		}()
+		<-cacheErrCh
+		s.releaseCacheSlot(weight)
 		return errors.New("cache write timeout")
 	}
 	if cacheErr != nil {
@@ -576,49 +592,322 @@ func (s *Service) fetchFullObjectToCache(
 	return cacheErr
 }
 
+// invalidationEpoch separates the post-delete timestamp used to identify stale
+// read fetches from the pre-delete order used to order concurrent write warms.
+type invalidationEpoch struct {
+	at    int64
+	order uint64
+}
+
+// backgroundFetchRequest is the immutable input for one full-object populate.
+// It is copied into a pending slot when a write-origin warm supersedes an older
+// read-origin fetch, so the replacement uses the credentials and authorization
+// mode from the latest write rather than the old fetch.
+type backgroundFetchRequest struct {
+	accessKey         string
+	secretKey         string
+	anonymous         bool
+	prio              populatePriority
+	startedAt         int64  // dedup marker epoch used by the tombstone gate
+	invalidatedAt     int64  // zero for read-origin triggers; otherwise post-delete timestamp
+	invalidationOrder uint64 // zero for direct/test triggers; otherwise write order
+}
+
+func (r backgroundFetchRequest) isAtOrAfter(other backgroundFetchRequest) bool {
+	if r.invalidationOrder != 0 && other.invalidationOrder != 0 {
+		return r.invalidationOrder >= other.invalidationOrder
+	}
+	return r.invalidatedAt >= other.invalidatedAt
+}
+
+// backgroundFetchState is stored only for bg: entries in activeBackgroundFetches.
+// Other prefixes in that map use their existing struct{} markers. The state keeps
+// one replaceable pending write warm without allowing two full-object fetches for
+// the same object to run at once.
+type backgroundFetchState struct {
+	mu sync.Mutex
+	// startedAt is assigned before the dedup marker is published, so no trigger
+	// can observe an active state without an execution epoch.
+	startedAt int64
+	// activeInvalidatedAt orders a write-origin fetch independently of when its
+	// worker was scheduled. A newer write must supersede an older pending warm
+	// even when the older worker has not reached the origin yet.
+	activeInvalidatedAt     int64
+	activeInvalidationOrder uint64
+	pending                 *backgroundFetchRequest
+	closed                  bool
+}
+
+// predates reports whether the active request belongs to an earlier
+// invalidation epoch. Write-origin requests use their write epoch rather than
+// the worker's scheduling timestamp, so a newer write cannot be lost in the
+// handoff gap before the older request reaches the origin.
+func (s *backgroundFetchState) predates(invalidatedAt int64, invalidationOrder uint64) bool {
+	if s.activeInvalidationOrder > 0 && invalidationOrder > 0 {
+		return s.activeInvalidationOrder <= invalidationOrder
+	}
+	return s.activeInvalidatedAt > 0 && s.activeInvalidatedAt <= invalidatedAt ||
+		s.activeInvalidatedAt == 0 && s.startedAt > 0 && s.startedAt <= invalidatedAt
+}
+
 // triggerBackgroundCacheFetch starts a background fetch of the full object.
 // Uses sync.Map for deduplication: only the first trigger for a given object
-// starts a fetch; subsequent triggers while the fetch is in progress are no-ops.
-// This avoids broadcast.Manager's "no late joiners" policy which incorrectly
-// allows multiple fetches when the first has already started streaming.
+// starts a fetch; subsequent read-miss triggers while the fetch is in progress
+// remain no-ops. A write-origin trigger uses
+// triggerBackgroundCacheFetchAfterInvalidation so it can retain one latest warm
+// when the active fetch began before that write's invalidation.
 // When anonymous is true the fetch is issued without credentials and, on success,
 // cached as public-read (see fetchFullObjectToCache); accessKey/secretKey are then
 // ignored. Pass anonymous=true exactly when the triggering request was anonymous, so
 // public-read is only ever inferred from a confirmed anonymous read.
 func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority) {
-	bcastKey := "bg:" + bucket + "/" + key
+	s.triggerBackgroundCacheFetchAt(bucket, key, accessKey, secretKey, anonymous, prio, invalidationEpoch{})
+}
 
-	// Atomic check-and-set: if key exists, a fetch is already in progress
-	if _, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, struct{}{}); loaded {
+// triggerBackgroundCacheFetchAfterInvalidation retains a write-origin warm when
+// an existing bg fetch started before the successful write's invalidation. The
+// timestamp and order are supplied by the mutation handler after its tombstone
+// write. The durable order check runs in the detached trigger, not on the client
+// write path.
+func (s *Service) triggerBackgroundCacheFetchAfterInvalidation(
+	bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, invalidatedAt invalidationEpoch,
+) {
+	s.triggerBackgroundCacheFetchAt(bucket, key, accessKey, secretKey, anonymous, prio, invalidatedAt)
+}
+
+func (s *Service) backgroundWarmSuperseded(bucket, key string, request backgroundFetchRequest) bool {
+	if request.invalidationOrder == 0 {
+		return false
+	}
+	ctx := context.Background()
+	tombstoneOrder := s.cache.GetTombstoneOrder(ctx, bucket, key)
+	// The order is owner-scoped because invalidationOrder is process-local. A
+	// foreign/legacy tombstone still has a shared timestamp fence, which closes
+	// the same delayed-trigger gap across proxy instances.
+	tombstoneAt := int64(0)
+	if tombstoneOrder == 0 {
+		tombstoneAt = s.cache.GetTombstoneTimestamp(ctx, bucket, key)
+	}
+	if tombstoneOrder > request.invalidationOrder ||
+		(tombstoneOrder == 0 && tombstoneAt > request.invalidatedAt) {
+		log.Debug().Str("bucket", bucket).Str("key", key).
+			Int64("warm_invalidated_at", request.invalidatedAt).
+			Int64("tombstone_at", tombstoneAt).
+			Uint64("warm_order", request.invalidationOrder).
+			Uint64("tombstone_order", tombstoneOrder).
+			Msg("Coalesced delayed background warm superseded by a newer invalidation")
+		return true
+	}
+	return false
+}
+
+// startUnstartedBackgroundFetch performs the final durable-fence check after
+// the state is published. It runs detached because the tombstone check can be a
+// backend read; the trigger must not add that round trip to the foreground write.
+// If a newer warm arrived while the check ran, it is promoted into the reserved
+// state so the marker never strands a pending warm.
+func (s *Service) startUnstartedBackgroundFetch(
+	bcastKey, bucket, key string, state *backgroundFetchState, request backgroundFetchRequest,
+) {
+	go func() {
+		for {
+			if !s.backgroundWarmSuperseded(bucket, key, request) {
+				metrics.RecordBackgroundFetchTriggered()
+				metrics.ActiveBackgroundFetches.Inc()
+				s.runBackgroundCacheFetch(bcastKey, bucket, key, state, request)
+				return
+			}
+
+			state.mu.Lock()
+			if state.pending == nil {
+				state.closed = true
+				state.mu.Unlock()
+				s.activeBackgroundFetches.CompareAndDelete(bcastKey, state)
+				return
+			}
+			request = *state.pending
+			state.pending = nil
+			state.startedAt = time.Now().UnixNano()
+			request.startedAt = state.startedAt
+			state.activeInvalidatedAt = request.invalidatedAt
+			state.activeInvalidationOrder = request.invalidationOrder
+			state.mu.Unlock()
+		}
+	}()
+}
+
+func (s *Service) triggerBackgroundCacheFetchAt(
+	bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, invalidatedAt invalidationEpoch,
+) {
+	bcastKey := "bg:" + bucket + "/" + key
+	request := backgroundFetchRequest{
+		accessKey:         accessKey,
+		secretKey:         secretKey,
+		anonymous:         anonymous,
+		prio:              prio,
+		invalidatedAt:     invalidatedAt.at,
+		invalidationOrder: invalidatedAt.order,
+	}
+	for {
+		// Publish the fetch epoch with the marker. A write can arrive before the
+		// goroutine is scheduled, and must still be able to retain its warm rather
+		// than observing a zero start time and coalescing it away.
+		state := &backgroundFetchState{
+			startedAt:               time.Now().UnixNano(),
+			activeInvalidatedAt:     request.invalidatedAt,
+			activeInvalidationOrder: request.invalidationOrder,
+		}
+		request.startedAt = state.startedAt
+		actual, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, state)
+		if !loaded {
+			s.startUnstartedBackgroundFetch(bcastKey, bucket, key, state, request)
+			return
+		}
+
+		active, ok := actual.(*backgroundFetchState)
+		if !ok {
+			// Keep compatibility with the other prefix-scoped users of this map
+			// and with tests that install a plain marker by hand.
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background fetch already in progress, coalescing")
+			return
+		}
+
+		active.mu.Lock()
+		if active.closed {
+			active.mu.Unlock()
+			// The owner is handing the exact state out of the map. Retry so a
+			// trigger arriving at that boundary cannot be stranded.
+			continue
+		}
+		if prio == priorityWarmWrite && invalidatedAt.at > 0 && active.predates(invalidatedAt.at, invalidatedAt.order) {
+			if active.pending == nil || request.isAtOrAfter(*active.pending) {
+				pending := request
+				active.pending = &pending // latest invalidation's credentials and priority win
+				active.mu.Unlock()
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Queued latest background warm behind an older fetch")
+				return
+			}
+			active.mu.Unlock()
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Coalesced older background warm behind a newer pending warm")
+			return
+		}
+		active.mu.Unlock()
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background fetch already in progress, coalescing")
 		return
 	}
+}
 
-	metrics.RecordBackgroundFetchTriggered()
-	metrics.ActiveBackgroundFetches.Inc()
+// runBackgroundCacheFetch serializes the active fetch and at most one pending
+// write-origin warm. The active gauge stays at one across the handoff because
+// the pending request never starts until the prior fetch and its cache writer
+// have exited.
+func (s *Service) runBackgroundCacheFetch(
+	bcastKey, bucket, key string, state *backgroundFetchState, current backgroundFetchRequest,
+) {
+	defer metrics.ActiveBackgroundFetches.Dec()
 
-	go func() {
-		defer metrics.ActiveBackgroundFetches.Dec()
-		defer s.activeBackgroundFetches.Delete(bcastKey)
-
+	for {
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
-		defer cancel()
+		err := s.fetchFullObjectToCacheAt(ctx, bucket, key, current.accessKey, current.secretKey, current.anonymous, current.prio, current.startedAt)
+		cancel()
+		s.recordBackgroundFetchResult(bucket, key, err)
 
-		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, prio)
-
-		switch {
-		case errors.Is(err, errCachePopulateDeclined):
-			// Deliberately skipped because the cache-write limit was saturated —
-			// not a fetch success or failure (already counted as a populate skip).
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background cache fetch skipped - concurrent write limit reached")
-		case err != nil:
-			log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background cache fetch failed")
-			metrics.RecordBackgroundFetchFailed()
-		default:
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background cache fetch completed")
-			metrics.RecordBackgroundFetchSucceeded()
+		var ok bool
+		current, ok = s.nextBackgroundFetch(bcastKey, bucket, key, state)
+		if !ok {
+			return
 		}
-	}()
+		metrics.RecordBackgroundFetchTriggered()
+	}
+}
+
+// recordBackgroundFetchResult keeps one metric outcome per actual fetch attempt,
+// including a serialized pending replacement.
+func (s *Service) recordBackgroundFetchResult(bucket, key string, err error) {
+	switch {
+	case errors.Is(err, errCachePopulateDeclined):
+		// Deliberately skipped because the cache-write limit was saturated —
+		// not a fetch success or failure (already counted as a populate skip).
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background cache fetch skipped - concurrent write limit reached")
+	case err != nil:
+		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Background cache fetch failed")
+		metrics.RecordBackgroundFetchFailed()
+	default:
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background cache fetch completed")
+		metrics.RecordBackgroundFetchSucceeded()
+	}
+}
+
+// nextBackgroundFetch takes the latest pending warm and checks both the visibility
+// gate and the durable invalidation fence after the active owner exits. A visible
+// entry that the pending request can read means the active fetch or another writer
+// already supplied the current object, so no replacement GET is needed. A signed
+// entry is not visible to an anonymous warm unless its ACL proves public read. A
+// metadata error is logged but treated as absent so a transient cache read failure
+// does not silently strand the promised write warm.
+//
+// The replacement's startedAt is assigned before either check. If a newer
+// invalidation lands after the checks but before the origin request starts, the
+// tombstone-aware cache write still sees that invalidation as newer and cannot
+// publish the stale response.
+func (s *Service) nextBackgroundFetch(
+	bcastKey, bucket, key string, state *backgroundFetchState,
+) (backgroundFetchRequest, bool) {
+	var candidate *backgroundFetchRequest
+	for {
+		state.mu.Lock()
+		if candidate == nil {
+			if state.pending != nil {
+				candidate = state.pending
+				state.pending = nil
+			}
+		}
+		if candidate == nil {
+			state.closed = true
+			state.mu.Unlock()
+			s.activeBackgroundFetches.CompareAndDelete(bcastKey, state)
+			return backgroundFetchRequest{}, false
+		}
+
+		// Establish the replacement's cache-write fence before reading metadata or
+		// the durable invalidation order. A tombstone that lands after this point
+		// blocks the replacement even if it arrives in the handoff window.
+		state.startedAt = time.Now().UnixNano()
+		candidate.startedAt = state.startedAt
+		state.activeInvalidatedAt = candidate.invalidatedAt
+		state.activeInvalidationOrder = candidate.invalidationOrder
+		state.mu.Unlock()
+
+		meta, found, err := s.cache.GetMeta(context.Background(), bucket, key)
+		if err != nil {
+			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Pending background warm metadata check failed; retrying")
+		}
+		visibleToCandidate := found && (!candidate.anonymous || (meta != nil && meta.IsPublicRead()))
+		superseded := s.backgroundWarmSuperseded(bucket, key, *candidate)
+
+		state.mu.Lock()
+		if state.pending != nil {
+			// A newer write arrived while the metadata or fence check was in
+			// flight. It supersedes the candidate, and must get its own checks.
+			candidate = state.pending
+			state.pending = nil
+			state.mu.Unlock()
+			continue
+		}
+		if visibleToCandidate || superseded {
+			state.closed = true
+			state.mu.Unlock()
+			s.activeBackgroundFetches.CompareAndDelete(bcastKey, state)
+			if visibleToCandidate {
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Pending background warm suppressed by visible metadata")
+			}
+			return backgroundFetchRequest{}, false
+		}
+
+		request := *candidate
+		state.mu.Unlock()
+		return request, true
+	}
 }
 
 // hasNoCacheDirectives reports whether any Cache-Control field has a directive that

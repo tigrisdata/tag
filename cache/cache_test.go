@@ -1,7 +1,11 @@
 package cache
 
 import (
+	"context"
 	"testing"
+
+	cacheclient "github.com/tigrisdata/ocache/client"
+	"github.com/tigrisdata/tag/config"
 )
 
 func TestIsNotFoundError(t *testing.T) {
@@ -158,5 +162,36 @@ func TestCache_Tombstone_DisabledCache(t *testing.T) {
 	ts := cache.GetTombstoneTimestamp(t.Context(), "bucket", "key")
 	if ts != 0 {
 		t.Errorf("GetTombstoneTimestamp() = %d, want 0", ts)
+	}
+}
+
+func TestCache_TombstoneOrderRetainsNewestLocalEpoch(t *testing.T) {
+	cfg := config.NewDefault()
+	client := cacheclient.NewMemoryCache()
+	store := NewCacheWithClient(client, &cfg.Cache)
+	ctx := context.Background()
+
+	if err := store.WriteTombstoneWithOrder(ctx, "bucket", "key", 9); err != nil {
+		t.Fatalf("WriteTombstoneWithOrder(new): %v", err)
+	}
+	if got := store.GetTombstoneOrder(ctx, "bucket", "key"); got != 9 {
+		t.Fatalf("initial tombstone order = %d, want 9", got)
+	}
+	if err := store.WriteTombstoneWithOrder(ctx, "bucket", "key", 3); err != nil {
+		t.Fatalf("WriteTombstoneWithOrder(old): %v", err)
+	}
+	if got := store.GetTombstoneOrder(ctx, "bucket", "key"); got != 9 {
+		t.Fatalf("older tombstone replaced order = %d, want 9", got)
+	}
+	if err := store.WriteTombstone(ctx, "bucket", "key"); err != nil {
+		t.Fatalf("WriteTombstone: %v", err)
+	}
+	if got := store.GetTombstoneOrder(ctx, "bucket", "key"); got != 9 {
+		t.Fatalf("unordered tombstone replaced order = %d, want 9", got)
+	}
+
+	other := NewCacheWithClient(client, &cfg.Cache)
+	if got := other.GetTombstoneOrder(ctx, "bucket", "key"); got != 0 {
+		t.Fatalf("foreign tombstone order = %d, want 0", got)
 	}
 }

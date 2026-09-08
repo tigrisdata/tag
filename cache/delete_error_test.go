@@ -1,9 +1,12 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strconv"
 	"testing"
+	"time"
 
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/config"
@@ -15,6 +18,7 @@ type flakyClient struct {
 	cacheclient.CacheClient
 	putErr    error // returned by Put (tombstone write) when non-nil
 	deleteErr error // returned by Delete (metadata delete) when non-nil
+	getErr    error // returned by the next Get when non-nil
 }
 
 func (f *flakyClient) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
@@ -22,6 +26,15 @@ func (f *flakyClient) Put(ctx context.Context, key string, data []byte, ttlSecon
 		return f.putErr
 	}
 	return f.CacheClient.Put(ctx, key, data, ttlSeconds)
+}
+
+func (f *flakyClient) Get(ctx context.Context, key string) ([]byte, error) {
+	if f.getErr != nil {
+		err := f.getErr
+		f.getErr = nil
+		return nil, err
+	}
+	return f.CacheClient.Get(ctx, key)
 }
 
 func (f *flakyClient) Delete(ctx context.Context, key string) error {
@@ -71,6 +84,126 @@ func TestDeleteWithMeta_SuccessReturnsNil(t *testing.T) {
 	}
 	if _, found, _ := c.GetMeta(ctx, "b", "k"); found {
 		t.Error("metadata still present after a successful DeleteWithMeta")
+	}
+}
+
+// A tombstone order already issued by this Cache must remain the fence without
+// another backend read. This keeps invalidations for unrelated keys independent
+// of tombstone-read latency or failure.
+func TestDeleteWithOrder_RetainsLocalFenceWithoutTombstoneRead(t *testing.T) {
+	ctx := context.Background()
+	backendDown := errors.New("tombstone read unavailable")
+	client := &flakyClient{CacheClient: cacheclient.NewMemoryCache()}
+	c := newCacheWithClientForTest(t, client)
+
+	meta := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"v1"`, ContentLength: 3, StatusCode: 200}
+	if err := c.PutWithMeta(ctx, "b", "k", meta, []byte("old"), 60); err != nil {
+		t.Fatalf("PutWithMeta: %v", err)
+	}
+	if err := c.WriteTombstoneWithOrder(ctx, "b", "k", 9); err != nil {
+		t.Fatalf("seed tombstone: %v", err)
+	}
+
+	writeStart := time.Now().UnixNano()
+	client.getErr = backendDown
+	if err := c.DeleteWithOrder(ctx, "b", "k", 3); err != nil {
+		t.Fatalf("DeleteWithOrder: %v", err)
+	}
+	// The injected read failure is still armed because WriteTombstoneWithOrder
+	// uses the local order table. Clear it before the read-side assertions.
+	client.getErr = nil
+	if _, found, err := c.GetMeta(ctx, "b", "k"); err != nil || found {
+		t.Fatalf("metadata after invalidation: found=%v err=%v", found, err)
+	}
+	if got := c.GetTombstoneOrder(ctx, "b", "k"); got != 9 {
+		t.Fatalf("replacement tombstone order = %d, want 9", got)
+	}
+
+	wrote, err := c.PutWithMetaStreamTombstoneAware(
+		ctx,
+		"b",
+		"k",
+		&CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"stale"`, ContentLength: 3, StatusCode: 200},
+		bytes.NewReader([]byte("old")),
+		60,
+		writeStart,
+	)
+	if err != nil {
+		t.Fatalf("stale populate: %v", err)
+	}
+	if wrote {
+		t.Fatal("stale populate bypassed the replacement tombstone fence")
+	}
+	if _, found, _ := c.GetMeta(ctx, "b", "k"); found {
+		t.Fatal("stale populate published metadata after invalidation")
+	}
+}
+
+func TestWriteTombstoneWithOrder_EvictedReadFailureLeavesTimestampFence(t *testing.T) {
+	ctx := context.Background()
+	backendDown := errors.New("evicted tombstone read unavailable")
+	client := &flakyClient{CacheClient: cacheclient.NewMemoryCache()}
+	c := newCacheWithClientForTest(t, client)
+	const bucket, key = "eviction-failure-bucket", "retained"
+
+	if err := c.WriteTombstoneWithOrder(ctx, bucket, key, 9); err != nil {
+		t.Fatalf("seed tombstone: %v", err)
+	}
+	for i := 0; i < tombstoneOrderCacheCapacity; i++ {
+		if err := c.WriteTombstoneWithOrder(ctx, bucket, "other-"+strconv.Itoa(i), uint64(i+1)); err != nil {
+			t.Fatalf("fill tombstone order cache at %d: %v", i, err)
+		}
+	}
+
+	writeStart := time.Now().UnixNano()
+	client.getErr = backendDown
+	if err := c.DeleteWithOrder(ctx, bucket, key, 3); err == nil {
+		t.Fatal("evicted tombstone read failure was not reported")
+	}
+	client.getErr = nil
+	if got := c.GetTombstoneOrder(ctx, bucket, key); got != 0 {
+		t.Fatalf("fallback tombstone order = %d, want unknown order 0", got)
+	}
+	if c.GetTombstoneTimestamp(ctx, bucket, key) <= writeStart {
+		t.Fatal("fallback tombstone did not preserve a newer timestamp fence")
+	}
+
+	wrote, err := c.PutWithMetaStreamTombstoneAware(
+		ctx,
+		bucket,
+		key,
+		&CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"stale"`, ContentLength: 3, StatusCode: 200},
+		bytes.NewReader([]byte("old")),
+		60,
+		writeStart,
+	)
+	if err != nil {
+		t.Fatalf("stale populate: %v", err)
+	}
+	if wrote {
+		t.Fatal("stale populate bypassed fallback timestamp fence")
+	}
+}
+
+func TestWriteTombstoneWithOrder_EvictedOrderReadsDurableFence(t *testing.T) {
+	ctx := context.Background()
+	client := cacheclient.NewMemoryCache()
+	c := newCacheWithClientForTest(t, client)
+	const bucket = "eviction-bucket"
+
+	if err := c.WriteTombstoneWithOrder(ctx, bucket, "retained", 9); err != nil {
+		t.Fatalf("seed tombstone: %v", err)
+	}
+	for i := 0; i < tombstoneOrderCacheCapacity; i++ {
+		if err := c.WriteTombstoneWithOrder(ctx, bucket, "other-"+strconv.Itoa(i), uint64(i+1)); err != nil {
+			t.Fatalf("fill tombstone order cache at %d: %v", i, err)
+		}
+	}
+	if err := c.WriteTombstoneWithOrder(ctx, bucket, "retained", 3); err != nil {
+		t.Fatalf("rewrite evicted tombstone: %v", err)
+	}
+	if got := c.GetTombstoneOrder(ctx, bucket, "retained"); got != 9 {
+		t.Fatalf("evicted tombstone order = %d, want 9", got)
 	}
 }
 

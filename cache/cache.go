@@ -3,13 +3,18 @@ package cache
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/rs/zerolog/log"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/ocache/coordinator"
@@ -39,13 +44,112 @@ var ErrNotFound = errors.New("not found in cache")
 // ErrCacheDisabled indicates the cache is disabled.
 var ErrCacheDisabled = errors.New("cache is disabled")
 
+// Seeded by wall time so independently started proxy processes do not reuse the
+// same local invalidation-order namespace. The order itself remains comparable
+// only inside one Cache instance; the timestamp fence remains the shared guard.
+var tombstoneOwnerSequence = uint64(time.Now().UnixNano())
+
+const (
+	// Keep the fast path bounded while retaining enough recent keys to avoid a
+	// durable-order read for ordinary low-cardinality traffic. Evicted keys are
+	// tracked by a no-false-negative Bloom filter and use the durable marker as
+	// the correctness-preserving fallback.
+	tombstoneOrderCacheCapacity = 16 * 1024
+	tombstoneEvictionFilterBits = 1 << 22
+	tombstoneEvictionHashCount  = 4
+)
+
+func newTombstoneOwner() uint64 {
+	var random [8]byte
+	if _, err := cryptorand.Read(random[:]); err == nil {
+		if owner := binary.BigEndian.Uint64(random[:]); owner != 0 {
+			return owner
+		}
+	}
+	return atomic.AddUint64(&tombstoneOwnerSequence, 1)
+}
+
+// tombstoneKeyLock serializes tombstone writes for one key. refs lets the registry
+// discard idle locks without losing the order retained in tombstoneOrders.
+type tombstoneKeyLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// tombstoneEvictionFilter remembers keys whose local order was evicted. It is a
+// Bloom filter rather than another key map: false positives cause an extra
+// durable read, but there are no false negatives that could permit an order
+// downgrade. The bitset never grows and is scoped to one Cache owner.
+type tombstoneEvictionFilter struct {
+	mu      sync.RWMutex
+	seed    maphash.Seed
+	bits    []uint64
+	evicted atomic.Bool
+}
+
+func newTombstoneEvictionFilter() *tombstoneEvictionFilter {
+	return &tombstoneEvictionFilter{
+		seed: maphash.MakeSeed(),
+		bits: make([]uint64, tombstoneEvictionFilterBits/64),
+	}
+}
+
+func (f *tombstoneEvictionFilter) positions(key string) [tombstoneEvictionHashCount]uint64 {
+	var h maphash.Hash
+	h.SetSeed(f.seed)
+	_, _ = h.WriteString(key)
+	x := h.Sum64()
+	var positions [tombstoneEvictionHashCount]uint64
+	for i := range positions {
+		x += 0x9e3779b97f4a7c15
+		z := x
+		z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+		z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+		positions[i] = (z ^ (z >> 31)) & (tombstoneEvictionFilterBits - 1)
+	}
+	return positions
+}
+
+func (f *tombstoneEvictionFilter) add(key string) {
+	positions := f.positions(key)
+	f.mu.Lock()
+	for _, position := range positions {
+		f.bits[position/64] |= uint64(1) << (position % 64)
+	}
+	f.mu.Unlock()
+	f.evicted.Store(true)
+}
+
+func (f *tombstoneEvictionFilter) mayContain(key string) bool {
+	if !f.evicted.Load() {
+		return false
+	}
+	positions := f.positions(key)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, position := range positions {
+		if f.bits[position/64]&(uint64(1)<<(position%64)) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // Cache wraps ocache client for TAG.
 type Cache struct {
-	client       cacheclient.CacheClient
-	defaultTTL   int64 // seconds
-	tombstoneTTL int64 // seconds; must outlive the longest racing cache-populate
-	enabled      bool
-	closed       bool
+	client           cacheclient.CacheClient
+	defaultTTL       int64 // seconds
+	tombstoneTTL     int64 // seconds; must outlive the longest racing cache-populate
+	enabled          bool
+	closed           bool
+	tombstoneLocksMu sync.Mutex
+	tombstoneLocks   map[string]*tombstoneKeyLock
+	// tombstoneOrders retains recent local invalidation order for at least as long
+	// as the durable tombstone. When capacity evicts a live key, the eviction filter
+	// directs later writes to the durable marker instead of permitting a downgrade.
+	tombstoneOrders         *expirable.LRU[string, uint64]
+	tombstoneEvictionFilter *tombstoneEvictionFilter
+	tombstoneOwner          uint64 // Identifies this process-local invalidation order space.
 }
 
 // NewCacheWithClient creates a cache with an injected client.
@@ -61,11 +165,21 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 		enabled = cfg.IsEnabled()
 		sizeThreshold = cfg.SizeThreshold
 	}
+	tombstoneTTL := TombstoneTTLSeconds(sizeThreshold)
+	evictionFilter := newTombstoneEvictionFilter()
 	return &Cache{
-		client:       client,
-		defaultTTL:   ttl,
-		tombstoneTTL: TombstoneTTLSeconds(sizeThreshold),
-		enabled:      enabled,
+		client:         client,
+		defaultTTL:     ttl,
+		tombstoneTTL:   tombstoneTTL,
+		enabled:        enabled,
+		tombstoneLocks: make(map[string]*tombstoneKeyLock),
+		tombstoneOrders: expirable.NewLRU(
+			tombstoneOrderCacheCapacity,
+			func(key string, _ uint64) { evictionFilter.add(key) },
+			time.Duration(tombstoneTTL)*time.Second+time.Minute,
+		),
+		tombstoneEvictionFilter: evictionFilter,
+		tombstoneOwner:          newTombstoneOwner(),
 	}
 }
 
@@ -73,14 +187,40 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 // All operations return successfully with "not found" or nil results.
 func NewDisabledCache() *Cache {
 	return &Cache{
-		enabled:      false,
-		tombstoneTTL: MinTombstoneTTLSeconds,
+		enabled:        false,
+		tombstoneTTL:   MinTombstoneTTLSeconds,
+		tombstoneOwner: newTombstoneOwner(),
 	}
 }
 
 // IsEnabled returns true if the cache is enabled.
 func (c *Cache) IsEnabled() bool {
 	return c.enabled && !c.closed
+}
+
+// acquireTombstoneKeyLock serializes the read/choose/write decision for one
+// tombstone key without making unrelated keys wait on backend I/O. The order
+// itself lives in tombstoneOrders, so an idle lock can be discarded safely.
+func (c *Cache) acquireTombstoneKeyLock(key string) func() {
+	c.tombstoneLocksMu.Lock()
+	lock := c.tombstoneLocks[key]
+	if lock == nil {
+		lock = &tombstoneKeyLock{}
+		c.tombstoneLocks[key] = lock
+	}
+	lock.refs++
+	c.tombstoneLocksMu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		c.tombstoneLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 && c.tombstoneLocks[key] == lock {
+			delete(c.tombstoneLocks, key)
+		}
+		c.tombstoneLocksMu.Unlock()
+	}
 }
 
 // ============================================================================
@@ -320,6 +460,14 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w i
 // invalidation while stale metadata is still readable. A not-found metadata delete is
 // success — the entry is already gone.
 func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
+	return c.DeleteWithOrder(ctx, bucket, key, 0)
+}
+
+// DeleteWithOrder removes an object's metadata and records the write order in
+// its tombstone. A non-zero order lets a delayed local warm prove that a later
+// invalidation has already superseded it, even after the in-process dedup state
+// is gone.
+func (c *Cache) DeleteWithOrder(ctx context.Context, bucket, key string, order uint64) error {
 	if !c.IsEnabled() {
 		return nil
 	}
@@ -329,7 +477,7 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	// Write tombstone FIRST - prevents in-flight writes from completing. A failure
 	// here leaves the invalidation incomplete (an in-flight populate could resurrect
 	// the entry), so it is a real failure — but still continue to the meta delete.
-	if err := c.WriteTombstone(ctx, bucket, key); err != nil {
+	if err := c.WriteTombstoneWithOrder(ctx, bucket, key, order); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).
 			Msg("Failed to write tombstone (continuing with delete)")
 		errs = append(errs, fmt.Errorf("write tombstone: %w", err))
@@ -358,11 +506,7 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 
 // Delete removes an object from the cache.
 func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
-	if !c.IsEnabled() {
-		return nil
-	}
-
-	return c.DeleteWithMeta(ctx, bucket, key)
+	return c.DeleteWithOrder(ctx, bucket, key, 0)
 }
 
 // DeleteIfETag invalidates the object's metadata only while it still carries
@@ -793,16 +937,63 @@ func TombstoneTTLSeconds(sizeThreshold int64) int64 {
 }
 
 // WriteTombstone writes an invalidation marker for a key.
-// The value is the timestamp as 8 bytes (int64 big-endian).
-// This is used to prevent stale cache writes from completing after invalidation.
+// The value starts with the timestamp as 8 bytes (int64 big-endian). Newer
+// writers append a process-local owner and invalidation order so delayed warm
+// triggers can be rejected after the in-process dedup state is removed.
 func (c *Cache) WriteTombstone(ctx context.Context, bucket, key string) error {
+	return c.WriteTombstoneWithOrder(ctx, bucket, key, 0)
+}
+
+// WriteTombstoneWithOrder writes an invalidation marker and retains the greatest
+// order already issued by this Cache instance for the key. The local order table
+// avoids a backend read on ordinary invalidations; a per-key lock keeps concurrent
+// writes from replacing a newer order with an older post-forward invalidation.
+// Orders from another Cache instance are ignored; their timestamp fence is still
+// shared.
+func (c *Cache) WriteTombstoneWithOrder(ctx context.Context, bucket, key string, order uint64) error {
 	if !c.IsEnabled() {
 		return nil
 	}
+
 	tombKey := MakeTombstoneKey(bucket, key)
-	ts := time.Now().UnixNano()
-	data := make([]byte, 8)
-	binary.BigEndian.PutUint64(data, uint64(ts))
+	unlock := c.acquireTombstoneKeyLock(tombKey)
+	defer unlock()
+
+	previousOrder, foundLocal := c.tombstoneOrders.Get(tombKey)
+	if !foundLocal && c.tombstoneEvictionFilter != nil && c.tombstoneEvictionFilter.mayContain(tombKey) {
+		previous, err := c.client.Get(ctx, tombKey)
+		switch {
+		case err == nil:
+			if len(previous) >= 24 && binary.BigEndian.Uint64(previous[8:16]) == c.tombstoneOwner {
+				previousOrder = binary.BigEndian.Uint64(previous[16:24])
+			}
+		case isNotFoundError(err):
+			// The local order was evicted but the durable fence has expired or
+			// was never written. The caller's order is safe to use.
+		default:
+			// Preserve the timestamp fence even though the order is unknown. A
+			// later warm can use the timestamp path, while returning the read
+			// error tells the caller the ordered invalidation was incomplete.
+			fallback := make([]byte, 8)
+			binary.BigEndian.PutUint64(fallback, uint64(time.Now().UnixNano()))
+			if putErr := c.client.Put(ctx, tombKey, fallback, c.tombstoneTTL); putErr != nil {
+				return errors.Join(err, putErr)
+			}
+			return err
+		}
+	}
+	if previousOrder > order {
+		order = previousOrder
+	}
+
+	data := make([]byte, 24)
+	binary.BigEndian.PutUint64(data[:8], uint64(time.Now().UnixNano()))
+	binary.BigEndian.PutUint64(data[8:16], c.tombstoneOwner)
+	binary.BigEndian.PutUint64(data[16:], order)
+	// Retain the attempted maximum even when Put reports an error. The backend
+	// may have accepted an ambiguous write, and a later lower order must not
+	// downgrade it; a later successful invalidation will rewrite the fence.
+	c.tombstoneOrders.Add(tombKey, order)
 	return c.client.Put(ctx, tombKey, data, c.tombstoneTTL)
 }
 
@@ -814,10 +1005,24 @@ func (c *Cache) GetTombstoneTimestamp(ctx context.Context, bucket, key string) i
 	}
 	tombKey := MakeTombstoneKey(bucket, key)
 	data, err := c.client.Get(ctx, tombKey)
-	if err != nil || len(data) != 8 {
+	if err != nil || len(data) < 8 {
 		return 0 // No tombstone or invalid data
 	}
-	return int64(binary.BigEndian.Uint64(data))
+	return int64(binary.BigEndian.Uint64(data[:8]))
+}
+
+// GetTombstoneOrder retrieves the optional process-local invalidation order for
+// a key. Legacy tombstones and markers from another Cache instance return zero.
+func (c *Cache) GetTombstoneOrder(ctx context.Context, bucket, key string) uint64 {
+	if !c.IsEnabled() {
+		return 0
+	}
+	tombKey := MakeTombstoneKey(bucket, key)
+	data, err := c.client.Get(ctx, tombKey)
+	if err != nil || len(data) < 24 || binary.BigEndian.Uint64(data[8:16]) != c.tombstoneOwner {
+		return 0
+	}
+	return binary.BigEndian.Uint64(data[16:24])
 }
 
 // ============================================================================
