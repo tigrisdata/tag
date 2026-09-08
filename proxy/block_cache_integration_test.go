@@ -888,7 +888,7 @@ func TestPutBlocksFromStream_ExactMultipleNoPhantomBlock(t *testing.T) {
 	meta := cache.MetaFromHTTPHeaders(wowBucket, wowKey, http.StatusOK, h)
 	meta.BlockSize = 4
 
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEFGH"), 60, time.Now().UnixNano()); err != nil {
+	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEFGH"), 60, time.Now().UnixNano(), cache.VersionAny); err != nil {
 		t.Fatalf("putBlocksFromStream: %v", err)
 	}
 	for i := int64(0); i <= 1; i++ {
@@ -918,7 +918,7 @@ func TestPutBlocksFromStream_MidStreamErrorLeavesMetaUnwritten(t *testing.T) {
 
 	// One full block, then a read error before the second.
 	r := &errAfterReader{data: []byte("ABCD")}
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, r, 60, time.Now().UnixNano()); err == nil {
+	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, r, 60, time.Now().UnixNano(), cache.VersionAny); err == nil {
 		t.Fatal("expected an error from the mid-stream read failure")
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
@@ -941,7 +941,7 @@ func TestPutBlocksFromStream_TruncatedStreamLeavesNoShortBlockOrMeta(t *testing.
 	meta.BlockSize = 4
 
 	// ...but the body carries only 6 bytes, ending cleanly (no read error).
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, time.Now().UnixNano()); err == nil {
+	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, time.Now().UnixNano(), cache.VersionAny); err == nil {
 		t.Fatal("expected an error from the truncated body")
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
@@ -966,7 +966,7 @@ func TestPutBlocksFromStream_OversizedStreamLeavesMetaUnwritten(t *testing.T) {
 	meta.BlockSize = 4
 
 	// ...but the body carries 6 bytes.
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, time.Now().UnixNano()); err == nil {
+	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, time.Now().UnixNano(), cache.VersionAny); err == nil {
 		t.Fatal("expected an error from the oversized body")
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
@@ -991,13 +991,13 @@ func TestBlockCache_InvalidateStaleBlockMetaOnlyMatchingETag(t *testing.T) {
 	}
 
 	// A lagging request that saw v1 as stale must NOT wipe the newer v2 entry.
-	svc.invalidateStaleBlockMeta(wowBucket, wowKey, `"v1"`)
+	svc.invalidateStaleMeta(wowBucket, wowKey, `"v1"`)
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
 		t.Error("v2 entry wrongly deleted by a stale-v1 invalidation")
 	}
 
 	// Invalidating the matching (current) version does delete it.
-	svc.invalidateStaleBlockMeta(wowBucket, wowKey, `"v2"`)
+	svc.invalidateStaleMeta(wowBucket, wowKey, `"v2"`)
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
 		t.Error("v2 entry not deleted by a matching-version invalidation")
 	}

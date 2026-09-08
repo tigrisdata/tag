@@ -161,7 +161,7 @@ func newGatedAssembledRangeService(t *testing.T, local bool) (*Service, *cache.C
 		StatusCode:    http.StatusOK,
 		BlockSize:     4,
 	}
-	if wrote, err := store.PutMetaTombstoneAware(context.Background(), bucket, key, meta, 60, time.Now().UnixNano()); err != nil || !wrote {
+	if wrote, err := store.PutMetaTombstoneAware(context.Background(), bucket, key, meta, 60, time.Now().UnixNano(), cache.VersionAny); err != nil || !wrote {
 		t.Fatalf("seed block meta = (wrote=%t, err=%v)", wrote, err)
 	}
 	return svc, store, client, mock, meta, trace

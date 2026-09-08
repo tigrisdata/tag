@@ -237,6 +237,29 @@ func (c *handlerPrefetchCacheClient) Put(ctx context.Context, key string, data [
 	return c.CacheClient.Put(ctx, key, data, ttlSeconds)
 }
 
+// The CAS operations route like Get/Put: metadata (the only CAS'd keys) stays
+// on the local client, block keys go to the remote owner.
+func (c *handlerPrefetchCacheClient) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	if !handlerPrefetchBlockKey(key) {
+		return c.local.GetWithVersion(ctx, key)
+	}
+	return c.CacheClient.GetWithVersion(ctx, key)
+}
+
+func (c *handlerPrefetchCacheClient) PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (uint64, error) {
+	if !handlerPrefetchBlockKey(key) {
+		return c.local.PutIfVersion(ctx, key, data, ttlSeconds, expected)
+	}
+	return c.CacheClient.PutIfVersion(ctx, key, data, ttlSeconds, expected)
+}
+
+func (c *handlerPrefetchCacheClient) DeleteIfVersion(ctx context.Context, key string, expected uint64) error {
+	if !handlerPrefetchBlockKey(key) {
+		return c.local.DeleteIfVersion(ctx, key, expected)
+	}
+	return c.CacheClient.DeleteIfVersion(ctx, key, expected)
+}
+
 func (c *handlerPrefetchCacheClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
 	if !handlerPrefetchBlockKey(key) {
 		return c.local.GetRangeStream(ctx, key, start, end, w)
@@ -377,7 +400,7 @@ func newHandlerPrefetchBenchmarkFixture(tb testing.TB, remote bool, blockCount i
 		StatusCode:    http.StatusOK,
 		BlockSize:     blockSize,
 	}
-	if wrote, err := store.PutMetaTombstoneAware(context.Background(), bucket, key, meta, 60, time.Now().UnixNano()); err != nil || !wrote {
+	if wrote, err := store.PutMetaTombstoneAware(context.Background(), bucket, key, meta, 60, time.Now().UnixNano(), cache.VersionAny); err != nil || !wrote {
 		tb.Fatalf("seed block metadata = (wrote=%t, err=%v)", wrote, err)
 	}
 	service := proxy.NewService(handlerPrefetchForwarder{}, store, cfg)

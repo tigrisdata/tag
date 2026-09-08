@@ -259,7 +259,9 @@ func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte
 	ttl := int(s.config.Cache.TTL.Seconds())
 	cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
 	defer cacheCancel()
-	wrote, err := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, writeStartTime)
+	// Put-if-absent: this tee follows the PUT's own invalidation; a racer that
+	// re-established the entry (a warm) caches the current version and wins.
+	wrote, err := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, writeStartTime, 0)
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Write-through cache tee write failed")
 		return teeFallbackWarm

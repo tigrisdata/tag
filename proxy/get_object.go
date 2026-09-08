@@ -158,7 +158,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					// Version-guarded: only drop the entry this client is revalidating, never a
 					// newer version a concurrent request re-established after an overwrite (an
 					// unconditional Delete would wipe that fresh entry and force needless churn).
-					s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+					s.invalidateStaleMeta(bucket, key, meta.ETag)
 				}
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Force revalidate, falling through to upstream")
 				// Fall through to cache miss path below
@@ -191,7 +191,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					// mid-probe) leaves the still-valid entry cached.
 					if bodyGone(rangeErr) {
 						log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range cache body missing - invalidating orphaned meta and forwarding with background cache")
-						s.cache.Delete(context.Background(), bucket, key)
+						// ETag-guarded: never removes an entry a concurrent
+						// request re-established under a newer version.
+						s.invalidateStaleMeta(bucket, key, meta.ETag)
 					}
 					// Body genuinely gone for an otherwise-cacheable request → a miss.
 					return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start, XCacheMiss)
@@ -240,7 +242,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					// still-valid hot entry. serveFromCache errors before committing
 					// headers, so falling through to the miss path below is safe either way.
 					if bodyGone(cacheBodyErr) {
-						s.cache.Delete(context.Background(), bucket, key)
+						s.invalidateStaleMeta(bucket, key, meta.ETag)
 					}
 					// Fall through to cache miss path
 				} else {

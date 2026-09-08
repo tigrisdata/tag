@@ -54,7 +54,7 @@ func (s *Service) revalidateAndServe(
 		}
 		// No stale bytes available (versioned body gone) and nothing written yet —
 		// last-resort direct fetch so the client gets a real response.
-		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, staleErr, start)
+		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, meta.ETag, staleErr, start)
 	}
 	defer resp.Body.Close()
 
@@ -72,13 +72,13 @@ func (s *Service) revalidateAndServe(
 		// returns the correct 206; this unifies the full-object and range paths.
 		log.Warn().Err(revalErr).Str("bucket", bucket).Str("key", key).
 			Msg("Revalidation 304 cache body unavailable, fetching from upstream")
-		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, revalErr, start)
+		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, meta.ETag, revalErr, start)
 	case http.StatusOK:
 		// Full-object response (no range or upstream ignored range)
-		return s.handleRevalidation200(ctx, w, bucket, key, resp, start)
+		return s.handleRevalidation200(ctx, w, bucket, key, meta.ETag, resp, start)
 	case http.StatusPartialContent:
 		// Range response — object changed, upstream returned only the requested range
-		return s.handleRevalidation206Range(ctx, w, r, bucket, key, accessKey, secretKey, resp, start)
+		return s.handleRevalidation206Range(ctx, w, r, bucket, key, accessKey, secretKey, meta.ETag, resp, start)
 	default:
 		// Unexpected status (4xx, 5xx) — drain body for connection reuse, serve stale
 		io.Copy(io.Discard, resp.Body)
@@ -93,7 +93,7 @@ func (s *Service) revalidateAndServe(
 			metrics.RecordRevalidationStaleServed()
 			return staleErr
 		}
-		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, staleErr, start)
+		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, meta.ETag, staleErr, start)
 	}
 }
 
@@ -105,7 +105,7 @@ func (s *Service) revalidateAndServe(
 // the correct 206.
 // bodyErr is why the cache could not serve; it decides whether the metadata is
 // invalidated (see bodyGone).
-func (s *Service) forwardAfterCacheMiss(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string, bodyErr error, start time.Time) error {
+func (s *Service) forwardAfterCacheMiss(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key, staleETag string, bodyErr error, start time.Time) error {
 	// Invalidate the metadata only when its body is genuinely gone. Otherwise the
 	// meta entry survives and every subsequent request is a meta-hit whose body
 	// probe fails and re-forwards to upstream — a persistent cold-miss loop,
@@ -114,7 +114,9 @@ func (s *Service) forwardAfterCacheMiss(ctx context.Context, w http.ResponseWrit
 	// A transient failure (e.g. a canceled context from a disconnected client) must
 	// not evict a still-valid entry, so bodyGone gates the delete.
 	if s.cache.IsEnabled() && bodyGone(bodyErr) {
-		s.cache.Delete(context.Background(), bucket, key)
+		// ETag-guarded: only the entry whose body was observed gone is removed,
+		// never one a concurrent request re-established under a newer version.
+		s.invalidateStaleMeta(bucket, key, staleETag)
 	}
 	writeCacheStatus(w, XCacheMiss)
 	forwardErr := s.forwarder.Forward(ctx, w, r)
@@ -157,12 +159,39 @@ func (s *Service) handleRevalidation304(
 	return true, nil
 }
 
+// revalidationExpectedVersion picks the meta-write precondition for a
+// revalidation repopulate. The guarded delete that precedes the repopulate is
+// best-effort, so "expect absent" alone is wrong: a transiently failed delete
+// leaves the KNOWN-STALE row in place, and put-if-absent would then refuse the
+// replacement and keep serving stale data. Instead:
+//   - entry absent → 0 (put-if-absent);
+//   - the observed stale row still present → its version (the replacement
+//     overwrites exactly that row; if it moves first, the newer write wins);
+//   - anything else present → a racer already re-established a fresh entry →
+//     0, which is guaranteed to mismatch, skipping the write in its favor.
+//
+// A read failure returns 0 as well: refusing to overwrite is the safe
+// direction when the store cannot be consulted, and the entry converges via
+// the next revalidation or TTL.
+func (s *Service) revalidationExpectedVersion(bucket, key, staleETag string) uint64 {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cur, version, found, err := s.cache.GetMetaWithVersion(ctx, bucket, key)
+	if err != nil || !found || cur == nil {
+		return 0
+	}
+	if cur.ETag == staleETag {
+		return version
+	}
+	return 0
+}
+
 // handleRevalidation200 handles a 200 OK revalidation response (object changed).
 // Streams the new body to the client while simultaneously updating the cache.
 func (s *Service) handleRevalidation200(
 	ctx context.Context,
 	w http.ResponseWriter,
-	bucket, key string,
+	bucket, key, staleETag string,
 	resp *http.Response,
 	start time.Time,
 ) error {
@@ -177,10 +206,12 @@ func (s *Service) handleRevalidation200(
 		s.cache.IsEnabled() &&
 		!s.hasNoCacheHeaders(resp.Header)
 
-	// Always delete stale cache entry when upstream confirms the object changed.
-	// Even if the new version is uncacheable (too large, no-store), the old cached
-	// version is known-stale and must not be served to future requests.
-	s.cache.Delete(context.Background(), bucket, key)
+	// Always delete the stale cache entry when upstream confirms the object
+	// changed. Even if the new version is uncacheable (too large, no-store), the
+	// old cached version is known-stale and must not be served to future
+	// requests. ETag-guarded: if a concurrent request already replaced the entry
+	// (with the fresh version), that newer entry is left in place.
+	s.invalidateStaleMeta(bucket, key, staleETag)
 
 	// Capture writeStartTime after Delete so our own tombstone doesn't block
 	// the subsequent cache write. A concurrent DELETE arriving after this point
@@ -212,15 +243,16 @@ func (s *Service) handleRevalidation200(
 	// blocks (size-only mode, RFC 0001) exactly as the read-miss/warm paths do — a revalidated
 	// whole-mode entry that grew into a block-eligible object must not be re-stored as one whole
 	// blob. Sub-block objects keep the whole-body write.
+	expected := s.revalidationExpectedVersion(bucket, key, staleETag)
 	cacheErrCh := make(chan error, 1)
 	go func() {
 		var cacheErr error
 		if s.isBlockEligibleSize(newMeta.ContentLength) {
 			newMeta.BlockSize = s.config.Cache.BlockSize
-			cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime)
+			cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime, expected)
 		} else {
 			_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(
-				context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime,
+				context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime, expected,
 			)
 		}
 		if cacheErr != nil {
@@ -341,15 +373,16 @@ func (s *Service) handleRevalidation206Range(
 	ctx context.Context,
 	w http.ResponseWriter,
 	r *http.Request,
-	bucket, key, accessKey, secretKey string,
+	bucket, key, accessKey, secretKey, staleETag string,
 	resp *http.Response,
 	start time.Time,
 ) error {
 	metrics.RecordRevalidationUpdated()
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Revalidation 206 - object changed, streaming range")
 
-	// Delete stale cache entry before repopulating
-	s.cache.Delete(context.Background(), bucket, key)
+	// Delete the stale cache entry before repopulating (ETag-guarded, as in
+	// handleRevalidation200).
+	s.invalidateStaleMeta(bucket, key, staleETag)
 
 	// Determine total object size from Content-Range header
 	_, _, totalSize, _ := parseContentRange(resp.Header.Get("Content-Range"))
@@ -425,7 +458,7 @@ func (s *Service) revalidateAndServeHead(
 		metrics.RecordRevalidationUpdated()
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD revalidation 200 - object changed")
 
-		s.cache.Delete(context.Background(), bucket, key)
+		s.invalidateStaleMeta(bucket, key, meta.ETag)
 		io.Copy(io.Discard, resp.Body)
 
 		copyHeaders(w.Header(), resp.Header)
