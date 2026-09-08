@@ -249,7 +249,7 @@ func (s *Service) handleRevalidation200(
 		var cacheErr error
 		if s.isBlockEligibleSize(newMeta.ContentLength) {
 			newMeta.BlockSize = s.config.Cache.BlockSize
-			cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime, expected)
+			_, cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime, expected)
 		} else {
 			_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(
 				context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime, expected,

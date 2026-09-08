@@ -870,16 +870,18 @@ func (s *Service) handleRangeWithBackgroundCache(
 }
 
 // writeNotModifiedFromCache answers a conditional request with 304 when the
-// cached entry satisfies the request's validators, preserving the historical
-// precedence: an If-None-Match match wins; otherwise an unexpired
-// If-Modified-Since. Returns true when it wrote the response. Shared by the
-// proxying GET hit path and the origin-less handler so the two cannot drift.
+// cached entry satisfies the request's validators. Per RFC 7232 §3.3, a
+// request carrying If-None-Match is judged by it ALONE — If-Modified-Since is
+// ignored, matching or not: LastModified is second-granular, so falling back
+// to it could 304 a client across a same-second overwrite it should see.
+// Returns true when it wrote the response. Shared by the proxying GET hit
+// path and the origin-less handler so the two cannot drift.
 func (s *Service) writeNotModifiedFromCache(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, operation string, start time.Time) bool {
-	matched := false
-	if inm := r.Header.Get("If-None-Match"); inm != "" && meta.MatchesETag(inm) {
-		matched = true
-	}
-	if !matched {
+	if inm := r.Header.Get("If-None-Match"); inm != "" {
+		if !meta.MatchesETag(inm) {
+			return false
+		}
+	} else {
 		ims := r.Header.Get("If-Modified-Since")
 		if ims == "" {
 			return false

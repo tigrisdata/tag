@@ -631,3 +631,84 @@ func TestTieredWriteClaimExcludesRetier(t *testing.T) {
 		t.Fatalf("completed PUT's marker disturbed: %+v", meta)
 	}
 }
+
+// RFC 7232 §3.3: a request carrying If-None-Match is judged by it alone. A
+// non-matching If-None-Match must never fall back to an unexpired
+// If-Modified-Since — LastModified is second-granular, so that fallback would
+// 304 a client across a same-second overwrite.
+func TestTieredConditionalGetIfNoneMatchBeatsIfModifiedSince(t *testing.T) {
+	mock, _, _ := tieredMock()
+	svc, _ := newTieredTestService(mock, 1024)
+
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "v2-body", nil); w.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d", w.Code)
+	}
+
+	// The client holds a STALE ETag but a fresh-enough date: the mismatching
+	// If-None-Match must win and return the full 200 body.
+	w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", map[string]string{
+		"If-None-Match":     `"stale-etag"`,
+		"If-Modified-Since": time.Now().UTC().Add(time.Hour).Format(http.TimeFormat),
+	})
+	if w.Code != http.StatusOK || w.Body.String() != "v2-body" {
+		t.Fatalf("GET = %d %q, want 200 with the current body (If-Modified-Since must be ignored)", w.Code, w.Body.String())
+	}
+}
+
+// raceOnConditionalReadClient injects a replacement right after the versioned
+// read that evaluates a conditional PUT's precondition, so the store's CAS
+// must refuse the write.
+type raceOnConditionalReadClient struct {
+	cacheclient.CacheClient
+	armed   bool
+	replace func()
+}
+
+func (r *raceOnConditionalReadClient) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	data, version, found, err := r.CacheClient.GetWithVersion(ctx, key)
+	if r.armed && found && r.replace != nil {
+		r.armed = false
+		r.replace()
+	}
+	return data, version, found, err
+}
+
+// A conditional PUT whose precondition races away between evaluation and
+// store must answer 412, not 200: the version observed at the If-Match check
+// is enforced by the store's CAS.
+func TestTieredConditionalPutRacedPreconditionAnswers412(t *testing.T) {
+	mock, _, _ := tieredMock()
+	wrapper := &raceOnConditionalReadClient{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 1024
+	c := cache.NewCacheWithClient(wrapper, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "v1-body", nil); w.Code != http.StatusOK {
+		t.Fatalf("seed PUT status = %d", w.Code)
+	}
+	etagV1 := func() string {
+		meta, _, _ := c.GetMeta(context.Background(), "b", "obj")
+		return meta.ETag
+	}()
+
+	// Arm the race: the moment the conditional PUT's evaluation reads the
+	// versioned row, a concurrent overwrite replaces it.
+	wrapper.replace = func() {
+		req := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader("racer!!"))
+		if err := svc.HandlePutObject(httptest.NewRecorder(), req); err != nil {
+			t.Errorf("racing PUT: %v", err)
+		}
+	}
+	wrapper.armed = true
+
+	w := tieredDo(t, svc, http.MethodPut, "/b/obj", "cond-body", map[string]string{"If-Match": etagV1})
+	if w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("raced conditional PUT = %d, want 412", w.Code)
+	}
+	if g := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); g.Body.String() != "racer!!" {
+		t.Fatalf("GET = %q, want the racer's body to survive", g.Body.String())
+	}
+}

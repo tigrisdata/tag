@@ -521,27 +521,26 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// PUT-then-DELETE serialization of that race — never a size-dependent flip
 	// in which write survives.
 	ttl := int(s.config.Cache.TTL.Seconds())
+	var wrote bool
 	if blockBound {
 		meta.BlockSize = s.config.Cache.BlockSize
-		if err := s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano(), expected); err != nil {
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
-			return err
-		}
+		wrote, err = s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano(), expected)
 	} else {
-		wrote, err := s.cache.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano(), expected)
-		if err != nil {
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
-			return err
-		}
-		if !wrote && expected != cache.VersionAny {
-			// The conditional's precondition raced away between evaluation and
-			// store: the honest answer is the 412 the client would have gotten
-			// had the racer arrived a moment earlier. (A tombstone-suppressed
-			// unconditional store keeps the legal PUT-then-DELETE 200 below.)
-			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
-			return nil
-		}
+		wrote, err = s.cache.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano(), expected)
+	}
+	if err != nil {
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return err
+	}
+	if !wrote && expected != cache.VersionAny {
+		// The conditional's precondition raced away between evaluation and
+		// store — in either representation. The honest answer is the 412 the
+		// client would have gotten had the racer arrived a moment earlier.
+		// (A tombstone-suppressed unconditional store keeps the legal
+		// PUT-then-DELETE 200 below.)
+		s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return nil
 	}
 
 	w.Header().Set("ETag", etag)

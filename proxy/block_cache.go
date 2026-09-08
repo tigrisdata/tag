@@ -1468,7 +1468,7 @@ func (s *Service) buildBlockMeta(bucket, key string, respHeader http.Header, tot
 // truncated bytes under a committed length (and poison a later range-path populate that trusts
 // existing blocks). fetchOneBlock validates block length the same way; this keeps the two block
 // writers consistent. A body longer than Content-Length is likewise rejected before the meta.
-func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, writeStartTime int64, expected uint64) (err error) {
+func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, writeStartTime int64, expected uint64) (wrote bool, err error) {
 	// On any early return, drain the rest of r. setupCacheListener feeds this from an io.Pipe; if
 	// we stop reading with bytes still queued (a mid-object PutBlockStream error, or an oversize
 	// body), the pipe writer goroutine blocks forever on Write, leaking it and never releasing the
@@ -1489,10 +1489,10 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 		bStart, bEnd := blockBounds(idx, meta.BlockSize, meta.ContentLength)
 		want := bEnd - bStart + 1
 		if _, err := io.ReadFull(r, buf[:want]); err != nil {
-			return fmt.Errorf("block split: block %d short read (%w) - upstream body shorter than Content-Length %d", idx, err, meta.ContentLength)
+			return false, fmt.Errorf("block split: block %d short read (%w) - upstream body shorter than Content-Length %d", idx, err, meta.ContentLength)
 		}
 		if perr := s.cache.PutBlockStream(ctx, bucket, key, meta.ETag, meta.BlockSize, idx, bytes.NewReader(buf[:want]), ttl); perr != nil {
-			return perr
+			return false, perr
 		}
 		metrics.CacheBlockPopulated.Inc()
 		metrics.CacheBlockBytesPopulated.Add(float64(want))
@@ -1501,15 +1501,12 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 	// before the meta so the entry can't claim a length its blocks overrun.
 	var probe [1]byte
 	if _, err := io.ReadFull(r, probe[:]); err != io.EOF {
-		return fmt.Errorf("block split: upstream body longer than Content-Length %d", meta.ContentLength)
+		return false, fmt.Errorf("block split: upstream body longer than Content-Length %d", meta.ContentLength)
 	}
 	// Every block was just written, so stamp the meta complete: full-object serves can skip
 	// the per-block probe pass and stream optimistically.
 	meta.BlocksComplete = true
-	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime, expected); err != nil {
-		return err
-	}
-	return nil
+	return s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime, expected)
 }
 
 // triggerBlockModePopulate populates a block-mode entry in the background after a cold range

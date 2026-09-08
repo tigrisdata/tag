@@ -257,7 +257,7 @@ func (s *Service) setupCacheListener(
 			// stays CAS-meaningful.
 			if s.isBlockEligibleSize(meta.ContentLength) {
 				meta.BlockSize = s.config.Cache.BlockSize
-				cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime, cache.VersionAny)
+				_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime, cache.VersionAny)
 			} else {
 				_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime, cache.VersionAny)
 			}
@@ -552,7 +552,7 @@ func (s *Service) fetchFullObjectToCache(
 		// entry first fetched the same-or-newer upstream state and wins.
 		if blockMode {
 			meta.BlockSize = s.config.Cache.BlockSize
-			cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, writeStartTime, 0)
+			_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, writeStartTime, 0)
 		} else {
 			_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(
 				cacheCtx, bucket, key, meta, body, ttl, writeStartTime, 0,
