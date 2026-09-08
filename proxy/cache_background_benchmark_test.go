@@ -133,7 +133,7 @@ func benchmarkBackgroundCachePopulate(b *testing.B, blockMode bool) {
 		started := make(chan struct{}, concurrency)
 		forwarder.setBatch(gate, started)
 		for _, key := range keys {
-			svc.triggerBackgroundCacheFetch(bucket, key, "access", "secret", false, priorityReadMiss, 0)
+			svc.triggerBackgroundCacheFetch(bucket, key, "access", "secret", false, priorityReadMiss, cache.VersionAny)
 		}
 
 		for range keys {
@@ -159,7 +159,7 @@ func benchmarkBackgroundCachePopulate(b *testing.B, blockMode bool) {
 		for {
 			allGone := true
 			for _, key := range keys {
-				if _, loaded := svc.activeBackgroundFetches.Load("bg:" + bucket + "/" + key); loaded {
+				if _, loaded := svc.activeBackgroundFetches.Load(backgroundFetchKey(bucket, key, cache.VersionAny)); loaded {
 					allGone = false
 					break
 				}

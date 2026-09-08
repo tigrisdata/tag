@@ -593,6 +593,14 @@ func (s *Service) fetchFullObjectToCache(
 // This avoids broadcast.Manager's "no late joiners" policy which incorrectly
 // allows multiple fetches when the first has already started streaming.
 // When anonymous is true the fetch is issued without credentials and, on success,
+// backgroundFetchKey is the coalescing key for one background fetch: bucket,
+// key, and the commit precondition. One definition, shared with the tests that
+// wait on in-flight markers, so a format change cannot silently break their
+// waits into instant misses.
+func backgroundFetchKey(bucket, key string, expected uint64) string {
+	return fmt.Sprintf("bg:%s/%s|%d", bucket, key, expected)
+}
+
 // cached as public-read (see fetchFullObjectToCache); accessKey/secretKey are then
 // ignored. Pass anonymous=true exactly when the triggering request was anonymous, so
 // public-read is only ever inferred from a confirmed anonymous read.
@@ -606,7 +614,7 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 	// one key are bounded by the distinct races that spawned them, and each is
 	// budget-gated like any populate; identical triggers (a read-miss stampede)
 	// still coalesce to one fetch.
-	bcastKey := fmt.Sprintf("bg:%s/%s|%d", bucket, key, expected)
+	bcastKey := backgroundFetchKey(bucket, key, expected)
 
 	// Atomic check-and-set: if key exists, an equivalent fetch is already in progress
 	if _, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, struct{}{}); loaded {

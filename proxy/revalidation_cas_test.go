@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -200,7 +199,7 @@ func TestBackgroundFetchRepairNotCoalescedBehindWarm(t *testing.T) {
 	//    and must lose to it.
 	close(gate)
 	waitFor(t, func() bool {
-		if _, busy := svc.activeBackgroundFetches.Load(fmt.Sprintf("bg:%s/%s|%d", bucket, key, uint64(0))); busy {
+		if _, busy := svc.activeBackgroundFetches.Load(backgroundFetchKey(bucket, key, 0)); busy {
 			return false
 		}
 		return true
