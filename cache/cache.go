@@ -317,7 +317,12 @@ func (c *Cache) GetMetaWithVersion(ctx context.Context, bucket, key string) (*Ca
 	metaBytes, version, found, err := c.client.GetWithVersion(ctx, MakeMetaKey(bucket, key))
 	if err != nil {
 		if isNotFoundError(err) {
-			return nil, 0, false, nil
+			// Defensive: a v1.13.0 client reports absence as found=false with a
+			// token, not an error. Should a client surface absence as an error
+			// anyway, pass through whatever version it attached rather than
+			// squashing to 0 — 0 would opt the caller into unordered
+			// put-if-absent that a fence exists to refuse.
+			return nil, version, false, nil
 		}
 		return nil, 0, false, err
 	}
@@ -465,8 +470,18 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 func (c *Cache) deleteMetaFenced(ctx context.Context, bucket, key string) error {
 	metaKey := MakeMetaKey(bucket, key)
 	expected := uint64(0)
-	const maxAttempts = 8
+	// Invalidation must not abandon a key because writers are racing it: each
+	// mismatch means exactly one more committed write to out-delete, so the
+	// loop always makes progress and terminates unless writes are continuous.
+	// It is bounded by the caller's context and a generous attempt ceiling
+	// (not the old count of 8 — a plain delete could never "lose a race", and
+	// giving up would leave known-stale metadata readable until TTL); genuine
+	// exhaustion is a pathology, surfaced as an error the callers record.
+	const maxAttempts = 64
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("fenced meta delete for %s/%s: %w", bucket, key, err)
+		}
 		err := c.client.DeleteIfVersion(ctx, metaKey, expected)
 		if err == nil {
 			return nil
@@ -480,7 +495,7 @@ func (c *Cache) deleteMetaFenced(ctx context.Context, bucket, key string) error 
 		}
 		return err
 	}
-	return fmt.Errorf("fenced meta delete for %s/%s lost %d consecutive version races", bucket, key, 8)
+	return fmt.Errorf("fenced meta delete for %s/%s lost %d consecutive version races", bucket, key, 64)
 }
 
 // Delete removes an object from the cache.
