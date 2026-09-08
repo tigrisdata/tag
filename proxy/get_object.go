@@ -352,8 +352,11 @@ func (s *Service) fetchAndBroadcast(
 		<-broadcaster.Done() // the fetch goroutine above records the upstream outcome
 		if upErr := broadcaster.Error(); upErr == nil ||
 			errors.Is(upErr, context.Canceled) || errors.Is(upErr, context.DeadlineExceeded) {
-			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
-				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, 0)
+			if _, tok, found, _ := s.cache.GetMetaWithVersion(context.Background(), bucket, key); !found {
+				// Absent-gated, carrying the absence TOKEN (ocache v1.13.0):
+				// the warm is ordered against a fenced delete landing after
+				// this look, where a bare put-if-absent would recreate over it.
+				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, tok)
 			}
 		}
 	}
@@ -842,8 +845,11 @@ func (s *Service) handleRangeWithBackgroundCache(
 		}
 	} else if cacheable {
 		defer func() {
-			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
-				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, 0)
+			if _, tok, found, _ := s.cache.GetMetaWithVersion(context.Background(), bucket, key); !found {
+				// Absent-gated, carrying the absence TOKEN (ocache v1.13.0):
+				// the warm is ordered against a fenced delete landing after
+				// this look, where a bare put-if-absent would recreate over it.
+				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, tok)
 			}
 		}()
 	}

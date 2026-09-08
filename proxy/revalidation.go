@@ -177,12 +177,19 @@ func (s *Service) revalidationExpectedVersion(bucket, key, staleETag string) uin
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cur, version, found, err := s.cache.GetMetaWithVersion(ctx, bucket, key)
-	if err != nil || !found || cur == nil {
+	if err != nil {
 		return 0
+	}
+	if !found || cur == nil {
+		// Absent: use the absence TOKEN (ocache v1.13.0), not 0 — the repopulate
+		// is then ordered against a fenced delete landing after this look.
+		return version
 	}
 	if cur.ETag == staleETag {
 		return version
 	}
+	// A fresh racer holds the key: 0 against a live row is a guaranteed
+	// mismatch, skipping the write in its favor.
 	return 0
 }
 

@@ -127,9 +127,7 @@ func (c *Cache) putMetaVersioned(ctx context.Context, bucket, key, metaKey strin
 		if err != nil && !isNotFoundError(err) {
 			return false, err
 		}
-		if !found {
-			version = 0
-		}
+		_ = found // absent reads carry a usable token since ocache v1.13.0
 		_, err = c.client.PutIfVersion(ctx, metaKey, metaBytes, ttl, version)
 		if err == nil {
 			return true, nil
@@ -324,7 +322,13 @@ func (c *Cache) GetMetaWithVersion(ctx context.Context, bucket, key string) (*Ca
 		return nil, 0, false, err
 	}
 	if !found || metaBytes == nil {
-		return nil, 0, false, nil
+		// Since ocache v1.13.0 (fenced deletes, #267) an absent read carries a
+		// nonzero token — the fence of the CAS delete that removed the key, or
+		// a fresh "absent as of now" stamp. Passing it through lets a populate
+		// that observed absence be ORDERED against a later fenced delete;
+		// squashing it to 0 would silently opt the caller back into legacy
+		// unordered put-if-absent. Callers test found, never version==0.
+		return nil, version, false, nil
 	}
 	meta, err := DecodeMeta(metaBytes)
 	if err != nil {
@@ -426,15 +430,18 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 		errs = append(errs, fmt.Errorf("write tombstone: %w", err))
 	}
 
-	metaKey := MakeMetaKey(bucket, key)
-
 	// Delete only the metadata. That is sufficient to make subsequent reads miss
 	// (a read resolves the body from meta.ETag, so with meta gone there is no body
 	// lookup), and the tombstone above blocks any in-flight repopulation. The
 	// versioned body is intentionally left to age out via TTL rather than deleted
 	// synchronously — deleting it could truncate an in-flight reader still
 	// streaming that exact version.
-	if err := c.client.Delete(ctx, metaKey); err != nil && !isNotFoundError(err) {
+	//
+	// FENCED (ocache v1.13.0, #267): the delete goes through the CAS op family
+	// so it leaves a fence, ordering token-carrying populates that observed
+	// pre-delete state. The tombstone above covers the writers that don't carry
+	// tokens yet; it is retained for this one overlap release and retired next.
+	if err := c.deleteMetaFenced(ctx, bucket, key); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta delete error")
 		errs = append(errs, fmt.Errorf("delete meta: %w", err))
 	}
@@ -445,6 +452,35 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidated cache metadata (body ages out via TTL)")
 	return nil
+}
+
+// deleteMetaFenced is the unconditional FENCED delete of a meta key: it must
+// remove whatever is live and leave a fence either way, so that a populate
+// that observed pre-delete state — including pre-delete ABSENCE — loses its
+// commit. DeleteIfVersion(key, 0) fences an absent/dead key directly; against
+// a live key it reports the current version, and the retry deletes exactly
+// that observed version. Bounded: each retry means a concurrent writer just
+// committed, and sustained contention on one meta key is a pathology worth
+// surfacing, not masking.
+func (c *Cache) deleteMetaFenced(ctx context.Context, bucket, key string) error {
+	metaKey := MakeMetaKey(bucket, key)
+	expected := uint64(0)
+	const maxAttempts = 8
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := c.client.DeleteIfVersion(ctx, metaKey, expected)
+		if err == nil {
+			return nil
+		}
+		if mm, mismatch := cacheclient.IsVersionMismatch(err); mismatch {
+			expected = mm.CurrentVersion
+			continue
+		}
+		if isNotFoundError(err) {
+			return nil
+		}
+		return err
+	}
+	return fmt.Errorf("fenced meta delete for %s/%s lost %d consecutive version races", bucket, key, 8)
 }
 
 // Delete removes an object from the cache.

@@ -31,6 +31,15 @@ func (f *flakyClient) Delete(ctx context.Context, key string) error {
 	return f.CacheClient.Delete(ctx, key)
 }
 
+// DeleteWithMeta's metadata removal goes through the fenced CAS delete since
+// ocache v1.13.0; the fault must be injected there too.
+func (f *flakyClient) DeleteIfVersion(ctx context.Context, key string, expected uint64) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	return f.CacheClient.DeleteIfVersion(ctx, key, expected)
+}
+
 func newCacheWithClientForTest(t *testing.T, client cacheclient.CacheClient) *Cache {
 	t.Helper()
 	cfg := config.NewDefault()
