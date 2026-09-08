@@ -597,11 +597,20 @@ func (s *Service) fetchFullObjectToCache(
 // ignored. Pass anonymous=true exactly when the triggering request was anonymous, so
 // public-read is only ever inferred from a confirmed anonymous read.
 func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, expected uint64) {
-	bcastKey := "bg:" + bucket + "/" + key
+	// Coalesce only triggers with IDENTICAL commit semantics: the precondition
+	// is part of the dedup key. Keyed by bucket/key alone, a VersionAny write
+	// repair arriving while an absent-gated warm is in flight would be dropped
+	// WITH its precondition — the in-flight warm then loses to the write's
+	// newer tombstone (its stamp predates it) and the repair that would have
+	// fixed the surviving state never runs. Distinct-precondition fetches for
+	// one key are bounded by the distinct races that spawned them, and each is
+	// budget-gated like any populate; identical triggers (a read-miss stampede)
+	// still coalesce to one fetch.
+	bcastKey := fmt.Sprintf("bg:%s/%s|%d", bucket, key, expected)
 
-	// Atomic check-and-set: if key exists, a fetch is already in progress
+	// Atomic check-and-set: if key exists, an equivalent fetch is already in progress
 	if _, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, struct{}{}); loaded {
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background fetch already in progress, coalescing")
+		log.Debug().Str("bucket", bucket).Str("key", key).Uint64("expected", expected).Msg("Equivalent background fetch already in progress, coalescing")
 		return
 	}
 

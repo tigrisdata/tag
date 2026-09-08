@@ -3,10 +3,12 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -151,6 +153,75 @@ func TestRevalidation206_BackgroundFetchReplacesStaleAfterFailedDelete(t *testin
 			meta, found, _ := c.GetMeta(ctx, bucket, key)
 			t.Fatalf("stale entry not replaced by the background fetch: found=%v meta=%+v", found, meta)
 		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// A VersionAny write repair must not be coalesced away behind an in-flight
+// absent-gated warm: the warm's commit loses to newer state by design, so
+// dropping the repair (with its precondition) leaves the wrong entry standing.
+func TestBackgroundFetchRepairNotCoalescedBehindWarm(t *testing.T) {
+	gate := make(chan struct{})
+	var calls atomic.Int64
+	mock := &mockForwarder{
+		doFullObjectFunc: func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+			n := calls.Add(1)
+			h := http.Header{}
+			h.Set("Content-Type", "text/plain")
+			if n == 1 {
+				// The absent-gated warm: held in flight until released.
+				<-gate
+				h.Set("ETag", `"old"`)
+				h.Set("Content-Length", "3")
+				return &http.Response{StatusCode: http.StatusOK, Header: h, ContentLength: 3, Body: io.NopCloser(strings.NewReader("old"))}, nil
+			}
+			h.Set("ETag", `"new"`)
+			h.Set("Content-Length", "3")
+			return &http.Response{StatusCode: http.StatusOK, Header: h, ContentLength: 3, Body: io.NopCloser(strings.NewReader("new"))}, nil
+		},
+	}
+	svc, c := newTestService(mock, true)
+	ctx := context.Background()
+	bucket, key := "b", "k"
+
+	// 1. Absent-gated warm starts and blocks in its upstream fetch.
+	svc.triggerBackgroundCacheFetch(bucket, key, "access", "secret", false, priorityReadMiss, 0)
+	waitFor(t, func() bool { return calls.Load() == 1 })
+
+	// 2. A write repair triggers while the warm is in flight. It must run,
+	//    not coalesce: with the old bucket/key-only dedup it was dropped here.
+	svc.triggerBackgroundCacheFetch(bucket, key, "access", "secret", false, priorityWarmWrite, cache.VersionAny)
+	waitFor(t, func() bool {
+		meta, found, _ := c.GetMeta(ctx, bucket, key)
+		return found && meta != nil && meta.ETag == `"new"`
+	})
+
+	// 3. The released warm commits put-if-absent against the repaired entry
+	//    and must lose to it.
+	close(gate)
+	waitFor(t, func() bool {
+		if _, busy := svc.activeBackgroundFetches.Load(fmt.Sprintf("bg:%s/%s|%d", bucket, key, uint64(0))); busy {
+			return false
+		}
+		return true
+	})
+	meta, found, _ := c.GetMeta(ctx, bucket, key)
+	if !found || meta == nil || meta.ETag != `"new"` {
+		t.Fatalf("repair's entry lost to the stale warm: found=%v meta=%+v", found, meta)
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		if cond() {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("condition not reached within 3s")
+		case <-time.After(5 * time.Millisecond):
 		}
 	}
 }
