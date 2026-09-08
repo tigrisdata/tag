@@ -825,28 +825,33 @@ func (s *Service) serveFullObjectFromBlockCache(
 	// bound after an out-of-band overwrite) and guarantee a window where the meta outlives
 	// every block. Best-effort: a skipped or failed promotion only means the next full GET
 	// probes again.
-	if !meta.BlocksComplete {
-		if remaining := s.remainingMetaTTL(meta); remaining > 0 {
-			expectETag := meta.ETag
-			go func() {
-				pctx, cancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
-				defer cancel()
-				// A promotion is a read-modify-write of live metadata, so it
-				// re-reads with the version and promotes THAT snapshot under a
-				// strict precondition: a concurrent overwrite's fresh entry can
-				// never be clobbered by a promoted copy of the old one. Any
-				// skip just means the next full GET probes again.
-				cur, version, found, gerr := s.cache.GetMetaWithVersion(pctx, bucket, key)
-				if gerr != nil || !found || cur == nil || cur.ETag != expectETag || cur.BlocksComplete {
-					return
-				}
-				promoted := *cur
-				promoted.BlocksComplete = true
-				if _, perr := s.cache.PutMetaTombstoneAware(pctx, bucket, key, &promoted, remaining, writeStartTime, version); perr != nil {
-					log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Blocks-complete promotion failed")
-				}
-			}()
-		}
+	if !meta.BlocksComplete && s.remainingMetaTTL(meta) > 0 {
+		expectETag := meta.ETag
+		go func() {
+			pctx, cancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
+			defer cancel()
+			// A promotion is a read-modify-write of live metadata, so it
+			// re-reads with the version and promotes THAT snapshot under a
+			// strict precondition: a concurrent overwrite's fresh entry can
+			// never be clobbered by a promoted copy of the old one. Any
+			// skip just means the next full GET probes again.
+			cur, version, found, gerr := s.cache.GetMetaWithVersion(pctx, bucket, key)
+			if gerr != nil || !found || cur == nil || cur.ETag != expectETag || cur.BlocksComplete {
+				return
+			}
+			// TTL from the RE-READ snapshot: the serve-path copy may have
+			// expired and been re-established since, and stamping the fresh
+			// row with the old copy's nearly-spent TTL would expire it early.
+			remaining := s.remainingMetaTTL(cur)
+			if remaining <= 0 {
+				return
+			}
+			promoted := *cur
+			promoted.BlocksComplete = true
+			if _, perr := s.cache.PutMetaTombstoneAware(pctx, bucket, key, &promoted, remaining, writeStartTime, version); perr != nil {
+				log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Blocks-complete promotion failed")
+			}
+		}()
 	}
 
 	meta.WriteHeaders(w)
