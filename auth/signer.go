@@ -342,34 +342,111 @@ func (s *RequestSigner) deriveSigningKey(secretKey, dateStr string) []byte {
 
 // shouldCopyHeader returns true if the header should be copied to the upstream request.
 func shouldCopyHeader(key string) bool {
-	lower := strings.ToLower(key)
-	switch lower {
-	// Content headers
-	case "content-type", "content-length", "content-encoding",
-		"content-disposition", "content-language", "cache-control",
-		"expires", "content-md5":
-		return true
-	// Range requests
-	case "range":
-		return true
-	// Conditional request headers
-	case "if-match", "if-none-match", "if-modified-since", "if-unmodified-since":
-		return true
+	// Header names are ASCII in ordinary HTTP traffic. Keep the common path in
+	// the original representation so case-insensitive matching does not create a
+	// temporary lowercased string. Non-ASCII names retain the old normalization
+	// before reaching the same classifier.
+	if !isASCIIHeaderName(key) {
+		key = strings.ToLower(key)
 	}
-	// All x-amz-* headers (S3 operations, metadata, etc.)
-	if strings.HasPrefix(lower, "x-amz-") {
-		return true
-	}
-	// All Tigris-specific headers (tigris-* and x-tigris-*), except proxy headers
-	// which must not be forwarded in signing mode to prevent client injection.
-	// The transparent forwarder overwrites these with .Set() so it's unaffected.
-	if strings.HasPrefix(lower, "x-tigris-proxy-") || lower == "x-tigris-forwarded-host" {
+	return shouldCopyASCIIHeader(key)
+}
+
+func shouldCopyASCIIHeader(key string) bool {
+	if len(key) == 0 {
 		return false
 	}
-	if strings.HasPrefix(lower, "tigris-") || strings.HasPrefix(lower, "x-tigris-") {
-		return true
+
+	// Dispatch by the first byte and, for exact content headers, by length so
+	// common names do not compare against the entire allowlist.
+	switch asciiLowerHeaderByte(key[0]) {
+	case 'c':
+		if hasPrefixFoldHeader(key, "content-") {
+			switch len(key) {
+			case len("content-type"):
+				return equalFoldHeader(key, "content-type")
+			case len("content-length"):
+				return equalFoldHeader(key, "content-length")
+			case len("content-encoding"):
+				return equalFoldHeader(key, "content-encoding") || equalFoldHeader(key, "content-language")
+			case len("content-disposition"):
+				return equalFoldHeader(key, "content-disposition")
+			case len("content-md5"):
+				return equalFoldHeader(key, "content-md5")
+			}
+			return false
+		}
+		return equalFoldHeader(key, "cache-control")
+	case 'e':
+		return equalFoldHeader(key, "expires")
+	case 'r':
+		return equalFoldHeader(key, "range")
+	case 'i':
+		switch len(key) {
+		case len("if-match"):
+			return equalFoldHeader(key, "if-match")
+		case len("if-none-match"):
+			return equalFoldHeader(key, "if-none-match")
+		case len("if-modified-since"):
+			return equalFoldHeader(key, "if-modified-since")
+		case len("if-unmodified-since"):
+			return equalFoldHeader(key, "if-unmodified-since")
+		}
+	case 'x':
+		// All x-amz-* headers (S3 operations, metadata, etc.).
+		if hasPrefixFoldHeader(key, "x-amz-") {
+			return true
+		}
+		// Proxy headers must be rejected before the broader x-tigris-* allowlist.
+		if hasPrefixFoldHeader(key, "x-tigris-proxy-") || equalFoldHeader(key, "x-tigris-forwarded-host") {
+			return false
+		}
+		return hasPrefixFoldHeader(key, "x-tigris-")
+	case 't':
+		return hasPrefixFoldHeader(key, "tigris-")
 	}
 	return false
+}
+
+func asciiLowerHeaderByte(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
+}
+
+// isASCIIHeaderName reports whether key contains only single-byte ASCII
+// characters. Invalid UTF-8 bytes take the normalization path as well.
+func isASCIIHeaderName(key string) bool {
+	for i := 0; i < len(key); i++ {
+		if key[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// equalFoldHeader compares an ASCII header name with a lowercase literal
+// without allocating. Non-ASCII bytes cannot match an ASCII literal.
+func equalFoldHeader(key, literal string) bool {
+	if len(key) != len(literal) {
+		return false
+	}
+	for i := range literal {
+		c := key[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != literal[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// hasPrefixFoldHeader compares an ASCII header prefix without allocating.
+func hasPrefixFoldHeader(key, prefix string) bool {
+	return len(key) >= len(prefix) && equalFoldHeader(key[:len(prefix)], prefix)
 }
 
 // hmacSHA256 computes HMAC-SHA256.
