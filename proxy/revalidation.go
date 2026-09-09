@@ -173,24 +173,27 @@ func (s *Service) handleRevalidation304(
 // A read failure returns 0 as well: refusing to overwrite is the safe
 // direction when the store cannot be consulted, and the entry converges via
 // the next revalidation or TTL.
-func (s *Service) revalidationExpectedVersion(bucket, key, staleETag string) uint64 {
+func (s *Service) revalidationExpectedVersion(bucket, key, staleETag string) (uint64, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cur, version, found, err := s.cache.GetMetaWithVersion(ctx, bucket, key)
 	if err != nil {
-		return 0
+		// No token, no ordered commit — expected=0 is the legacy unordered
+		// put-if-absent and could publish over a fence. Skip the repopulate;
+		// the client is still served and the entry heals on a later read.
+		return 0, false
 	}
 	if !found || cur == nil {
 		// Absent: use the absence TOKEN (ocache v1.13.0), not 0 — the repopulate
 		// is then ordered against a fenced delete landing after this look.
-		return version
+		return version, true
 	}
 	if cur.ETag == staleETag {
-		return version
+		return version, true
 	}
 	// A fresh racer holds the key: 0 against a live row is a guaranteed
 	// mismatch, skipping the write in its favor.
-	return 0
+	return 0, true
 }
 
 // handleRevalidation200 handles a 200 OK revalidation response (object changed).
@@ -250,7 +253,8 @@ func (s *Service) handleRevalidation200(
 	// blocks (size-only mode, RFC 0001) exactly as the read-miss/warm paths do — a revalidated
 	// whole-mode entry that grew into a block-eligible object must not be re-stored as one whole
 	// blob. Sub-block objects keep the whole-body write.
-	expected := s.revalidationExpectedVersion(bucket, key, staleETag)
+	expected, tokenOK := s.revalidationExpectedVersion(bucket, key, staleETag)
+	shouldCache = shouldCache && tokenOK
 	cacheErrCh := make(chan error, 1)
 	go func() {
 		var cacheErr error
@@ -418,7 +422,9 @@ func (s *Service) handleRevalidation206Range(
 		// is best-effort, and if it failed the fetch must overwrite exactly
 		// the surviving known-stale row rather than being refused by
 		// put-if-absent.
-		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, s.revalidationExpectedVersion(bucket, key, staleETag))
+		if rewarmTok, tokenOK := s.revalidationExpectedVersion(bucket, key, staleETag); tokenOK {
+			s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, rewarmTok)
+		}
 	}
 
 	return copyErr

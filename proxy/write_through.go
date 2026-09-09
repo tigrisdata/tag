@@ -194,7 +194,10 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 		metrics.WarmOnWriteTriggered.Inc()
 		// Token at trigger time, like warmOnWrite: repairs exactly the state
 		// this write left (absence, or the survivor of a failed invalidation).
-		_, warmTok, _, _ := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
+		warmTok, ok := s.warmToken(bucket, key)
+		if !ok {
+			return
+		}
 		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, warmTok)
 	}()
 	return true
@@ -224,7 +227,9 @@ func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte
 	// block us.
 	_, expected, _, tokErr := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
 	if tokErr != nil {
-		expected = 0
+		// No token, no ordered commit: fall back to the warm, which reads its
+		// own token (and skips likewise if the store is still failing).
+		return teeFallbackWarm
 	}
 
 	headCtx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)

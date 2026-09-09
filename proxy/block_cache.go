@@ -1525,15 +1525,22 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
 
-		// Stamp the write start BEFORE fetching, so an invalidation that lands mid-populate is
-		// newer than our timestamp and blocks the meta write (mirrors the whole-object paths).
-		writeStartTime := time.Now().UnixNano()
+		// Decision-time token BEFORE fetching, so an invalidation that lands
+		// mid-populate bumps the fence past it and the meta commit loses
+		// (mirrors the whole-object paths). No token, no ordered commit: skip.
+		// An entry present at decision time does NOT skip: the blocks are
+		// ETag-keyed and useful to it, and finalizeBlockModeMeta's own
+		// re-check backs off the meta write in its favor.
+		_, expected, _, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+		if tokErr != nil {
+			return
+		}
 
 		if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, touched); err != nil {
 			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block-mode populate skipped - block fetch failed")
 			return
 		}
-		s.finalizeBlockModeMeta(ctx, bucket, key, meta, len(touched), writeStartTime)
+		s.finalizeBlockModeMeta(ctx, bucket, key, meta, len(touched), expected)
 	}()
 }
 
@@ -1542,9 +1549,10 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 // need to act between the two steps (write-time footer warming records per-block
 // attribution there) share this logic instead of re-deriving its race handling.
 //
-// writeStartTime must be stamped BEFORE the blocks were fetched, so an invalidation
-// landing mid-populate is newer and blocks the meta write.
-func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, blockCount int, writeStartTime int64) {
+// expected must be the caller's decision-time token, read BEFORE the blocks were
+// fetched (or the HEAD made): an invalidation landing mid-populate bumps the
+// fence past it and the meta commit loses.
+func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, blockCount int, expected uint64) {
 	// Re-check that no entry was established concurrently before stamping block-mode meta.
 	// The schedule-time !found gate can go stale during the block fetch: a racing
 	// full-GET miss may have whole-cached the object. Overwriting that with block-mode meta
@@ -1555,11 +1563,10 @@ func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string,
 		return
 	}
 	ttl := int(s.config.Cache.TTL.Seconds())
-	// Put-if-absent: this establishment was decided right after the write's own
-	// invalidation cleared the entry. If a racer (a warm, another establish)
-	// repopulated first, its entry describes the same or a newer version — the
-	// lost precondition leaves it in place.
-	wrote, err := s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, 0)
+	// Committed under the decision-time absence token: a racer (a warm, another
+	// establish) or a fenced delete that landed since bumps the version and the
+	// lost precondition leaves the newer state in place.
+	wrote, err := s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, expected)
 	if err != nil || !wrote {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (precondition lost or error)")
 		return

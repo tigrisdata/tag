@@ -890,7 +890,10 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 		// succeeded, the surviving stale row's live version if it failed — the
 		// warm then repairs exactly that state and loses to anything newer,
 		// including a fenced delete landing mid-fetch.
-		_, warmTok, _, _ := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
+		warmTok, ok := s.warmToken(bucket, key)
+		if !ok {
+			return
+		}
 		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*anonymous*/, priorityWarmWrite, warmTok)
 		return
 	}
@@ -900,8 +903,23 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 		return
 	}
 	metrics.WarmOnWriteTriggered.Inc()
-	_, warmTok, _, _ := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
+	warmTok, ok := s.warmToken(bucket, key)
+	if !ok {
+		return
+	}
 	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, warmTok)
+}
+
+// warmToken reads a warm trigger's decision-time token. ok=false means the
+// token could not be read and the warm must be SKIPPED: expected=0 is the
+// legacy unordered put-if-absent and would publish over a fence.
+func (s *Service) warmToken(bucket, key string) (uint64, bool) {
+	_, tok, _, err := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
+	if err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Warm skipped - decision-time token unavailable")
+		return 0, false
+	}
+	return tok, true
 }
 
 // HandlePassthrough handles requests that are passed through without caching.
