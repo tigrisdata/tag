@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/rs/zerolog/log"
 
@@ -304,8 +303,11 @@ func (s *Service) warmParquetFooterBlocks(bucket, key, accessKey, secretKey stri
 	// without contacting upstream, so a warm whose footer blocks are all still
 	// cached performs NO upstream validation and would happily re-publish meta for
 	// a deleted object. meta_on_write.go and write_through.go both stamp before
-	// their HEAD for the same reason.
-	writeStartTime := time.Now().UnixNano()
+	// Decision-time token BEFORE the footer work; no token, no ordered commit.
+	_, expected, found, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+	if tokErr != nil || found {
+		return
+	}
 
 	meta, footerLen, ok := s.readParquetTrailerFromUpstream(ctx, bucket, key, accessKey, secretKey)
 	if !ok {
@@ -317,9 +319,9 @@ func (s *Service) warmParquetFooterBlocks(bucket, key, accessKey, secretKey stri
 		return
 	}
 
-	// Meta last, tombstone-aware -- the RFC 0001 visibility gate. Blocks stay useful
+	// Meta last, version-preconditioned -- the RFC 0001 visibility gate. Blocks stay useful
 	// even if this backs off, since they are keyed by ETag.
-	s.finalizeBlockModeMeta(ctx, bucket, key, meta, 0, writeStartTime)
+	s.finalizeBlockModeMeta(ctx, bucket, key, meta, 0, expected)
 }
 
 // readParquetTrailerFromUpstream fetches the object's last 8 bytes. A suffix range is

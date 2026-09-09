@@ -18,6 +18,7 @@ import (
 func newBackgroundCacheService(t *testing.T, cfg *config.Config, response func() *http.Response) (*Service, *cache.Cache) {
 	t.Helper()
 
+	cfg.Cache.SetLegacyCoordination(false) // background-populate tests assert CAS semantics
 	cacheStore := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
 	forwarder := &mockForwarder{
 		doFullObjectFunc: func(_ context.Context, _, _, _, _ string) (*http.Response, error) {
@@ -361,10 +362,10 @@ func TestFetchFullObjectToCache_DetachedWriteSurvivesFetchCancellation(t *testin
 	}
 }
 
-func TestFetchFullObjectToCache_TombstoneBlocksDirectWrite(t *testing.T) {
+func TestFetchFullObjectToCache_FenceBlocksDirectWrite(t *testing.T) {
 	const (
 		bucket = "background-bucket"
-		key    = "tombstone-key"
+		key    = "fenced-key"
 		body   = "stale background body"
 	)
 
@@ -372,18 +373,24 @@ func TestFetchFullObjectToCache_TombstoneBlocksDirectWrite(t *testing.T) {
 	cfg.Cache.SetBlockCachingEnabled(false)
 	var cacheStore *cache.Cache
 	svc, cacheStore := newBackgroundCacheService(t, cfg, func() *http.Response {
-		if err := cacheStore.WriteTombstone(context.Background(), bucket, key); err != nil {
-			t.Fatalf("WriteTombstone: %v", err)
+		// The fenced invalidation lands mid-fetch, after the trigger's
+		// decision-time token below was read.
+		if err := cacheStore.DeleteWithMeta(context.Background(), bucket, key); err != nil {
+			t.Fatalf("fenced invalidation: %v", err)
 		}
 		return cacheableGetResponse(body, `"stale-etag"`)
 	})
 
-	if err := svc.fetchFullObjectToCache(context.Background(), bucket, key, "access", "secret", false, priorityReadMiss, 0); err != nil {
+	_, tok, found, err := cacheStore.GetMetaWithVersion(context.Background(), bucket, key)
+	if err != nil || found {
+		t.Fatalf("absent read: found=%v err=%v", found, err)
+	}
+	if err := svc.fetchFullObjectToCache(context.Background(), bucket, key, "access", "secret", false, priorityReadMiss, tok); err != nil {
 		t.Fatalf("fetchFullObjectToCache: %v", err)
 	}
 	if _, found, err := cacheStore.GetMeta(context.Background(), bucket, key); err != nil {
 		t.Fatalf("GetMeta: %v", err)
 	} else if found {
-		t.Fatal("direct cache write bypassed a newer tombstone")
+		t.Fatal("direct cache write bypassed a newer fence")
 	}
 }

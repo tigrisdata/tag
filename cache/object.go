@@ -275,6 +275,12 @@ func DecodeMeta(data []byte) (*CachedObjectMeta, error) {
 	return &meta, nil
 }
 
+// MakeTombstoneKey creates the cache key for legacy invalidation tombstones
+// (legacyCoordinator only; CAS mode writes none).
+func MakeTombstoneKey(bucket, key string) string {
+	return "tomb|" + bucket + "|" + key
+}
+
 // MakeMetaKey creates the cache key for object metadata.
 func MakeMetaKey(bucket, key string) string {
 	return metaKeyPrefix + bucket + "|" + key
@@ -306,9 +312,4 @@ func MakeBodyKey(bucket, key, etag string) string {
 func MakeBlockKey(bucket, key, etag string, blockSize, blockIdx int64) string {
 	return blockKeyPrefix + bucket + "|" + key + "|" + etagKeyComponent(etag) + "|" +
 		strconv.FormatInt(blockSize, 10) + "|" + strconv.FormatInt(blockIdx, 10)
-}
-
-// MakeTombstoneKey creates the cache key for invalidation tombstones.
-func MakeTombstoneKey(bucket, key string) string {
-	return tombKeyPrefix + bucket + "|" + key
 }

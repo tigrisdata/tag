@@ -3,7 +3,6 @@ package cache
 import (
 	"context"
 	"testing"
-	"time"
 
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/config"
@@ -11,6 +10,7 @@ import (
 
 func newETagTestCache() *Cache {
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // these tests assert CAS-coordinator semantics
 	return NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
 }
 
@@ -79,28 +79,31 @@ func TestDeleteIfETag_AbsentIsNoop(t *testing.T) {
 	}
 }
 
-// The match path writes a tombstone (like DeleteWithMeta), so an in-flight
-// stamp-based populate that began before the guarded delete is still blocked.
-func TestDeleteIfETag_WritesTombstoneOnMatch(t *testing.T) {
+// The match path's CAS delete leaves a fence, so an in-flight populate whose
+// decision-time token predates the guarded delete is still blocked.
+func TestDeleteIfETag_FencesOnMatch(t *testing.T) {
 	c := newETagTestCache()
 	ctx := context.Background()
 	seedEntry(t, c, "b", "k", `"v1"`, "body-v1")
 
-	// A populate "decides" before the delete...
-	populateStart := time.Now().UnixNano()
+	// A populate "decides" before the delete, capturing its token...
+	_, tok, found, err := c.GetMetaWithVersion(ctx, "b", "k")
+	if err != nil || !found {
+		t.Fatalf("token read: found=%v err=%v", found, err)
+	}
 
 	if deleted, err := c.DeleteIfETag(ctx, "b", "k", `"v1"`); err != nil || !deleted {
 		t.Fatalf("DeleteIfETag: deleted=%v err=%v", deleted, err)
 	}
 
-	// ...and its tombstone-aware meta write must now be refused.
+	// ...and its token-carrying meta write must now be refused by the fence.
 	meta := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"v1"`, StatusCode: 200}
-	wrote, err := c.PutMetaTombstoneAware(ctx, "b", "k", meta, 60, populateStart, VersionAny)
+	wrote, err := c.PutMetaIfVersion(ctx, "b", "k", meta, 60, tok)
 	if err != nil {
-		t.Fatalf("PutMetaTombstoneAware: %v", err)
+		t.Fatalf("PutMetaIfVersion: %v", err)
 	}
 	if wrote {
-		t.Fatal("stale populate resurrected the entry - guarded delete wrote no tombstone")
+		t.Fatal("stale populate resurrected the entry - guarded delete left no fence")
 	}
 }
 
@@ -131,6 +134,7 @@ func TestDeleteIfETag_VersionedReplacementInsideWindowSurvives(t *testing.T) {
 	mem := cacheclient.NewMemoryCache()
 	wrapper := &raceOnReadClient{CacheClient: mem}
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // CAS-window semantics under test
 	c := NewCacheWithClient(wrapper, &cfg.Cache)
 	ctx := context.Background()
 
@@ -176,6 +180,7 @@ func TestDeleteIfETag_VersionedReplacementInsideWindowSurvives(t *testing.T) {
 func TestDeleteIfETag_PopulateReplacementInsideWindowSurvives(t *testing.T) {
 	wrapper := &raceOnReadClient{CacheClient: cacheclient.NewMemoryCache()}
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // CAS-window semantics under test
 	c := NewCacheWithClient(wrapper, &cfg.Cache)
 	ctx := context.Background()
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/xml"
 	"net/http"
-	"time"
 
 	"github.com/rs/zerolog/log"
 
@@ -73,7 +72,11 @@ func (s *Service) establishBlockMetaFromHead(bucket, key, accessKey, secretKey, 
 
 	// Stamp before the HEAD, so an invalidation landing mid-flight is newer than this
 	// timestamp and blocks the meta write.
-	writeStartTime := time.Now().UnixNano()
+	// Decision-time token BEFORE the HEAD; no token, no ordered commit.
+	_, expected, found, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+	if tokErr != nil || found {
+		return
+	}
 
 	resp, err := s.forwarder.DoConditionalHeadRequest(ctx, bucket, key, accessKey, secretKey, "", 0)
 	if err != nil {
@@ -107,7 +110,7 @@ func (s *Service) establishBlockMetaFromHead(bucket, key, accessKey, secretKey, 
 
 	// Deliberately NOT BlocksComplete: no block has been written, so a full-object
 	// serve must take the probe pass rather than stream optimistically.
-	s.finalizeBlockModeMeta(ctx, bucket, key, meta, 0, writeStartTime)
+	s.finalizeBlockModeMeta(ctx, bucket, key, meta, 0, expected)
 }
 
 // completedMultipartETag extracts the ETag from a CompleteMultipartUpload response.
