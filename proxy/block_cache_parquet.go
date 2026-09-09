@@ -317,7 +317,7 @@ func (s *Service) warmParquetFooterBlocks(bucket, key, accessKey, secretKey stri
 		return
 	}
 
-	// Meta last, tombstone-aware -- the RFC 0001 visibility gate. Blocks stay useful
+	// Meta last, version-preconditioned -- the RFC 0001 visibility gate. Blocks stay useful
 	// even if this backs off, since they are keyed by ETag.
 	s.finalizeBlockModeMeta(ctx, bucket, key, meta, 0, writeStartTime)
 }

@@ -10,18 +10,10 @@ import (
 )
 
 // flakyClient wraps a real client and can inject failures into the two backend
-// operations DeleteWithMeta performs: Put (tombstone) and Delete (metadata).
+// operation DeleteWithMeta performs: the fenced CAS delete of the metadata.
 type flakyClient struct {
 	cacheclient.CacheClient
-	putErr    error // returned by Put (tombstone write) when non-nil
 	deleteErr error // returned by Delete (metadata delete) when non-nil
-}
-
-func (f *flakyClient) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
-	if f.putErr != nil {
-		return f.putErr
-	}
-	return f.CacheClient.Put(ctx, key, data, ttlSeconds)
 }
 
 func (f *flakyClient) Delete(ctx context.Context, key string) error {
@@ -50,13 +42,6 @@ func newCacheWithClientForTest(t *testing.T, client cacheclient.CacheClient) *Ca
 // successful invalidation while stale metadata is still readable.
 func TestDeleteWithMeta_PropagatesBackendFailures(t *testing.T) {
 	backendDown := errors.New("backend unavailable")
-
-	t.Run("tombstone write fails", func(t *testing.T) {
-		c := newCacheWithClientForTest(t, &flakyClient{CacheClient: cacheclient.NewMemoryCache(), putErr: backendDown})
-		if err := c.DeleteWithMeta(context.Background(), "b", "k"); err == nil {
-			t.Error("DeleteWithMeta returned nil when the tombstone write failed — invalidation was not actually complete")
-		}
-	})
 
 	t.Run("metadata delete fails", func(t *testing.T) {
 		c := newCacheWithClientForTest(t, &flakyClient{CacheClient: cacheclient.NewMemoryCache(), deleteErr: backendDown})

@@ -220,10 +220,10 @@ func (s *Service) handleRevalidation200(
 	// (with the fresh version), that newer entry is left in place.
 	s.invalidateStaleMeta(bucket, key, staleETag)
 
-	// Capture writeStartTime after Delete so our own tombstone doesn't block
-	// the subsequent cache write. A concurrent DELETE arriving after this point
-	// will have a newer tombstone that correctly blocks our write.
-	writeStartTime := time.Now().UnixNano()
+	// The repopulate's precondition (picked below) is read AFTER the guarded
+	// delete, so our own invalidation doesn't block the write, while a
+	// concurrent DELETE arriving later bumps the fence past it and correctly
+	// does.
 
 	// Write response headers to client
 	copyHeaders(w.Header(), resp.Header)
@@ -256,10 +256,10 @@ func (s *Service) handleRevalidation200(
 		var cacheErr error
 		if s.isBlockEligibleSize(newMeta.ContentLength) {
 			newMeta.BlockSize = s.config.Cache.BlockSize
-			cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime, expected)
+			cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, expected)
 		} else {
-			_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(
-				context.Background(), bucket, key, newMeta, pr, ttl, writeStartTime, expected,
+			_, cacheErr = s.cache.PutWithMetaStreamIfVersion(
+				context.Background(), bucket, key, newMeta, pr, ttl, expected,
 			)
 		}
 		if cacheErr != nil {

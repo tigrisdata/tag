@@ -17,19 +17,23 @@ When running multiple TAG nodes:
 - **Hashing**: Consistent hashing distributes keys across nodes
 - **Local/Remote**: Requests for keys owned by other nodes forwarded via gRPC
 
-## Tombstone Pattern for Cache Invalidation
+## Fenced CAS Pattern for Cache Invalidation
 
-Prevents stale async cache writes after invalidation:
+Prevents stale async cache writes after invalidation (ocache v1.13.0, ocache#267):
 
 ```
-1. DELETE arrives → Write tombstone with timestamp
-2. Delete meta and body keys
-3. Async cache writer checks tombstone before writing metadata
-4. If tombstone timestamp > write start time → skip metadata write
-5. Tombstones expire after 60 seconds (short TTL)
+1. Writer reads its DECISION-TIME token: GetMetaWithVersion — absent reads
+   return a nonzero absence token; test found, never version==0
+2. DELETE/invalidation → fenced CAS delete (DeleteIfVersion; on a live key the
+   mismatch reports the current version for the retry) — bumps the fence
+3. Writer commits with PutMetaIfVersion(expected = its token)
+4. Any delete or write after the token → version mismatch → commit refused
+5. Fences are retained by the store (fence-retention, default 6h)
 ```
 
-This ensures in-flight background cache writes don't resurrect deleted objects.
+Guarantees hold within the CAS op family only: never mix plain Put/Delete with
+CAS ops on a managed key. On a lost commit, refetch before retrying — never
+retry the same bytes with a fresh token.
 
 ## Stream Multiplexing > Batching
 
@@ -59,9 +63,11 @@ Robust error handling is critical:
 
 While beneficial for throughput, explicit batching (waiting for timeout or N items) adds visible latency. Prefer zero-latency approaches.
 
-### Missing Tombstone Checks in Async Writers
+### Missing Decision-Time Tokens in Async Writers
 
-Background cache writers must check for tombstones before finalizing writes to prevent stale data.
+Background cache writers must capture their version token BEFORE fetching and
+commit under it — a token read at commit time can postdate a delete and
+resurrect stale data.
 
 ## Best Practices
 

@@ -3,7 +3,6 @@ package cache
 import (
 	"context"
 	"testing"
-	"time"
 
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/config"
@@ -42,9 +41,9 @@ func TestFencedDelete_BlocksPopulateThatObservedPreDeleteAbsence(t *testing.T) {
 
 	// The populate commits with its pre-delete token: the fence must refuse it.
 	meta := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"pre-delete"`, StatusCode: 200}
-	wrote, err := c.PutMetaTombstoneAware(ctx, "b", "k", meta, 60, time.Now().UnixNano(), tok)
+	wrote, err := c.PutMetaIfVersion(ctx, "b", "k", meta, 60, tok)
 	if err != nil {
-		t.Fatalf("PutMetaTombstoneAware: %v", err)
+		t.Fatalf("PutMetaIfVersion: %v", err)
 	}
 	if wrote {
 		t.Fatal("populate holding a pre-delete absence token committed over the fence")
@@ -76,9 +75,9 @@ func TestFencedDelete_SecondFenceBlocksRefillHoldingFirst(t *testing.T) {
 	}
 	// The refill's commit with the first token must mismatch.
 	meta := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"pre-commit"`, StatusCode: 200}
-	wrote, err := c.PutMetaTombstoneAware(ctx, "b", "k", meta, 60, time.Now().UnixNano(), tok1)
+	wrote, err := c.PutMetaIfVersion(ctx, "b", "k", meta, 60, tok1)
 	if err != nil {
-		t.Fatalf("PutMetaTombstoneAware: %v", err)
+		t.Fatalf("PutMetaIfVersion: %v", err)
 	}
 	if wrote {
 		t.Fatal("refill holding the first fence's token committed over the second fence")

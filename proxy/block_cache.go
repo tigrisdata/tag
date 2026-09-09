@@ -784,10 +784,6 @@ func (s *Service) serveFullObjectFromBlockCache(
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Complete-serve buffer budget declined - serving via probe path")
 	}
 
-	// Stamp the promotion's write-start BEFORE the assembly work below: any invalidation that
-	// lands during it is then provably newer and blocks the promoted meta write.
-	writeStartTime := startTime.UnixNano()
-
 	// A full GET must produce every block. bailIfMostlyMissing=true asks ensureBlocksCached to
 	// fall through (rather than assemble) when most blocks are absent — e.g. only a footer range
 	// was ever cached — since per-block assembly would be a large amplification versus one
@@ -817,7 +813,7 @@ func (s *Service) serveFullObjectFromBlockCache(
 		return false, ferr
 	}
 
-	// Every block is now present: promote the entry to complete (async, tombstone-aware with
+	// Every block is now present: promote the entry to complete (async, version-preconditioned with
 	// the pre-assembly timestamp, so a racing invalidation blocks the write) — later full GETs
 	// then take the probe-free path instead of re-probing every block. The rewrite carries the
 	// entry's REMAINING TTL, never a fresh one: promotion does not consult upstream, so
@@ -848,7 +844,7 @@ func (s *Service) serveFullObjectFromBlockCache(
 			}
 			promoted := *cur
 			promoted.BlocksComplete = true
-			if _, perr := s.cache.PutMetaTombstoneAware(pctx, bucket, key, &promoted, remaining, writeStartTime, version); perr != nil {
+			if _, perr := s.cache.PutMetaIfVersion(pctx, bucket, key, &promoted, remaining, version); perr != nil {
 				log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Blocks-complete promotion failed")
 			}
 		}()
@@ -1454,7 +1450,7 @@ func (s *Service) buildBlockMeta(bucket, key string, respHeader http.Header, tot
 }
 
 // putBlocksFromStream consumes a full-object body and writes it as fixed-size blocks
-// (meta.BlockSize), then stamps the block-mode meta (tombstone-aware) as the visibility gate —
+// (meta.BlockSize), then publishes the block-mode meta (version-preconditioned) as the visibility gate —
 // mirroring the range path's "blocks first, meta last" ordering. It buffers at most one block
 // (<= block_size) at a time, so peak memory is bounded regardless of object size. This is the
 // shared full-object populate path: block mode is established from ANY full-object fetch (a
@@ -1468,7 +1464,7 @@ func (s *Service) buildBlockMeta(bucket, key string, respHeader http.Header, tot
 // truncated bytes under a committed length (and poison a later range-path populate that trusts
 // existing blocks). fetchOneBlock validates block length the same way; this keeps the two block
 // writers consistent. A body longer than Content-Length is likewise rejected before the meta.
-func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, writeStartTime int64, expected uint64) (err error) {
+func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, expected uint64) (err error) {
 	// On any early return, drain the rest of r. setupCacheListener feeds this from an io.Pipe; if
 	// we stop reading with bytes still queued (a mid-object PutBlockStream error, or an oversize
 	// body), the pipe writer goroutine blocks forever on Write, leaking it and never releasing the
@@ -1506,7 +1502,7 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 	// Every block was just written, so stamp the meta complete: full-object serves can skip
 	// the per-block probe pass and stream optimistically.
 	meta.BlocksComplete = true
-	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime, expected); err != nil {
+	if _, err := s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, expected); err != nil {
 		return err
 	}
 	return nil
@@ -1514,7 +1510,7 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 
 // triggerBlockModePopulate populates a block-mode entry in the background after a cold range
 // miss: it fetches the blocks the request touched and, only if they all land, writes the
-// block-mode meta (tombstone-aware, the visibility gate). It never touches the original
+// block-mode meta (version-preconditioned, the visibility gate). It never touches the original
 // request or its response body — blocks are fetched with fresh aligned range GETs.
 func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, touched []int64) {
 	// Cap the background fan-out (same bound as the range serve): a request that touched a huge
@@ -1563,9 +1559,9 @@ func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string,
 	// invalidation cleared the entry. If a racer (a warm, another establish)
 	// repopulated first, its entry describes the same or a newer version — the
 	// lost precondition leaves it in place.
-	wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime, 0)
+	wrote, err := s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, 0)
 	if err != nil || !wrote {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (tombstone or error)")
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (precondition lost or error)")
 		return
 	}
 	log.Debug().Str("bucket", bucket).Str("key", key).Int("blocks", blockCount).Int64("block_size", meta.BlockSize).Msg("Block-mode entry populated")
