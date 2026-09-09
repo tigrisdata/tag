@@ -132,3 +132,22 @@ func TestLegacyCoordinator_NeverCallsCASAPI(t *testing.T) {
 	}
 	_ = time.Now()
 }
+
+// expected==0 carries no decision-time token, so the legacy coordinator must
+// refuse it outright — even on a virgin key with no tombstone anywhere.
+func TestLegacyCoordinator_ZeroExpectedRefused(t *testing.T) {
+	c, mem := newLegacyTestCache()
+	ctx := context.Background()
+
+	meta := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"v1"`, StatusCode: 200}
+	wrote, err := c.PutMetaIfVersion(ctx, "b", "k", meta, 60, 0)
+	if err != nil {
+		t.Fatalf("PutMetaIfVersion(expected=0): %v", err)
+	}
+	if wrote {
+		t.Fatal("legacy coordinator accepted an unordered expected=0 write")
+	}
+	if data, err := mem.Get(ctx, MakeMetaKey("b", "k")); err == nil && data != nil {
+		t.Fatal("refused write still landed in the store")
+	}
+}
