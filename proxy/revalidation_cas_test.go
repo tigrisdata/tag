@@ -224,3 +224,54 @@ func waitFor(t *testing.T, cond func() bool) {
 		}
 	}
 }
+
+// The foreground miss populate carries its decision-time token: a fenced
+// delete landing while the body streams from upstream must make the commit
+// lose — pre-delete bytes are never cached, with no tombstone involved.
+func TestForegroundPopulate_LosesToFencedDeleteMidFetch(t *testing.T) {
+	body := "pre-delete bytes"
+	var c *cache.Cache
+	mock := &mockForwarder{}
+	mock.doRequestFunc = func(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error) {
+		// The racing invalidation lands after the populate's token read,
+		// while the "fetch" is in flight.
+		if err := c.DeleteWithMeta(context.Background(), "b", "k"); err != nil {
+			t.Errorf("racing invalidation: %v", err)
+		}
+		h := http.Header{}
+		h.Set("Content-Type", "text/plain")
+		h.Set("ETag", `"v1"`)
+		h.Set("Content-Length", "16")
+		return &http.Response{StatusCode: http.StatusOK, Header: h, ContentLength: 16, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}
+
+	var svc *Service
+	svc, c = newTestService(mock, true)
+	ctx := context.Background()
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/b/k", nil)
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject: %v", err)
+	}
+	if w.Code != http.StatusOK || w.Body.String() != body {
+		t.Fatalf("client response = %d %q, want the upstream body", w.Code, w.Body.String())
+	}
+
+	// The populate's decision-time token predates the fenced delete: nothing
+	// may be cached.
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			if meta, found, _ := c.GetMeta(ctx, "b", "k"); found {
+				t.Fatalf("pre-delete bytes cached over the fence: %+v", meta)
+			}
+			return
+		case <-time.After(20 * time.Millisecond):
+			if meta, found, _ := c.GetMeta(ctx, "b", "k"); found {
+				t.Fatalf("pre-delete bytes cached over the fence: %+v", meta)
+			}
+		}
+	}
+}

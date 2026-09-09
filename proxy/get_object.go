@@ -389,6 +389,21 @@ func (s *Service) streamFromUpstream(
 	// (a miss), never serving stale.
 	writeStartTime := time.Now().UnixNano()
 
+	// The populate's DECISION-TIME token, read before the upstream request: the
+	// commit applies only if the entry is unchanged from this instant — a
+	// fenced delete (or any write) landing while the body streams makes the
+	// commit lose atomically, never retried with the same bytes. This is the
+	// refill pattern the fence contract requires (ocache v1.13.0): a token
+	// read after the fetch could postdate a delete and resurrect pre-delete
+	// bytes. Covers presence (live version) and absence (absence token) alike.
+	_, expected, _, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+	if tokErr != nil {
+		// Without a token the commit cannot be ordered; 0 against a live row
+		// mismatches and against a fresh void is unordered — the safe failure
+		// is skipping the populate, which the mismatch delivers.
+		expected = 0
+	}
+
 	// Execute upstream request
 	resp, err := s.forwarder.DoRequestWithCreds(ctx, r, accessKey, secretKey)
 	if err != nil {
@@ -412,7 +427,7 @@ func (s *Service) streamFromUpstream(
 		// Reserve against the memory budget by the object's actual size (capped at
 		// the buffer ceiling), so small objects don't each reserve the worst case.
 		weight := s.populateWeight(resp.ContentLength)
-		_, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, writeStartTime)
+		_, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, writeStartTime, expected)
 	}
 
 	// If an anonymous GET succeeded and Tigris didn't set an explicit per-object ACL,

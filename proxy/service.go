@@ -886,11 +886,12 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	// probe). See the doc comment: never infer public-read from a public write.
 	if hasNoAuthCredentials(r) {
 		metrics.WarmOnWriteTriggered.Inc()
-		// VersionAny: the warm follows this write's best-effort invalidation,
-		// and the displaced version's identity is unknown — the warm fetches
-		// the just-written current state, so last-write-wins is correct even
-		// over a survivor of a failed invalidation.
-		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*anonymous*/, priorityWarmWrite, cache.VersionAny)
+		// Token at trigger time: the absence token if this write's invalidation
+		// succeeded, the surviving stale row's live version if it failed — the
+		// warm then repairs exactly that state and loses to anything newer,
+		// including a fenced delete landing mid-fetch.
+		_, warmTok, _, _ := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
+		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*anonymous*/, priorityWarmWrite, warmTok)
 		return
 	}
 
@@ -899,7 +900,8 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 		return
 	}
 	metrics.WarmOnWriteTriggered.Inc()
-	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, cache.VersionAny)
+	_, warmTok, _, _ := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
+	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, warmTok)
 }
 
 // HandlePassthrough handles requests that are passed through without caching.

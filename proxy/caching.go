@@ -166,6 +166,7 @@ func (s *Service) setupCacheListener(
 	slotHeld bool,
 	weight int64,
 	writeStartTime int64,
+	expected uint64, // decision-time token; the meta commit's CAS precondition
 ) (*io.PipeWriter, chan error) {
 	// Bound concurrent cache-populate operations. When the limit is saturated,
 	// skip caching entirely: the object is still served/forwarded from upstream,
@@ -250,16 +251,17 @@ func (s *Service) setupCacheListener(
 			// read-back. The whole-vs-block boundary is size, not access pattern (RFC 0001): both
 			// full and range paths converge on one representation per size class. Sub-block objects
 			// keep the single whole-body write.
-			// VersionAny: the miss path can legitimately run while metadata
-			// still exists (a forced-revalidation fall-through, an anonymous
-			// read of a non-public entry), and this populate IS the refresh —
-			// last-write-wins is the contract, version-stamped so the row
-			// stays CAS-meaningful.
+			// The decision-time token from before the upstream fetch: when the
+			// miss path runs while metadata still exists (a forced-revalidation
+			// fall-through, an anonymous read of a non-public entry) this
+			// populate refreshes exactly the version it observed — and loses
+			// to anything newer, including a fenced delete, instead of
+			// last-write-winning stale bytes over it.
 			if s.isBlockEligibleSize(meta.ContentLength) {
 				meta.BlockSize = s.config.Cache.BlockSize
-				cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime, cache.VersionAny)
+				cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime, expected)
 			} else {
-				_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime, cache.VersionAny)
+				_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime, expected)
 			}
 			if cacheErr != nil {
 				log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")

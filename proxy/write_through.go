@@ -193,9 +193,10 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 		// only SPAWNS the fetch and returns, so this goroutine returns and its deferred release frees
 		// the slot, which the warm's (separate) blocking acquire then observes.
 		metrics.WarmOnWriteTriggered.Inc()
-		// VersionAny, like warmOnWrite: this warm follows the PUT's
-		// invalidation and must repair even a survivor of its failure.
-		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, cache.VersionAny)
+		// Token at trigger time, like warmOnWrite: repairs exactly the state
+		// this write left (absence, or the survivor of a failed invalidation).
+		_, warmTok, _, _ := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
+		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, warmTok)
 	}()
 	return true
 }
