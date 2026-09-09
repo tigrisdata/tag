@@ -101,7 +101,11 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		if xmlErr := xml.Unmarshal(bodyBytes, &deleteReq); xmlErr == nil {
 			requestedCounts = make(map[string]int)
 			for _, obj := range deleteReq.Objects {
-				s.invalidateObject(context.Background(), bucket, obj.Key)
+				// Proxy modes only — see preForwardInvalidate; in tiered
+				// mode a listed key may be a local-tier only-copy that a
+				// rejected bulk delete must leave intact (the per-key
+				// post-success invalidation below carries tiered).
+				s.preForwardInvalidate(context.Background(), bucket, obj.Key)
 				requestedCounts[obj.Key]++
 				log.Debug().
 					Str("bucket", bucket).

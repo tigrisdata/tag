@@ -81,8 +81,13 @@ type Service struct {
 	retierMu       sync.Mutex
 	retierClaims   map[string]int
 	retierInflight map[string]context.CancelFunc
-	blockFetchMu   sync.Mutex                  // Guards blockFetches
-	blockFetches   map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
+	// retierRecentMismatch backs off re-tier attempts for a marker version
+	// whose upstream fetch came back changed or gone: without it a marker
+	// that is persistently stale versus the upstream object re-downloads and
+	// discards the full body on EVERY validated GET for the marker's TTL.
+	retierRecentMismatch *expirable.LRU[string, struct{}]
+	blockFetchMu         sync.Mutex                  // Guards blockFetches
+	blockFetches         map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
 	// recentFooterWork suppresses repeat footer scans for an object version that was
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
@@ -177,6 +182,9 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 	// Allocated only when the feature that uses it is on.
 	if cfg.Cache.ParquetOptimization {
 		svc.recentFooterWork = expirable.NewLRU[string, struct{}](maxFooterWorkTracking, nil, footerWorkCooldown)
+	}
+	if cfg.IsTiered() {
+		svc.retierRecentMismatch = expirable.NewLRU[string, struct{}](maxRetierMismatchTracking, nil, retierMismatchCooldown)
 	}
 	return svc
 }
@@ -631,9 +639,13 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandlePutObject")
 
-	// Invalidate cache BEFORE forwarding to ensure consistency
-	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
-	s.invalidateObject(context.Background(), bucket, key)
+	// Invalidate cache BEFORE forwarding to ensure consistency: it prevents
+	// stale data from being served if forwarding succeeds but cache
+	// invalidation fails. Proxy modes only — see preForwardInvalidate; in
+	// tiered mode the key may hold a local-tier only-copy or a live marker
+	// that a rejected forward must leave intact (tiered relies on the
+	// post-success invalidation below).
+	s.preForwardInvalidate(context.Background(), bucket, key)
 
 	// Forward to Tigris, recording the upstream status. When eligible, forwardPutMaybeTee
 	// tees the decoded body so we can populate the cache directly (write-through) instead of
@@ -699,9 +711,13 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleDeleteObject")
 
-	// Invalidate cache BEFORE forwarding to ensure consistency
-	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
-	s.invalidateObject(context.Background(), bucket, key)
+	// Invalidate cache BEFORE forwarding to ensure consistency: it prevents
+	// stale data from being served if forwarding succeeds but cache
+	// invalidation fails. Proxy modes only — see preForwardInvalidate; in
+	// tiered mode the key may hold a local-tier only-copy or a live marker
+	// that a rejected forward must leave intact (tiered relies on the
+	// post-success invalidation below).
+	s.preForwardInvalidate(context.Background(), bucket, key)
 
 	// Forward to upstream, recording the upstream status.
 	rec := &statusRecorder{ResponseWriter: w}
@@ -806,10 +822,13 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleCopyObject")
 
-	// Invalidate cache for destination object BEFORE forwarding to ensure consistency
-	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
+	// Invalidate cache for destination object BEFORE forwarding to ensure
+	// consistency: it prevents stale data from being served if forwarding
+	// succeeds but cache invalidation fails. Proxy modes only — see
+	// preForwardInvalidate; in tiered mode the destination may be a
+	// local-tier only-copy that a failed copy must leave intact.
 	if s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		s.preForwardInvalidate(context.Background(), bucket, key)
 	}
 
 	// Forward to upstream, capturing the response so we can confirm the copy
@@ -862,7 +881,25 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 // only store and an acked-but-failed delete keeps serving until TTL. Proxy-mode
 // callers ignore it: there the origin is authoritative and the upstream DELETE
 // already succeeded, so a failed local invalidation is a stale-cache blip.
+// preForwardInvalidate is the proxy-mode "invalidate BEFORE forwarding"
+// consistency step, shared by the mutating handlers (DELETE, CopyObject,
+// CompleteMultipartUpload, bulk DeleteObjects). In proxy mode dropping a
+// cache entry is always safe, and doing it up front means a forward that
+// succeeds but whose post-invalidation fails cannot leave stale data served.
+// In TIERED mode it is the opposite of safe: the cache is authoritative and a
+// local-tier entry is the ONLY copy, so destroying it before upstream has
+// authorized and confirmed the operation turns a rejected request into data
+// loss (and drops a live marker on a failed upstream-tier op). Tiered relies
+// solely on the post-success invalidation these handlers already perform.
+func (s *Service) preForwardInvalidate(ctx context.Context, bucket, key string) {
+	if s.config.IsTiered() {
+		return
+	}
+	s.invalidateObject(ctx, bucket, key)
+}
+
 func (s *Service) invalidateObject(ctx context.Context, bucket, key string) error {
+
 	if !s.cache.IsEnabled() {
 		return nil
 	}
@@ -910,6 +947,14 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) erro
 // populate is the read-after-write guard.
 func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
+		return
+	}
+	// Never in tiered mode: a warm is a populate with none of tiered's guards
+	// (no write claim, no tier decision), and it would establish a local-tier
+	// entry for an object the mode documents as read-as-miss (copies,
+	// multipart completions). The re-tier is tiered's one read-triggered
+	// populate.
+	if s.config.IsTiered() {
 		return
 	}
 
@@ -989,7 +1034,9 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// upload overwrites the object, so any previously cached version is now stale;
 	// like PutObject/DeleteObject/CopyObject, invalidate up front so a forward that
 	// succeeds but whose post-invalidation fails can't leave stale data served.
-	s.invalidateObject(context.Background(), bucket, key)
+	// Proxy modes only — see preForwardInvalidate; in tiered mode the key may
+	// hold a local-tier only-copy that a failed completion must leave intact.
+	s.preForwardInvalidate(context.Background(), bucket, key)
 
 	// Forward to upstream with response capture
 	capture, err := s.forwarder.ForwardWithCapture(ctx, w, r)

@@ -90,9 +90,15 @@ func MetaFromHTTPHeaders(bucket, key string, statusCode int, headers http.Header
 		UserMetadata:         make(map[string]string),
 	}
 
-	// Parse Content-Length
+	// Parse Content-Length. Absent means UNKNOWN (a chunked upstream
+	// response), recorded as -1 — never 0, which is a real length (an empty
+	// object) that WriteHeaders must advertise. Producers that know the exact
+	// body length (the local-store engine, block populates) overwrite this
+	// with the measured value.
 	if cl := headers.Get("Content-Length"); cl != "" {
 		meta.ContentLength, _ = strconv.ParseInt(cl, 10, 64)
+	} else {
+		meta.ContentLength = -1
 	}
 
 	// Parse Last-Modified to Unix timestamp
@@ -140,6 +146,10 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter, opts ...WriteHead
 	if m.ContentLength >= 0 {
 		// Zero included: S3 sends Content-Length: 0 for an empty object, and a HEAD
 		// without it makes clients read the length as unknown rather than zero.
+		// Negative means genuinely unknown (a chunked upstream response,
+		// recorded as -1 by MetaFromHTTPHeaders) and the header is omitted —
+		// an affirmative 0 there would make clients read a non-empty object
+		// as zero bytes.
 		w.Header().Set("Content-Length", strconv.FormatInt(m.ContentLength, 10))
 	}
 	if m.LastModified > 0 {

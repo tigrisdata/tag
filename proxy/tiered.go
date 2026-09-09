@@ -193,10 +193,19 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// it only arms the identity guard of the failure sweep in putUpstreamMarker.
 	// A failed lookup leaves the prior unknown, and the sweep then refuses to
 	// delete anything rather than guess.
+	// Only a PLAIN object PUT writes the object and therefore owns the marker.
+	// A sub-resource PUT with no dedicated route (?retention, ?legal-hold, …)
+	// reaches this path too, but it does not create a new object version: it
+	// must forward untouched — stamping a marker from its request headers
+	// would replace the real metadata with the sub-resource call's shape, and
+	// a 2xx response without an ETag would sweep the object's live metadata
+	// into an authoritative miss.
+	markerOwning := originlessPlainObject(r)
+
 	var prior *cache.CachedObjectMeta
 	var priorVersion uint64
 	priorKnown := false
-	if s.cache.IsEnabled() {
+	if markerOwning && s.cache.IsEnabled() {
 		if m, version, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key); cacheErr == nil {
 			priorKnown = true
 			priorVersion = version
@@ -209,7 +218,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	rec := &statusRecorder{ResponseWriter: w}
 	err = s.forwarder.Forward(ctx, rec, r)
 
-	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
+	if err == nil && rec.wroteSuccess() && markerOwning && s.cache.IsEnabled() {
 		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, prior, priorVersion, priorKnown)
 	}
 
@@ -328,6 +337,13 @@ func (s *Service) invalidateDisplacedTieredMeta(bucket, key string, prior *cache
 // retierFetchTimeout bounds the background re-tier fetch and store.
 const retierFetchTimeout = 60 * time.Second
 
+// A marker version whose re-tier fetch found upstream changed/gone is not
+// retried for this long — the next attempt costs a full discarded download.
+const (
+	maxRetierMismatchTracking = 4096
+	retierMismatchCooldown    = 5 * time.Minute
+)
+
 // maybeRetierOnRead heals a mis-tiered object: a validated GET hit an
 // upstream-tier marker whose size fits the local tier — typically a small PUT
 // that was forwarded before its key was learned. A background fetch moves the
@@ -364,6 +380,14 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 	}
 	if accessKey == "" || secretKey == "" || !s.cache.IsEnabled() {
 		return
+	}
+	// Backoff, not an outcome: a recent attempt for this exact marker version
+	// already found upstream changed or gone (recorded then as "changed"), so
+	// repeating the full-body fetch within the cooldown only burns bandwidth.
+	if s.retierRecentMismatch != nil {
+		if _, recent := s.retierRecentMismatch.Get(bucket + "|" + key + "|" + marker.ETag); recent {
+			return
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), retierFetchTimeout)
 	if !s.tryRegisterRetier(bucket, key, cancel) {
@@ -417,6 +441,11 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != etag {
 			// Gone or replaced by a concurrent write; its state wins the key.
+			// Remember the mismatch so reads through this marker version stop
+			// re-fetching the body until the cooldown lapses.
+			if s.retierRecentMismatch != nil {
+				s.retierRecentMismatch.Add(bucket+"|"+key+"|"+etag, struct{}{})
+			}
 			_, _ = io.Copy(io.Discard, resp.Body)
 			metrics.RecordTieredRetier("changed")
 			return
@@ -564,8 +593,14 @@ func (s *Service) handleTieredDeleteLocal(w http.ResponseWriter, r *http.Request
 }
 
 // deleteUpstreamObjectAsync issues the cross-tier cleanup DELETE in the
-// background, signed with the (validated) caller's credentials. Best-effort:
-// a failure leaves an orphan that the cache bucket's own expiry collects.
+// background, signed with the credentials the validated request resolved —
+// which in the transparent-auth flow are TAG's OWN credentials, not the
+// client's. Tiered deployments must therefore grant TAG's credentials delete
+// permission on the upstream cache bucket (unlike proxy mode's read-only
+// guidance, which targets customer buckets); with read-only credentials every
+// cleanup is rejected 403 and orphans accumulate until bucket expiry.
+// Best-effort: a failure leaves an orphan that the cache bucket's own expiry
+// collects.
 func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secretKey string) {
 	if accessKey == "" || secretKey == "" {
 		return
@@ -579,6 +614,20 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), tieredCleanupTimeout)
 		defer cancel()
+		// The If-Match guard below cannot protect a LIVE upstream object that
+		// carries the SAME ETag: plain-PUT ETags are content MD5, so a
+		// delete + re-put of identical bytes recreates the object under the
+		// displaced prior's ETag, and this delayed delete would then remove
+		// the body the current marker points at. Re-check the key's current
+		// metadata first and abort when it is an upstream-tier marker for
+		// exactly this ETag — that body is authoritative again, not an
+		// orphan. (A racer between this check and the DELETE narrows to the
+		// same-ETag re-establishment landing inside one round trip; the
+		// If-Match still guards every different-ETag interleaving.)
+		if cur, found, gerr := s.cache.GetMeta(ctx, bucket, key); gerr == nil && found && cur != nil && cur.BodyUpstream && cur.ETag == etag {
+			metrics.RecordTieredCleanupSkipped("live_marker")
+			return
+		}
 		resp, err := s.forwarder.DoObjectDeleteRequest(ctx, bucket, key, etag, accessKey, secretKey)
 		if err != nil {
 			// Debug, not Info: per-request error logs flood under an upstream

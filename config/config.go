@@ -297,7 +297,9 @@ type CacheConfig struct {
 	// EVERY node in the cluster runs a CAS-capable release, and flip via a
 	// brisk rolling restart (nodes in different modes order writes with
 	// different mechanisms during that window). Standalone nodes may flip
-	// immediately after upgrading.
+	// immediately after upgrading. Tiered mode requires CAS and selects it
+	// automatically when this is unset; an explicit true there is rejected
+	// at startup (see validateMode).
 	LegacyCoordination *bool `yaml:"legacy_coordination"`
 
 	// BlockCachingEnabled turns on block-aligned caching for large objects (RFC 0001):
@@ -827,6 +829,20 @@ func validateMode(cfg *Config) error {
 		if !cfg.Cache.IsEnabled() {
 			return fmt.Errorf("tiered mode requires the cache to be enabled")
 		}
+		// Tiered mode REQUIRES CAS-strength meta coordination: the cache is
+		// authoritative and the local tier holds the only copy, so an ordering
+		// race that would be transient staleness in proxy mode (legacy
+		// coordination's accepted write-vs-write window) is permanent data
+		// loss here — a re-tier or populate could overwrite an acknowledged
+		// write. Every node running tiered is CAS-capable by construction (the
+		// mode ships with the coordinator), so the legacy default's
+		// mixed-cluster rationale does not apply: unset selects CAS
+		// automatically, and an explicit legacy_coordination=true is a
+		// contradiction rejected like the other tiered conflicts above.
+		if cfg.Cache.LegacyCoordination != nil && *cfg.Cache.LegacyCoordination {
+			return fmt.Errorf("tiered mode requires CAS meta coordination: remove cache.legacy_coordination")
+		}
+		cfg.Cache.SetLegacyCoordination(false)
 	}
 	return nil
 }

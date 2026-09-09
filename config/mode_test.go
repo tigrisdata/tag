@@ -117,6 +117,42 @@ func TestMode_TieredDefaultsBlockCachingOff(t *testing.T) {
 	}
 }
 
+func TestMode_TieredSelectsCASCoordination(t *testing.T) {
+	var cfg Config
+	applyDefaults(&cfg)
+	cfg.Mode = ModeTiered
+	if err := validate(&cfg); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if cfg.Cache.IsLegacyCoordination() {
+		t.Fatal("tiered mode did not auto-select CAS coordination")
+	}
+}
+
+func TestMode_TieredRejectsExplicitLegacyCoordination(t *testing.T) {
+	var cfg Config
+	applyDefaults(&cfg)
+	cfg.Mode = ModeTiered
+	cfg.Cache.SetLegacyCoordination(true)
+	if err := validate(&cfg); err == nil {
+		t.Fatal("validate accepted tiered mode with legacy coordination forced on")
+	}
+}
+
+// The env override applies before validation, so forcing legacy coordination
+// through the environment is the same contradiction as forcing it in yaml.
+func TestMode_TieredRejectsLegacyCoordinationEnv(t *testing.T) {
+	t.Setenv("TAG_MODE", ModeTiered)
+	t.Setenv("TAG_CACHE_LEGACY_COORDINATION", "true")
+	path := writeModeConfig(t, `
+upstream:
+  endpoint: "https://t3.storage.dev"
+`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load accepted tiered mode with legacy coordination forced by env")
+	}
+}
+
 func TestMode_TieredRequiresCache(t *testing.T) {
 	var cfg Config
 	applyDefaults(&cfg)

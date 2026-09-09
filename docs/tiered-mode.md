@@ -49,6 +49,14 @@ marker, so they stay readable) — the first such write's 2xx is itself what
 teaches the keys, and re-tier-on-read moves those objects into the local tier
 on their first validated read.
 
+**Credential requirement**: unlike proxy mode's read-only guidance (which
+targets customer buckets), tiered mode's upstream is the operator's own cache
+bucket, and TAG's `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` must have
+**delete** permission there — the cross-tier cleanup DELETE and the re-tier
+fetch are signed with TAG's own credentials. With read-only credentials every
+cleanup is rejected (visible as `tag_tiered_cleanup_total{outcome="rejected"}`)
+and displaced upstream copies accumulate until bucket expiry.
+
 ## Configuration
 
 ```yaml
@@ -66,6 +74,13 @@ Startup is fatal when tiered mode is combined with:
   (individual blocks expiring would break authoritative local misses). Block
   caching defaults to **off** in this mode.
 - `cache.enabled: false` — the local metadata store is the mode.
+- `cache.legacy_coordination: true` — tiered mode requires CAS-strength meta
+  coordination (the cache is authoritative and the local tier holds the only
+  copy, so ordering races that are transient staleness in proxy mode would be
+  data loss here). CAS coordination is selected **automatically** when the
+  setting is unset; every node running tiered is CAS-capable by construction,
+  so the proxy modes' legacy default has no upgrade population to protect in
+  this mode.
 - `upstream.transparent_proxy` set to anything — superseded by `mode`.
 
 ## Not implemented (v1)
@@ -75,3 +90,12 @@ upstream. Objects created upstream without TAG stamping a marker (a multipart
 completion, a server-side copy) read as misses through TAG until written
 again via a plain PUT. Client `Cache-Control` revalidation directives are not
 consulted — the cache is the store.
+
+A validated GET/HEAD carrying a query parameter the local engine does not
+implement (`versionId`, `partNumber`, `attributes`, presigned
+`response-content-*` overrides) answers 501 NotImplemented when the object is
+local-tier or uncached — the local store is authoritative there and cannot
+forward without breaking that authority. The same request against an
+upstream-tier object forwards normally. Sub-resource PUTs with no dedicated
+route (`retention`, `legal-hold`) forward to upstream without touching the
+object's local metadata.
