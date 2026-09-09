@@ -577,7 +577,7 @@ func (s *Service) releaseCacheSlot(weight int64) {
 // written while forwarding an upstream response. Forward() returns nil even when
 // upstream responds 4xx/5xx (the response streamed successfully), so mutating
 // handlers use this to gate post-forward cache re-invalidation on an actual 2xx —
-// otherwise a rejected PUT/DELETE/COPY would still tombstone the destination and
+// otherwise a rejected PUT/DELETE/COPY would still fence the destination and
 // discard a valid racing refill, causing later reads to miss unnecessarily.
 type statusRecorder struct {
 	http.ResponseWriter
@@ -631,8 +631,8 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 
 	// Re-invalidate AFTER upstream confirms the write. A GET that raced the
 	// in-flight PUT may have fetched the pre-PUT object and begun re-caching it;
-	// this second invalidation writes a tombstone newer than that write's start
-	// time, so the tombstone-aware cache write skips the stale repopulation —
+	// this second invalidation bumps the fence past that write's decision-time
+	// token, so its version-preconditioned commit loses —
 	// restoring read-after-write semantics.
 	// Gated on a 2xx: a rejected PUT leaves the object unchanged, so re-invalidating
 	// would only discard a valid racing refill and cause an unnecessary later miss.
@@ -687,7 +687,7 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// Re-invalidate AFTER upstream confirms the delete, for the same
 	// read-after-write reason as HandlePutObject: a GET racing the in-flight
 	// DELETE may have re-cached the not-yet-deleted object; this second
-	// tombstone blocks that stale repopulation.
+	// fence bump blocks that stale repopulation.
 	// Gated on a 2xx: a rejected DELETE leaves the object present, so re-invalidating
 	// would only discard a valid racing refill and cause an unnecessary later miss.
 	// Routed through invalidateObject (like the pre-forward call) so a failure of this
@@ -794,7 +794,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 
 	// Re-invalidate the destination AFTER upstream confirms the copy, for the same
 	// read-after-write reason as HandlePutObject: a GET racing the in-flight copy
-	// may have re-cached the pre-copy destination object; this second tombstone
+	// may have re-cached the pre-copy destination object; this second fence bump
 	// blocks that stale repopulation.
 	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
 	// unchanged, so re-invalidating would only discard a valid racing refill.
@@ -827,7 +827,7 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 	return !isS3ErrorBody(capture.Body)
 }
 
-// invalidateObject removes an object's cached metadata (writing a tombstone) and
+// invalidateObject removes an object's cached metadata (a fenced CAS delete) and
 // records the true outcome of the attempt. A failed backend invalidation is recorded
 // as an error rather than success: a false-green delete metric would hide the very
 // read-after-write hazard the invalidation exists to prevent, since the stale entry
@@ -872,10 +872,10 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
 // this key is already in flight — a concurrent read-path warm, or the warm from a
 // rapid prior write to the same key — this warm coalesces into that one and is
 // dropped. When it coalesces into a fetch that predates this write, that fetch's own
-// populate is tombstone-blocked (its writeStartTime is older than this write's
+// populate is fence-blocked (its decision-time token predates this write's
 // invalidation), so it writes nothing either: the key is simply left absent, not
 // left stale. The next read then misses and inline-populates the current object.
-// This can never serve a stale object — the same tombstone that blocks the racing
+// This can never serve a stale object — the same fence that blocks the racing
 // populate is the read-after-write guard.
 func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
@@ -885,12 +885,16 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	// Anonymous write → anonymous warm (unsigned fetch, public-read learned from the
 	// probe). See the doc comment: never infer public-read from a public write.
 	if hasNoAuthCredentials(r) {
+		// Token at trigger time: the absence token if this write's invalidation
+		// succeeded, the surviving stale row's live version if it failed — the
+		// warm then repairs exactly that state and loses to anything newer,
+		// including a fenced delete landing mid-fetch.
+		warmTok, ok := s.warmToken(bucket, key)
+		if !ok {
+			return
+		}
 		metrics.WarmOnWriteTriggered.Inc()
-		// VersionAny: the warm follows this write's best-effort invalidation,
-		// and the displaced version's identity is unknown — the warm fetches
-		// the just-written current state, so last-write-wins is correct even
-		// over a survivor of a failed invalidation.
-		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*anonymous*/, priorityWarmWrite, cache.VersionAny)
+		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*anonymous*/, priorityWarmWrite, warmTok)
 		return
 	}
 
@@ -898,8 +902,24 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	if err != nil || accessKey == "" || secretKey == "" {
 		return
 	}
+	warmTok, ok := s.warmToken(bucket, key)
+	if !ok {
+		return
+	}
 	metrics.WarmOnWriteTriggered.Inc()
-	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, cache.VersionAny)
+	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, warmTok)
+}
+
+// warmToken reads a warm trigger's decision-time token. ok=false means the
+// token could not be read and the warm must be SKIPPED: expected=0 is the
+// legacy unordered put-if-absent and would publish over a fence.
+func (s *Service) warmToken(bucket, key string) (uint64, bool) {
+	_, tok, _, err := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
+	if err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Warm skipped - decision-time token unavailable")
+		return 0, false
+	}
+	return tok, true
 }
 
 // HandlePassthrough handles requests that are passed through without caching.
@@ -948,7 +968,7 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 	// Re-invalidate AFTER upstream confirms the completion, for the same
 	// read-after-write reason as HandlePutObject: a GET racing the in-flight
-	// completion may have re-cached the pre-overwrite object; this second tombstone
+	// completion may have re-cached the pre-overwrite object; this second fence bump
 	// blocks that stale repopulation. Gated on a confirmed-successful completion
 	// (2xx and not a 200-with-<Error> body) so a failed completion, which leaves the
 	// object unchanged, doesn't discard a valid racing refill.

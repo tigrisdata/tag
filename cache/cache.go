@@ -3,7 +3,6 @@ package cache
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -41,11 +40,10 @@ var ErrCacheDisabled = errors.New("cache is disabled")
 
 // Cache wraps ocache client for TAG.
 type Cache struct {
-	client       cacheclient.CacheClient
-	defaultTTL   int64 // seconds
-	tombstoneTTL int64 // seconds; must outlive the longest racing cache-populate
-	enabled      bool
-	closed       bool
+	client     cacheclient.CacheClient
+	defaultTTL int64 // seconds
+	enabled    bool
+	closed     bool
 }
 
 // NewCacheWithClient creates a cache with an injected client.
@@ -53,19 +51,16 @@ type Cache struct {
 func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig) *Cache {
 	ttl := int64(config.DefaultCacheTTL.Seconds())
 	enabled := true // Default to enabled
-	var sizeThreshold int64
 	if cfg != nil {
 		if cfg.TTL > 0 {
 			ttl = int64(cfg.TTL.Seconds())
 		}
 		enabled = cfg.IsEnabled()
-		sizeThreshold = cfg.SizeThreshold
 	}
 	return &Cache{
-		client:       client,
-		defaultTTL:   ttl,
-		tombstoneTTL: TombstoneTTLSeconds(sizeThreshold),
-		enabled:      enabled,
+		client:     client,
+		defaultTTL: ttl,
+		enabled:    enabled,
 	}
 }
 
@@ -73,8 +68,7 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 // All operations return successfully with "not found" or nil results.
 func NewDisabledCache() *Cache {
 	return &Cache{
-		enabled:      false,
-		tombstoneTTL: MinTombstoneTTLSeconds,
+		enabled: false,
 	}
 }
 
@@ -149,7 +143,12 @@ func (c *Cache) putMetaVersioned(ctx context.Context, bucket, key, metaKey strin
 // immutable entry that ages out via TTL, so a reader that resolved a given
 // metadata version always finds its exact body — no delete-during-read can
 // truncate an in-flight response. Invalidation removes only the metadata (plus a
-// tombstone), which is enough to make subsequent reads miss and refetch.
+// fence), which is enough to make subsequent reads miss and refetch.
+// PutWithMeta is DELIBERATELY UNORDERED (VersionAny): last-write-wins, immune
+// to fences. It exists for tests and simple seeding, has no production caller,
+// and must never be used on a populate path — a populate that observed
+// pre-delete state would resurrect it. Production paths commit through the
+// IfVersion wrappers with a decision-time token.
 func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *CachedObjectMeta, body []byte, ttl int) error {
 	if !c.IsEnabled() {
 		return nil
@@ -205,31 +204,27 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 	return nil
 }
 
-// PutWithMetaStreamTombstoneAware is like PutWithMetaStream but checks for
-// tombstones after body streaming and before writing metadata. If a tombstone
-// exists that's newer than writeStartTime, the metadata write is skipped and
-// the orphaned body is cleaned up. Checking after body stream (rather than
-// before) closes the TOCTOU window where an invalidation during streaming
-// could be missed, causing resurrected metadata without a body.
+// PutWithMetaStreamIfVersion is like PutWithMetaStream but commits the
+// metadata under the caller's decision-time version precondition (see
+// putMetaVersioned): body first, then the meta write that makes the entry
+// visible — refused atomically if the entry changed (including a fenced
+// delete) since the caller's token was read.
 //
-// Returns wrote=true only when the metadata was actually written (the entry is now
-// visible). It is false when the write was skipped without error — the object was not
-// cacheable (no ETag) or a newer tombstone superseded it — so callers can distinguish a
-// no-op from a real write (e.g. for metrics or a fallback).
-// The expected version is the precondition of the meta write (see
-// putMetaVersioned): 0 for a populate decided while the entry was absent,
-// the observed version for a read-modify-write, VersionAny to preserve
-// last-write-wins. The tombstone check is retained alongside it — tombstones
-// still order writers that carry no useful precondition (VersionAny), and
-// belt-and-braces costs one point read.
-func (c *Cache) PutWithMetaStreamTombstoneAware(
+// The expected version is the meta write's precondition: 0 for legacy
+// unordered put-if-absent, a decision-time token (live version or absence
+// token) for an ordered populate, VersionAny for last-write-wins.
+//
+// Returns wrote=true only when the metadata was actually written (the entry
+// is now visible). It is false when the write was skipped without error — the
+// object was not cacheable (no ETag) or the precondition was lost — so
+// callers can distinguish a no-op from a real write.
+func (c *Cache) PutWithMetaStreamIfVersion(
 	ctx context.Context,
 	bucket, key string,
 	meta *CachedObjectMeta,
 	body io.Reader,
 	ttl int,
-	writeStartTime int64, // Unix nano timestamp when write started
-	expected uint64, // version precondition for the meta write
+	expected uint64, // decision-time version precondition for the meta write
 ) (wrote bool, err error) {
 	if !c.IsEnabled() {
 		return false, nil
@@ -266,32 +261,22 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		return false, err
 	}
 
-	// Check tombstone AFTER body stream, right before meta write.
-	// This closes the TOCTOU window: if the key was invalidated during body streaming
-	// (e.g., a PUT/DELETE arrived while we were writing), we skip the meta write.
-	// Without this, a slow body stream could allow meta to be written after a
-	// concurrent invalidation deletes meta+body, resurrecting stale metadata.
-	tombTs := c.GetTombstoneTimestamp(ctx, bucket, key)
-	if tombTs >= writeStartTime {
-		log.Debug().Str("bucket", bucket).Str("key", key).
-			Int64("tombstone_ts", tombTs).
-			Int64("write_start", writeStartTime).
-			Msg("Skipping meta write - tombstone detected after body stream")
-		// The just-written versioned body is left to age out via TTL rather than
-		// deleted synchronously: a concurrent populate of the same ETag could have
-		// a reader streaming this exact body key, and deleting it would truncate
-		// that reader. Without a visible meta entry the orphaned body is unreachable
-		// and harmless until it expires.
-		return false, nil
-	}
+	// No tombstone gate: the version precondition below IS the invalidation
+	// guard — a fenced delete (or any write) landing after the caller's
+	// decision-time token makes this commit lose atomically. On a lost commit
+	// the just-written versioned body is left to age out via TTL rather than
+	// deleted synchronously: a concurrent populate of the same ETag could have
+	// a reader streaming this exact body key, and deleting it would truncate
+	// that reader. Without a visible meta entry the orphaned body is
+	// unreachable and harmless until it expires.
 
 	// Write metadata AFTER body (makes entry visible), under the version
 	// precondition. A lost precondition leaves the newer entry in place and the
-	// just-written body to TTL, like the tombstone branch.
+	// just-written body to TTL.
 	wrote, err = c.putMetaVersioned(ctx, bucket, key, metaKey, metaBytes, int64(ttl), expected)
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
-		// Same rationale as the tombstone branch: leave the versioned body to TTL
+		// Same rationale as the lost-precondition branch: leave the versioned body to TTL
 		// rather than risk truncating a concurrent same-version reader.
 		return false, err
 	}
@@ -304,7 +289,7 @@ func (c *Cache) PutWithMetaStreamTombstoneAware(
 		Str("key", key).
 		Int("ttl", ttl).
 		Int("meta_size", len(metaBytes)).
-		Msg("Cached object with metadata (streamed, tombstone-aware)")
+		Msg("Cached object with metadata (streamed, version-preconditioned)")
 	return true, nil
 }
 
@@ -412,8 +397,9 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w i
 	return nil
 }
 
-// DeleteWithMeta removes both metadata and body from cache.
-// Writes a tombstone first to prevent in-flight cache writes from completing.
+// DeleteWithMeta removes both metadata and body from cache via the fenced CAS
+// delete: the fence it leaves is what stops an in-flight populate that
+// observed pre-delete state (including pre-delete absence) from completing.
 //
 // Both steps are attempted even if the first fails (best-effort invalidation), but a
 // genuine backend failure of either is returned so callers don't report a successful
@@ -426,26 +412,17 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 
 	var errs []error
 
-	// Write tombstone FIRST - prevents in-flight writes from completing. A failure
-	// here leaves the invalidation incomplete (an in-flight populate could resurrect
-	// the entry), so it is a real failure — but still continue to the meta delete.
-	if err := c.WriteTombstone(ctx, bucket, key); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).
-			Msg("Failed to write tombstone (continuing with delete)")
-		errs = append(errs, fmt.Errorf("write tombstone: %w", err))
-	}
-
 	// Delete only the metadata. That is sufficient to make subsequent reads miss
 	// (a read resolves the body from meta.ETag, so with meta gone there is no body
-	// lookup), and the tombstone above blocks any in-flight repopulation. The
+	// lookup), and the fence left by the CAS delete blocks any in-flight
+	// token-carrying repopulation. The
 	// versioned body is intentionally left to age out via TTL rather than deleted
 	// synchronously — deleting it could truncate an in-flight reader still
 	// streaming that exact version.
 	//
 	// FENCED (ocache v1.13.0, #267): the delete goes through the CAS op family
-	// so it leaves a fence, ordering token-carrying populates that observed
-	// pre-delete state. The tombstone above covers the writers that don't carry
-	// tokens yet; it is retained for this one overlap release and retired next.
+	// so it leaves a fence, ordering every token-carrying populate that
+	// observed pre-delete state — the sole invalidation mechanism.
 	if err := c.deleteMetaFenced(ctx, bucket, key); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta delete error")
 		errs = append(errs, fmt.Errorf("delete meta: %w", err))
@@ -520,13 +497,6 @@ func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
 // today's plain-put populates the version adds nothing and the protection
 // equals the previous compare-then-delete — the same read→delete window as
 // before, never wider. Versioning the populate paths closes it.
-//
-// The tombstone is still written on the match path (same rationale as
-// DeleteWithMeta: it blocks in-flight stamp-based populates, which CAS on this
-// key does not order). On a lost CAS the tombstone may have been written
-// spuriously; that can suppress one racing populate — churn, bounded by the
-// tombstone TTL — but never removes data, which is strictly milder than the
-// unguarded delete this replaces.
 func (c *Cache) DeleteIfETag(ctx context.Context, bucket, key, staleETag string) (bool, error) {
 	if !c.IsEnabled() {
 		return false, nil
@@ -553,25 +523,19 @@ func (c *Cache) DeleteIfETag(ctx context.Context, bucket, key, staleETag string)
 		return false, nil
 	}
 
-	var errs []error
-	if terr := c.WriteTombstone(ctx, bucket, key); terr != nil {
-		log.Debug().Err(terr).Str("bucket", bucket).Str("key", key).
-			Msg("Failed to write tombstone (continuing with guarded delete)")
-		errs = append(errs, fmt.Errorf("write tombstone: %w", terr))
-	}
 	if derr := c.client.DeleteIfVersion(ctx, metaKey, version); derr != nil {
 		if _, mismatch := cacheclient.IsVersionMismatch(derr); mismatch {
 			// Replaced (or removed) between the read and the delete: the newer
 			// state wins, exactly what the guard exists for.
 			return false, nil
 		}
-		errs = append(errs, fmt.Errorf("guarded meta delete: %w", derr))
-		return false, errors.Join(errs...)
+		return false, fmt.Errorf("guarded meta delete: %w", derr)
 	}
 	// The versioned body is intentionally left to age out via TTL, as in
-	// DeleteWithMeta.
+	// DeleteWithMeta. The CAS delete's fence orders in-flight token-carrying
+	// populates.
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidated cache metadata (ETag-guarded)")
-	return true, errors.Join(errs...)
+	return true, nil
 }
 
 // recordServeLocality records whether a successful body read for bodyKey was
@@ -813,8 +777,8 @@ func (c *Cache) PutBlock(ctx context.Context, bucket, key, etag string, blockSiz
 
 // PutBlockStream writes a single block of a block-mode object to cache. Blocks are
 // ETag-scoped (MakeBlockKey) exactly like whole bodies, and — like bodies — are never
-// deleted on invalidation; they age out by TTL. The block-mode meta (written tombstone-
-// aware via PutMetaTombstoneAware) is the visibility gate, and reads only resolve blocks
+// deleted on invalidation; they age out by TTL. The block-mode meta (written version-
+// preconditioned via PutMetaIfVersion) is the visibility gate, and reads only resolve blocks
 // after a meta hit, so a block written for a since-deleted object is unreachable and
 // harmless. An empty etag is not block-cached (no version discriminator). See RFC 0001.
 func (c *Cache) PutBlockStream(ctx context.Context, bucket, key, etag string, blockSize, blockIdx int64, r io.Reader, ttl int) error {
@@ -833,17 +797,15 @@ func (c *Cache) PutBlockStream(ctx context.Context, bucket, key, etag string, bl
 	return nil
 }
 
-// PutMetaTombstoneAware writes only the object metadata (no body), gated on the tombstone
-// like PutWithMetaStreamTombstoneAware: if an invalidation landed at or after writeStartTime
-// the write is skipped and wrote=false is returned. It is the visibility gate for a block-
-// mode entry — callers write the touched blocks first, then this meta last. See RFC 0001.
-// The expected version is the meta write's precondition (see putMetaVersioned).
-func (c *Cache) PutMetaTombstoneAware(
+// PutMetaIfVersion writes only the object metadata (no body), committed under
+// the caller's decision-time version precondition (see putMetaVersioned). It
+// is the visibility gate for a block-mode entry — callers write the touched
+// blocks first, then this meta last. See RFC 0001.
+func (c *Cache) PutMetaIfVersion(
 	ctx context.Context,
 	bucket, key string,
 	meta *CachedObjectMeta,
 	ttl int,
-	writeStartTime int64,
 	expected uint64,
 ) (wrote bool, err error) {
 	if !c.IsEnabled() {
@@ -861,103 +823,7 @@ func (c *Cache) PutMetaTombstoneAware(
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta encode error")
 		return false, err
 	}
-	// Tombstone gate right before the (visibility-granting) meta write: if the key was
-	// invalidated at or after our write start, skip so we don't resurrect stale metadata.
-	tombTs := c.GetTombstoneTimestamp(ctx, bucket, key)
-	if tombTs >= writeStartTime {
-		log.Debug().Str("bucket", bucket).Str("key", key).
-			Int64("tombstone_ts", tombTs).Int64("write_start", writeStartTime).
-			Msg("Skipping block-mode meta write - tombstone detected")
-		return false, nil
-	}
 	return c.putMetaVersioned(ctx, bucket, key, metaKey, metaBytes, int64(ttl), expected)
-}
-
-// ============================================================================
-// Tombstone methods for cache invalidation
-// ============================================================================
-
-const (
-	// MinTombstoneTTLSeconds is the floor for how long an invalidation tombstone
-	// lives (10 minutes). It comfortably exceeds a small object's populate.
-	MinTombstoneTTLSeconds = 600
-
-	// The constants below mirror the proxy's cache-populate timeouts so the TTL can
-	// model the same window. They are kept honest by
-	// TestTombstoneTTLCoversPopulateWindow in the proxy package, which sweeps
-	// thresholds and fails if either side drifts.
-
-	// tombstoneWriteThroughput mirrors the conservative streaming-write throughput
-	// the proxy assumes when sizing a cache-populate timeout (proxy:
-	// minCacheWriteThroughput, 5 MB/s).
-	tombstoneWriteThroughput = 5 * 1024 * 1024
-
-	// tombstoneMinWriteSeconds mirrors the proxy's floor on that write timeout
-	// (proxy: cacheWriteTimeout, 60s).
-	tombstoneMinWriteSeconds = 60
-
-	// tombstoneFetchSeconds mirrors the upstream fetch that precedes the write
-	// (proxy: backgroundFetchTimeout, 5m).
-	tombstoneFetchSeconds = 300
-
-	// tombstoneMarginSeconds is slack on top of the modeled window.
-	tombstoneMarginSeconds = 300
-)
-
-// TombstoneTTLSeconds returns how long an invalidation tombstone must live for a
-// given cache size threshold.
-//
-// A tombstone's whole job is to outlive any cache-populate that could race it: a
-// populate is only compared against the tombstone immediately before its metadata
-// write, so if the tombstone expires first the guard reads zero and the racing
-// (stale) write proceeds — silently resurrecting invalidated content.
-//
-// The longest populate is bounded by the upstream fetch PLUS the streaming write of
-// the largest cacheable object, so this is derived from sizeThreshold rather than
-// fixed: raising cache.size_threshold must not silently reintroduce that race.
-//
-// The derivation mirrors that window's shape — write + fetch + margin — rather than
-// scaling the write time by a factor. That matters: a multiplicative approximation
-// (e.g. 2 x write) grows on a different curve than the additive window and crosses
-// it, collapsing the margin to zero where write time approaches the fetch bound
-// (~1.5 GiB) and silently reopening the race. Modeling the same shape keeps a
-// constant margin at every threshold.
-func TombstoneTTLSeconds(sizeThreshold int64) int64 {
-	write := int64(tombstoneMinWriteSeconds)
-	if sizeThreshold > 0 {
-		if w := sizeThreshold / tombstoneWriteThroughput; w > write {
-			write = w
-		}
-	}
-	return max(write+tombstoneFetchSeconds+tombstoneMarginSeconds, MinTombstoneTTLSeconds)
-}
-
-// WriteTombstone writes an invalidation marker for a key.
-// The value is the timestamp as 8 bytes (int64 big-endian).
-// This is used to prevent stale cache writes from completing after invalidation.
-func (c *Cache) WriteTombstone(ctx context.Context, bucket, key string) error {
-	if !c.IsEnabled() {
-		return nil
-	}
-	tombKey := MakeTombstoneKey(bucket, key)
-	ts := time.Now().UnixNano()
-	data := make([]byte, 8)
-	binary.BigEndian.PutUint64(data, uint64(ts))
-	return c.client.Put(ctx, tombKey, data, c.tombstoneTTL)
-}
-
-// GetTombstoneTimestamp retrieves the tombstone timestamp for a key.
-// Returns 0 if no tombstone exists.
-func (c *Cache) GetTombstoneTimestamp(ctx context.Context, bucket, key string) int64 {
-	if !c.IsEnabled() {
-		return 0
-	}
-	tombKey := MakeTombstoneKey(bucket, key)
-	data, err := c.client.Get(ctx, tombKey)
-	if err != nil || len(data) != 8 {
-		return 0 // No tombstone or invalid data
-	}
-	return int64(binary.BigEndian.Uint64(data))
 }
 
 // ============================================================================

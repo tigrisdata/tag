@@ -547,7 +547,7 @@ func TestBlockCache_PipelineConcurrentFillDoesNotExhaustInlineFetchCap(t *testin
 		StatusCode:    http.StatusOK,
 		BlockSize:     blockSize,
 	}
-	if wrote, err := store.PutMetaTombstoneAware(context.Background(), bucket, key, meta, 60, time.Now().UnixNano(), cache.VersionAny); err != nil || !wrote {
+	if wrote, err := store.PutMetaIfVersion(context.Background(), bucket, key, meta, 60, cache.VersionAny); err != nil || !wrote {
 		t.Fatalf("seed block metadata = (wrote=%t, err=%v)", wrote, err)
 	}
 

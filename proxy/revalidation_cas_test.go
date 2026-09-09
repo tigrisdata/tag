@@ -224,3 +224,124 @@ func waitFor(t *testing.T, cond func() bool) {
 		}
 	}
 }
+
+// The foreground miss populate carries its decision-time token: a fenced
+// delete landing while the body streams from upstream must make the commit
+// lose — pre-delete bytes are never cached, with no tombstone involved.
+func TestForegroundPopulate_LosesToFencedDeleteMidFetch(t *testing.T) {
+	body := "pre-delete bytes"
+	var c *cache.Cache
+	mock := &mockForwarder{}
+	mock.doRequestFunc = func(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error) {
+		// The racing invalidation lands after the populate's token read,
+		// while the "fetch" is in flight.
+		if err := c.DeleteWithMeta(context.Background(), "b", "k"); err != nil {
+			t.Errorf("racing invalidation: %v", err)
+		}
+		h := http.Header{}
+		h.Set("Content-Type", "text/plain")
+		h.Set("ETag", `"v1"`)
+		h.Set("Content-Length", "16")
+		return &http.Response{StatusCode: http.StatusOK, Header: h, ContentLength: 16, Body: io.NopCloser(strings.NewReader(body))}, nil
+	}
+
+	var svc *Service
+	svc, c = newTestService(mock, true)
+	ctx := context.Background()
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/b/k", nil)
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject: %v", err)
+	}
+	if w.Code != http.StatusOK || w.Body.String() != body {
+		t.Fatalf("client response = %d %q, want the upstream body", w.Code, w.Body.String())
+	}
+
+	// The populate's decision-time token predates the fenced delete: nothing
+	// may be cached.
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			if meta, found, _ := c.GetMeta(ctx, "b", "k"); found {
+				t.Fatalf("pre-delete bytes cached over the fence: %+v", meta)
+			}
+			return
+		case <-time.After(20 * time.Millisecond):
+			if meta, found, _ := c.GetMeta(ctx, "b", "k"); found {
+				t.Fatalf("pre-delete bytes cached over the fence: %+v", meta)
+			}
+		}
+	}
+}
+
+// failingGetVersionClient fails exactly the Nth GetWithVersion call, so a
+// failure can be injected at a precise read (e.g. the revalidation picker's,
+// which follows the guarded delete's own read).
+type failingGetVersionClient struct {
+	cacheclient.CacheClient
+	calls  int
+	failOn int
+}
+
+func (f *failingGetVersionClient) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	f.calls++
+	if f.failOn != 0 && f.calls == f.failOn {
+		return nil, 0, false, errors.New("transient backend failure")
+	}
+	return f.CacheClient.GetWithVersion(ctx, key)
+}
+
+// A revalidation-200 whose precondition token cannot be read must stream to
+// the client WITHOUT caching: a commit would carry the legacy unordered
+// expected=0 and could publish over a fence.
+func TestRevalidation200_TokenFailureSkipsCaching(t *testing.T) {
+	newBody := "fresh content"
+	mock := &mockForwarder{
+		conditionalResp: &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(newBody)),
+			Header: http.Header{
+				"Content-Type":   []string{"text/plain"},
+				"Content-Length": []string{"13"},
+				"Etag":           []string{`"new"`},
+			},
+		},
+	}
+	wrapped := &failingGetVersionClient{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	c := cache.NewCacheWithClient(wrapped, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+	ctx := context.Background()
+	bucket, key := "b", "k"
+
+	stale := &cache.CachedObjectMeta{
+		Bucket: bucket, Key: key, ETag: `"old"`,
+		ContentType: "text/plain", ContentLength: 5, StatusCode: http.StatusOK,
+	}
+	if err := c.PutWithMeta(ctx, bucket, key, stale, []byte("stale"), 0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Fail exactly the picker's read. GetWithVersion call ledger: the seed's
+	// PutWithMeta VersionAny loop is #1, the guarded delete's own read is #2
+	// (succeeds — the stale row is removed and fenced), the picker's is #3.
+	wrapped.failOn = 3
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/b/k", nil)
+	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", stale, time.Now()); err != nil {
+		t.Fatalf("revalidateAndServe: %v", err)
+	}
+	if w.Body.String() != newBody {
+		t.Fatalf("client body = %q, want the fresh content", w.Body.String())
+	}
+
+	// The guarded delete removed the stale row; with no token the repopulate
+	// must have been skipped entirely — nothing cached, never a commit with
+	// the unordered expected=0.
+	if meta, found, _ := c.GetMeta(ctx, bucket, key); found {
+		t.Fatalf("entry cached despite token-read failure: %+v", meta)
+	}
+}

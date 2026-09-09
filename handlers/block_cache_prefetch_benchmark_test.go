@@ -396,7 +396,7 @@ func newHandlerPrefetchBenchmarkFixture(tb testing.TB, remote bool, blockCount i
 		StatusCode:    http.StatusOK,
 		BlockSize:     blockSize,
 	}
-	if wrote, err := store.PutMetaTombstoneAware(context.Background(), bucket, key, meta, 60, time.Now().UnixNano(), cache.VersionAny); err != nil || !wrote {
+	if wrote, err := store.PutMetaIfVersion(context.Background(), bucket, key, meta, 60, cache.VersionAny); err != nil || !wrote {
 		tb.Fatalf("seed block metadata = (wrote=%t, err=%v)", wrote, err)
 	}
 	service := proxy.NewService(handlerPrefetchForwarder{}, store, cfg)

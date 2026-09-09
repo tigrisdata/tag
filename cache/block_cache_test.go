@@ -7,7 +7,6 @@ import (
 	"io"
 	"strings"
 	"testing"
-	"time"
 
 	cacheclient "github.com/tigrisdata/ocache/client"
 	pb "github.com/tigrisdata/ocache/proto"
@@ -377,17 +376,17 @@ func TestPutRemoteBlockBytesPropagatesRejectedWrite(t *testing.T) {
 	}
 }
 
-// PutMetaTombstoneAware writes meta, and skips the write when a newer tombstone exists.
-func TestPutMetaTombstoneAware(t *testing.T) {
+// PutMetaIfVersion writes meta, and skips the write when a newer tombstone exists.
+func TestPutMetaIfVersion(t *testing.T) {
 	c := newBlockTestCache(t)
 	ctx := context.Background()
 	bucket, key := "b", "k"
 	meta := &CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"v1"`, ContentLength: 100, StatusCode: 200, BlockSize: 4}
 
 	// No tombstone → meta is written.
-	wrote, err := c.PutMetaTombstoneAware(ctx, bucket, key, meta, 60, time.Now().UnixNano(), VersionAny)
+	wrote, err := c.PutMetaIfVersion(ctx, bucket, key, meta, 60, VersionAny)
 	if err != nil || !wrote {
-		t.Fatalf("PutMetaTombstoneAware = (%v, %v), want (true, nil)", wrote, err)
+		t.Fatalf("PutMetaIfVersion = (%v, %v), want (true, nil)", wrote, err)
 	}
 	got, found, _ := c.GetMeta(ctx, bucket, key)
 	if !found {
@@ -397,15 +396,17 @@ func TestPutMetaTombstoneAware(t *testing.T) {
 		t.Fatalf("GetMeta after write: blockSize=%d, want 4", got.BlockSize)
 	}
 
-	// A tombstone newer than the write start → meta write skipped.
-	writeStart := time.Now().UnixNano()
-	time.Sleep(time.Millisecond)
-	c.WriteTombstone(ctx, bucket, key)
-	wrote, err = c.PutMetaTombstoneAware(ctx, bucket, key, meta, 60, writeStart, VersionAny)
+	// A stale precondition (the version observed before a fenced invalidation)
+	// → meta write refused.
+	_, staleTok, _, _ := c.GetMetaWithVersion(ctx, bucket, key)
+	if err := c.DeleteWithMeta(ctx, bucket, key); err != nil {
+		t.Fatalf("fenced invalidation: %v", err)
+	}
+	wrote, err = c.PutMetaIfVersion(ctx, bucket, key, meta, 60, staleTok)
 	if err != nil {
-		t.Fatalf("PutMetaTombstoneAware (tombstoned) err = %v", err)
+		t.Fatalf("PutMetaIfVersion (fenced) err = %v", err)
 	}
 	if wrote {
-		t.Error("PutMetaTombstoneAware wrote meta despite a newer tombstone")
+		t.Error("PutMetaIfVersion wrote meta despite a newer fence")
 	}
 }
