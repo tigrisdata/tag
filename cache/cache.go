@@ -144,6 +144,11 @@ func (c *Cache) putMetaVersioned(ctx context.Context, bucket, key, metaKey strin
 // metadata version always finds its exact body — no delete-during-read can
 // truncate an in-flight response. Invalidation removes only the metadata (plus a
 // fence), which is enough to make subsequent reads miss and refetch.
+// PutWithMeta is DELIBERATELY UNORDERED (VersionAny): last-write-wins, immune
+// to fences. It exists for tests and simple seeding, has no production caller,
+// and must never be used on a populate path — a populate that observed
+// pre-delete state would resurrect it. Production paths commit through the
+// IfVersion wrappers with a decision-time token.
 func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *CachedObjectMeta, body []byte, ttl int) error {
 	if !c.IsEnabled() {
 		return nil

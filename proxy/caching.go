@@ -547,11 +547,12 @@ func (s *Service) fetchFullObjectToCache(
 		// Block-eligible full fetches retain the size-based representation used by the
 		// foreground miss path: blocks are written first and version-preconditioned metadata is
 		// published last. Smaller objects use the whole-body stream writer.
-		// The precondition comes from the trigger's context: 0 for the
-		// absent-gated re-warms, the stale row's version for a revalidation
-		// re-warm (so a FAILED guarded delete cannot leave known-stale state
-		// that put-if-absent then refuses to repair), VersionAny for the
-		// warm-after-write paths whose displaced version is unknown.
+		// The precondition is the trigger's decision-time token: the absence
+		// token for the absent-gated re-warms, the revalidation picker's
+		// verdict for a revalidation re-warm (so a FAILED guarded delete
+		// cannot leave known-stale state the repopulate refuses to repair),
+		// and warmToken for the warm-after-write paths. A trigger that cannot
+		// read a token does not fire.
 		if blockMode {
 			meta.BlockSize = s.config.Cache.BlockSize
 			cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, expected)
@@ -605,8 +606,8 @@ func backgroundFetchKey(bucket, key string, expected uint64) string {
 // public-read is only ever inferred from a confirmed anonymous read.
 func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, expected uint64) {
 	// Coalesce only triggers with IDENTICAL commit semantics: the precondition
-	// is part of the dedup key. Keyed by bucket/key alone, a VersionAny write
-	// repair arriving while an absent-gated warm is in flight would be dropped
+	// is part of the dedup key. Keyed by bucket/key alone, a write repair
+	// arriving while an absent-gated warm is in flight would be dropped
 	// WITH its precondition — the in-flight warm then loses to the write's
 	// newer fence (its token predates it) and the repair that would have
 	// fixed the surviving state never runs. Distinct-precondition fetches for
