@@ -440,14 +440,21 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != etag {
-			// Gone or replaced by a concurrent write; its state wins the key.
-			// Remember the mismatch so reads through this marker version stop
-			// re-fetching the body until the cooldown lapses.
-			if s.retierRecentMismatch != nil {
-				s.retierRecentMismatch.Add(bucket+"|"+key+"|"+etag, struct{}{})
-			}
 			_, _ = io.Copy(io.Discard, resp.Body)
-			metrics.RecordTieredRetier("changed")
+			// Only a DEFINITIVE answer about the object counts as changed and
+			// enters the backoff: a 200 with a different ETag (replaced) or a
+			// 404 (gone). A transient status (5xx, 429, an auth blip) says
+			// nothing about the object — recording it would suppress healing
+			// for the whole cooldown and mislabel the outcome.
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+				if s.retierRecentMismatch != nil {
+					s.retierRecentMismatch.Add(bucket+"|"+key+"|"+etag, struct{}{})
+				}
+				metrics.RecordTieredRetier("changed")
+				return
+			}
+			metrics.RecordTieredRetier("error")
+			log.Debug().Int("status", resp.StatusCode).Str("bucket", bucket).Str("key", key).Msg("Re-tier fetch returned transient status")
 			return
 		}
 
@@ -644,6 +651,30 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 		// must be left alone) are completed outcomes, not failures.
 		if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusPreconditionFailed {
 			log.Debug().Int("status", resp.StatusCode).Str("bucket", bucket).Str("key", key).Msg("Cross-tier cleanup delete rejected")
+			return
+		}
+		// REPAIR the residual same-ETag race the pre-check cannot close: a
+		// concurrent large PUT of identical bytes can recreate the upstream
+		// object under this ETag and publish its marker between the check
+		// above and the DELETE landing, and MD5 ETags give If-Match no way to
+		// tell the versions apart. If the key's CURRENT metadata is now a
+		// live marker for this ETag, the body it points at may be the one
+		// just deleted — converge on the authoritative miss instead of
+		// advertising it: DeleteIfETag removes the marker only while it still
+		// carries this ETag, the caller re-populates from its system of
+		// record, and tiered semantics make "not cached" a complete, safe
+		// answer. (If the racing PUT instead landed wholly after the DELETE,
+		// its live body loses only its marker — the same clean miss and
+		// re-populate, an availability blip rather than an object advertised
+		// with no body behind it.)
+		if resp.StatusCode < 300 {
+			if cur, found, gerr := s.cache.GetMeta(ctx, bucket, key); gerr == nil && found && cur != nil && cur.BodyUpstream && cur.ETag == etag {
+				if _, derr := s.cache.DeleteIfETag(ctx, bucket, key, etag); derr != nil {
+					log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Cleanup repair: marker removal failed; stale marker serves until TTL")
+				} else {
+					metrics.RecordTieredCleanupSkipped("marker_repaired")
+				}
+			}
 		}
 	}()
 }
