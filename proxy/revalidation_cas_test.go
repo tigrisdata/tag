@@ -52,6 +52,7 @@ func TestRevalidation200_ReplacesStaleEntryAfterFailedDelete(t *testing.T) {
 
 	wrapped := &failingDeleteClient{CacheClient: cacheclient.NewMemoryCache()}
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // fault injection targets CAS-coordinator ops
 	c := cache.NewCacheWithClient(wrapped, &cfg.Cache)
 	svc := NewService(mock, c, cfg)
 	ctx := context.Background()
@@ -113,6 +114,7 @@ func TestRevalidation206_BackgroundFetchReplacesStaleAfterFailedDelete(t *testin
 
 	wrapped := &failingDeleteClient{CacheClient: cacheclient.NewMemoryCache()}
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // fault injection targets CAS-coordinator ops
 	c := cache.NewCacheWithClient(wrapped, &cfg.Cache)
 	svc := NewService(mock, c, cfg)
 	ctx := context.Background()
@@ -311,6 +313,7 @@ func TestRevalidation200_TokenFailureSkipsCaching(t *testing.T) {
 	}
 	wrapped := &failingGetVersionClient{CacheClient: cacheclient.NewMemoryCache()}
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // fault injection targets CAS-coordinator ops
 	c := cache.NewCacheWithClient(wrapped, &cfg.Cache)
 	svc := NewService(mock, c, cfg)
 	ctx := context.Background()

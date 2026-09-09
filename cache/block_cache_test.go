@@ -19,6 +19,7 @@ func newBlockTestCache(t *testing.T) *Cache {
 	t.Helper()
 	mem := cacheclient.NewMemoryCache()
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // block meta tests assert CAS semantics
 	return NewCacheWithClient(mem, &cfg.Cache)
 }
 

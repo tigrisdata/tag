@@ -43,7 +43,9 @@ type Cache struct {
 	client     cacheclient.CacheClient
 	defaultTTL int64 // seconds
 	enabled    bool
-	closed     bool
+	closed     bool // coord is the meta-key ordering strategy: legacy tombstones (default)
+	// or CAS fences/versions. Selected once at construction; see coordinator.go.
+	coord metaCoordinator
 }
 
 // NewCacheWithClient creates a cache with an injected client.
@@ -51,16 +53,27 @@ type Cache struct {
 func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig) *Cache {
 	ttl := int64(config.DefaultCacheTTL.Seconds())
 	enabled := true // Default to enabled
+	legacy := true  // Default to the legacy coordinator (see coordinator.go)
+	var sizeThreshold int64
 	if cfg != nil {
 		if cfg.TTL > 0 {
 			ttl = int64(cfg.TTL.Seconds())
 		}
 		enabled = cfg.IsEnabled()
+		legacy = cfg.IsLegacyCoordination()
+		sizeThreshold = cfg.SizeThreshold
+	}
+	var coord metaCoordinator
+	if legacy {
+		coord = &legacyCoordinator{client: client, tombstoneTTL: TombstoneTTLSeconds(sizeThreshold)}
+	} else {
+		coord = &casCoordinator{client: client}
 	}
 	return &Cache{
 		client:     client,
 		defaultTTL: ttl,
 		enabled:    enabled,
+		coord:      coord,
 	}
 }
 
@@ -89,66 +102,11 @@ func (c *Cache) IsEnabled() bool {
 // subsequent conditional operation on the key.
 const VersionAny = ^uint64(0)
 
-// putMetaVersioned writes metaBytes to metaKey under a version precondition.
-// expected == VersionAny preserves plain-Put semantics (unconditional,
-// last-write-wins) via a bounded read-CAS loop; any other value — including 0,
-// put-if-absent — is a strict precondition, and a lost race returns
-// (false, nil): the newer entry wins.
+// putMetaVersioned commits the meta bytes through the selected coordinator
+// (see coordinator.go for both mechanisms' semantics).
 func (c *Cache) putMetaVersioned(ctx context.Context, bucket, key, metaKey string, metaBytes []byte, ttl int64, expected uint64) (bool, error) {
-	if expected != VersionAny {
-		if _, err := c.client.PutIfVersion(ctx, metaKey, metaBytes, ttl, expected); err != nil {
-			if _, mismatch := cacheclient.IsVersionMismatch(err); mismatch {
-				// Debug + metric, per the repo's log policy: the counter is the
-				// rollout-visibility signal — a lost precondition replaces what
-				// was previously a SILENT lost update, so a low rate here is
-				// the feature working, and growth means a precondition was
-				// chosen wrong for its path.
-				metrics.RecordCacheOperation("meta_put", "precondition_lost")
-				log.Debug().Str("bucket", bucket).Str("key", key).Uint64("expected", expected).
-					Msg("Skipping meta write - version precondition lost to a newer write")
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
-	}
-	// Unconditional: retry the CAS against whatever is current. Contention on a
-	// single object's metadata is bounded by the populate paths racing it, so
-	// the loop terminating early is a pathology worth surfacing, not masking.
-	const maxAttempts = 8
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		_, version, found, err := c.client.GetWithVersion(ctx, metaKey)
-		if err != nil && !isNotFoundError(err) {
-			return false, err
-		}
-		_ = found // absent reads carry a usable token since ocache v1.13.0
-		_, err = c.client.PutIfVersion(ctx, metaKey, metaBytes, ttl, version)
-		if err == nil {
-			return true, nil
-		}
-		if _, mismatch := cacheclient.IsVersionMismatch(err); !mismatch {
-			return false, err
-		}
-	}
-	return false, fmt.Errorf("meta write for %s/%s lost %d consecutive version races", bucket, key, 8)
+	return c.coord.putMeta(ctx, bucket, key, metaKey, metaBytes, ttl, expected)
 }
-
-// PutWithMeta stores object metadata and body in separate cache entries.
-// This follows the gateway's LiteCache pattern for proper S3 caching.
-// IMPORTANT: Body is written BEFORE metadata to ensure metadata presence
-// guarantees body availability. This prevents race conditions where a reader
-// finds metadata but body hasn't been written yet.
-// Body lifecycle note: bodies are addressed by ETag and are never deleted
-// synchronously (not on overwrite, not on invalidation). Each version is an
-// immutable entry that ages out via TTL, so a reader that resolved a given
-// metadata version always finds its exact body — no delete-during-read can
-// truncate an in-flight response. Invalidation removes only the metadata (plus a
-// fence), which is enough to make subsequent reads miss and refetch.
-// PutWithMeta is DELIBERATELY UNORDERED (VersionAny): last-write-wins, immune
-// to fences. It exists for tests and simple seeding, has no production caller,
-// and must never be used on a populate path — a populate that observed
-// pre-delete state would resurrect it. Production paths commit through the
-// IfVersion wrappers with a decision-time token.
 func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *CachedObjectMeta, body []byte, ttl int) error {
 	if !c.IsEnabled() {
 		return nil
@@ -293,42 +251,16 @@ func (c *Cache) PutWithMetaStreamIfVersion(
 	return true, nil
 }
 
-// GetMetaWithVersion is GetMeta plus the meta row's CAS version — the value a
-// read-modify-write passes back as its precondition. Version 0 means absent.
+// GetMetaWithVersion is GetMeta plus the decision-time TOKEN a subsequent
+// commit must carry (semantics per coordinator: a store version in CAS mode,
+// a wall-clock stamp in legacy mode). Absent entries return found=false with
+// a valid token; callers test found, never token==0.
 func (c *Cache) GetMetaWithVersion(ctx context.Context, bucket, key string) (*CachedObjectMeta, uint64, bool, error) {
 	if !c.IsEnabled() {
 		return nil, 0, false, nil
 	}
-	metaBytes, version, found, err := c.client.GetWithVersion(ctx, MakeMetaKey(bucket, key))
-	if err != nil {
-		if isNotFoundError(err) {
-			// Defensive: a v1.13.0 client reports absence as found=false with a
-			// token, not an error. Should a client surface absence as an error
-			// anyway, pass through whatever version it attached rather than
-			// squashing to 0 — 0 would opt the caller into unordered
-			// put-if-absent that a fence exists to refuse.
-			return nil, version, false, nil
-		}
-		return nil, 0, false, err
-	}
-	if !found || metaBytes == nil {
-		// Since ocache v1.13.0 (fenced deletes, #267) an absent read carries a
-		// nonzero token — the fence of the CAS delete that removed the key, or
-		// a fresh "absent as of now" stamp. Passing it through lets a populate
-		// that observed absence be ORDERED against a later fenced delete;
-		// squashing it to 0 would silently opt the caller back into legacy
-		// unordered put-if-absent. Callers test found, never version==0.
-		return nil, version, false, nil
-	}
-	meta, err := DecodeMeta(metaBytes)
-	if err != nil {
-		return nil, 0, false, err
-	}
-	return meta, version, true, nil
+	return c.coord.getMetaWithVersion(ctx, bucket, key)
 }
-
-// GetMeta retrieves only object metadata from cache (no body).
-// Use this for HEAD requests to avoid fetching the body.
 func (c *Cache) GetMeta(ctx context.Context, bucket, key string) (*CachedObjectMeta, bool, error) {
 	if !c.IsEnabled() {
 		return nil, false, nil
@@ -436,46 +368,11 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	return nil
 }
 
-// deleteMetaFenced is the unconditional FENCED delete of a meta key: it must
-// remove whatever is live and leave a fence either way, so that a populate
-// that observed pre-delete state — including pre-delete ABSENCE — loses its
-// commit. DeleteIfVersion(key, 0) fences an absent/dead key directly; against
-// a live key it reports the current version, and the retry deletes exactly
-// that observed version. Bounded: each retry means a concurrent writer just
-// committed, and sustained contention on one meta key is a pathology worth
-// surfacing, not masking.
+// deleteMetaFenced routes the unconditional invalidation through the selected
+// coordinator (fenced CAS delete, or legacy tombstone + plain delete).
 func (c *Cache) deleteMetaFenced(ctx context.Context, bucket, key string) error {
-	metaKey := MakeMetaKey(bucket, key)
-	expected := uint64(0)
-	// Invalidation must not abandon a key because writers are racing it: each
-	// mismatch means exactly one more committed write to out-delete, so the
-	// loop always makes progress and terminates unless writes are continuous.
-	// It is bounded by the caller's context and a generous attempt ceiling
-	// (not the old count of 8 — a plain delete could never "lose a race", and
-	// giving up would leave known-stale metadata readable until TTL); genuine
-	// exhaustion is a pathology, surfaced as an error the callers record.
-	const maxAttempts = 64
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("fenced meta delete for %s/%s: %w", bucket, key, err)
-		}
-		err := c.client.DeleteIfVersion(ctx, metaKey, expected)
-		if err == nil {
-			return nil
-		}
-		if mm, mismatch := cacheclient.IsVersionMismatch(err); mismatch {
-			expected = mm.CurrentVersion
-			continue
-		}
-		if isNotFoundError(err) {
-			return nil
-		}
-		return err
-	}
-	return fmt.Errorf("fenced meta delete for %s/%s lost %d consecutive version races", bucket, key, 64)
+	return c.coord.deleteMeta(ctx, bucket, key)
 }
-
-// Delete removes an object from the cache.
 func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
 	if !c.IsEnabled() {
 		return nil
@@ -485,64 +382,21 @@ func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
 }
 
 // DeleteIfETag invalidates the object's metadata only while it still carries
-// the given ETag, using the store's per-key CAS (ocache #254): the version is
-// read together with the metadata, and the delete is conditioned on it.
-// Returns (false, nil) when the entry is already gone, carries a different
-// ETag, or was replaced by a VERSION-STAMPED write between the read and the
-// delete — the newer entry wins in each case.
-//
-// Scope of the guard: exact against version-stamped writers (CAS deletes, and
-// populates once they carry version preconditions). A plain Put resets a row
-// to the legacy version (storage EffectiveRowVersion semantics), so between
-// today's plain-put populates the version adds nothing and the protection
-// equals the previous compare-then-delete — the same read→delete window as
-// before, never wider. Versioning the populate paths closes it.
+// the given ETag, through the selected coordinator: an atomic versioned CAS
+// in CAS mode; the pre-CAS narrowed compare-then-delete in legacy mode.
+// Returns (false, nil) when the entry is absent, different, or replaced.
 func (c *Cache) DeleteIfETag(ctx context.Context, bucket, key, staleETag string) (bool, error) {
 	if !c.IsEnabled() {
 		return false, nil
 	}
-	metaKey := MakeMetaKey(bucket, key)
-
-	metaBytes, version, found, err := c.client.GetWithVersion(ctx, metaKey)
-	if err != nil {
-		if isNotFoundError(err) {
-			return false, nil
-		}
-		return false, err
+	deleted, err := c.coord.deleteMetaIfETag(ctx, bucket, key, staleETag)
+	if err == nil && deleted {
+		// The versioned body is intentionally left to age out via TTL, as in
+		// DeleteWithMeta.
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidated cache metadata (ETag-guarded)")
 	}
-	if !found || metaBytes == nil {
-		return false, nil
-	}
-	meta, err := DecodeMeta(metaBytes)
-	if err != nil {
-		// Undecodable metadata is not the version the caller observed; leave it
-		// for the read path's own decode-error handling.
-		return false, err
-	}
-	if meta.ETag != staleETag {
-		return false, nil
-	}
-
-	if derr := c.client.DeleteIfVersion(ctx, metaKey, version); derr != nil {
-		if _, mismatch := cacheclient.IsVersionMismatch(derr); mismatch {
-			// Replaced (or removed) between the read and the delete: the newer
-			// state wins, exactly what the guard exists for.
-			return false, nil
-		}
-		return false, fmt.Errorf("guarded meta delete: %w", derr)
-	}
-	// The versioned body is intentionally left to age out via TTL, as in
-	// DeleteWithMeta. The CAS delete's fence orders in-flight token-carrying
-	// populates.
-	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Invalidated cache metadata (ETag-guarded)")
-	return true, nil
+	return deleted, err
 }
-
-// recordServeLocality records whether a successful body read for bodyKey was
-// satisfied from local storage or pulled from a peer over gRPC. It is a no-op
-// when the underlying client cannot report key ownership (e.g. non-cluster
-// clients or an ocache version without IsLocal), so the metric stays honest
-// rather than reporting a guessed locality.
 func (c *Cache) recordServeLocality(bodyKey string) {
 	lc, ok := c.client.(localityChecker)
 	if !ok {

@@ -276,6 +276,11 @@ func main() {
 
 		// Wrap embedded cache with the cache.Cache interface.
 		objectCache = cache.NewCacheWithClient(newEmbeddedBlockCacheClient(embeddedCache), &cfg.Cache)
+		if cfg.Cache.IsLegacyCoordination() {
+			log.Info().Msg("Cache meta coordination: legacy tombstones (set cache.legacy_coordination=false for fenced CAS once all nodes support it)")
+		} else {
+			log.Info().Msg("Cache meta coordination: fenced CAS")
+		}
 
 		// Publish this node's local cache size as tag_cache_size_bytes. ocache keeps
 		// the total live (an atomic), so sampling it is cheap.

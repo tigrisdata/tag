@@ -10,6 +10,7 @@ import (
 
 func newETagTestCache() *Cache {
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // these tests assert CAS-coordinator semantics
 	return NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
 }
 
@@ -133,6 +134,7 @@ func TestDeleteIfETag_VersionedReplacementInsideWindowSurvives(t *testing.T) {
 	mem := cacheclient.NewMemoryCache()
 	wrapper := &raceOnReadClient{CacheClient: mem}
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // CAS-window semantics under test
 	c := NewCacheWithClient(wrapper, &cfg.Cache)
 	ctx := context.Background()
 
@@ -178,6 +180,7 @@ func TestDeleteIfETag_VersionedReplacementInsideWindowSurvives(t *testing.T) {
 func TestDeleteIfETag_PopulateReplacementInsideWindowSurvives(t *testing.T) {
 	wrapper := &raceOnReadClient{CacheClient: cacheclient.NewMemoryCache()}
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // CAS-window semantics under test
 	c := NewCacheWithClient(wrapper, &cfg.Cache)
 	ctx := context.Background()
 

@@ -18,6 +18,7 @@ import (
 func newBackgroundCacheService(t *testing.T, cfg *config.Config, response func() *http.Response) (*Service, *cache.Cache) {
 	t.Helper()
 
+	cfg.Cache.SetLegacyCoordination(false) // background-populate tests assert CAS semantics
 	cacheStore := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
 	forwarder := &mockForwarder{
 		doFullObjectFunc: func(_ context.Context, _, _, _, _ string) (*http.Response, error) {

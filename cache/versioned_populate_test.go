@@ -10,6 +10,7 @@ import (
 
 func newVersionedTestCache() (*Cache, *cacheclient.MemoryCache) {
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // these tests assert CAS-coordinator semantics
 	mem := cacheclient.NewMemoryCache()
 	return NewCacheWithClient(mem, &cfg.Cache), mem
 }

@@ -35,6 +35,23 @@ Guarantees hold within the CAS op family only: never mix plain Put/Delete with
 CAS ops on a managed key. On a lost commit, refetch before retrying — never
 retry the same bytes with a fresh token.
 
+## Coordination Modes (metaCoordinator)
+
+Meta invalidation/populate ordering is a strategy selected once at construction
+(`cache/coordinator.go`), never per-call if/else:
+
+- **Legacy (default)**: `cache.legacy_coordination: true` — the pre-v1.21
+  tombstone mechanism (plain Get/Put/Delete + timestamp tombstones). Safe for
+  any cluster mix, including nodes upgrading straight from ≤v1.20.
+- **CAS**: `legacy_coordination: false` — the fenced CAS pattern above.
+  Requires every node in the cluster to be CAS-capable (≥v1.21) BEFORE the
+  flip; flip via config + a brisk rolling restart (mixed-mechanism window is
+  bounded by the restart).
+
+The proxy layer is mode-blind: it carries an opaque uint64 token (store version
+in CAS mode, wall-clock stamp in legacy mode) from decision to commit. Never
+branch on the mode outside the coordinator implementations.
+
 ## Stream Multiplexing > Batching
 
 For distributed caches, prefer stream multiplexing over explicit batching:

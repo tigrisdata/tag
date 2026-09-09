@@ -13,6 +13,7 @@ func newVersioningTestCache(t *testing.T) (*Cache, cacheclient.CacheClient) {
 	t.Helper()
 	mem := cacheclient.NewMemoryCache()
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // versioning tests assert CAS semantics
 	return NewCacheWithClient(mem, &cfg.Cache), mem
 }
 

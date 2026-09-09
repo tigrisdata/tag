@@ -35,6 +35,7 @@ func (f *flakyClient) DeleteIfVersion(ctx context.Context, key string, expected 
 func newCacheWithClientForTest(t *testing.T, client cacheclient.CacheClient) *Cache {
 	t.Helper()
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // fault injection targets the CAS coordinator's ops
 	return NewCacheWithClient(client, &cfg.Cache)
 }
 
