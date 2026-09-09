@@ -223,10 +223,14 @@ func (s *Service) handleRevalidation200(
 	// (with the fresh version), that newer entry is left in place.
 	s.invalidateStaleMeta(bucket, key, staleETag)
 
-	// The repopulate's precondition (picked below) is read AFTER the guarded
-	// delete, so our own invalidation doesn't block the write, while a
-	// concurrent DELETE arriving later bumps the fence past it and correctly
-	// does.
+	// The repopulate's precondition is read AFTER the guarded delete, so our
+	// own invalidation doesn't block the write, while a concurrent DELETE
+	// arriving later bumps the fence past it and correctly does. It must be
+	// read BEFORE the not-cacheable early-return below: a failed token read
+	// downgrades this response to stream-only — never a commit with the
+	// legacy unordered expected=0.
+	expected, tokenOK := s.revalidationExpectedVersion(bucket, key, staleETag)
+	shouldCache = shouldCache && tokenOK
 
 	// Write response headers to client
 	copyHeaders(w.Header(), resp.Header)
@@ -253,8 +257,6 @@ func (s *Service) handleRevalidation200(
 	// blocks (size-only mode, RFC 0001) exactly as the read-miss/warm paths do — a revalidated
 	// whole-mode entry that grew into a block-eligible object must not be re-stored as one whole
 	// blob. Sub-block objects keep the whole-body write.
-	expected, tokenOK := s.revalidationExpectedVersion(bucket, key, staleETag)
-	shouldCache = shouldCache && tokenOK
 	cacheErrCh := make(chan error, 1)
 	go func() {
 		var cacheErr error
