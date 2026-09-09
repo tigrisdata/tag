@@ -646,35 +646,46 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 		}
 		defer resp.Body.Close()
 		_, _ = io.Copy(io.Discard, resp.Body)
-		metrics.RecordTieredCleanup(resp.StatusCode, nil)
 		// 404 (already gone) and 412 (If-Match lost to a newer version, which
 		// must be left alone) are completed outcomes, not failures.
-		if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusPreconditionFailed {
-			log.Debug().Int("status", resp.StatusCode).Str("bucket", bucket).Str("key", key).Msg("Cross-tier cleanup delete rejected")
+		if resp.StatusCode >= 300 {
+			metrics.RecordTieredCleanup(resp.StatusCode, nil)
+			if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusPreconditionFailed {
+				log.Debug().Int("status", resp.StatusCode).Str("bucket", bucket).Str("key", key).Msg("Cross-tier cleanup delete rejected")
+			}
 			return
 		}
-		// REPAIR the residual same-ETag race the pre-check cannot close: a
-		// concurrent large PUT of identical bytes can recreate the upstream
-		// object under this ETag and publish its marker between the check
-		// above and the DELETE landing, and MD5 ETags give If-Match no way to
-		// tell the versions apart. If the key's CURRENT metadata is now a
-		// live marker for this ETag, the body it points at may be the one
-		// just deleted — converge on the authoritative miss instead of
-		// advertising it: DeleteIfETag removes the marker only while it still
-		// carries this ETag, the caller re-populates from its system of
-		// record, and tiered semantics make "not cached" a complete, safe
-		// answer. (If the racing PUT instead landed wholly after the DELETE,
-		// its live body loses only its marker — the same clean miss and
-		// re-populate, an availability blip rather than an object advertised
-		// with no body behind it.)
-		if resp.StatusCode < 300 {
-			if cur, found, gerr := s.cache.GetMeta(ctx, bucket, key); gerr == nil && found && cur != nil && cur.BodyUpstream && cur.ETag == etag {
-				if _, derr := s.cache.DeleteIfETag(ctx, bucket, key, etag); derr != nil {
-					log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Cleanup repair: marker removal failed; stale marker serves until TTL")
-				} else {
-					metrics.RecordTieredCleanupSkipped("marker_repaired")
-				}
-			}
+		// The DELETE landed. REPAIR the residual same-ETag race the pre-check
+		// cannot close: a concurrent large PUT of identical bytes can
+		// recreate the upstream object under this ETag and publish its marker
+		// between the check above and the DELETE landing, and MD5 ETags give
+		// If-Match no way to tell the versions apart. If the key's CURRENT
+		// metadata is a live marker for this ETag, the body it points at may
+		// be the one just deleted — converge on the authoritative miss
+		// instead of advertising it: the caller re-populates from its system
+		// of record, and tiered semantics make "not cached" a complete, safe
+		// answer. The removal commits under the OBSERVED VERSION, not the
+		// ETag — identical content reuses MD5 ETags, so an ETag guard could
+		// take out a same-content successor (a local-tier PUT or a re-tier
+		// commit) that landed after this read; the version guard refuses
+		// exactly those. One outcome is recorded per cleanup: deleted,
+		// marker_repaired, or repair_failed.
+		cur, curVersion, found, gerr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+		if gerr != nil || !found || cur == nil || !cur.BodyUpstream || cur.ETag != etag {
+			metrics.RecordTieredCleanup(resp.StatusCode, nil)
+			return
+		}
+		repaired, derr := s.cache.DeleteMetaIfVersion(ctx, bucket, key, curVersion)
+		switch {
+		case derr != nil:
+			metrics.RecordTieredCleanupSkipped("repair_failed")
+			log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Cleanup repair: marker removal failed; stale marker serves until TTL")
+		case repaired:
+			metrics.RecordTieredCleanupSkipped("marker_repaired")
+		default:
+			// The entry moved since the read — a newer write owns the key and
+			// keeps its metadata; the cleanup itself still completed.
+			metrics.RecordTieredCleanup(resp.StatusCode, nil)
 		}
 	}()
 }

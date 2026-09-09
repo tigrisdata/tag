@@ -383,6 +383,19 @@ func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
 	return c.DeleteWithMeta(ctx, bucket, key)
 }
 
+// DeleteMetaIfVersion invalidates the object's metadata only while it still
+// carries the observed version token (from GetMetaWithVersion): the guard is
+// the exact snapshot the caller examined, so an entry replaced in between —
+// even by identical content reusing the same MD5 ETag — refuses the delete.
+// Returns (false, nil) when replaced or absent. CAS-coordinator strength; the
+// legacy coordinator refuses (see coordinator.go).
+func (c *Cache) DeleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error) {
+	if !c.IsEnabled() {
+		return false, nil
+	}
+	return c.coord.deleteMetaIfVersion(ctx, bucket, key, version)
+}
+
 // DeleteIfETag invalidates the object's metadata only while it still carries
 // the given ETag, through the selected coordinator: an atomic versioned CAS
 // in CAS mode; the pre-CAS narrowed compare-then-delete in legacy mode.

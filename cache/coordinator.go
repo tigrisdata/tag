@@ -58,6 +58,13 @@ type metaCoordinator interface {
 	// deleteMetaIfETag invalidates only while the entry still carries
 	// staleETag. Returns (false, nil) when absent, different, or replaced.
 	deleteMetaIfETag(ctx context.Context, bucket, key, staleETag string) (bool, error)
+	// deleteMetaIfVersion invalidates only while the entry still carries the
+	// caller's observed version token — a check-then-delete whose guard is
+	// exactly the check's snapshot, unlike deleteMetaIfETag's content ETag
+	// (which identical bytes can reuse across entries and tiers). CAS-
+	// coordinator strength: legacy coordination stores no versions to compare
+	// and refuses with (false, nil).
+	deleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error)
 }
 
 // ============================================================================
@@ -190,6 +197,21 @@ func (c *casCoordinator) deleteMetaIfETag(ctx context.Context, bucket, key, stal
 			return false, nil
 		}
 		return false, fmt.Errorf("guarded meta delete: %w", derr)
+	}
+	return true, nil
+}
+
+func (c *casCoordinator) deleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error) {
+	if derr := c.client.DeleteIfVersion(ctx, MakeMetaKey(bucket, key), version); derr != nil {
+		if _, mismatch := cacheclient.IsVersionMismatch(derr); mismatch {
+			// Replaced (or removed) since the caller's read: the newer state
+			// wins — exactly what the guard exists for.
+			return false, nil
+		}
+		if isNotFoundError(derr) {
+			return false, nil
+		}
+		return false, fmt.Errorf("version-guarded meta delete: %w", derr)
 	}
 	return true, nil
 }
@@ -344,4 +366,13 @@ func (c *legacyCoordinator) tombstoneTimestamp(ctx context.Context, bucket, key 
 		return 0
 	}
 	return int64(binary.BigEndian.Uint64(data))
+}
+
+// deleteMetaIfVersion is a CAS-strength identity delete: legacy coordination
+// stores no versions (its tokens are wall-clock stamps never persisted with
+// the row), so there is nothing to compare the caller's token against and the
+// only safe answer is to refuse. Its sole caller (the tiered cleanup repair)
+// runs under CAS coordination by construction — tiered mode rejects legacy.
+func (c *legacyCoordinator) deleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error) {
+	return false, nil
 }
