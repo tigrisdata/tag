@@ -117,13 +117,13 @@ func TestMeasure_FirstOpenUpstreamRoundTrips(t *testing.T) {
 	}
 }
 
-// mustPrimeMeta writes the entry and asserts it landed. PutMetaTombstoneAware
+// mustPrimeMeta writes the entry and asserts it landed. PutMetaIfVersion
 // reports refusal through its bool, not an error, so discarding that return makes a
 // silently empty cache look like a primed one -- which is exactly how the first run
 // of this measurement produced "no improvement".
 func mustPrimeMeta(t *testing.T, c *cache.Cache, bucket, key string, meta *cache.CachedObjectMeta) {
 	t.Helper()
-	wrote, err := c.PutMetaTombstoneAware(context.Background(), bucket, key, meta, 3600, time.Now().UnixNano())
+	wrote, err := c.PutMetaIfVersion(context.Background(), bucket, key, meta, 3600, cache.VersionAny)
 	if err != nil || !wrote {
 		t.Fatalf("prime meta: wrote=%v err=%v", wrote, err)
 	}

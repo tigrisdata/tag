@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/cache"
@@ -192,8 +191,14 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 		// Holding the tee reservation across this doesn't stall the warm: triggerBackgroundCacheFetch
 		// only SPAWNS the fetch and returns, so this goroutine returns and its deferred release frees
 		// the slot, which the warm's (separate) blocking acquire then observes.
+		// Token at trigger time, like warmOnWrite: repairs exactly the state
+		// this write left (absence, or the survivor of a failed invalidation).
+		warmTok, ok := s.warmToken(bucket, key)
+		if !ok {
+			return
+		}
 		metrics.WarmOnWriteTriggered.Inc()
-		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite)
+		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, warmTok)
 	}()
 	return true
 }
@@ -213,13 +218,19 @@ const (
 // authoritatively shows the object should not be cached (so warming is pointless), and
 // teeFallbackWarm when it couldn't confirm/write the version (so a read-back warm may help).
 func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte, accessKey, secretKey string) teeOutcome {
-	// Stamp the tombstone reference BEFORE the HEAD (mirroring warm-on-write, which stamps
-	// before its fetch), so the whole HEAD-to-write window is guarded: a competing overwrite
-	// whose invalidation lands after this point is newer than writeStartTime and skips our
-	// write, while one that landed earlier is caught by the ETag-consistency check below. It
-	// is still newer than this PUT's own post-forward invalidation (stamped before this
-	// goroutine ran), so our own invalidation doesn't block us.
-	writeStartTime := time.Now().UnixNano()
+	// Decision-time token BEFORE the HEAD (mirroring the populate paths), so
+	// the whole HEAD-to-write window is ordered: a competing overwrite whose
+	// invalidation lands after this read bumps the fence past this token and
+	// the write loses, while one that landed earlier is caught by the
+	// ETag-consistency check below. Read after this PUT's own post-forward
+	// invalidation (this goroutine runs after it), so our own fence doesn't
+	// block us.
+	_, expected, _, tokErr := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
+	if tokErr != nil {
+		// No token, no ordered commit: fall back to the warm, which reads its
+		// own token (and skips likewise if the store is still failing).
+		return teeFallbackWarm
+	}
 
 	headCtx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 	defer cancel()
@@ -259,14 +270,16 @@ func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte
 	ttl := int(s.config.Cache.TTL.Seconds())
 	cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
 	defer cacheCancel()
-	wrote, err := s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, writeStartTime)
+	// Put-if-absent: this tee follows the PUT's own invalidation; a racer that
+	// re-established the entry (a warm) caches the current version and wins.
+	wrote, err := s.cache.PutWithMetaStreamIfVersion(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, expected)
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Write-through cache tee write failed")
 		return teeFallbackWarm
 	}
 	if !wrote {
-		// A newer tombstone (competing DELETE/overwrite) superseded our teed version, so
-		// nothing was cached. Warm instead: its own writeStartTime is newer than that tombstone,
+		// A newer fence or write (competing DELETE/overwrite) superseded our teed version, so
+		// nothing was cached. Warm instead: its own decision-time token postdates that change,
 		// so it caches the CURRENT version (or no-ops on a delete) rather than our stale body.
 		return teeFallbackWarm
 	}

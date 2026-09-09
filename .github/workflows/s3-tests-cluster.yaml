@@ -28,13 +28,15 @@ jobs:
       contents: read
       packages: write
 
-    # Run the 2-node cluster suite twice: whole-object caching (default) and block-aligned caching
-    # (small block size) enabled on both nodes, so cross-node block routing/fetch gets end-to-end
-    # coverage. fail-fast off so one mode's failure doesn't cancel the other.
+    # Run the 2-node cluster suite with the default (whole-object caching) config only.
+    # The blocks variant was dropped from CI to halve the duplicate compat runs; run it
+    # locally with `make s3-test-local-cluster-blocks` when touching cross-node block
+    # routing/fetch. The matrix form is kept so the job name (and any required-check
+    # reference to it) stays stable.
     strategy:
       fail-fast: false
       matrix:
-        cache_mode: [default, blocks]
+        cache_mode: [default]
 
     name: s3-compat-tests-cluster (${{ matrix.cache_mode }})
 

@@ -118,7 +118,7 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 
 	// Re-invalidate AFTER upstream confirms the deletes, for the same
 	// read-after-write reason as HandleDeleteObject: a GET racing the in-flight
-	// bulk delete may have re-cached a not-yet-deleted object; this second tombstone
+	// bulk delete may have re-cached a not-yet-deleted object; this second fence bump
 	// blocks that stale repopulation. A key is re-invalidated when at least one of
 	// its requested entries was deleted — i.e. more entries were requested for the
 	// key than upstream reported as errored. Counting by key (never matching version

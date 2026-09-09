@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"context"
+	"errors"
+	"io"
 	"testing"
 	"time"
 )
@@ -26,6 +29,55 @@ func TestHasNoCacheDirectives(t *testing.T) {
 				t.Errorf("hasNoCacheDirectives(%q) = %t, want %t", tc.cacheControls, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestContextBoundReaderDoesNotAcceptCloseAsComplete(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pipeReader, pipeWriter := io.Pipe()
+	defer pipeWriter.Close()
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := (&contextBoundReader{ctx: ctx, reader: pipeReader}).Read(make([]byte, 1))
+		readErr <- err
+	}()
+
+	cancel()
+	_ = pipeWriter.Close()
+	select {
+	case err := <-readErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("contextBoundReader.Read() = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("contextBoundReader.Read() remained blocked after cancellation")
+	}
+}
+
+func TestWaitForCacheWriteHonorsDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	release := make(chan struct{})
+	cacheErrCh := make(chan error, 1)
+	go func() {
+		<-release
+		cacheErrCh <- nil
+	}()
+
+	if err, timedOut := waitForCacheWrite(ctx, cacheErrCh); !timedOut || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForCacheWrite() = (%v, %t), want deadline timeout", err, timedOut)
+	}
+
+	// The production channel is buffered so a writer that ignores cancellation can
+	// finish without blocking after the fetch has returned.
+	close(release)
+	select {
+	case <-cacheErrCh:
+	case <-time.After(time.Second):
+		t.Fatal("cache writer did not finish after release")
 	}
 }
 

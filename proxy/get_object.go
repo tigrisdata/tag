@@ -28,9 +28,8 @@ var bufferPool = sync.Pool{
 }
 
 // smallObjectThreshold defines the max size for direct buffered serving.
-// Objects at or below this size buffer the body directly instead of using
-// io.Pipe + goroutine. This eliminates per-request goroutine spawn, io.Pipe
-// allocation, and synchronization overhead for small objects.
+// Objects at or below this size buffer the body directly so they can be served
+// from one pooled buffer without a streaming writer.
 const smallObjectThreshold = 64 * 1024 // 64KB
 
 // putBuffer returns a buffer to the pool only if it hasn't grown too large.
@@ -50,6 +49,32 @@ type countingWriter struct {
 }
 
 func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.written += int64(n)
+	return n, err
+}
+
+// lazyCommitWriter counts a cache body stream and commits the response when
+// the first nonempty chunk arrives. Empty and failed streams can therefore be
+// handled by the cache-miss fallback without sending cache headers first.
+type lazyCommitWriter struct {
+	w         http.ResponseWriter
+	meta      *cache.CachedObjectMeta
+	written   int64
+	committed bool
+}
+
+func (cw *lazyCommitWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if !cw.committed {
+		cw.meta.WriteHeaders(cw.w)
+		writeCacheStatus(cw.w, XCacheHit)
+		cw.w.WriteHeader(cw.meta.StatusCode)
+		cw.committed = true
+	}
+
 	n, err := cw.w.Write(p)
 	cw.written += int64(n)
 	return n, err
@@ -130,7 +155,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					// Version-guarded: only drop the entry this client is revalidating, never a
 					// newer version a concurrent request re-established after an overwrite (an
 					// unconditional Delete would wipe that fresh entry and force needless churn).
-					s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+					s.invalidateStaleMeta(bucket, key, meta.ETag)
 				}
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Force revalidate, falling through to upstream")
 				// Fall through to cache miss path below
@@ -163,7 +188,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					// mid-probe) leaves the still-valid entry cached.
 					if bodyGone(rangeErr) {
 						log.Debug().Str("bucket", bucket).Str("key", key).Msg("Range cache body missing - invalidating orphaned meta and forwarding with background cache")
-						s.cache.Delete(context.Background(), bucket, key)
+						// ETag-guarded: never removes an entry a concurrent
+						// request re-established under a newer version.
+						s.invalidateStaleMeta(bucket, key, meta.ETag)
 					}
 					// Body genuinely gone for an otherwise-cacheable request → a miss.
 					return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start, XCacheMiss)
@@ -212,7 +239,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					// still-valid hot entry. serveFromCache errors before committing
 					// headers, so falling through to the miss path below is safe either way.
 					if bodyGone(cacheBodyErr) {
-						s.cache.Delete(context.Background(), bucket, key)
+						s.invalidateStaleMeta(bucket, key, meta.ETag)
 					}
 					// Fall through to cache miss path
 				} else {
@@ -325,8 +352,11 @@ func (s *Service) fetchAndBroadcast(
 		<-broadcaster.Done() // the fetch goroutine above records the upstream outcome
 		if upErr := broadcaster.Error(); upErr == nil ||
 			errors.Is(upErr, context.Canceled) || errors.Is(upErr, context.DeadlineExceeded) {
-			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
-				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss)
+			if _, tok, found, gerr := s.cache.GetMetaWithVersion(context.Background(), bucket, key); gerr == nil && !found {
+				// Absent-gated, carrying the absence TOKEN (ocache v1.13.0):
+				// the warm is ordered against a fenced delete landing after
+				// this look, where a bare put-if-absent would recreate over it.
+				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, tok)
 			}
 		}
 	}
@@ -348,16 +378,18 @@ func (s *Service) streamFromUpstream(
 	broadcaster *broadcast.Broadcaster,
 ) error {
 	// Stamp the cache-write start BEFORE issuing the upstream request, not after
-	// its headers arrive. The tombstone guard compares this against any invalidation
-	// that landed while we were fetching, and upstream takes its read snapshot at
-	// some point after we send. Stamping after the response would leave the whole
-	// upstream round-trip unguarded: a PUT that lands in that window writes a
-	// tombstone OLDER than our timestamp, the guard passes, and we cache the
-	// pre-PUT body we just read — stale. Stamping first makes the timestamp strictly
-	// earlier than the read snapshot, so any racing invalidation is provably newer
-	// and blocks the write. The cost is skipping an occasional still-fresh populate
-	// (a miss), never serving stale.
-	writeStartTime := time.Now().UnixNano()
+	// The populate's DECISION-TIME token, read before the upstream request: the
+	// commit applies only if the entry is unchanged from this instant — a
+	// fenced delete (or any write) landing while the body streams makes the
+	// commit lose atomically, never retried with the same bytes. This is the
+	// refill pattern the fence contract requires (ocache v1.13.0): a token
+	// read after the fetch could postdate a delete and resurrect pre-delete
+	// bytes. Covers presence (live version) and absence (absence token) alike.
+	_, expected, _, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+	// Without a token the commit cannot be ordered — expected=0 is the LEGACY
+	// unordered put-if-absent, which would publish over a fence. The safe
+	// failure is not populating at all: tokenOK gates the cache listener below.
+	tokenOK := tokErr == nil
 
 	// Execute upstream request
 	resp, err := s.forwarder.DoRequestWithCreds(ctx, r, accessKey, secretKey)
@@ -373,6 +405,7 @@ func (s *Service) streamFromUpstream(
 	// read would establish (RFC 0001), so there is no whole/block collision to guard against.
 	shouldCache := resp.StatusCode == http.StatusOK &&
 		s.cache.IsEnabled() &&
+		tokenOK &&
 		!s.hasNoCacheHeaders(resp.Header) &&
 		s.isWithinSizeThreshold(resp)
 
@@ -382,7 +415,7 @@ func (s *Service) streamFromUpstream(
 		// Reserve against the memory budget by the object's actual size (capped at
 		// the buffer ceiling), so small objects don't each reserve the worst case.
 		weight := s.populateWeight(resp.ContentLength)
-		_, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, writeStartTime)
+		_, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, expected)
 	}
 
 	// If an anonymous GET succeeded and Tigris didn't set an explicit per-object ACL,
@@ -815,8 +848,11 @@ func (s *Service) handleRangeWithBackgroundCache(
 		}
 	} else if cacheable {
 		defer func() {
-			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
-				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss)
+			if _, tok, found, gerr := s.cache.GetMetaWithVersion(context.Background(), bucket, key); gerr == nil && !found {
+				// Absent-gated, carrying the absence TOKEN (ocache v1.13.0):
+				// the warm is ordered against a fenced delete landing after
+				// this look, where a bare put-if-absent would recreate over it.
+				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, tok)
 			}
 		}()
 	}

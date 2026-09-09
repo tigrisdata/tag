@@ -119,38 +119,135 @@ func TestPopulateWeight(t *testing.T) {
 	}
 }
 
-// TestService_BackgroundReservationClampedToBudget guards against the background
-// path reserving the raw ceiling: when the budget is smaller than the per-populate
-// ceiling, a background populate (unknown size) must still admit — one at a time —
-// via populateWeight's budget clamp, not fail admission entirely.
-func TestService_BackgroundReservationClampedToBudget(t *testing.T) {
-	const budget = 8 << 20 // 8MB budget, below the 80MB ceiling
+// TestService_BackgroundReservationRejectsWhenBudgetTooSmall guards against the
+// background path under-reserving its direct writer: when the budget is smaller
+// than the direct-populate ceiling, admission rejects the populate rather than
+// pretending that a smaller reservation can bound its buffers.
+func TestService_BackgroundReservationRejectsWhenBudgetTooSmall(t *testing.T) {
+	const budget = 8 << 20 // 8MB budget, below the 80MB test ceiling
 	s := &Service{
-		cacheSemaphore: make(chan struct{}, 256),
-		populateBudget: newByteBudget(budget, 0, 1),
-		perPopulateCap: 80 << 20,
-		config:         &config.Config{},
+		cacheSemaphore:              make(chan struct{}, 256),
+		populateBudget:              newByteBudget(budget, 0, 1),
+		backgroundPopulateWriterCap: 80 << 20,
+		config:                      &config.Config{},
 	}
 	s.config.Cache.MaxPopulateMemoryBytes = budget
 
-	w := s.populateWeight(-1) // what fetchFullObjectToCache reserves
-	if w != budget {
-		t.Fatalf("populateWeight(-1) = %d, want %d (clamped to budget)", w, budget)
+	w := s.backgroundPopulateWeight() // what fetchFullObjectToCache reserves
+	if w != 80<<20 {
+		t.Fatalf("backgroundPopulateWeight() = %d, want %d (full direct reservation)", w, 80<<20)
 	}
-	if !s.acquireCacheSlot(context.Background(), w, priorityReadMiss) {
-		t.Fatal("background populate should admit one-at-a-time when budget < ceiling")
+	if s.acquireCacheSlot(context.Background(), w, priorityReadMiss) {
+		t.Fatal("background populate should be rejected when its buffers exceed the budget")
 	}
-	if s.acquireCacheSlot(context.Background(), s.populateWeight(-1), priorityReadMiss) {
-		t.Fatal("second concurrent background populate should be throttled by the full budget")
+	if s.acquireCacheSlot(context.Background(), w, priorityWarmWrite) {
+		t.Fatal("warm background populate should be rejected when its buffers exceed the budget")
 	}
-	s.releaseCacheSlot(w)
-	if !s.acquireCacheSlot(context.Background(), s.populateWeight(-1), priorityReadMiss) {
-		t.Fatal("after release the next background populate should admit")
+	// A rejected read-miss must return the count slot it briefly took.
+	if !s.acquireCacheSlot(context.Background(), 1, priorityReadMiss) {
+		t.Fatal("count or byte budget leaked after oversized background rejection")
+	}
+	s.releaseCacheSlot(1)
+}
+
+// TestBackgroundPopulateBufferBytes verifies the direct background reservation
+// includes the clustered sender and destination buffers, direct storage buffers and,
+// in block mode, one pooled block scratch buffer rather than the foreground relay.
+func TestBackgroundPopulateBufferBytes(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Cache.BlockSize = 1 << 20
+	scratch := int64(cfg.Cache.BlockSize)
+	writer := backgroundCacheClientStreamBufferBytes + backgroundCacheServerChunkBufferBytes +
+		backgroundStorageFileBufferBytes + backgroundStorageProbeBufferBytes
+	if got, want := backgroundPopulateBufferBytes(cfg), writer+scratch; got != want {
+		t.Errorf("backgroundPopulateBufferBytes(block mode) = %d, want %d", got, want)
+	}
+
+	cfg.Cache.SetBlockCachingEnabled(false)
+	if got, want := backgroundPopulateBufferBytes(cfg), writer; got != want {
+		t.Errorf("backgroundPopulateBufferBytes(whole mode) = %d, want %d", got, want)
+	}
+
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 0
+	if got, want := backgroundPopulateBufferBytes(cfg), writer; got != want {
+		t.Errorf("backgroundPopulateBufferBytes(zero block size) = %d, want %d", got, want)
 	}
 }
 
-// TestPerPopulateBufferBytes verifies the per-populate ceiling accounts for the
-// broadcast listener channel plus the cache-write queue's 64-chunk floor.
+// TestBackgroundReservationIncludesClusteredStreamBuffers verifies that the aggregate
+// budget rejects a second direct writer when two clustered writers would need more than it.
+func TestBackgroundReservationIncludesClusteredStreamBuffers(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Cache.SetBlockCachingEnabled(false)
+	weight := backgroundPopulateBufferBytes(cfg)
+	want := backgroundCacheClientStreamBufferBytes + backgroundCacheServerChunkBufferBytes +
+		backgroundStorageFileBufferBytes + backgroundStorageProbeBufferBytes
+	if weight != want {
+		t.Fatalf("whole-object background reservation = %d, want %d", weight, want)
+	}
+
+	const budget = 7 << 20
+	s := &Service{
+		cacheSemaphore:              make(chan struct{}, 2),
+		populateBudget:              newByteBudget(budget, 0, weight),
+		backgroundPopulateWriterCap: weight,
+		config:                      cfg,
+	}
+	if !s.acquireCacheSlot(context.Background(), weight, priorityReadMiss) {
+		t.Fatal("first whole-object populate should fit")
+	}
+	if s.acquireCacheSlot(context.Background(), weight, priorityReadMiss) {
+		t.Fatal("second whole-object populate should exceed the 7 MiB budget")
+	}
+	s.releaseCacheSlot(weight)
+}
+
+// TestBackgroundReservationAddsBlockScratchOnlyAfterSelection verifies that a small
+// whole-object warm can fit even when a block representation would not fit the budget.
+func TestBackgroundReservationAddsBlockScratchOnlyAfterSelection(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4 << 20
+	writer := backgroundPopulateWriterBufferBytes()
+	scratch := int64(cfg.Cache.BlockSize)
+	budget := writer + scratch - 1
+	s := &Service{
+		cacheSemaphore:              make(chan struct{}, 1),
+		populateBudget:              newByteBudget(budget, 0, backgroundPopulateBufferBytes(cfg)),
+		backgroundPopulateWriterCap: writer,
+		config:                      cfg,
+	}
+
+	if !s.acquireCacheSlot(context.Background(), writer, priorityReadMiss) {
+		t.Fatal("whole-object writer reservation should fit")
+	}
+	if s.tryAcquireCacheBytes(scratch, priorityWarmWrite) {
+		t.Fatal("block scratch reservation should exceed the remaining budget")
+	}
+	s.releaseCacheSlot(writer)
+
+	if !s.acquireCacheSlot(context.Background(), writer, priorityReadMiss) {
+		t.Fatal("whole-object warm should remain admissible without block scratch")
+	}
+	s.releaseCacheSlot(writer)
+}
+
+// TestGetExactBlockBuf avoids reusing an oversized pooled buffer for the direct block writer.
+func TestGetExactBlockBuf(t *testing.T) {
+	const blockSize = 1 << 20
+	large := make([]byte, 16<<20)
+	blockBufPool.Put(&large)
+
+	bufp := getExactBlockBuf(blockSize)
+	if got := cap(*bufp); got != blockSize {
+		t.Fatalf("getExactBlockBuf capacity = %d, want %d", got, blockSize)
+	}
+	putBlockBuf(bufp)
+}
+
+// TestPerPopulateBufferBytes verifies the foreground relay ceiling accounts for
+// the broadcast listener channel plus the cache-write queue's 64-chunk floor.
 func TestPerPopulateBufferBytes(t *testing.T) {
 	mk := func(chunk, channelBuf int) *config.Config {
 		c := &config.Config{}

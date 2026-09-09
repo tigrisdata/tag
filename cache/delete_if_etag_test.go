@@ -1,0 +1,206 @@
+package cache
+
+import (
+	"context"
+	"testing"
+
+	cacheclient "github.com/tigrisdata/ocache/client"
+	"github.com/tigrisdata/tag/config"
+)
+
+func newETagTestCache() *Cache {
+	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // these tests assert CAS-coordinator semantics
+	return NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+}
+
+func seedEntry(t *testing.T, c *Cache, bucket, key, etag, body string) {
+	t.Helper()
+	meta := &CachedObjectMeta{
+		Bucket:        bucket,
+		Key:           key,
+		ETag:          etag,
+		ContentLength: int64(len(body)),
+		StatusCode:    200,
+	}
+	if err := c.PutWithMeta(context.Background(), bucket, key, meta, []byte(body), 0); err != nil {
+		t.Fatalf("PutWithMeta: %v", err)
+	}
+}
+
+// The guard's positive edge: the entry still carries the observed ETag, so the
+// guarded delete removes it and subsequent reads miss.
+func TestDeleteIfETag_RemovesMatchingEntry(t *testing.T) {
+	c := newETagTestCache()
+	ctx := context.Background()
+	seedEntry(t, c, "b", "k", `"v1"`, "body-v1")
+
+	deleted, err := c.DeleteIfETag(ctx, "b", "k", `"v1"`)
+	if err != nil {
+		t.Fatalf("DeleteIfETag: %v", err)
+	}
+	if !deleted {
+		t.Fatal("deleted = false, want true for a matching ETag")
+	}
+	if _, found, _ := c.GetMeta(ctx, "b", "k"); found {
+		t.Fatal("meta still present after guarded delete")
+	}
+}
+
+// The guard's negative edge: a newer version replaced the observed one, and
+// the guarded delete must leave it untouched.
+func TestDeleteIfETag_SparesReplacedEntry(t *testing.T) {
+	c := newETagTestCache()
+	ctx := context.Background()
+	seedEntry(t, c, "b", "k", `"v2"`, "body-v2")
+
+	deleted, err := c.DeleteIfETag(ctx, "b", "k", `"v1"`)
+	if err != nil {
+		t.Fatalf("DeleteIfETag: %v", err)
+	}
+	if deleted {
+		t.Fatal("deleted = true, want false: the entry carries a newer ETag")
+	}
+	meta, found, _ := c.GetMeta(ctx, "b", "k")
+	if !found || meta == nil || meta.ETag != `"v2"` {
+		t.Fatalf("newer entry disturbed: found=%v meta=%+v", found, meta)
+	}
+}
+
+// Absent entries are a no-op, not an error.
+func TestDeleteIfETag_AbsentIsNoop(t *testing.T) {
+	c := newETagTestCache()
+	deleted, err := c.DeleteIfETag(context.Background(), "b", "missing", `"v1"`)
+	if err != nil {
+		t.Fatalf("DeleteIfETag: %v", err)
+	}
+	if deleted {
+		t.Fatal("deleted = true for an absent entry")
+	}
+}
+
+// The match path's CAS delete leaves a fence, so an in-flight populate whose
+// decision-time token predates the guarded delete is still blocked.
+func TestDeleteIfETag_FencesOnMatch(t *testing.T) {
+	c := newETagTestCache()
+	ctx := context.Background()
+	seedEntry(t, c, "b", "k", `"v1"`, "body-v1")
+
+	// A populate "decides" before the delete, capturing its token...
+	_, tok, found, err := c.GetMetaWithVersion(ctx, "b", "k")
+	if err != nil || !found {
+		t.Fatalf("token read: found=%v err=%v", found, err)
+	}
+
+	if deleted, err := c.DeleteIfETag(ctx, "b", "k", `"v1"`); err != nil || !deleted {
+		t.Fatalf("DeleteIfETag: deleted=%v err=%v", deleted, err)
+	}
+
+	// ...and its token-carrying meta write must now be refused by the fence.
+	meta := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"v1"`, StatusCode: 200}
+	wrote, err := c.PutMetaIfVersion(ctx, "b", "k", meta, 60, tok)
+	if err != nil {
+		t.Fatalf("PutMetaIfVersion: %v", err)
+	}
+	if wrote {
+		t.Fatal("stale populate resurrected the entry - guarded delete left no fence")
+	}
+}
+
+// raceOnReadClient injects a concurrent replacement at the worst instant: the
+// versioned read has returned (ETag comparison will pass against the stale
+// snapshot), and the replacement lands before the delete runs.
+type raceOnReadClient struct {
+	cacheclient.CacheClient
+	raced   bool
+	replace func()
+}
+
+func (r *raceOnReadClient) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	data, version, found, err := r.CacheClient.GetWithVersion(ctx, key)
+	if !r.raced && found && r.replace != nil {
+		r.raced = true
+		r.replace()
+	}
+	return data, version, found, err
+}
+
+// The guard's central guarantee, exercised in the exact window it protects: a
+// version-stamped replacement landing between the versioned read and the
+// delete must survive. The old compare-then-delete would have compared against
+// the stale snapshot, passed, and deleted the new entry; only the version
+// condition on the delete itself catches this.
+func TestDeleteIfETag_VersionedReplacementInsideWindowSurvives(t *testing.T) {
+	mem := cacheclient.NewMemoryCache()
+	wrapper := &raceOnReadClient{CacheClient: mem}
+	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // CAS-window semantics under test
+	c := NewCacheWithClient(wrapper, &cfg.Cache)
+	ctx := context.Background()
+
+	seedEntry(t, c, "b", "k", `"v1"`, "body-v1")
+	wrapper.replace = func() {
+		// A CAS writer replaces the entry: it reads the current version (via
+		// the raw client, not the wrapper, so the injection doesn't recurse)
+		// and swaps against it, bumping past the snapshot the delete holds.
+		v2 := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"v2"`, StatusCode: 200}
+		encoded, err := v2.Encode()
+		if err != nil {
+			t.Errorf("encode v2: %v", err)
+			return
+		}
+		_, cur, _, _ := mem.GetWithVersion(ctx, MakeMetaKey("b", "k"))
+		if _, err := mem.PutIfVersion(ctx, MakeMetaKey("b", "k"), encoded, 0, cur); err != nil {
+			t.Errorf("versioned replacement: %v", err)
+		}
+	}
+
+	deleted, err := c.DeleteIfETag(ctx, "b", "k", `"v1"`)
+	if err != nil {
+		t.Fatalf("DeleteIfETag: %v", err)
+	}
+	if !wrapper.raced {
+		t.Fatal("test wiring: the replacement was never injected")
+	}
+	if deleted {
+		t.Fatal("deleted = true: the guarded delete claimed a win over a newer entry")
+	}
+	meta, found, _ := c.GetMeta(ctx, "b", "k")
+	if !found || meta == nil || meta.ETag != `"v2"` {
+		t.Fatalf("versioned replacement inside the CAS window was deleted: found=%v meta=%+v", found, meta)
+	}
+}
+
+// The tripwire, flipped: every meta write in this package is now
+// version-stamped (putMetaVersioned — strict preconditions or the VersionAny
+// bumping loop), so an ordinary populate replacing the entry inside the window
+// bumps the version and the guarded delete loses. This is the state the
+// original limitation test existed to force: the guard is now exact against
+// ALL of this package's writers, not only conditional ones.
+func TestDeleteIfETag_PopulateReplacementInsideWindowSurvives(t *testing.T) {
+	wrapper := &raceOnReadClient{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // CAS-window semantics under test
+	c := NewCacheWithClient(wrapper, &cfg.Cache)
+	ctx := context.Background()
+
+	seedEntry(t, c, "b", "k", `"v1"`, "body-v1")
+	wrapper.replace = func() {
+		seedEntry(t, c, "b", "k", `"v2"`, "body-v2")
+	}
+
+	deleted, err := c.DeleteIfETag(ctx, "b", "k", `"v1"`)
+	if err != nil {
+		t.Fatalf("DeleteIfETag: %v", err)
+	}
+	if !wrapper.raced {
+		t.Fatal("test wiring: the replacement was never injected")
+	}
+	if deleted {
+		t.Fatal("deleted = true: the guarded delete claimed a win over a populate's replacement")
+	}
+	meta, found, _ := c.GetMeta(ctx, "b", "k")
+	if !found || meta == nil || meta.ETag != `"v2"` {
+		t.Fatalf("populate replacement inside the CAS window was deleted: found=%v meta=%+v", found, meta)
+	}
+}

@@ -28,13 +28,15 @@ jobs:
       contents: read
       packages: write
 
-    # Run the full suite twice: once with whole-object caching (default) and once with
-    # block-aligned caching enabled (small block size), so block populate/assembly/range
-    # paths get end-to-end coverage. fail-fast off so one mode's failure doesn't cancel the other.
+    # Run the suite with the default (whole-object caching) config only. The blocks
+    # variant was dropped from CI to halve the duplicate compat runs; run it locally
+    # with `make s3-test-local-blocks` when touching block populate/assembly/range
+    # paths. The matrix form is kept so the job name (and any required-check
+    # reference to it) stays stable.
     strategy:
       fail-fast: false
       matrix:
-        cache_mode: [default, blocks]
+        cache_mode: [default]
 
     name: s3-compat-tests (${{ matrix.cache_mode }})
 

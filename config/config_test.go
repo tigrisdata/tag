@@ -1354,3 +1354,41 @@ func TestLoad_NegativeEnvDisablesLimits(t *testing.T) {
 		t.Errorf("MaxConcurrentWrites = %d, want -1 (disabled)", cfg.Cache.MaxConcurrentWrites)
 	}
 }
+
+func TestLoad_LegacyCoordinationOverrideByEnv(t *testing.T) {
+	cases := []struct {
+		name       string
+		yaml       string
+		env        string
+		wantLegacy bool
+	}{
+		// Legacy coordination is the default: unset yaml + unset env = legacy.
+		{"default legacy", "cache:\n  enabled: true\n", "", true},
+		{"yaml selects cas", "cache:\n  enabled: true\n  legacy_coordination: false\n", "", false},
+		{"env selects cas", "cache:\n  enabled: true\n", "false", false},
+		{"env 0 selects cas", "cache:\n  enabled: true\n", "0", false},
+		{"env re-enables legacy over yaml", "cache:\n  enabled: true\n  legacy_coordination: false\n", "true", true},
+		// Fail-safe: anything but an explicit "false"/"0" keeps legacy —
+		// a typo must never flip a fleet onto the CAS coordinator.
+		{"unrecognized env keeps legacy", "cache:\n  enabled: true\n", "no", true},
+		{"unrecognized env overrides cas yaml", "cache:\n  enabled: true\n  legacy_coordination: false\n", "False ", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			if tc.env != "" {
+				t.Setenv("TAG_CACHE_LEGACY_COORDINATION", tc.env)
+			}
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.IsLegacyCoordination() != tc.wantLegacy {
+				t.Errorf("IsLegacyCoordination = %v, want %v", cfg.Cache.IsLegacyCoordination(), tc.wantLegacy)
+			}
+		})
+	}
+}

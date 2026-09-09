@@ -1,7 +1,11 @@
 package proxy
 
 import (
+	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -285,6 +289,235 @@ func TestBuildTransparentRequest_DateHandling(t *testing.T) {
 				if len(gotAmzDate) != 16 || gotAmzDate[8] != 'T' || gotAmzDate[15] != 'Z' {
 					t.Errorf("Synthesized X-Amz-Date = %q, want ISO 8601 format (20060102T150405Z)", gotAmzDate)
 				}
+			}
+		})
+	}
+}
+
+func TestBuildTransparentRequest_BorrowsHeaderValues(t *testing.T) {
+	fwd := &transparentForwarder{
+		baseForwarder:    newBaseForwarder("https://upstream.example.com", "us-east-1", 10),
+		proxySigner:      auth.NewProxySigner("test-access-key", "test-secret-key"),
+		upstreamEndpoint: "https://upstream.example.com",
+	}
+	req, err := http.NewRequest(http.MethodPut, "http://localhost:8080/bucket/key", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "client.example.com"
+	unrelatedHeader := make([]string, 2, 4)
+	unrelatedHeader[0] = "one"
+	unrelatedHeader[1] = "two"
+	req.Header = http.Header{
+		"Authorization":             {"client-auth"},
+		"Date":                      {"Wed, 11 Feb 2026 05:55:14 GMT"},
+		"X-Amz-Content-Sha256":      {StreamingPayloadHash},
+		"Content-Encoding":          {"gzip"},
+		"X-Tigris-Forwarded-Host":   {"client-forwarded-host"},
+		"X-Tigris-Proxy-Access-Key": {"client-access-key"},
+		"X-Tigris-Proxy-Timestamp":  {"client-timestamp"},
+		"X-Tigris-Proxy-Signature":  {"client-signature"},
+		"X-Unrelated":               unrelatedHeader,
+	}
+	original := req.Header.Clone()
+	unrelatedValues := req.Header["X-Unrelated"]
+	authorizationValues := req.Header["Authorization"]
+
+	fwdReq, err := fwd.buildTransparentRequest(t.Context(), req)
+	if err != nil {
+		t.Fatalf("buildTransparentRequest() error = %v", err)
+	}
+
+	if got := fwdReq.Header.Get("Authorization"); got != "client-auth" {
+		t.Errorf("Authorization = %q, want client-auth", got)
+	}
+	if &fwdReq.Header["Authorization"][0] != &authorizationValues[0] {
+		t.Error("Authorization value slice was copied")
+	}
+	if &fwdReq.Header["X-Unrelated"][0] != &unrelatedValues[0] {
+		t.Error("unrelated header value slice was copied")
+	}
+	fwdReq.Header.Add("X-Unrelated", "three")
+	if got := req.Header.Values("X-Unrelated"); !reflect.DeepEqual(got, []string{"one", "two"}) {
+		t.Errorf("inbound multi-value header changed after outbound append = %v", got)
+	}
+	if got := fwdReq.Header.Values("X-Unrelated"); !reflect.DeepEqual(got, []string{"one", "two", "three"}) {
+		t.Errorf("outbound multi-value header = %v, want appended value", got)
+	}
+	fwdReq.Header.Set("X-Borrowed-Map", "visible-only-on-forwarded-request")
+	if got := req.Header.Get("X-Borrowed-Map"); got != "" {
+		t.Errorf("inbound header map changed, got %q", got)
+	}
+
+	if got := fwdReq.Header.Get("X-Amz-Date"); got != "20260211T055514Z" {
+		t.Errorf("X-Amz-Date = %q, want synthesized date", got)
+	}
+	if got := fwdReq.Header.Get("Content-Encoding"); got != "aws-chunked,gzip" {
+		t.Errorf("Content-Encoding = %q, want aws-chunked,gzip", got)
+	}
+	for _, header := range []string{
+		"X-Tigris-Forwarded-Host",
+		"X-Tigris-Proxy-Access-Key",
+		"X-Tigris-Proxy-Timestamp",
+		"X-Tigris-Proxy-Signature",
+	} {
+		if got := fwdReq.Header.Get(header); got == original.Get(header) {
+			t.Errorf("%s was not overwritten for upstream request", header)
+		}
+	}
+	if !reflect.DeepEqual(req.Header, original) {
+		t.Errorf("inbound headers changed during build = %#v, want %#v", req.Header, original)
+	}
+}
+
+type transparentForwarderTestBody struct {
+	request        *http.Request
+	closeErr       error
+	closeCalls     int
+	headersAtClose http.Header
+}
+
+func (b *transparentForwarderTestBody) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (b *transparentForwarderTestBody) Close() error {
+	b.closeCalls++
+	b.headersAtClose = b.request.Header.Clone()
+	return b.closeErr
+}
+
+type transparentForwarderTestTransport struct {
+	body *transparentForwarderTestBody
+	err  error
+}
+
+func (t *transparentForwarderTestTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if t.err != nil {
+		return nil, t.err
+	}
+	t.body.request = r
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       t.body,
+	}, nil
+}
+
+func newTransparentForwarderForTest(transport http.RoundTripper) *transparentForwarder {
+	base := newBaseForwarder("https://upstream.example.com", "us-east-1", 10)
+	base.httpClient = &http.Client{Transport: transport}
+	fwd := &transparentForwarder{
+		baseForwarder:    base,
+		proxySigner:      auth.NewProxySigner("test-access-key", "test-secret-key"),
+		upstreamEndpoint: "https://upstream.example.com",
+	}
+	fwd.initInterceptor()
+	return fwd
+}
+
+func newTransparentRequestForTest(t *testing.T) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, "http://localhost:8080/bucket/key", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "client.example.com"
+	req.Header.Set("Authorization", "client-auth")
+	req.Header.Set("X-Tigris-Forwarded-Host", "client-forwarded-host")
+	req.Header.Set("X-Tigris-Proxy-Access-Key", "client-access-key")
+	req.Header.Set("X-Tigris-Proxy-Timestamp", "client-timestamp")
+	req.Header.Set("X-Tigris-Proxy-Signature", "client-signature")
+	return req
+}
+
+func TestTransparentForwarderKeepsInboundHeadersPrivateWhileBodyIsOpen(t *testing.T) {
+	closeErr := errors.New("close failed")
+	body := &transparentForwarderTestBody{closeErr: closeErr}
+	fwd := newTransparentForwarderForTest(&transparentForwarderTestTransport{body: body})
+	req := newTransparentRequestForTest(t)
+	original := req.Header.Clone()
+
+	resp, err := fwd.DoRequestWithCreds(t.Context(), req, "", "")
+	if err != nil {
+		t.Fatalf("DoRequestWithCreds() error = %v", err)
+	}
+	if !reflect.DeepEqual(req.Header, original) {
+		t.Errorf("headers changed while response body was open = %#v, want %#v", req.Header, original)
+	}
+	if got := body.request.Header.Get("X-Tigris-Proxy-Access-Key"); got == original.Get("X-Tigris-Proxy-Access-Key") {
+		t.Error("outbound request did not overwrite the client proxy header")
+	}
+	if err := resp.Body.Close(); !errors.Is(err, closeErr) {
+		t.Errorf("response Body.Close() error = %v, want %v", err, closeErr)
+	}
+	if body.closeCalls != 1 {
+		t.Errorf("underlying body Close calls = %d, want 1", body.closeCalls)
+	}
+	if !reflect.DeepEqual(req.Header, original) {
+		t.Errorf("headers after response close = %#v, want %#v", req.Header, original)
+	}
+	if got := body.headersAtClose.Get("X-Tigris-Proxy-Access-Key"); got == original.Get("X-Tigris-Proxy-Access-Key") {
+		t.Error("underlying body did not observe the outbound proxy header")
+	}
+}
+
+func TestTransparentForwarderLeavesHeadersOnTransportError(t *testing.T) {
+	transportErr := errors.New("transport failed")
+	fwd := newTransparentForwarderForTest(&transparentForwarderTestTransport{err: transportErr})
+	req := newTransparentRequestForTest(t)
+	original := req.Header.Clone()
+
+	resp, err := fwd.DoRequestWithCreds(t.Context(), req, "", "")
+	if resp != nil {
+		t.Errorf("DoRequestWithCreds() response = %#v, want nil", resp)
+	}
+	if err == nil || !strings.Contains(err.Error(), transportErr.Error()) {
+		t.Fatalf("DoRequestWithCreds() error = %v, want %v", err, transportErr)
+	}
+	if !reflect.DeepEqual(req.Header, original) {
+		t.Errorf("headers after transport error = %#v, want %#v", req.Header, original)
+	}
+}
+
+func TestTransparentForwarderSynchronousPathsKeepHeadersPrivate(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(*transparentForwarder, http.ResponseWriter, *http.Request) error
+	}{
+		{
+			name: "Forward",
+			call: func(fwd *transparentForwarder, w http.ResponseWriter, r *http.Request) error {
+				return fwd.Forward(r.Context(), w, r)
+			},
+		},
+		{
+			name: "ForwardWithCapture",
+			call: func(fwd *transparentForwarder, w http.ResponseWriter, r *http.Request) error {
+				_, err := fwd.ForwardWithCapture(r.Context(), w, r)
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := &transparentForwarderTestBody{}
+			fwd := newTransparentForwarderForTest(&transparentForwarderTestTransport{body: body})
+			req := newTransparentRequestForTest(t)
+			original := req.Header.Clone()
+
+			if err := tt.call(fwd, httptest.NewRecorder(), req); err != nil {
+				t.Fatalf("forwarding error = %v", err)
+			}
+			if body.closeCalls != 1 {
+				t.Errorf("underlying body Close calls = %d, want 1", body.closeCalls)
+			}
+			if !reflect.DeepEqual(req.Header, original) {
+				t.Errorf("headers after forwarding = %#v, want %#v", req.Header, original)
+			}
+			if got := body.headersAtClose.Get("X-Tigris-Proxy-Access-Key"); got == original.Get("X-Tigris-Proxy-Access-Key") {
+				t.Error("upstream body did not observe the generated proxy header")
 			}
 		})
 	}
