@@ -12,9 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
+	"github.com/tigrisdata/tag/metrics"
 )
 
 // blockMockForwarder serves range GETs from a backing object, for both the initial
@@ -1831,3 +1833,103 @@ func TestBlockCache_SequentialClientWriteFailureDoesNotFetchRemainder(t *testing
 
 // clientForwards reports how many client-range forwards have hit upstream.
 func (m *blockMockForwarder) clientForwards() int32 { return m.forwards.Load() }
+
+// blockPutHookClient fires hook once, synchronously, on the first PutStream of hookKey —
+// letting a test interleave an invalidation with a block assembly in progress.
+type blockPutHookClient struct {
+	cacheclient.CacheClient
+	hookKey string
+	fired   atomic.Bool
+	hook    func()
+}
+
+func (h *blockPutHookClient) PutStream(ctx context.Context, key string, r io.Reader, ttl int64) error {
+	if key == h.hookKey && h.fired.CompareAndSwap(false, true) {
+		h.hook()
+	}
+	return h.CacheClient.PutStream(ctx, key, r, ttl)
+}
+
+// An invalidation landing DURING the full-GET assembly must refuse the
+// blocks-complete promotion: the promotion's token is read before assembly, so
+// the mid-assembly delete + same-ETag re-establishment (whose blocks the
+// promotion knows nothing about) stays !BlocksComplete. Regression test for
+// the post-assembly token read, under the default legacy coordination.
+func TestBlockCache_PromotionRefusedWhenInvalidationRacesAssembly(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	hooked := &blockPutHookClient{
+		CacheClient: cacheclient.NewMemoryCache(),
+		hookKey:     cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 2),
+	}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(hooked, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// The moment assembly writes the missing block: invalidate, then
+	// re-establish the same-ETag entry (as a fresh partial populate would).
+	hooked.hook = func() {
+		ctx := context.Background()
+		prior, found, _ := c.GetMeta(ctx, wowBucket, wowKey)
+		if !found {
+			t.Error("hook: no meta to displace")
+			return
+		}
+		if err := c.DeleteWithMeta(ctx, wowBucket, wowKey); err != nil {
+			t.Errorf("hook: invalidation: %v", err)
+			return
+		}
+		_, tok, _, _ := c.GetMetaWithVersion(ctx, wowBucket, wowKey)
+		fresh := *prior
+		fresh.BlocksComplete = false
+		if wrote, err := c.PutMetaIfVersion(ctx, wowBucket, wowKey, &fresh, 60, tok); err != nil || !wrote {
+			t.Errorf("hook: re-establish: wrote=%v err=%v", wrote, err)
+		}
+	}
+
+	// Partial entry via a cold range miss (blocks 0,1 of 3).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	// The refused promotion is observable as a precondition_lost meta_put — the
+	// only such refusal in this flow (the hook's own re-establishment is checked
+	// to succeed), so waiting on it synchronizes with the fire-and-forget
+	// promotion goroutine instead of racing it with a fixed sleep.
+	lostBefore := testutil.ToFloat64(metrics.CacheOperations.WithLabelValues("meta_put", "precondition_lost"))
+
+	// Full GET assembles block 2 (firing the hook mid-assembly) and serves.
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("full GET: code=%d body=%q", w2.Code, w2.Body.String())
+	}
+	if !hooked.fired.Load() {
+		t.Fatal("hook never fired: assembly did not write the missing block")
+	}
+
+	// The displaced assembly's promotion must be attempted AND refused; the
+	// re-established entry stays !BlocksComplete throughout.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+		if found && m.BlocksComplete {
+			t.Fatal("promotion committed over a mid-assembly invalidation")
+		}
+		if testutil.ToFloat64(metrics.CacheOperations.WithLabelValues("meta_put", "precondition_lost")) > lostBefore {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("promotion refusal never observed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

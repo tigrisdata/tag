@@ -168,9 +168,11 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 // visible — refused atomically if the entry changed (including a fenced
 // delete) since the caller's token was read.
 //
-// The expected version is the meta write's precondition: 0 for legacy
-// unordered put-if-absent, a decision-time token (live version or absence
-// token) for an ordered populate, VersionAny for last-write-wins.
+// The expected version is the meta write's precondition: a decision-time
+// token (live version or absence token) for an ordered populate, VersionAny
+// for last-write-wins. 0 is unordered put-if-absent under the CAS
+// coordinator but is REFUSED by the legacy coordinator (nothing to order
+// against) — production callers always carry a nonzero token.
 //
 // Returns wrote=true only when the metadata was actually written (the entry
 // is now visible). It is false when the write was skipped without error — the

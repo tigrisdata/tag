@@ -256,6 +256,15 @@ func (c *legacyCoordinator) getMetaWithVersion(ctx context.Context, bucket, key 
 }
 
 func (c *legacyCoordinator) putMeta(ctx context.Context, bucket, key, metaKey string, metaBytes []byte, ttl int64, expected uint64) (bool, error) {
+	if expected == 0 {
+		// No decision-time token to order against. The CAS coordinator's
+		// expected==0 is unordered put-if-absent; that has no tombstone
+		// analogue, and writing here could resurrect an invalidated entry.
+		// Refuse — a skipped cache write is always safe. Production callers
+		// always carry a nonzero token (legacy stamps are wall-clock nanos).
+		metrics.RecordCacheOperation("meta_put", "precondition_lost")
+		return false, nil
+	}
 	if expected != VersionAny {
 		// Tombstone gate right before the visibility-granting meta write: an
 		// invalidation at or after the caller's decision-time stamp blocks the

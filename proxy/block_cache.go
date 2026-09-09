@@ -784,6 +784,22 @@ func (s *Service) serveFullObjectFromBlockCache(
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Complete-serve buffer budget declined - serving via probe path")
 	}
 
+	// Decision-time token for the post-assembly promotion, read BEFORE assembly begins: the
+	// promotion's claim ("every block present") is decided by the assembly, so an invalidation
+	// landing DURING it must refuse the commit. A token read after assembly would postdate such
+	// an invalidation and let the promotion mark a concurrently re-established (possibly
+	// partial) same-ETag entry complete. The token counts only with its OWN snapshot live and
+	// carrying the serve ETag — an absent or different-ETag entry means the serve-path copy is
+	// already displaced, and its token could order the commit against the wrong history. A
+	// failed or disqualified read just skips the promotion.
+	var promoToken uint64
+	promoTokenOK := false
+	if !meta.BlocksComplete {
+		if cur, tok, found, terr := s.cache.GetMetaWithVersion(ctx, bucket, key); terr == nil && found && cur != nil && cur.ETag == meta.ETag {
+			promoToken, promoTokenOK = tok, true
+		}
+	}
+
 	// A full GET must produce every block. bailIfMostlyMissing=true asks ensureBlocksCached to
 	// fall through (rather than assemble) when most blocks are absent — e.g. only a footer range
 	// was ever cached — since per-block assembly would be a large amplification versus one
@@ -813,25 +829,26 @@ func (s *Service) serveFullObjectFromBlockCache(
 		return false, ferr
 	}
 
-	// Every block is now present: promote the entry to complete (async, version-preconditioned with
-	// the pre-assembly timestamp, so a racing invalidation blocks the write) — later full GETs
-	// then take the probe-free path instead of re-probing every block. The rewrite carries the
-	// entry's REMAINING TTL, never a fresh one: promotion does not consult upstream, so
-	// extending the lifetime would reset the staleness clock (up to doubling the configured
-	// bound after an out-of-band overwrite) and guarantee a window where the meta outlives
-	// every block. Best-effort: a skipped or failed promotion only means the next full GET
-	// probes again.
-	if !meta.BlocksComplete && s.remainingMetaTTL(meta) > 0 {
+	// Every block is now present: promote the entry to complete (async, committed under the
+	// PRE-assembly token, so an invalidation racing the assembly refuses the write) — later
+	// full GETs then take the probe-free path instead of re-probing every block. The rewrite
+	// carries the entry's REMAINING TTL, never a fresh one: promotion does not consult
+	// upstream, so extending the lifetime would reset the staleness clock (up to doubling the
+	// configured bound after an out-of-band overwrite) and guarantee a window where the meta
+	// outlives every block. Best-effort: a skipped or failed promotion only means the next
+	// full GET probes again.
+	if !meta.BlocksComplete && promoTokenOK && s.remainingMetaTTL(meta) > 0 {
 		expectETag := meta.ETag
 		go func() {
 			pctx, cancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
 			defer cancel()
-			// A promotion is a read-modify-write of live metadata, so it
-			// re-reads with the version and promotes THAT snapshot under a
-			// strict precondition: a concurrent overwrite's fresh entry can
-			// never be clobbered by a promoted copy of the old one. Any
-			// skip just means the next full GET probes again.
-			cur, version, found, gerr := s.cache.GetMetaWithVersion(pctx, bucket, key)
+			// Re-read for the CONTENT to promote (a promoted copy of a stale
+			// snapshot must never clobber a fresh entry) — but commit under
+			// the pre-assembly decision-time token: any invalidation or
+			// overwrite since that read, including one DURING the assembly,
+			// loses the precondition. Any skip just means the next full GET
+			// probes again.
+			cur, _, found, gerr := s.cache.GetMetaWithVersion(pctx, bucket, key)
 			if gerr != nil || !found || cur == nil || cur.ETag != expectETag || cur.BlocksComplete {
 				return
 			}
@@ -844,7 +861,7 @@ func (s *Service) serveFullObjectFromBlockCache(
 			}
 			promoted := *cur
 			promoted.BlocksComplete = true
-			if _, perr := s.cache.PutMetaIfVersion(pctx, bucket, key, &promoted, remaining, version); perr != nil {
+			if _, perr := s.cache.PutMetaIfVersion(pctx, bucket, key, &promoted, remaining, promoToken); perr != nil {
 				log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Blocks-complete promotion failed")
 			}
 		}()
