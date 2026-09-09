@@ -294,7 +294,10 @@ func (c *legacyCoordinator) deleteMeta(ctx context.Context, bucket, key string) 
 
 // deleteMetaIfETag is the pre-CAS compare-then-delete: it narrows the window
 // ("deletes only the version we just observed as stale") rather than closing
-// it — the accepted legacy semantics.
+// it — the accepted legacy semantics. A replacement landing between the
+// compare and the delete is removed too; that degrades to v1.20's
+// unconditional delete at these call sites — a spurious miss and refetch,
+// never stale data. Closing the window takes CAS; that IS the other mode.
 func (c *legacyCoordinator) deleteMetaIfETag(ctx context.Context, bucket, key, staleETag string) (bool, error) {
 	metaBytes, err := c.client.Get(ctx, MakeMetaKey(bucket, key))
 	if err != nil {

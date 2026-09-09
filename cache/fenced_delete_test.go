@@ -88,6 +88,7 @@ func TestFencedDelete_SecondFenceBlocksRefillHoldingFirst(t *testing.T) {
 // reports the live version, and the retry deletes exactly that version.
 func TestDeleteMetaFenced_RemovesLiveKey(t *testing.T) {
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // exercises the CAS coordinator's mismatch-retry
 	mem := cacheclient.NewMemoryCache()
 	c := NewCacheWithClient(mem, &cfg.Cache)
 	ctx := context.Background()
