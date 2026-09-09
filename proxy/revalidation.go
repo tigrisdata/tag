@@ -191,9 +191,12 @@ func (s *Service) revalidationExpectedVersion(bucket, key, staleETag string) (ui
 	if cur.ETag == staleETag {
 		return version, true
 	}
-	// A fresh racer holds the key: 0 against a live row is a guaranteed
-	// mismatch, skipping the write in its favor.
-	return 0, true
+	// A fresh racer holds the key: skip the write in its favor. There is no
+	// precondition that fails in every future — 0 mismatches the live row, but
+	// if the racer is fenced-deleted before our (asynchronous) commit, 0
+	// becomes legacy put-if-absent over absence and would publish our
+	// pre-fetch bytes over that fence.
+	return 0, false
 }
 
 // handleRevalidation200 handles a 200 OK revalidation response (object changed).

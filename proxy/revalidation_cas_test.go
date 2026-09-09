@@ -345,3 +345,70 @@ func TestRevalidation200_TokenFailureSkipsCaching(t *testing.T) {
 		t.Fatalf("entry cached despite token-read failure: %+v", meta)
 	}
 }
+
+// A fresh racer holding the key makes the revalidation SKIP its cache write —
+// not attempt a "guaranteed mismatch" with expected=0, which stops being
+// guaranteed the moment the racer is fenced-deleted before the async commit
+// (0 over fenced absence is the legacy put-if-absent and would succeed).
+func TestRevalidation200_FreshRacerSkipsCaching(t *testing.T) {
+	newBody := "fresh content"
+	var c *cache.Cache
+	mock := &mockForwarder{
+		conditionalResp: &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(newBody)),
+			Header: http.Header{
+				"Content-Type":   []string{"text/plain"},
+				"Content-Length": []string{"13"},
+				"Etag":           []string{`"new"`},
+			},
+		},
+	}
+	var svc *Service
+	svc, c = newTestService(mock, true)
+	ctx := context.Background()
+	bucket, key := "b", "k"
+
+	stale := &cache.CachedObjectMeta{
+		Bucket: bucket, Key: key, ETag: `"old"`,
+		ContentType: "text/plain", ContentLength: 5, StatusCode: http.StatusOK,
+	}
+	if err := c.PutWithMeta(ctx, bucket, key, stale, []byte("stale"), 0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// After the guarded delete clears the stale row, a racer re-establishes
+	// the entry with a different ETag, and is then fenced-deleted — the exact
+	// interleaving where expected=0 would publish over the fence. Injecting at
+	// the picker's read: replace-and-fence so the commit-time state is a fence.
+	racer := &cache.CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"racer"`, ContentLength: 5, StatusCode: http.StatusOK}
+	// Simulate deterministically: seed the racer NOW so the picker sees it,
+	// then fence it away right after revalidateAndServe's picker ran — done by
+	// racing inside the forwarder's conditional response body read.
+	if err := c.PutWithMeta(ctx, bucket, key, racer, []byte("racer"), 0); err != nil {
+		t.Fatalf("seed racer: %v", err)
+	}
+	mock.conditionalResp.Body = io.NopCloser(readerFunc(func(p []byte) (int, error) {
+		// First body read happens after the picker: fence the racer away.
+		if err := c.DeleteWithMeta(context.Background(), bucket, key); err != nil {
+			t.Errorf("fence racer: %v", err)
+		}
+		return copy(p, newBody), io.EOF
+	}))
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/b/k", nil)
+	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", stale, time.Now()); err != nil {
+		t.Fatalf("revalidateAndServe: %v", err)
+	}
+	if w.Body.String() != newBody {
+		t.Fatalf("client body = %q", w.Body.String())
+	}
+	if meta, found, _ := c.GetMeta(ctx, bucket, key); found {
+		t.Fatalf("cache write published over the racer's fence: %+v", meta)
+	}
+}
+
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
