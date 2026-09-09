@@ -191,13 +191,13 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 		// Holding the tee reservation across this doesn't stall the warm: triggerBackgroundCacheFetch
 		// only SPAWNS the fetch and returns, so this goroutine returns and its deferred release frees
 		// the slot, which the warm's (separate) blocking acquire then observes.
-		metrics.WarmOnWriteTriggered.Inc()
 		// Token at trigger time, like warmOnWrite: repairs exactly the state
 		// this write left (absence, or the survivor of a failed invalidation).
 		warmTok, ok := s.warmToken(bucket, key)
 		if !ok {
 			return
 		}
+		metrics.WarmOnWriteTriggered.Inc()
 		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, warmTok)
 	}()
 	return true

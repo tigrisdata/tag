@@ -885,7 +885,6 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	// Anonymous write → anonymous warm (unsigned fetch, public-read learned from the
 	// probe). See the doc comment: never infer public-read from a public write.
 	if hasNoAuthCredentials(r) {
-		metrics.WarmOnWriteTriggered.Inc()
 		// Token at trigger time: the absence token if this write's invalidation
 		// succeeded, the surviving stale row's live version if it failed — the
 		// warm then repairs exactly that state and loses to anything newer,
@@ -894,6 +893,7 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 		if !ok {
 			return
 		}
+		metrics.WarmOnWriteTriggered.Inc()
 		s.triggerBackgroundCacheFetch(bucket, key, "", "", true /*anonymous*/, priorityWarmWrite, warmTok)
 		return
 	}
@@ -902,11 +902,11 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	if err != nil || accessKey == "" || secretKey == "" {
 		return
 	}
-	metrics.WarmOnWriteTriggered.Inc()
 	warmTok, ok := s.warmToken(bucket, key)
 	if !ok {
 		return
 	}
+	metrics.WarmOnWriteTriggered.Inc()
 	s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, warmTok)
 }
 
