@@ -788,11 +788,14 @@ func (s *Service) serveFullObjectFromBlockCache(
 	// promotion's claim ("every block present") is decided by the assembly, so an invalidation
 	// landing DURING it must refuse the commit. A token read after assembly would postdate such
 	// an invalidation and let the promotion mark a concurrently re-established (possibly
-	// partial) same-ETag entry complete. A failed token read just skips the promotion.
+	// partial) same-ETag entry complete. The token counts only with its OWN snapshot live and
+	// carrying the serve ETag — an absent or different-ETag entry means the serve-path copy is
+	// already displaced, and its token could order the commit against the wrong history. A
+	// failed or disqualified read just skips the promotion.
 	var promoToken uint64
 	promoTokenOK := false
 	if !meta.BlocksComplete {
-		if _, tok, _, terr := s.cache.GetMetaWithVersion(ctx, bucket, key); terr == nil {
+		if cur, tok, found, terr := s.cache.GetMetaWithVersion(ctx, bucket, key); terr == nil && found && cur != nil && cur.ETag == meta.ETag {
 			promoToken, promoTokenOK = tok, true
 		}
 	}

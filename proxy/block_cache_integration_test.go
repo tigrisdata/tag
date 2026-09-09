@@ -12,9 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
+	"github.com/tigrisdata/tag/metrics"
 )
 
 // blockMockForwarder serves range GETs from a backing object, for both the initial
@@ -1896,6 +1898,12 @@ func TestBlockCache_PromotionRefusedWhenInvalidationRacesAssembly(t *testing.T) 
 		t.Fatal("meta not populated")
 	}
 
+	// The refused promotion is observable as a precondition_lost meta_put — the
+	// only such refusal in this flow (the hook's own re-establishment is checked
+	// to succeed), so waiting on it synchronizes with the fire-and-forget
+	// promotion goroutine instead of racing it with a fixed sleep.
+	lostBefore := testutil.ToFloat64(metrics.CacheOperations.WithLabelValues("meta_put", "precondition_lost"))
+
 	// Full GET assembles block 2 (firing the hook mid-assembly) and serves.
 	w2 := httptest.NewRecorder()
 	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
@@ -1908,13 +1916,20 @@ func TestBlockCache_PromotionRefusedWhenInvalidationRacesAssembly(t *testing.T) 
 		t.Fatal("hook never fired: assembly did not write the missing block")
 	}
 
-	// The re-established entry must never be promoted by the displaced assembly.
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
+	// The displaced assembly's promotion must be attempted AND refused; the
+	// re-established entry stays !BlocksComplete throughout.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
 		m, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
 		if found && m.BlocksComplete {
 			t.Fatal("promotion committed over a mid-assembly invalidation")
 		}
-		time.Sleep(10 * time.Millisecond)
+		if testutil.ToFloat64(metrics.CacheOperations.WithLabelValues("meta_put", "precondition_lost")) > lostBefore {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("promotion refusal never observed")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
