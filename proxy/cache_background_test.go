@@ -68,7 +68,7 @@ func TestFetchFullObjectToCache_DrainsUncacheableBody(t *testing.T) {
 		return resp
 	})
 
-	if err := svc.fetchFullObjectToCache(context.Background(), "background-bucket", "no-etag", "access", "secret", false, priorityReadMiss); err != nil {
+	if err := svc.fetchFullObjectToCache(context.Background(), "background-bucket", "no-etag", "access", "secret", false, priorityReadMiss, 0); err != nil {
 		t.Fatalf("fetchFullObjectToCache: %v", err)
 	}
 	if source == nil {
@@ -99,7 +99,7 @@ func TestFetchFullObjectToCache_DrainsBodyAfterCacheWriteFailure(t *testing.T) {
 	}
 	svc := NewService(forwarder, cacheStore, cfg)
 
-	if err := svc.fetchFullObjectToCache(context.Background(), "background-bucket", "partial-failure", "access", "secret", false, priorityReadMiss); err == nil {
+	if err := svc.fetchFullObjectToCache(context.Background(), "background-bucket", "partial-failure", "access", "secret", false, priorityReadMiss, 0); err == nil {
 		t.Fatal("partial cache write failure was swallowed")
 	}
 	if source == nil {
@@ -129,7 +129,7 @@ func TestFetchFullObjectToCache_DrainsBodyWhenBlockScratchUnavailable(t *testing
 		return resp
 	})
 
-	err := svc.fetchFullObjectToCache(context.Background(), "background-bucket", "block-scratch-unavailable", "access", "secret", false, priorityReadMiss)
+	err := svc.fetchFullObjectToCache(context.Background(), "background-bucket", "block-scratch-unavailable", "access", "secret", false, priorityReadMiss, 0)
 	if !errors.Is(err, errCachePopulateDeclined) {
 		t.Fatalf("fetchFullObjectToCache error = %v, want errCachePopulateDeclined", err)
 	}
@@ -158,7 +158,7 @@ func TestFetchFullObjectToCache_WritesWholeBodyDirectly(t *testing.T) {
 		return cacheableGetResponse(body, etag)
 	})
 
-	if err := svc.fetchFullObjectToCache(context.Background(), bucket, key, "access", "secret", false, priorityReadMiss); err != nil {
+	if err := svc.fetchFullObjectToCache(context.Background(), bucket, key, "access", "secret", false, priorityReadMiss, 0); err != nil {
 		t.Fatalf("fetchFullObjectToCache: %v", err)
 	}
 
@@ -200,7 +200,7 @@ func TestFetchFullObjectToCache_SmallWholeObjectFitsWithoutBlockScratch(t *testi
 		return cacheableGetResponse(body, `"small-whole-etag"`)
 	})
 
-	if err := svc.fetchFullObjectToCache(context.Background(), bucket, key, "access", "secret", false, priorityReadMiss); err != nil {
+	if err := svc.fetchFullObjectToCache(context.Background(), bucket, key, "access", "secret", false, priorityReadMiss, 0); err != nil {
 		t.Fatalf("fetchFullObjectToCache: %v", err)
 	}
 	meta, found, err := cacheStore.GetMeta(context.Background(), bucket, key)
@@ -246,7 +246,7 @@ func TestFetchFullObjectToCache_WarmWaitsForBlockScratchWithoutHoldingCountSlot(
 
 	warmDone := make(chan error, 1)
 	go func() {
-		warmDone <- svc.fetchFullObjectToCache(context.Background(), bucket, key, "access", "secret", false, priorityWarmWrite)
+		warmDone <- svc.fetchFullObjectToCache(context.Background(), bucket, key, "access", "secret", false, priorityWarmWrite, 0)
 	}()
 	select {
 	case <-started:
@@ -308,7 +308,7 @@ func TestFetchFullObjectToCache_WritesBlockBodyDirectly(t *testing.T) {
 		return cacheableGetResponse(body, etag)
 	})
 
-	if err := svc.fetchFullObjectToCache(context.Background(), bucket, key, "access", "secret", false, priorityReadMiss); err != nil {
+	if err := svc.fetchFullObjectToCache(context.Background(), bucket, key, "access", "secret", false, priorityReadMiss, 0); err != nil {
 		t.Fatalf("fetchFullObjectToCache: %v", err)
 	}
 
@@ -353,7 +353,7 @@ func TestFetchFullObjectToCache_DetachedWriteSurvivesFetchCancellation(t *testin
 
 	ctx, cancelContext := context.WithCancel(context.Background())
 	cancel = cancelContext
-	if err := svc.fetchFullObjectToCache(ctx, bucket, key, "access", "secret", false, priorityReadMiss); err != nil {
+	if err := svc.fetchFullObjectToCache(ctx, bucket, key, "access", "secret", false, priorityReadMiss, 0); err != nil {
 		t.Fatalf("fetchFullObjectToCache: %v", err)
 	}
 	if _, found, err := cacheStore.GetMeta(context.Background(), bucket, key); err != nil || !found {
@@ -378,7 +378,7 @@ func TestFetchFullObjectToCache_TombstoneBlocksDirectWrite(t *testing.T) {
 		return cacheableGetResponse(body, `"stale-etag"`)
 	})
 
-	if err := svc.fetchFullObjectToCache(context.Background(), bucket, key, "access", "secret", false, priorityReadMiss); err != nil {
+	if err := svc.fetchFullObjectToCache(context.Background(), bucket, key, "access", "secret", false, priorityReadMiss, 0); err != nil {
 		t.Fatalf("fetchFullObjectToCache: %v", err)
 	}
 	if _, found, err := cacheStore.GetMeta(context.Background(), bucket, key); err != nil {

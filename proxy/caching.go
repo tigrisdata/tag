@@ -388,6 +388,7 @@ func (s *Service) fetchFullObjectToCache(
 	bucket, key, accessKey, secretKey string,
 	anonymous bool,
 	prio populatePriority,
+	expected uint64, // meta-write precondition (see putMetaVersioned)
 ) error {
 	// This is a background fetch whose only purpose is to populate the cache, so
 	// reserve a cache-populate slot up front. If the concurrent-write limit is
@@ -547,15 +548,17 @@ func (s *Service) fetchFullObjectToCache(
 		// Block-eligible full fetches retain the size-based representation used by the
 		// foreground miss path: blocks are written first and tombstone-aware metadata is
 		// published last. Smaller objects use the whole-body stream writer.
-		// Put-if-absent: background populates are triggered on a metadata miss,
-		// so their precondition is absence — a racer that re-established the
-		// entry first fetched the same-or-newer upstream state and wins.
+		// The precondition comes from the trigger's context: 0 for the
+		// absent-gated re-warms, the stale row's version for a revalidation
+		// re-warm (so a FAILED guarded delete cannot leave known-stale state
+		// that put-if-absent then refuses to repair), VersionAny for the
+		// warm-after-write paths whose displaced version is unknown.
 		if blockMode {
 			meta.BlockSize = s.config.Cache.BlockSize
-			cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, writeStartTime, 0)
+			cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, writeStartTime, expected)
 		} else {
 			_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(
-				cacheCtx, bucket, key, meta, body, ttl, writeStartTime, 0,
+				cacheCtx, bucket, key, meta, body, ttl, writeStartTime, expected,
 			)
 		}
 		cacheErrCh <- cacheErr
@@ -590,15 +593,32 @@ func (s *Service) fetchFullObjectToCache(
 // This avoids broadcast.Manager's "no late joiners" policy which incorrectly
 // allows multiple fetches when the first has already started streaming.
 // When anonymous is true the fetch is issued without credentials and, on success,
+// backgroundFetchKey is the coalescing key for one background fetch: bucket,
+// key, and the commit precondition. One definition, shared with the tests that
+// wait on in-flight markers, so a format change cannot silently break their
+// waits into instant misses.
+func backgroundFetchKey(bucket, key string, expected uint64) string {
+	return fmt.Sprintf("bg:%s/%s|%d", bucket, key, expected)
+}
+
 // cached as public-read (see fetchFullObjectToCache); accessKey/secretKey are then
 // ignored. Pass anonymous=true exactly when the triggering request was anonymous, so
 // public-read is only ever inferred from a confirmed anonymous read.
-func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority) {
-	bcastKey := "bg:" + bucket + "/" + key
+func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, expected uint64) {
+	// Coalesce only triggers with IDENTICAL commit semantics: the precondition
+	// is part of the dedup key. Keyed by bucket/key alone, a VersionAny write
+	// repair arriving while an absent-gated warm is in flight would be dropped
+	// WITH its precondition — the in-flight warm then loses to the write's
+	// newer tombstone (its stamp predates it) and the repair that would have
+	// fixed the surviving state never runs. Distinct-precondition fetches for
+	// one key are bounded by the distinct races that spawned them, and each is
+	// budget-gated like any populate; identical triggers (a read-miss stampede)
+	// still coalesce to one fetch.
+	bcastKey := backgroundFetchKey(bucket, key, expected)
 
-	// Atomic check-and-set: if key exists, a fetch is already in progress
+	// Atomic check-and-set: if key exists, an equivalent fetch is already in progress
 	if _, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, struct{}{}); loaded {
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background fetch already in progress, coalescing")
+		log.Debug().Str("bucket", bucket).Str("key", key).Uint64("expected", expected).Msg("Equivalent background fetch already in progress, coalescing")
 		return
 	}
 
@@ -612,7 +632,7 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
 
-		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, prio)
+		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, prio, expected)
 
 		switch {
 		case errors.Is(err, errCachePopulateDeclined):
