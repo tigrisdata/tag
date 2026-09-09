@@ -289,6 +289,17 @@ type CacheConfig struct {
 	// best-effort background GET (deduplicated and shed under the populate budget).
 	// It costs one extra upstream GET per write, so it defaults to false.
 	WarmOnWrite bool `yaml:"warm_on_write"`
+	// LegacyCoordination selects the cache's meta-key ordering mechanism
+	// (cache/coordinator.go). true (the DEFAULT when unset) runs the legacy
+	// timestamp-tombstone mechanism, byte-faithful to v1.20 — rolling upgrades
+	// from any earlier release are homogeneous under it. false runs the CAS
+	// coordinator (ocache fences + versions, no tombstones); set it only when
+	// EVERY node in the cluster runs a CAS-capable release, and flip via a
+	// brisk rolling restart (nodes in different modes order writes with
+	// different mechanisms during that window). Standalone nodes may flip
+	// immediately after upgrading.
+	LegacyCoordination *bool `yaml:"legacy_coordination"`
+
 	// BlockCachingEnabled turns on block-aligned caching for large objects (RFC 0001):
 	// objects at or above BlockSize are cached at BlockSize granularity on read, so a range
 	// read (e.g. a Parquet footer) populates and serves only the blocks it touches instead of
@@ -321,6 +332,21 @@ func (c *CacheConfig) IsEnabled() bool {
 		return true // Default to enabled
 	}
 	return *c.Enabled
+}
+
+// IsLegacyCoordination returns whether the legacy tombstone coordinator is
+// selected (default: true when nil — the safe choice for mixed-version
+// clusters; see the field comment).
+func (c *CacheConfig) IsLegacyCoordination() bool {
+	if c.LegacyCoordination == nil {
+		return true
+	}
+	return *c.LegacyCoordination
+}
+
+// SetLegacyCoordination sets the LegacyCoordination field to the given value.
+func (c *CacheConfig) SetLegacyCoordination(enabled bool) {
+	c.LegacyCoordination = &enabled
 }
 
 // IsBlockCachingEnabled returns whether block-aligned caching is enabled (default: true when nil).
@@ -664,6 +690,12 @@ func applyEnvOverrides(cfg *Config) {
 		// Override block-aligned caching from environment (accepts true/false/1/0).
 		if b, ok := envBool("TAG_CACHE_BLOCK_CACHING_ENABLED"); ok {
 			cfg.Cache.SetBlockCachingEnabled(b)
+		}
+		// Override cache coordination mode from environment. Fail-safe: only
+		// an explicit "false"/"0" selects the CAS coordinator; anything else
+		// (typos included) keeps the legacy default.
+		if val := os.Getenv("TAG_CACHE_LEGACY_COORDINATION"); val != "" {
+			cfg.Cache.SetLegacyCoordination(!(val == "false" || val == "0"))
 		}
 		// Override the block granularity from environment (0/unset keeps the default).
 		if n, ok := envInt64("TAG_CACHE_BLOCK_SIZE"); ok && n > 0 {

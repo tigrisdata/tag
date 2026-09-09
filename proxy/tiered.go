@@ -181,14 +181,14 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// intact — S3 semantics say a rejected PUT changes nothing. Reads racing
 	// the in-flight PUT serve the prior version, which is the atomic-replace
 	// behavior clients expect. The one read-triggered populate in this mode —
-	// the re-tier — cannot be blocked by tombstone ordering here (this path
-	// writes none); it defends itself with an identity-guarded commit instead
-	// (see maybeRetierOnRead).
+	// the re-tier — cannot be ordered against this path's writes here (it
+	// performs none pre-forward); it defends itself with a claim plus its own
+	// pre-fetch decision token instead (see maybeRetierOnRead).
 	// No post-success invalidation either: the marker overwrites the prior
 	// metadata directly (a displaced local body ages out by TTL, the engine's
-	// own overwrite semantics), which lets the marker be stamped with the
-	// handler's START — see putUpstreamMarker for why that closes the
-	// concurrent-DELETE resurrection race.
+	// own overwrite semantics), which lets the marker commit under the
+	// PRE-FORWARD decision token — see putUpstreamMarker for why that closes
+	// the concurrent-DELETE resurrection race.
 	// Capture the displaced prior before forwarding — tolerated, never blocking:
 	// it only arms the identity guard of the failure sweep in putUpstreamMarker.
 	// A failed lookup leaves the prior unknown, and the sweep then refuses to
@@ -210,7 +210,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	err = s.forwarder.Forward(ctx, rec, r)
 
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, start, prior, priorVersion, priorKnown)
+		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, prior, priorVersion, priorKnown)
 	}
 
 	status := "success"
@@ -226,12 +226,12 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 // left. Headers come from the PUT request (the same mapping as every populate
 // path); the ETag comes from upstream's response.
 //
-// The write stamp is the handler's START, from before the forward began. Any
-// DELETE that runs concurrently with — or after — this PUT writes its
-// tombstone after that instant, so the tombstone-aware write refuses the
+// The store's expectation is the PRE-FORWARD decision token (read before the
+// forward began). Any DELETE that runs concurrently with — or after — this
+// PUT enters the store after that token, so the versioned write refuses the
 // marker and a deleted object can never be resurrected as metadata. The
-// forward path writes no tombstones of its own between start and here, so
-// only a genuine DELETE can suppress the marker.
+// forward path performs no meta writes of its own between the token read and
+// here, so only a genuine racer can suppress the marker.
 //
 // When the marker cannot be established (no response ETag, store failure, or
 // tombstone suppression), the entry converges on an authoritative miss via
@@ -240,7 +240,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 // the key. The client's 200 stands (the object IS stored upstream), and the
 // caller's ordinary miss handling re-populates on the next read. Failures log
 // at Warn (flood-safe: only successful 2xx PUTs reach here).
-func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, start time.Time, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
+func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
 	if etag == "" {
 		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Upstream PUT response had no ETag - no tier marker; object reads as a miss until re-put")
@@ -265,27 +265,33 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, s
 	ttl := int(s.config.Cache.TTL.Seconds())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	// The marker replaces exactly the displaced prior: its version (0 when
-	// nothing predated this PUT) is the CAS expectation, so a write that raced
-	// in during the forward wins the key and the marker is refused into the
-	// convergence sweep below — the same treatment as a tombstone suppression.
-	// With the prior unknown (its lookup failed), VersionAny preserves the
-	// overwrite semantics rather than guessing a precondition.
-	expected := priorVersion
+	// The marker replaces exactly the displaced prior: the pre-forward token
+	// (the prior's live version, or the absence token when nothing predated
+	// this PUT) is the store's expectation, so a DELETE or write that raced in
+	// during the forward wins the key and the marker is refused into the
+	// convergence sweep below. With the prior unknown (its lookup failed)
+	// there is no token to order by, and an unordered marker could resurrect
+	// over a DELETE that ran during the forward — so no marker is written:
+	// the object reads as a miss until re-put, the same degradation as the
+	// missing-ETag path, on a path that already requires the metadata store
+	// to be failing.
 	if !priorKnown {
-		expected = cache.VersionAny
+		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
+		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Prior lookup failed - no tier marker; object reads as a miss until re-put")
+		return
 	}
-	wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, start.UnixNano(), expected)
+	wrote, err := s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, priorVersion)
 	if err != nil {
 		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
 		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Failed to write upstream tier marker; object reads as a miss until re-put")
 		return
 	}
 	if !wrote {
-		// Suppressed by a newer tombstone: a DELETE won the key. Its own
-		// invalidation normally removes the prior metadata; the guarded sweep
-		// covers the case where that removal failed after the tombstone landed,
-		// so the stale prior cannot outlive the delete.
+		// A racer entered the store after the pre-forward token was read — a
+		// DELETE (whose own invalidation normally removes the prior metadata)
+		// or a newer write. The guarded sweep covers the case where a DELETE's
+		// removal failed after it won, so the stale prior cannot outlive it;
+		// a newer write keeps the key through the sweep's identity guard.
 		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
 	}
 }
@@ -345,9 +351,10 @@ const retierFetchTimeout = 60 * time.Second
 //     mutex, so every interleaving lands on cancel-or-refuse. What remains is
 //     two truly concurrent commits racing in the store — the same unordered
 //     outcome S3 itself gives two concurrent writers;
-//   - tombstones: the store is stamped from BEFORE the fetch, so a DELETE
-//     racing the re-tier writes a provably newer tombstone and blocks it
-//     (DELETEs need no cancellation — tombstones already order them).
+//   - decision tokens: the commit's token is read BEFORE the fetch, so a
+//     DELETE racing the re-tier enters the store provably after it and the
+//     commit is refused (DELETEs need no cancellation — the coordinator's
+//     ordering already covers them).
 //
 // The upstream copy is left as an orphan for the upstream bucket's expiry —
 // deleting it here could race a concurrent write of the same key.
@@ -385,9 +392,14 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		defer s.releaseCacheSlot(weight)
 		defer cancel()
 
-		// Stamp BEFORE the fetch: a DELETE racing this populate writes its
-		// tombstone after this instant and provably blocks the commit below.
-		stamp := time.Now().UnixNano()
+		// Decision token BEFORE the fetch: a DELETE (or any write) racing this
+		// populate enters the store after this token and provably refuses the
+		// commit below — the token-model form of the old stamp-before-fetch.
+		_, decToken, tfound, terr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+		if terr != nil || !tfound {
+			metrics.RecordTieredRetier("changed")
+			return
+		}
 
 		resp, err := s.forwarder.DoFullObjectRequest(ctx, bucket, key, accessKey, secretKey)
 		if err != nil {
@@ -422,14 +434,15 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		body := buf[:marker.ContentLength]
 
 		// Identity-guarded commit: only re-write the entry if it still IS the
-		// marker this re-tier was triggered by — and the observed version
-		// becomes the store's CAS expectation, so anything landing between
-		// this check and the commit refuses the commit atomically. The
+		// marker this re-tier was triggered by. The commit's expectation is
+		// the PRE-FETCH decision token, so anything landing after that
+		// instant — including during the fetch — refuses the commit
+		// atomically; this re-read is purely the identity guard. The
 		// cancellation check comes after it — a racing PUT cancels before it
 		// stores, so an alive context here means no PUT has entered the store
-		// ahead of us; the version precondition then holds the line for
+		// ahead of us; the token precondition then holds the line for
 		// whatever the claim window cannot see.
-		cur, curVersion, found, gerr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+		cur, _, found, gerr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 		if gerr != nil || !found || cur == nil || cur.ETag != etag || !cur.BodyUpstream {
 			metrics.RecordTieredRetier("changed")
 			return
@@ -450,15 +463,16 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		// carries no Content-Length header for MetaFromHTTPHeaders to copy.
 		meta.ContentLength = int64(len(body))
 		ttl := int(s.config.Cache.TTL.Seconds())
-		wrote, werr := s.cache.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, bytes.NewReader(body), ttl, stamp, curVersion)
+		wrote, werr := s.cache.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, bytes.NewReader(body), ttl, decToken)
 		if werr != nil {
 			metrics.RecordTieredRetier("error")
 			log.Debug().Err(werr).Str("bucket", bucket).Str("key", key).Msg("Re-tier store failed")
 			return
 		}
 		if !wrote {
-			// A newer tombstone suppressed the commit: the object stays on the
-			// marker (or stays deleted) — not a re-tier.
+			// A racer entered the store after the pre-fetch token: the object
+			// stays on its current state (marker, newer write, or deleted) —
+			// not a re-tier.
 			metrics.RecordTieredRetier("changed")
 			return
 		}

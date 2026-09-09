@@ -178,7 +178,12 @@ ifeq ($(UNAME_S),Darwin)
 	brew install snappy lz4 zstd bzip2 zlib
 else
 	@echo "Detected Linux - using apt-get..."
-	sudo apt-get update
+	# A broken THIRD-PARTY repo (e.g. the CI runner image's Chrome repo serving a
+	# Hash Sum mismatch) fails apt-get update outright, though the compression libs
+	# below come from the main Ubuntu archive. Tolerate index-refresh failures and
+	# let install decide: it succeeds from existing/partial indexes, and still
+	# fails loudly if the packages genuinely cannot be resolved.
+	sudo apt-get update || echo "WARNING: apt-get update failed (broken unrelated repo?) - installing from existing indexes"
 	sudo apt-get install -y libsnappy-dev liblz4-dev libzstd-dev libbz2-dev zlib1g-dev
 endif
 	@echo "System dependencies installed successfully."

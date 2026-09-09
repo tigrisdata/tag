@@ -24,6 +24,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_SIZE_THRESHOLD`         | Max object size to cache (bytes); larger bodies pass through uncached                                                                                                                          | `1073741824` (1 GiB)     |
 | `TAG_CACHE_META_ON_WRITE`          | Cache an object's metadata (not its body) when TAG proxies its write, so the first read resolves it from cache instead of a round trip. Closes the multipart gap, where write-through cannot tee a body TAG never sees (`true`/`1`; any other value leaves it off). **Requires block caching**; silently does nothing when `block_caching_enabled` is false or `block_size` is not positive | `false`                  |
 | `TAG_CACHE_PARQUET_OPTIMIZATION`   | Cache a parquet object's metadata blocks ahead of the reader that needs them, so opening the file does not discover them as serial misses. Two triggers: a read reaching the object's tail (helps second and later opens) and a write through TAG (helps the first). Only fires when the metadata spans more than the tail block (`true`/`1`; any other value leaves it off). **Requires block caching**; silently does nothing when `block_caching_enabled` is false or `block_size` is not positive | `false`                  |
+| `TAG_CACHE_LEGACY_COORDINATION`    | Meta invalidation/populate coordination mechanism. `true` (default) = legacy tombstones, compatible with any cluster mix including nodes upgrading straight from ≤v1.20. Fail-safe parsing: only an explicit `false`/`0` selects the fenced-CAS coordinator; any other value keeps legacy. Flip only once every node in the cluster is CAS-capable, then rolling-restart briskly | `true`                   |
 | `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
 | `TAG_CACHE_CLUSTER_ADDR`          | Address for memberlist gossip                                                   | `:7000`                  |
 | `TAG_CACHE_GRPC_ADDR`             | Address for gRPC server                                                         | `:9000`                  |
@@ -186,6 +187,14 @@ cache:
   # warm-on-write), so a range read populates and serves only the blocks it touches. On by
   # default; set false to cache whole objects instead.
   block_caching_enabled: true
+
+  # Meta invalidation/populate coordination. true (default) = legacy tombstone mechanism,
+  # compatible with any cluster mix — including nodes upgrading directly from <=v1.20. false =
+  # fenced-CAS coordination (stronger ordering; requires every node in the cluster to be
+  # CAS-capable BEFORE flipping, then a brisk rolling restart). Standalone deployments may flip
+  # immediately. Override with TAG_CACHE_LEGACY_COORDINATION (fail-safe: only an explicit
+  # "false"/"0" selects CAS).
+  legacy_coordination: true
 
   # Block granularity AND the whole-vs-block boundary for every populate path: an object
   # smaller than one block is whole-cached, one this size or larger is block-cached. Size it to
@@ -395,6 +404,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `ttl`                   | duration | `24h`            | Default TTL for cached objects                                                      |
 | `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
 | `block_caching_enabled` | bool     | `true`           | Enable block-aligned caching for large objects (RFC 0001)                           |
+| `legacy_coordination`   | bool     | `true`           | Meta coordination mechanism: `true` = legacy tombstones (safe for any cluster mix, incl. direct ≤v1.20 upgrades); `false` = fenced CAS (all nodes must be CAS-capable before flipping) |
 | `block_size`            | int64    | `1048576`        | Block granularity **and** the read-side whole-vs-block boundary (must stay below ocache's 64 MB compaction threshold) |
 | `parquet_optimization`  | bool     | `false`          | Prefetch a parquet object's metadata blocks on a tail read (only when the metadata spans more than the tail block) |
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |

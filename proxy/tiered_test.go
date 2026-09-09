@@ -681,6 +681,10 @@ func TestTieredConditionalPutRacedPreconditionAnswers412(t *testing.T) {
 	wrapper := &raceOnConditionalReadClient{CacheClient: cacheclient.NewMemoryCache()}
 	cfg := config.NewDefault()
 	cfg.Mode = config.ModeTiered
+	// Closing the check-then-store race against a competing WRITE is
+	// CAS-coordinator strength; legacy coordination orders commits against
+	// deletes only (the pre-CAS engine's documented accepted race).
+	cfg.Cache.SetLegacyCoordination(false)
 	cfg.Cache.SetBlockCachingEnabled(false)
 	cfg.Cache.SizeThreshold = 1024
 	c := cache.NewCacheWithClient(wrapper, &cfg.Cache)

@@ -322,23 +322,34 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		return nil
 	}
 
-	// Conditional writes. The precondition is evaluated here and then ENFORCED
-	// at the store: the observed row's version becomes the meta write's CAS
-	// expectation, so a concurrent write between check and store surfaces as a
-	// refused store (answered 412) instead of a silent lost update — the
-	// check-then-store race the pre-CAS engine documented as accepted.
-	// Semantics follow the ceph suite: If-Match against a MISSING object answers
-	// NoSuchKey (there is nothing to match), a present-but-different ETag is the
-	// 412; If-None-Match refuses when the object exists.
-	expected := cache.VersionAny // plain PUT: overwrite, version-stamped
+	// EVERY store commits under a decision-time token read here, before the
+	// body is consumed: a DELETE (or competing PUT) that lands after this
+	// instant refuses the commit — the ordering the pre-coordinator engine got
+	// from stamping writeStartTime at handler start, now expressed as the
+	// opaque token the selected coordinator orders by (fenced version under
+	// CAS, wall-clock stamp under legacy). For an absent key the token is the
+	// nonzero absence token, never 0 (ocache v1.13 contract).
+	//
+	// Conditional writes additionally evaluate the precondition here and then
+	// ENFORCE it at the store: a concurrent write between check and store
+	// surfaces as a refused store (answered 412) instead of a silent lost
+	// update. That closure is CAS-coordinator strength; under legacy
+	// coordination the token orders against DELETEs only, and write-vs-write
+	// remains the check-then-store race the pre-CAS engine documented as
+	// accepted. Semantics follow the ceph suite: If-Match against a MISSING
+	// object answers NoSuchKey (there is nothing to match), a
+	// present-but-different ETag is the 412; If-None-Match refuses when the
+	// object exists.
+	existing, expected, found, merr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+	if merr != nil {
+		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		return merr
+	}
+	conditional := false
 	ifMatch := r.Header.Get("If-Match")
 	ifNoneMatch := r.Header.Get("If-None-Match")
 	if ifMatch != "" || ifNoneMatch != "" {
-		existing, existingVersion, found, merr := s.cache.GetMetaWithVersion(ctx, bucket, key)
-		if merr != nil {
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
-			return merr
-		}
+		conditional = true
 		// Existence means SERVABLE existence — the same gate every read uses. An
 		// incomplete entry (orphaned meta, missing blocks) is invisible on every
 		// request shape, so If-None-Match:* must store over it (that IS the
@@ -354,16 +365,12 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 				return servErr
 			}
 		}
-		// The store must apply against exactly the state this evaluation saw:
-		// the observed version when a row was (servably) present, put-if-absent
-		// when not. An unservable row still occupies the meta key though, so
-		// "absent" here still expects ITS version — the healing overwrite must
-		// replace that exact orphan, not race whatever appears meanwhile.
-		if found && existing != nil {
-			expected = existingVersion
-		} else {
-			expected = 0
-		}
+		// The store applies against exactly the state this evaluation saw: the
+		// token above is the observed row's version when present (an unservable
+		// row still occupies the meta key, and the healing overwrite must
+		// replace that exact orphan), and the absence token when not — either
+		// way, whatever appears between this evaluation and the store refuses
+		// the commit.
 		switch {
 		case ifMatch != "" && !exists:
 			s3err.WriteError(w, r, s3err.ErrNoSuchKey)
@@ -515,32 +522,35 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// len(body), enforced above), so the staging buffer reserved there is
 	// exactly the one this branch allocates.
 	//
-	// Both branches are tombstone-aware with writeStartTime = the handler's
-	// start (UnixNano — the gate compares nanosecond stamps): a DELETE arriving
-	// mid-PUT wins regardless of object size, and the 200 below is the legal
-	// PUT-then-DELETE serialization of that race — never a size-dependent flip
-	// in which write survives.
+	// Both branches commit under the handler-start decision token: a DELETE
+	// arriving mid-PUT wins regardless of object size, and the 200 below is
+	// the legal PUT-then-DELETE serialization of that race — never a
+	// size-dependent flip in which write survives.
 	ttl := int(s.config.Cache.TTL.Seconds())
 	var wrote bool
 	if blockBound {
 		meta.BlockSize = s.config.Cache.BlockSize
-		wrote, err = s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano(), expected)
+		wrote, err = s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, expected)
 	} else {
-		wrote, err = s.cache.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, bytes.NewReader(body), ttl, start.UnixNano(), expected)
+		wrote, err = s.cache.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, bytes.NewReader(body), ttl, expected)
 	}
 	if err != nil {
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return err
 	}
-	if !wrote && expected != cache.VersionAny {
-		// The conditional's precondition raced away between evaluation and
-		// store — in either representation. The honest answer is the 412 the
-		// client would have gotten had the racer arrived a moment earlier.
-		// (A tombstone-suppressed unconditional store keeps the legal
-		// PUT-then-DELETE 200 below.)
-		s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
-		return nil
+	if !wrote {
+		if conditional {
+			// The conditional's precondition raced away between evaluation and
+			// store. The honest answer is the 412 the client would have gotten
+			// had the racer arrived a moment earlier.
+			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return nil
+		}
+		// An unconditional store refused: a DELETE or competing PUT entered
+		// the store after this handler's decision token. The 200 below is the
+		// legal serialization of that race (this PUT, then the racer) — the
+		// racer's state keeps the key, exactly as on real S3.
 	}
 
 	w.Header().Set("ETag", etag)

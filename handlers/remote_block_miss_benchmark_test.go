@@ -678,7 +678,7 @@ func (f *remoteBlockMissBenchmarkFixture) seedMeta(tb testing.TB, bucket, key st
 		StatusCode:    http.StatusOK,
 		BlockSize:     f.blockLen,
 	}
-	if wrote, err := f.cache.PutMetaTombstoneAware(context.Background(), bucket, key, meta, 60, time.Now().UnixNano(), cache.VersionAny); err != nil || !wrote {
+	if wrote, err := f.cache.PutMetaIfVersion(context.Background(), bucket, key, meta, 60, cache.VersionAny); err != nil || !wrote {
 		tb.Fatalf("seed block metadata = (wrote=%t, err=%v)", wrote, err)
 	}
 	return meta

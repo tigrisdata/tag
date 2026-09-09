@@ -355,8 +355,11 @@ func (s *Service) fetchAndBroadcast(
 		<-broadcaster.Done() // the fetch goroutine above records the upstream outcome
 		if upErr := broadcaster.Error(); upErr == nil ||
 			errors.Is(upErr, context.Canceled) || errors.Is(upErr, context.DeadlineExceeded) {
-			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
-				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss)
+			if _, tok, found, gerr := s.cache.GetMetaWithVersion(context.Background(), bucket, key); gerr == nil && !found {
+				// Absent-gated, carrying the absence TOKEN (ocache v1.13.0):
+				// the warm is ordered against a fenced delete landing after
+				// this look, where a bare put-if-absent would recreate over it.
+				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, tok)
 			}
 		}
 	}
@@ -378,16 +381,18 @@ func (s *Service) streamFromUpstream(
 	broadcaster *broadcast.Broadcaster,
 ) error {
 	// Stamp the cache-write start BEFORE issuing the upstream request, not after
-	// its headers arrive. The tombstone guard compares this against any invalidation
-	// that landed while we were fetching, and upstream takes its read snapshot at
-	// some point after we send. Stamping after the response would leave the whole
-	// upstream round-trip unguarded: a PUT that lands in that window writes a
-	// tombstone OLDER than our timestamp, the guard passes, and we cache the
-	// pre-PUT body we just read — stale. Stamping first makes the timestamp strictly
-	// earlier than the read snapshot, so any racing invalidation is provably newer
-	// and blocks the write. The cost is skipping an occasional still-fresh populate
-	// (a miss), never serving stale.
-	writeStartTime := time.Now().UnixNano()
+	// The populate's DECISION-TIME token, read before the upstream request: the
+	// commit applies only if the entry is unchanged from this instant — a
+	// fenced delete (or any write) landing while the body streams makes the
+	// commit lose atomically, never retried with the same bytes. This is the
+	// refill pattern the fence contract requires (ocache v1.13.0): a token
+	// read after the fetch could postdate a delete and resurrect pre-delete
+	// bytes. Covers presence (live version) and absence (absence token) alike.
+	_, expected, _, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+	// Without a token the commit cannot be ordered — expected=0 is the LEGACY
+	// unordered put-if-absent, which would publish over a fence. The safe
+	// failure is not populating at all: tokenOK gates the cache listener below.
+	tokenOK := tokErr == nil
 
 	// Execute upstream request
 	resp, err := s.forwarder.DoRequestWithCreds(ctx, r, accessKey, secretKey)
@@ -403,6 +408,7 @@ func (s *Service) streamFromUpstream(
 	// read would establish (RFC 0001), so there is no whole/block collision to guard against.
 	shouldCache := resp.StatusCode == http.StatusOK &&
 		s.cache.IsEnabled() &&
+		tokenOK &&
 		!s.hasNoCacheHeaders(resp.Header) &&
 		s.isWithinSizeThreshold(resp)
 
@@ -412,7 +418,7 @@ func (s *Service) streamFromUpstream(
 		// Reserve against the memory budget by the object's actual size (capped at
 		// the buffer ceiling), so small objects don't each reserve the worst case.
 		weight := s.populateWeight(resp.ContentLength)
-		_, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, writeStartTime)
+		_, cacheErrCh = s.setupCacheListener(ctx, bucket, key, broadcaster, false, weight, expected)
 	}
 
 	// If an anonymous GET succeeded and Tigris didn't set an explicit per-object ACL,
@@ -845,8 +851,11 @@ func (s *Service) handleRangeWithBackgroundCache(
 		}
 	} else if cacheable {
 		defer func() {
-			if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
-				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss)
+			if _, tok, found, gerr := s.cache.GetMetaWithVersion(context.Background(), bucket, key); gerr == nil && !found {
+				// Absent-gated, carrying the absence TOKEN (ocache v1.13.0):
+				// the warm is ordered against a fenced delete landing after
+				// this look, where a bare put-if-absent would recreate over it.
+				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, tok)
 			}
 		}()
 	}
