@@ -1082,6 +1082,37 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// hold a local-tier only-copy that a failed completion must leave intact.
 	s.preForwardInvalidate(context.Background(), bucket, key)
 
+	// Tiered: the completed object assembles UPSTREAM, so on success it gets a
+	// BodyUpstream marker — like a large PUT — instead of the old read-as-miss
+	// punt. Same discipline as handleTieredPut: the key is claimed for the
+	// handler's duration (cancels and excludes re-tiers), and the prior + its
+	// decision token are captured BEFORE the forward so the marker commit is
+	// ordered against anything racing the completion. Credentials (when the
+	// request validates) let the marker be built from an upstream HEAD with a
+	// real Content-Length.
+	var (
+		mpPrior      *cache.CachedObjectMeta
+		mpPriorVer   uint64
+		mpPriorKnown bool
+		mpAK, mpSK   string
+	)
+	if s.config.IsTiered() {
+		s.claimRetierWrite(bucket, key)
+		defer s.releaseRetierWrite(bucket, key)
+		if s.cache.IsEnabled() {
+			if m, v, found, cerr := s.cache.GetMetaWithVersion(ctx, bucket, key); cerr == nil {
+				mpPriorKnown = true
+				mpPriorVer = v
+				if found {
+					mpPrior = m
+				}
+			}
+		}
+		if result, ak, sk, aerr := s.forwarder.ValidateAndGetCredentials(r); aerr == nil && result == AuthValidated {
+			mpAK, mpSK = ak, sk
+		}
+	}
+
 	// Forward to upstream with response capture
 	capture, err := s.forwarder.ForwardWithCapture(ctx, w, r)
 	if err != nil {
@@ -1096,17 +1127,25 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// object unchanged, doesn't discard a valid racing refill.
 	completed := s3WriteSucceeded(capture)
 	if completed && s.cache.IsEnabled() {
-		s.convergeInvalidation(context.Background(), bucket, key)
-		// Warm-on-write is the only way to make a multipart-completed object hot:
-		// TAG never sees its assembled body, so a write-through tee is impossible.
-		s.warmOnWrite(r, bucket, key)
-		// The path that matters for parquet: ingestors write via multipart, so this
-		// is where a freshly written file's metadata gets warmed (RFC 0002).
-		s.warmParquetFooterOnWrite(r, bucket, key)
-		// Prototype: establish the metadata entry so the first read does not pay an
-		// upstream round trip to discover it. Multipart is the gap — write-through
-		// cannot tee a body TAG never sees.
-		s.cacheBlockMetaOnWrite(r, bucket, key, completedMultipartETag(capture))
+		if s.config.IsTiered() {
+			// The marker IS the post-completion cache state: stamping it under
+			// the pre-forward token replaces the proxy-mode invalidate (which
+			// would bump the version and refuse the marker), and the object is
+			// immediately readable — HEAD from the marker, GET forwarded.
+			s.stampUpstreamMarkerAfterCompletion(bucket, key, completedMultipartETag(capture), mpAK, mpSK, mpPrior, mpPriorVer, mpPriorKnown)
+		} else {
+			s.convergeInvalidation(context.Background(), bucket, key)
+			// Warm-on-write is the only way to make a multipart-completed object hot:
+			// TAG never sees its assembled body, so a write-through tee is impossible.
+			s.warmOnWrite(r, bucket, key)
+			// The path that matters for parquet: ingestors write via multipart, so this
+			// is where a freshly written file's metadata gets warmed (RFC 0002).
+			s.warmParquetFooterOnWrite(r, bucket, key)
+			// Prototype: establish the metadata entry so the first read does not pay an
+			// upstream round trip to discover it. Multipart is the gap — write-through
+			// cannot tee a body TAG never sees.
+			s.cacheBlockMetaOnWrite(r, bucket, key, completedMultipartETag(capture))
+		}
 	}
 
 	// Cache successful completions in ocache for idempotent replays. Only cache a

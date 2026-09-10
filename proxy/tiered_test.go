@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -908,5 +909,85 @@ func TestTieredEngineContentMD5AndRequestID(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "<RequestId>"+rid+"</RequestId>") {
 		t.Fatalf("body RequestId does not echo header %q: %s", rid, w.Body.String())
+	}
+}
+
+// A multipart completion in tiered mode stamps a BodyUpstream marker (the
+// assembled body lives upstream by construction), replacing the old
+// read-as-miss punt: HEAD answers from the marker with the HEAD-sourced
+// length, GET forwards for the body.
+func TestTieredMultipartCompletionStampsMarker(t *testing.T) {
+	mock, forwards, _ := tieredMock()
+	completionXML := `<CompleteMultipartUploadResult><ETag>"mp-etag-3"</ETag></CompleteMultipartUploadResult>`
+	mock.captureFunc = func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(completionXML))
+		return &ResponseCapture{StatusCode: http.StatusOK, Body: []byte(completionXML), Complete: true, Headers: http.Header{}}, nil
+	}
+	headHdr := http.Header{}
+	headHdr.Set("ETag", `"mp-etag-3"`)
+	headHdr.Set("Content-Length", "5242880")
+	headHdr.Set("Content-Type", "application/octet-stream")
+	mock.conditionalResp = &http.Response{StatusCode: http.StatusOK, Header: headHdr, Body: http.NoBody}
+	svc, c := newTieredTestService(mock, 1024)
+
+	req := httptest.NewRequest(http.MethodPost, "/b/mp-obj?uploadId=u1", strings.NewReader("<CompleteMultipartUpload/>"))
+	w := httptest.NewRecorder()
+	if err := svc.HandleCompleteMultipartUpload(w, req); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("completion status = %d", w.Code)
+	}
+
+	meta, found, _ := c.GetMeta(context.Background(), "b", "mp-obj")
+	if !found || meta == nil || !meta.BodyUpstream {
+		t.Fatalf("no BodyUpstream marker after completion: %+v", meta)
+	}
+	if meta.ETag != `"mp-etag-3"` || meta.ContentLength != 5242880 {
+		t.Fatalf("marker = ETag %q CL %d, want the HEAD-sourced identity", meta.ETag, meta.ContentLength)
+	}
+
+	// HEAD from the marker, no forward; GET forwards for the body.
+	before := forwards.Load()
+	if hw := tieredDo(t, svc, http.MethodHead, "/b/mp-obj", "", nil); hw.Code != http.StatusOK || hw.Header().Get("Content-Length") != "5242880" {
+		t.Fatalf("HEAD = %d CL %q, want 200 with the marker's length", hw.Code, hw.Header().Get("Content-Length"))
+	}
+	if forwards.Load() != before {
+		t.Fatal("HEAD of a marker forwarded upstream")
+	}
+	gw := tieredDo(t, svc, http.MethodGet, "/b/mp-obj", "", nil)
+	if gw.Code != http.StatusOK || gw.Body.String() != "upstream body" {
+		t.Fatalf("GET = %d %q, want the forwarded body", gw.Code, gw.Body.String())
+	}
+}
+
+// A completion whose upstream HEAD is unavailable still stamps an ETag-only
+// marker (unknown length): the object must exist in the authoritative view —
+// GETs forward regardless, HEAD just omits the length.
+func TestTieredMultipartCompletionMarkerWithoutHead(t *testing.T) {
+	mock, _, _ := tieredMock()
+	completionXML := `<CompleteMultipartUploadResult><ETag>"mp-etag-9"</ETag></CompleteMultipartUploadResult>`
+	mock.captureFunc = func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(completionXML))
+		return &ResponseCapture{StatusCode: http.StatusOK, Body: []byte(completionXML), Complete: true, Headers: http.Header{}}, nil
+	}
+	mock.conditionalErr = errors.New("upstream HEAD unavailable")
+	svc, c := newTieredTestService(mock, 1024)
+
+	req := httptest.NewRequest(http.MethodPost, "/b/mp-obj?uploadId=u2", strings.NewReader("<CompleteMultipartUpload/>"))
+	if err := svc.HandleCompleteMultipartUpload(httptest.NewRecorder(), req); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	meta, found, _ := c.GetMeta(context.Background(), "b", "mp-obj")
+	if !found || meta == nil || !meta.BodyUpstream || meta.ETag != `"mp-etag-9"` {
+		t.Fatalf("no fallback marker: %+v", meta)
+	}
+	if meta.ContentLength >= 0 {
+		t.Fatalf("fallback marker CL = %d, want unknown (-1)", meta.ContentLength)
+	}
+	if gw := tieredDo(t, svc, http.MethodGet, "/b/mp-obj", "", nil); gw.Code != http.StatusOK || gw.Body.String() != "upstream body" {
+		t.Fatalf("GET via fallback marker = %d %q", gw.Code, gw.Body.String())
 	}
 }

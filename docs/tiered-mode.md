@@ -85,11 +85,16 @@ Startup is fatal when tiered mode is combined with:
 
 ## Not implemented (v1)
 
-Listings, multipart, copies, tagging, and ACL operations pass through to
-upstream. Objects created upstream without TAG stamping a marker (a multipart
-completion, a server-side copy) read as misses through TAG until written
-again via a plain PUT. Client `Cache-Control` revalidation directives are not
-consulted — the cache is the store.
+Listings, multipart transfers, copies, tagging, and ACL operations pass
+through to upstream. A multipart **completion** stamps an upstream-tier
+marker — the assembled object is upstream-tier by construction — so
+multipart-written objects are immediately readable (HEAD from the marker,
+GET forwarded); the marker's metadata comes from an upstream HEAD when the
+completing request validated, and falls back to an ETag-only marker with
+unknown length otherwise. Objects created upstream without a marker-stamping
+operation (a server-side copy) read as misses through TAG until written
+again via a plain PUT. Client `Cache-Control` revalidation directives are
+not consulted — the cache is the store.
 
 A validated GET/HEAD carrying a query parameter the local engine does not
 implement (`versionId`, `partNumber`, `attributes`, presigned

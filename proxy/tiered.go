@@ -36,10 +36,13 @@ package proxy
 // authority — exactly as in transparent mode; keys are learned from those
 // responses, and the window before learning behaves like a cache miss.
 //
-// Deliberately NOT reimplemented here (v1): listings, multipart, copies,
-// tagging, ACLs all pass through to upstream. Objects created upstream without
-// TAG's involvement (a multipart completion, a server-side copy) get no local
-// metadata and therefore read as misses through TAG until written again.
+// Deliberately NOT reimplemented here (v1): listings, multipart transfers,
+// copies, tagging, ACLs all pass through to upstream. A multipart COMPLETION
+// does stamp a BodyUpstream marker (the assembled object is upstream-tier by
+// construction — see HandleCompleteMultipartUpload), so multipart-written
+// objects exist in the authoritative view; objects created upstream without
+// any marker-stamping op (a server-side copy) still read as misses through
+// TAG until written again.
 
 import (
 	"bytes"
@@ -285,19 +288,23 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, p
 		meta.ContentEncoding = stripAWSChunkedToken(meta.ContentEncoding)
 	}
 
+	s.commitUpstreamMarker(bucket, key, meta, prior, priorVersion, priorKnown)
+}
+
+// commitUpstreamMarker commits a BodyUpstream marker under the caller's
+// PRE-FORWARD decision token — shared by the large-PUT path and the multipart
+// completion. The marker replaces exactly the displaced prior: the token (the
+// prior's live version, or the absence token when nothing predated the write)
+// is the store's expectation, so a DELETE or write that raced in during the
+// forward wins the key and the marker is refused into the convergence sweep.
+// With the prior unknown (its lookup failed) there is no token to order by,
+// and an unordered marker could resurrect over a DELETE that ran during the
+// forward — so no marker is written: the object reads as a miss until re-put,
+// on a path that already requires the metadata store to be failing.
+func (s *Service) commitUpstreamMarker(bucket, key string, meta *cache.CachedObjectMeta, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
 	ttl := int(s.config.Cache.TTL.Seconds())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	// The marker replaces exactly the displaced prior: the pre-forward token
-	// (the prior's live version, or the absence token when nothing predated
-	// this PUT) is the store's expectation, so a DELETE or write that raced in
-	// during the forward wins the key and the marker is refused into the
-	// convergence sweep below. With the prior unknown (its lookup failed)
-	// there is no token to order by, and an unordered marker could resurrect
-	// over a DELETE that ran during the forward — so no marker is written:
-	// the object reads as a miss until re-put, the same degradation as the
-	// missing-ETag path, on a path that already requires the metadata store
-	// to be failing.
 	if !priorKnown {
 		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Prior lookup failed - no tier marker; object reads as a miss until re-put")
@@ -317,6 +324,47 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, p
 		// a newer write keeps the key through the sweep's identity guard.
 		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
 	}
+}
+
+// stampUpstreamMarkerAfterCompletion makes a multipart-completed object exist
+// in TAG's authoritative view: completion assembles the body UPSTREAM, so the
+// object is upstream-tier by construction, and without a marker it would read
+// as an authoritative miss until re-put (the old v1 punt). Metadata comes
+// from a HEAD to upstream when the caller's request validated (TAG's
+// credentials work on the cache bucket, and the HEAD's Content-Length keeps
+// range-reading callers honest); an ETag-only marker with unknown length is
+// the fallback — GETs forward regardless, HEAD just omits the length, and
+// the re-tier skips unknown-length markers. Commit and sweep are the
+// large-PUT path's, under the same pre-forward token.
+func (s *Service) stampUpstreamMarkerAfterCompletion(bucket, key, etag, accessKey, secretKey string, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
+	if etag == "" {
+		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
+		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Multipart completion carried no ETag - no tier marker; object reads as a miss until re-put")
+		return
+	}
+	var meta *cache.CachedObjectMeta
+	if accessKey != "" && secretKey != "" {
+		hctx, hcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer hcancel()
+		if resp, herr := s.forwarder.DoConditionalHeadRequest(hctx, bucket, key, accessKey, secretKey, "", 0); herr == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				meta = cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
+				if hetag := resp.Header.Get("ETag"); hetag != "" {
+					etag = hetag // a write raced the HEAD: describe what upstream serves; the token still orders the commit
+				}
+			}
+		}
+	}
+	if meta == nil {
+		meta = &cache.CachedObjectMeta{Bucket: bucket, Key: key, StatusCode: http.StatusOK, CachedAt: time.Now().Unix(), ContentLength: -1}
+	}
+	meta.ETag = etag
+	meta.BodyUpstream = true
+	if meta.LastModified == 0 {
+		meta.LastModified = time.Now().Unix()
+	}
+	s.commitUpstreamMarker(bucket, key, meta, prior, priorVersion, priorKnown)
 }
 
 // invalidateDisplacedTieredMeta converges a key on an authoritative miss
