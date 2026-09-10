@@ -763,7 +763,7 @@ func (s *Service) handleRangeWithBackgroundCache(
 	// Forward the Range request directly to client (low latency)
 	resp, err := s.forwarder.DoRequestWithCreds(ctx, r, accessKey, secretKey)
 	if err != nil {
-		metrics.RecordRequest("GetObject", "error", metrics.SourceLocal, time.Since(startTime).Seconds())
+		metrics.RecordRequest("GetObject", "error", metrics.SourceUpstream, time.Since(startTime).Seconds())
 		return err
 	}
 	defer resp.Body.Close()

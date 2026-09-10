@@ -483,7 +483,9 @@ func (s *Service) revalidateAndServeHead(
 		copyHeaders(w.Header(), resp.Header)
 		writeCacheStatus(w, XCacheRevalidated)
 		w.WriteHeader(resp.StatusCode)
-		metrics.RecordRequest("HeadObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
+		// The response headers came from upstream's 200 — this is an upstream
+		// answer, unlike the 304 path below that serves the cached metadata.
+		metrics.RecordRequest("HeadObject", "success", metrics.SourceUpstream, time.Since(start).Seconds())
 		return nil
 	}
 
