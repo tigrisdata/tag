@@ -810,10 +810,14 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 
 			if !forceRevalidate {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD served from cache")
-				meta.WriteHeaders(w)
-				writeCacheStatus(w, XCacheHit)
-				w.WriteHeader(meta.StatusCode)
-				metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
+				// Client conditionals are evaluated BEFORE the serve: this
+				// path answered a conditional HEAD with a full 200 header
+				// set where the GET hit path (and the tiered/origin-less
+				// engine) correctly answer 304/412 from the same metadata.
+				if s.answerConditionalsFromMeta(w, r, meta, "HeadObject", start) {
+					return nil
+				}
+				serveMetaHit(w, meta, "HeadObject", start)
 				return nil
 			}
 			// forceRevalidate but no ETag — fall through to upstream

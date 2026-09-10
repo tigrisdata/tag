@@ -833,3 +833,40 @@ func TestRevalidation304_CacheBodyUnavailable_FallsThrough(t *testing.T) {
 		t.Errorf("body = %q, want %q", w.Body.String(), freshBody)
 	}
 }
+
+// A conditional HEAD answered from cache must evaluate the client's
+// conditionals: If-None-Match carrying the cached ETag is a 304, a stale one
+// a 200 — the same RFC 7232 answers the GET hit path and the origin-less
+// engine give from identical metadata. This path used to serve an
+// unconditional 200 header set.
+func TestHeadCacheHit_EvaluatesClientConditionals(t *testing.T) {
+	mock := &mockForwarder{}
+	svc, c := newTestService(mock, true)
+
+	meta := &cache.CachedObjectMeta{
+		Bucket: "b", Key: "k", ETag: `"v1"`, ContentLength: 2, StatusCode: 200,
+	}
+	if err := c.PutWithMeta(context.Background(), "b", "k", meta, []byte("hi"), 60); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodHead, "/b/k", nil)
+	req.Header.Set("If-None-Match", `"v1"`)
+	w := httptest.NewRecorder()
+	if err := svc.HandleHeadObject(w, req); err != nil {
+		t.Fatalf("HEAD: %v", err)
+	}
+	if w.Code != http.StatusNotModified {
+		t.Fatalf("matching If-None-Match HEAD = %d, want 304", w.Code)
+	}
+
+	req2 := httptest.NewRequest(http.MethodHead, "/b/k", nil)
+	req2.Header.Set("If-None-Match", `"stale"`)
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleHeadObject(w2, req2); err != nil {
+		t.Fatalf("HEAD: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Header().Get("ETag") != `"v1"` {
+		t.Fatalf("mismatched If-None-Match HEAD = %d ETag %q, want 200 with the cached ETag", w2.Code, w2.Header().Get("ETag"))
+	}
+}
