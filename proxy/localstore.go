@@ -24,27 +24,27 @@ import (
 	"github.com/tigrisdata/tag/s3err"
 )
 
-// Origin-less mode: TAG with no upstream, serving and storing on its own.
+// The local-store engine: TAG serving and storing on its own, with no
+// upstream involved. Its sole consumer is TIERED MODE's local tier — the
+// handlers keep their HandleOriginless names from the abandoned stand-alone
+// origin-less mode, whose branch is deleted; the engine itself is what
+// survived it.
 //
-// The mode is expressed at the ROUTER: the server registers this handler set
-// instead of the proxying one, so every path that assumes an upstream —
-// revalidation, broadcast coalescing, background fetch, the proxy mutation
-// handlers with their invalidate-before-forward ordering — is unreachable by
-// construction. What this file does not implement, the mode cannot do.
-//
-// Trust model: THE NETWORK IS THE BOUNDARY. Origin-less TAG cannot validate
-// signatures (signature validation learns keys from an upstream), so requests
-// are served and accepted regardless of authentication or cached ACL — an
-// Authorization header is ignored, not evaluated. Deploy this mode only on a
-// network segment reachable solely by its intended callers; the explicit,
-// contradiction-checked upstream.disabled switch is the consent for that trade.
+// The engine is reached only through the tiered dispatch (handleTieredObject
+// / handleTieredPut / handleTieredDeleteLocal), so every path that assumes
+// an upstream — revalidation, broadcast coalescing, background fetch, the
+// proxy mutation handlers with their invalidate-before-forward ordering — is
+// unreachable by construction. Requests arrive already validated by the
+// tiered handlers (unvalidated requests forward upstream before the engine
+// is consulted).
 //
 // Reads:  GET/HEAD of one object from cache; a miss is NoSuchKey, the caller's
 //         cue to fall back to its authoritative store.
 // Writes: PUT stores the object in the local cache under cache.ttl; DELETE
 //         invalidates. This is how the tier is populated — by its callers,
 //         directly.
-// Everything else — listings, multipart, copies, tagging, ACLs — answers 501.
+// Everything else — listings, multipart, copies, tagging, ACLs — answers 501
+// or forwards at the tiered layer above.
 
 // HandleOriginlessObject serves GET and HEAD for a single object from cache
 // alone. A miss is the final answer: NoSuchKey — the caller's cue to fall back
@@ -171,17 +171,6 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 // handler says — 304, HEAD 200, a served body — flows from this one predicate, so
 // existence and serveability cannot disagree.
 func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) (bool, error) {
-	// A BLOCK-MODE entry cannot be this engine's: its modes force block
-	// caching off, so such metadata was written by a prior deployment mode
-	// sharing the cache directory (e.g. a proxy+blocks node flipped to
-	// tiered). Serving it would need the proxying block pipeline (optimistic
-	// streaming with upstream recovery) that an authoritative store must not
-	// use — so it is simply not servable here: an authoritative miss, the
-	// caller re-populates, and the stale entry ages out by TTL.
-	if meta.BlockSize > 0 {
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Block-mode entry from a prior deployment mode - not servable by the local store")
-		return false, nil
-	}
 	// A zero-length object is vacuously servable: no byte can be missing, and the
 	// first-byte probe below cannot see one anyway — the embedded backend returns
 	// nil + zero bytes for a present-but-empty body and an absent one alike (the
