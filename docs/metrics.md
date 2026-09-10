@@ -454,18 +454,19 @@ sum(rate(tag_cache_populate_skipped_total[5m]))
 **Type:** Counter
 
 Tiered mode's cross-tier cleanup deletes (issued when a small local write
-displaces an upstream-tier version), by outcome. Cleanup is best-effort:
-anything other than `deleted` / `already_gone` / `replaced` leaves an orphan
-for the upstream bucket's own expiry — failures are Debug-logged, so this
-counter is the rollout-visibility signal.
+displaces an upstream-tier version), by outcome — exactly one per cleanup.
+Cleanup is best-effort: anything other than `deleted` / `already_gone` /
+`replaced` / `marker_repaired` leaves an orphan for the upstream bucket's own
+expiry — failures are Debug-logged, so this counter is the rollout-visibility
+signal.
 
 | Label     | Description                                                              |
 | --------- | ------------------------------------------------------------------------ |
-| `outcome` | `deleted`, `already_gone` (404), `replaced` (412 — a newer version took the key, left alone), `rejected` (other upstream refusal), `error` (request failed), `no_etag` (no displaced ETag to bind to; skipped) |
+| `outcome` | `deleted`, `already_gone` (404), `replaced` (412 — a newer version took the key, left alone), `rejected` (other upstream refusal), `error` (request failed), `no_etag` (no displaced ETag to bind to; skipped), `live_marker` (skipped: the key's current metadata is a live marker for this ETag — the body is authoritative again), `marker_repaired` (a same-ETag marker raced in during the delete; the repair removed it, converging on an authoritative miss the caller re-populates), `repair_failed` (the repair could not run or could not remove the raced-in marker — it may stay authoritative over a deleted body until TTL) |
 
 ```promql
 # Orphan-producing cleanup rate (should be ~0)
-sum(rate(tag_tiered_cleanup_total{outcome=~"rejected|error|no_etag"}[5m]))
+sum(rate(tag_tiered_cleanup_total{outcome=~"rejected|error|no_etag|repair_failed"}[5m]))
 ```
 
 #### tag_tiered_retier_total
