@@ -4,10 +4,6 @@ import (
 	"context"
 	"encoding/xml"
 	"net/http"
-
-	"github.com/rs/zerolog/log"
-
-	"github.com/tigrisdata/tag/cache"
 )
 
 // Metadata caching on write (prototype).
@@ -78,26 +74,14 @@ func (s *Service) establishBlockMetaFromHead(bucket, key, accessKey, secretKey, 
 		return
 	}
 
-	resp, err := s.forwarder.DoConditionalHeadRequest(ctx, bucket, key, accessKey, secretKey, "", 0)
-	if err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Meta-on-write - HEAD failed")
+	// Shared HEAD-and-verify: ok only when upstream answers 200 for exactly
+	// the ETag this write produced — a concurrent overwrite's meta would
+	// describe an object whose blocks a later read fetches under a different
+	// version, the torn-pair hazard write_through guards against.
+	meta, ok := s.headObjectMeta(ctx, bucket, key, accessKey, secretKey, writtenETag)
+	if !ok {
 		return
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return
-	}
-
-	// Only establish the version we actually wrote. A concurrent overwrite returns a
-	// different ETag, and caching that meta would describe an object whose blocks a
-	// later read would fetch under a different version — the same torn-pair hazard
-	// write_through guards against.
-	if resp.Header.Get("ETag") != writtenETag {
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Meta-on-write skipped - superseded by a concurrent overwrite")
-		return
-	}
-
-	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
 	if !meta.IsCacheable(s.config.Cache.SizeThreshold) {
 		return
 	}

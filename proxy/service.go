@@ -1099,15 +1099,7 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	if s.config.IsTiered() {
 		s.claimRetierWrite(bucket, key)
 		defer s.releaseRetierWrite(bucket, key)
-		if s.cache.IsEnabled() {
-			if m, v, found, cerr := s.cache.GetMetaWithVersion(ctx, bucket, key); cerr == nil {
-				mpPriorKnown = true
-				mpPriorVer = v
-				if found {
-					mpPrior = m
-				}
-			}
-		}
+		mpPrior, mpPriorVer, mpPriorKnown = s.captureMarkerPrior(ctx, bucket, key)
 		if result, ak, sk, aerr := s.forwarder.ValidateAndGetCredentials(r); aerr == nil && result == AuthValidated {
 			mpAK, mpSK = ak, sk
 		}

@@ -213,14 +213,8 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	var prior *cache.CachedObjectMeta
 	var priorVersion uint64
 	priorKnown := false
-	if markerOwning && s.cache.IsEnabled() {
-		if m, version, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key); cacheErr == nil {
-			priorKnown = true
-			priorVersion = version
-			if found {
-				prior = m
-			}
-		}
+	if markerOwning {
+		prior, priorVersion, priorKnown = s.captureMarkerPrior(ctx, bucket, key)
 	}
 
 	rec := &statusRecorder{ResponseWriter: w}
@@ -257,6 +251,25 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 // the key. The client's 200 stands (the object IS stored upstream), and the
 // caller's ordinary miss handling re-populates on the next read. Failures log
 // at Warn (flood-safe: only successful 2xx PUTs reach here).
+// captureMarkerPrior reads the displaced prior and its decision-time token
+// BEFORE a marker-stamping forward (large PUT, multipart completion). A
+// failed lookup leaves the prior unknown — the marker is then not written and
+// the sweep refuses to delete anything rather than guess (see
+// commitUpstreamMarker). Tolerated, never blocking.
+func (s *Service) captureMarkerPrior(ctx context.Context, bucket, key string) (prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
+	if !s.cache.IsEnabled() {
+		return nil, 0, false
+	}
+	if m, version, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key); cacheErr == nil {
+		priorKnown = true
+		priorVersion = version
+		if found {
+			prior = m
+		}
+	}
+	return prior, priorVersion, priorKnown
+}
+
 func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
 	if etag == "" {
 		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
@@ -362,13 +375,8 @@ func (s *Service) stampUpstreamMarkerAfterCompletion(bucket, key, etag, accessKe
 	go func() {
 		hctx, hcancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer hcancel()
-		resp, herr := s.forwarder.DoConditionalHeadRequest(hctx, bucket, key, accessKey, secretKey, "", 0)
-		if herr != nil {
-			return
-		}
-		defer resp.Body.Close()
-		_, _ = io.Copy(io.Discard, resp.Body)
-		if resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != etag {
+		full, ok := s.headObjectMeta(hctx, bucket, key, accessKey, secretKey, etag)
+		if !ok {
 			// Gone or replaced already; whatever state won the key stands.
 			return
 		}
@@ -379,8 +387,6 @@ func (s *Service) stampUpstreamMarkerAfterCompletion(bucket, key, etag, accessKe
 		if gerr != nil || !found || cur == nil || !cur.BodyUpstream || cur.ETag != etag || cur.ContentLength >= 0 {
 			return
 		}
-		full := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
-		full.ETag = etag
 		full.BodyUpstream = true
 		if full.LastModified == 0 {
 			// A HEAD without Last-Modified must not zero the phase-1 write
@@ -393,6 +399,29 @@ func (s *Service) stampUpstreamMarkerAfterCompletion(bucket, key, etag, accessKe
 			log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Completion marker upgrade failed; unknown-length marker serves until TTL")
 		}
 	}()
+}
+
+// headObjectMeta HEADs the object with TAG-signed credentials and builds its
+// metadata, returning ok only when upstream answered 200 for EXACTLY the
+// expected ETag — a mismatch means a concurrent overwrite superseded the
+// caller's version, and describing the newer object under the older identity
+// is the torn-pair hazard the write paths guard against. Shared by the
+// completion-marker upgrade and meta-on-write (establishBlockMetaFromHead);
+// each caller applies its mode-specific fields and commit discipline.
+func (s *Service) headObjectMeta(ctx context.Context, bucket, key, accessKey, secretKey, expectETag string) (*cache.CachedObjectMeta, bool) {
+	resp, err := s.forwarder.DoConditionalHeadRequest(ctx, bucket, key, accessKey, secretKey, "", 0)
+	if err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Marker HEAD failed")
+		return nil, false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != expectETag {
+		return nil, false
+	}
+	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
+	meta.ETag = expectETag
+	return meta, true
 }
 
 // invalidateDisplacedTieredMeta converges a key on an authoritative miss
