@@ -322,10 +322,7 @@ func (s *Service) serveFromCache(
 ) error {
 	// Zero-byte objects: no body to serve
 	if meta.ContentLength == 0 {
-		meta.WriteHeaders(w)
-		writeCacheStatus(w, XCacheHit)
-		w.WriteHeader(meta.StatusCode)
-		metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+		serveMetaHit(w, meta, "GetObject", start)
 		return nil
 	}
 
@@ -508,10 +505,7 @@ func (s *Service) revalidateAndServeHead(
 		}
 	}
 
-	meta.WriteHeaders(w)
-	writeCacheStatus(w, XCacheHit)
-	w.WriteHeader(meta.StatusCode)
-	metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
+	serveMetaHit(w, meta, "HeadObject", start)
 	return nil
 }
 

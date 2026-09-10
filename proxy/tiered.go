@@ -89,17 +89,13 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 	if found && meta != nil && meta.BodyUpstream {
 		// Upstream tier: the local metadata answers everything except a GET body.
 		if r.Method == http.MethodHead && originlessPlainObject(r) {
-			if writePreconditionFailed(w, r, meta) {
-				metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+			// Same conditional-then-serve shape as the engine's HEAD path,
+			// minus its servability probe: a marker has no local body to
+			// probe, and the metadata alone is the authoritative answer.
+			if s.answerConditionalsFromMeta(w, r, meta, operation, start) {
 				return nil
 			}
-			if s.writeNotModifiedFromCache(w, r, meta, operation, start) {
-				return nil
-			}
-			meta.WriteHeaders(w)
-			writeCacheStatus(w, XCacheHit)
-			w.WriteHeader(meta.StatusCode)
-			metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+			serveMetaHit(w, meta, operation, start)
 			return nil
 		}
 		// The mode's one body forward. The forward itself never populates;

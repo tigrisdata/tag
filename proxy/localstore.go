@@ -130,19 +130,12 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 	// Conditional requests are answered from the cached metadata; there is no
 	// upstream for a client's Cache-Control to revalidate against, so no-cache and
 	// no-store are simply not consulted — the cached copy is the only copy.
-	if writePreconditionFailed(w, r, meta) {
-		metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
-		return nil
-	}
-	if s.writeNotModifiedFromCache(w, r, meta, operation, start) {
+	if s.answerConditionalsFromMeta(w, r, meta, operation, start) {
 		return nil
 	}
 
 	if r.Method == http.MethodHead {
-		meta.WriteHeaders(w)
-		writeCacheStatus(w, XCacheHit)
-		w.WriteHeader(meta.StatusCode)
-		metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+		serveMetaHit(w, meta, operation, start)
 		return nil
 	}
 
@@ -548,13 +541,18 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// token (see below) so the client's 200 always means the bytes are
 	// stored — identically for both size branches.
 	ttl := int(s.config.Cache.TTL.Seconds())
-	var wrote bool
 	if blockBound {
 		meta.BlockSize = s.config.Cache.BlockSize
-		wrote, err = s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, expected)
-	} else {
-		wrote, err = s.cache.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, bytes.NewReader(body), ttl, expected)
 	}
+	// One store shape for the first attempt and the retry loop below.
+	store := func(token uint64) (bool, error) {
+		if blockBound {
+			return s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, token)
+		}
+		return s.cache.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, bytes.NewReader(body), ttl, token)
+	}
+	var wrote bool
+	wrote, err = store(expected)
 	if err != nil {
 		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 		return err
@@ -591,11 +589,7 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 				metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 				return terr
 			}
-			if blockBound {
-				wrote, err = s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, retryToken)
-			} else {
-				wrote, err = s.cache.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, bytes.NewReader(body), ttl, retryToken)
-			}
+			wrote, err = store(retryToken)
 			if err != nil {
 				metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 				return err

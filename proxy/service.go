@@ -47,6 +47,30 @@ func writeCacheStatus(w http.ResponseWriter, status string) {
 	}
 }
 
+// serveMetaHit commits a metadata-only cache-hit response: the entry's
+// headers, the HIT status, the original status code, and the success metric.
+// The one shape for every "answer from metadata" site — HEADs, marker serves,
+// empty bodies — so a header added to one is added to all.
+func serveMetaHit(w http.ResponseWriter, meta *cache.CachedObjectMeta, operation string, start time.Time) {
+	meta.WriteHeaders(w)
+	writeCacheStatus(w, XCacheHit)
+	w.WriteHeader(meta.StatusCode)
+	metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+}
+
+// answerConditionalsFromMeta evaluates the client's conditional headers
+// against cached metadata in RFC 7232 order — the 412 preconditions
+// (If-Match / If-Unmodified-Since) before the 304 conditionals
+// (If-None-Match / If-Modified-Since) — and writes the response when one
+// decides. Returns true when it wrote; the caller serves normally otherwise.
+func (s *Service) answerConditionalsFromMeta(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, operation string, start time.Time) bool {
+	if writePreconditionFailed(w, r, meta) {
+		metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+		return true
+	}
+	return s.writeNotModifiedFromCache(w, r, meta, operation, start)
+}
+
 // cacheMissStatus returns the X-Cache status for a request not served from cache:
 // DISABLED when caching is off, BYPASS when the client opted out (Cache-Control:
 // no-store), otherwise MISS. Only MISS counts as a cache miss.
