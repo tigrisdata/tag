@@ -10,6 +10,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -522,10 +523,11 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// len(body), enforced above), so the staging buffer reserved there is
 	// exactly the one this branch allocates.
 	//
-	// Both branches commit under the handler-start decision token: a DELETE
-	// arriving mid-PUT wins regardless of object size, and the 200 below is
-	// the legal PUT-then-DELETE serialization of that race — never a
-	// size-dependent flip in which write survives.
+	// Both branches commit under the handler-start decision token; a refused
+	// commit is detected, never silent. Conditional writes answer the 412
+	// their precondition earned; unconditional writes retry under a fresh
+	// token (see below) so the client's 200 always means the bytes are
+	// stored — identically for both size branches.
 	ttl := int(s.config.Cache.TTL.Seconds())
 	var wrote bool
 	if blockBound {
@@ -547,10 +549,43 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return nil
 		}
-		// An unconditional store refused: a DELETE or competing PUT entered
-		// the store after this handler's decision token. The 200 below is the
-		// legal serialization of that race (this PUT, then the racer) — the
-		// racer's state keeps the key, exactly as on real S3.
+		// A refused UNCONDITIONAL client write is retried under a fresh token,
+		// never acked without storing: the racer that bumped the version may be
+		// TAG's OWN re-tier heal committing the PRE-PUT version (the write
+		// claim is process-local, so a re-tier on another node — or one whose
+		// cancellation landed after its last context check — can slip in), and
+		// treating that as "the racer's state keeps the key" would silently
+		// revert an acknowledged client write in the mode's authoritative
+		// store. A client write is by definition the newest state for the key;
+		// re-reading and retrying serializes it after whatever won the round.
+		// A genuine concurrent client racer (PUT or DELETE) just loses the
+		// last-writer race to this PUT — a legal S3 serialization either way.
+		// Bounded: exhaustion or an error answers retryably (500), so the
+		// client never holds a 200 for bytes that were not stored.
+		for attempt := 0; attempt < 8 && !wrote; attempt++ {
+			if cerr := ctx.Err(); cerr != nil {
+				metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+				return cerr
+			}
+			_, retryToken, _, terr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+			if terr != nil {
+				metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+				return terr
+			}
+			if blockBound {
+				wrote, err = s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, retryToken)
+			} else {
+				wrote, err = s.cache.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, bytes.NewReader(body), ttl, retryToken)
+			}
+			if err != nil {
+				metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+				return err
+			}
+		}
+		if !wrote {
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return fmt.Errorf("put %s/%s: store refused %d retries under fresh tokens", bucket, key, 8)
+		}
 	}
 
 	w.Header().Set("ETag", etag)

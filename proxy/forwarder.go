@@ -334,10 +334,9 @@ func (b *baseForwarder) executeRequest(fwdReq *http.Request, inContentLength int
 // (from AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) are valid Tigris credentials
 // that can sign requests directly.
 func (b *baseForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
-	path := "/" + bucket + "/" + key
-
-	// Create request without Range header - just a simple GET for the full object
-	fwdReq, err := b.signer.SignRequest(ctx, "GET", path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, nil)
+	// SignObjectRequest takes the key literally: a key containing '?' must not
+	// be split into path + query (it would fetch a truncated sibling key).
+	fwdReq, err := b.signer.SignObjectRequest(ctx, "GET", bucket, key, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -386,14 +385,15 @@ func (b *baseForwarder) DoAnonymousFullObjectRequest(ctx context.Context, bucket
 // If-Match precondition: a 412 means the object was already replaced and must
 // be left alone.
 func (b *baseForwarder) DoObjectDeleteRequest(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error) {
-	path := "/" + bucket + "/" + key
-
 	var extraHeaders http.Header
 	if etag != "" {
 		extraHeaders = http.Header{}
 		extraHeaders.Set("If-Match", etag)
 	}
-	fwdReq, err := b.signer.SignRequest(ctx, http.MethodDelete, path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
+	// SignObjectRequest takes the key literally: splitting a '?'-bearing key
+	// into path + query would aim this DESTRUCTIVE request at a truncated
+	// sibling key.
+	fwdReq, err := b.signer.SignObjectRequest(ctx, http.MethodDelete, bucket, key, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -431,8 +431,6 @@ func (b *baseForwarder) DoConditionalHeadRequest(ctx context.Context, bucket, ke
 // Sends If-None-Match and/or If-Modified-Since headers for cache revalidation.
 // Uses standard SigV4 signing because these are synthetic requests initiated by TAG.
 func (b *baseForwarder) doConditionalRequest(ctx context.Context, method, bucket, key, accessKey, secretKey, etag string, lastModified int64, rangeHeader string) (*http.Response, error) {
-	path := "/" + bucket + "/" + key
-
 	extraHeaders := http.Header{}
 	if etag != "" {
 		extraHeaders.Set("If-None-Match", etag)
@@ -445,7 +443,8 @@ func (b *baseForwarder) doConditionalRequest(ctx context.Context, method, bucket
 		extraHeaders.Set("Range", rangeHeader)
 	}
 
-	fwdReq, err := b.signer.SignRequest(ctx, method, path, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
+	// SignObjectRequest takes the key literally — see DoObjectDeleteRequest.
+	fwdReq, err := b.signer.SignObjectRequest(ctx, method, bucket, key, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
 	if err != nil {
 		return nil, err
 	}

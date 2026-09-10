@@ -777,3 +777,69 @@ func TestTieredCleanupRepairsRacedSameETagMarker(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// bodyPutRaceClient fires race once, on the first PutStream of a body| key —
+// the window between an unconditional PUT's decision-token read and its meta
+// commit (the engine writes body first, meta second).
+type bodyPutRaceClient struct {
+	cacheclient.CacheClient
+	armed atomic.Bool
+	race  func()
+}
+
+func (b *bodyPutRaceClient) PutStream(ctx context.Context, key string, rd io.Reader, ttl int64) error {
+	err := b.CacheClient.PutStream(ctx, key, rd, ttl)
+	if err == nil && strings.HasPrefix(key, "body|") && b.armed.CompareAndSwap(true, false) && b.race != nil {
+		b.race()
+	}
+	return err
+}
+
+// An unconditional client PUT whose versioned store is refused must RETRY and
+// win, never ack 200 without storing: the racer may be TAG's own re-tier heal
+// committing the PRE-PUT version (the write claim is process-local — a
+// re-tier on another cluster node is invisible to it), and dropping the
+// client's bytes on that refusal silently reverts an acknowledged write in
+// the authoritative store. A client write is by definition the newest state.
+func TestTieredUnconditionalPutRetriesOverRacedCommit(t *testing.T) {
+	mock, _, _ := tieredMock()
+	wrapper := &bodyPutRaceClient{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 1024
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c := cache.NewCacheWithClient(wrapper, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// Seed a local-tier prior (the version the "re-tier" will re-commit).
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "old-content", nil); w.Code != http.StatusOK {
+		t.Fatalf("seed PUT status = %d", w.Code)
+	}
+	oldMeta, _, _ := c.GetMeta(context.Background(), "b", "obj")
+
+	// The moment the client PUT's body lands (after its decision token was
+	// read, before its meta commit): a re-tier-shaped racer commits the OLD
+	// metadata under the current version, bumping it.
+	wrapper.race = func() {
+		ctx := context.Background()
+		_, tok, _, _ := c.GetMetaWithVersion(ctx, "b", "obj")
+		redo := *oldMeta
+		if wrote, err := c.PutMetaIfVersion(ctx, "b", "obj", &redo, 60, tok); err != nil || !wrote {
+			t.Errorf("racer commit: wrote=%v err=%v", wrote, err)
+		}
+	}
+	wrapper.armed.Store(true)
+
+	w := tieredDo(t, svc, http.MethodPut, "/b/obj", "client-new-bytes", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("client PUT status = %d", w.Code)
+	}
+	// The 200 must mean the CLIENT's bytes are what the key serves.
+	g := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil)
+	if g.Code != http.StatusOK || g.Body.String() != "client-new-bytes" {
+		t.Fatalf("GET after acked PUT = %d %q, want the client's bytes (acked write reverted?)", g.Code, g.Body.String())
+	}
+}
