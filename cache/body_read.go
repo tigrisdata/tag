@@ -23,9 +23,10 @@ type bodyReadProgressWriter struct {
 	started time.Time
 
 	lastProgress atomic.Int64
-	// inFlight is the number of non-empty destination writes in progress. -1 is
-	// reserved for a watchdog that has won the idle-expiry race, so a new write
-	// cannot enter after cancellation is committed.
+	// inFlight is 0 when no non-empty destination write is in progress, 1 while
+	// one is active, and -1 when the watchdog has won the idle-expiry race. The
+	// cache clients call the io.Writer synchronously, so one active write is the
+	// ordinary path; the CAS loop still serializes an unexpected concurrent call.
 	inFlight        atomic.Int32
 	waitingForWrite atomic.Bool
 	writeDone       chan struct{}
@@ -46,7 +47,7 @@ func (w *bodyReadProgressWriter) beginWrite() bool {
 		if state < 0 {
 			return false
 		}
-		if w.inFlight.CompareAndSwap(state, state+1) {
+		if state == 0 && w.inFlight.CompareAndSwap(0, 1) {
 			return true
 		}
 	}
@@ -71,15 +72,10 @@ func (w *bodyReadProgressWriter) Write(p []byte) (int, error) {
 }
 
 func (w *bodyReadProgressWriter) finishWrite() {
-	remaining := w.inFlight.Add(-1)
-	if remaining != 0 {
-		return
-	}
-
-	// Start the next idle interval after the destination has accepted the
-	// cache chunk. The time spent inside Write was cache progress, not a
-	// stalled cache read.
+	// Publish progress before clearing inFlight. A watchdog that sees the state
+	// become idle must also see the timestamp for the completed write.
 	w.lastProgress.Store(time.Since(w.started).Nanoseconds())
+	w.inFlight.Store(0)
 
 	// Wake a watchdog that is waiting for an in-flight write to finish. The
 	// state is authoritative; a buffered, coalesced notification avoids making
