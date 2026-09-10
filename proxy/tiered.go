@@ -671,7 +671,15 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 		// exactly those. One outcome is recorded per cleanup: deleted,
 		// marker_repaired, or repair_failed.
 		cur, curVersion, found, gerr := s.cache.GetMetaWithVersion(ctx, bucket, key)
-		if gerr != nil || !found || cur == nil || !cur.BodyUpstream || cur.ETag != etag {
+		if gerr != nil {
+			// The repair check could not run: a raced-in same-ETag marker may
+			// remain authoritative over the just-deleted body until TTL. Its
+			// own outcome, never folded into "deleted".
+			metrics.RecordTieredCleanupSkipped("repair_failed")
+			log.Debug().Err(gerr).Str("bucket", bucket).Str("key", key).Msg("Cleanup repair: post-delete read failed; a raced-in marker may serve until TTL")
+			return
+		}
+		if !found || cur == nil || !cur.BodyUpstream || cur.ETag != etag {
 			metrics.RecordTieredCleanup(resp.StatusCode, nil)
 			return
 		}
