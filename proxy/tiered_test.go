@@ -528,9 +528,16 @@ func TestTieredRetierSkipsReplacedObject(t *testing.T) {
 	}
 	waitRetierDone(t, svc, "b", "obj")
 
+	// The replaced object's state wins the key — and the marker CONVERGES to
+	// it: the re-tier must never commit the older body, but leaving the old
+	// marker authoritative would advertise an ETag on HEAD that no GET
+	// serves. The rewritten marker carries the live upstream identity.
 	meta, found, _ := c.GetMeta(context.Background(), "b", "obj")
-	if !found || meta == nil || !meta.BodyUpstream || meta.ETag != `"upstream-etag"` {
-		t.Fatalf("marker disturbed by a version-mismatched re-tier: %+v", meta)
+	if !found || meta == nil || !meta.BodyUpstream {
+		t.Fatalf("marker lost after a version-mismatched re-tier: %+v", meta)
+	}
+	if meta.ETag != `"a-newer-version"` {
+		t.Fatalf("marker ETag = %q, want convergence to the live upstream version", meta.ETag)
 	}
 }
 

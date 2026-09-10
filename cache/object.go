@@ -59,6 +59,16 @@ type CachedObjectMeta struct {
 	// hint, not an invariant: false (including on entries written before the field existed)
 	// only means the probe-first path is used.
 	BlocksComplete bool `json:"blocks_complete,omitempty"`
+	// ContentLengthKnown records that ContentLength carries a real declared or
+	// measured length — including a genuine 0 for an empty object. Encode sets
+	// it automatically from ContentLength >= 0; DecodeMeta treats a row
+	// WITHOUT it whose ContentLength is 0 as UNKNOWN (-1): rows persisted
+	// before the -1 sentinel existed stored 0 for both "empty" and "unknown"
+	// (no Content-Length on the upstream response), and re-reading that
+	// ambiguous 0 as an affirmative zero length would serve non-empty cached
+	// objects as empty. Those legacy rows revert to their pre-upgrade
+	// omit-the-header behavior until TTL replaces them.
+	ContentLengthKnown bool `json:"content_length_known,omitempty"`
 	// CachedAt is the Unix time (seconds) this meta was built from a live upstream response.
 	// Rewrites of an existing meta that do NOT consult upstream (the blocks-complete
 	// promotion) use it to compute the entry's remaining TTL so they never extend its
@@ -247,6 +257,33 @@ func (m *CachedObjectMeta) MatchesETag(etag string) bool {
 	return normalizeETag(etag) == normalizeETag(m.ETag)
 }
 
+// MatchesETagHeader evaluates a full If-Match / If-None-Match header value
+// against the object's ETag. RFC 7232 allows a comma-separated LIST of
+// entity-tags ("e1", "e2"), and matching the header as one opaque tag makes a
+// list that contains the live ETag never match — fatal on the authoritative
+// paths (origin-less and tiered), where there is no upstream to answer
+// correctly instead: legal conditional writes 412 and valid 304s are lost.
+// Splitting on ',' is exact here because ETags are quoted strings whose only
+// legal inner characters exclude ',' (RFC 7232 §2.3).
+func (m *CachedObjectMeta) MatchesETagHeader(header string) bool {
+	if header == "" || m.ETag == "" {
+		return false
+	}
+	if header == "*" {
+		return true
+	}
+	for _, candidate := range strings.Split(header, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" {
+			return true
+		}
+		if candidate != "" && normalizeETag(candidate) == normalizeETag(m.ETag) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsModifiedSince returns true if the object was modified after the given time.
 // Used for If-Modified-Since conditional requests.
 func (m *CachedObjectMeta) IsModifiedSince(since time.Time) bool {
@@ -281,16 +318,26 @@ func etagKeyComponent(etag string) string {
 	return etag
 }
 
-// Encode serializes metadata to JSON bytes for cache storage.
+// Encode serializes metadata to JSON bytes for cache storage. It stamps
+// ContentLengthKnown from the length itself, so every producer — engine
+// writes, markers, block finalizes — gets the disambiguation without
+// having to remember the field exists.
 func (m *CachedObjectMeta) Encode() ([]byte, error) {
+	m.ContentLengthKnown = m.ContentLength >= 0
 	return json.Marshal(m)
 }
 
-// DecodeMeta deserializes JSON bytes to CachedObjectMeta.
+// DecodeMeta deserializes JSON bytes to CachedObjectMeta. A row without
+// ContentLengthKnown whose ContentLength is 0 predates the -1 unknown
+// sentinel, where 0 was ambiguous between "empty" and "unknown" — it decodes
+// as unknown so a non-empty cached object is never served as empty.
 func DecodeMeta(data []byte) (*CachedObjectMeta, error) {
 	var meta CachedObjectMeta
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, err
+	}
+	if !meta.ContentLengthKnown && meta.ContentLength == 0 {
+		meta.ContentLength = -1
 	}
 	return &meta, nil
 }

@@ -112,8 +112,17 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 	}
 
 	// Local tier, or no metadata at all: the engine serves it, and its miss is
-	// the authoritative NoSuchKey.
-	return s.HandleOriginlessObject(w, r)
+	// the authoritative NoSuchKey. The metadata read ABOVE — the one the tier
+	// decision was made from — is threaded through: a second read here could
+	// see a large PUT's marker committed in between and mint a false
+	// authoritative miss from a mid-overwrite snapshot.
+	if !originlessPlainObject(r) {
+		return s.HandleOriginlessUnsupported(w, r)
+	}
+	if !found {
+		meta = nil
+	}
+	return s.serveOriginlessObject(w, r, operation, start, meta)
 }
 
 // handleTieredPut routes a PUT to its tier by declared size.
@@ -261,6 +270,15 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, p
 	meta.LastModified = time.Now().Unix()
 	if declaredSize, ok := originlessPutSize(r); ok {
 		meta.ContentLength = declaredSize
+	} else {
+		// No decoded size declared (a streaming-signed PUT without
+		// X-Amz-Decoded-Content-Length): MetaFromHTTPHeaders copied the
+		// request's WIRE Content-Length, which counts aws-chunked framing.
+		// Advertising it would misreport HEADs, and an inflated-but-under-
+		// threshold value would send every validated GET into a re-tier whose
+		// fetch can never match the length. Unknown is the honest value; the
+		// re-tier skips unknown-length markers.
+		meta.ContentLength = -1
 	}
 	// Mirror the engine's PUT: upstream stores the decoded object, so a
 	// streaming-signed upload's aws-chunked token is wire framing, not the
@@ -450,6 +468,28 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 				if s.retierRecentMismatch != nil {
 					s.retierRecentMismatch.Add(bucket+"|"+key+"|"+etag, struct{}{})
 				}
+				// The marker is now PROVEN wrong, and the pre-fetch token is
+				// still in hand — converge it instead of leaving the
+				// divergence authoritative for the marker's TTL. Gone (404 —
+				// e.g. the cache bucket's own expiry collected the body):
+				// remove the marker under the token, so HEAD stops answering
+				// 200 for an object whose GET forwards to 404. Replaced (a
+				// different live ETag): rewrite the marker from the response,
+				// so HEAD advertises the object that actually serves. Either
+				// commit refuses if anything else won the key meanwhile; a
+				// refused or failed converge just leaves the backoff doing
+				// its job until the next attempt.
+				if resp.StatusCode == http.StatusNotFound {
+					if _, derr := s.cache.DeleteMetaIfVersion(ctx, bucket, key, decToken); derr != nil {
+						log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Re-tier converge: marker removal failed")
+					}
+				} else {
+					fresh := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
+					fresh.BodyUpstream = true
+					if _, perr := s.cache.PutMetaIfVersion(ctx, bucket, key, fresh, int(s.config.Cache.TTL.Seconds()), decToken); perr != nil {
+						log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Re-tier converge: marker rewrite failed")
+					}
+				}
 				metrics.RecordTieredRetier("changed")
 				return
 			}
@@ -460,11 +500,25 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 
 		buf := make([]byte, bufSize)
 		n, err := io.ReadFull(resp.Body, buf)
-		if err == nil || (!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF)) || int64(n) != marker.ContentLength {
-			// Longer than the marker declared, shorter (truncated read), or a
-			// transport failure: nothing safe to store.
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			// Transport failure mid-body: transient, nothing safe to store —
+			// and no backoff, a blip must not suppress healing.
 			metrics.RecordTieredRetier("error")
-			log.Debug().Err(err).Int("read", n).Str("bucket", bucket).Str("key", key).Msg("Re-tier body mismatch")
+			log.Debug().Err(err).Int("read", n).Str("bucket", bucket).Str("key", key).Msg("Re-tier body read failed")
+			return
+		}
+		if err == nil || int64(n) != marker.ContentLength {
+			// The body read COMPLETED and its length contradicts the marker
+			// (longer: err==nil means the CL+1-sized buffer filled; shorter:
+			// clean EOF before CL). That is as definitive as a changed ETag —
+			// this marker version can never re-tier — so it enters the same
+			// backoff; without it the doomed full download repeats on every
+			// validated GET for the marker's TTL.
+			if s.retierRecentMismatch != nil {
+				s.retierRecentMismatch.Add(bucket+"|"+key+"|"+etag, struct{}{})
+			}
+			metrics.RecordTieredRetier("changed")
+			log.Debug().Int("read", n).Int64("declared", marker.ContentLength).Str("bucket", bucket).Str("key", key).Msg("Re-tier body length contradicts marker")
 			return
 		}
 		body := buf[:marker.ContentLength]

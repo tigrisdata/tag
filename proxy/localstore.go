@@ -83,7 +83,26 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 		metrics.RecordRequest(operation, "error", time.Since(start).Seconds())
 		return cacheErr
 	}
-	if !found || meta == nil {
+	if !found {
+		meta = nil
+	}
+	return s.serveOriginlessObject(w, r, operation, start, meta)
+}
+
+// serveOriginlessObject serves GET/HEAD from an ALREADY-READ metadata
+// snapshot (nil = authoritative miss). Tiered mode calls it with the meta its
+// tier decision was made from: re-reading here opened a window where a large
+// PUT committing its BodyUpstream marker between the two reads made the
+// engine treat the marker as a local-tier entry, probe the body under the NEW
+// upstream ETag, and answer an authoritative NoSuchKey for an object that
+// existed before, during, and after the overwrite. One read, one decision —
+// a read racing an overwrite serves the version its snapshot saw, the legal
+// atomic-replace answer (and the hottest path saves a doubled meta read).
+func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, operation string, start time.Time, meta *cache.CachedObjectMeta) error {
+	ctx := r.Context()
+	bucket, key := ParseBucketKey(r)
+
+	if meta == nil {
 		return s.originlessMiss(w, r, operation, start)
 	}
 
@@ -236,7 +255,7 @@ func (s *Service) originlessMiss(w http.ResponseWriter, r *http.Request, operati
 // are evaluated separately, after these.
 func writePreconditionFailed(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta) bool {
 	if im := r.Header.Get("If-Match"); im != "" {
-		if im != "*" && !meta.MatchesETag(im) {
+		if im != "*" && !meta.MatchesETagHeader(im) {
 			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
 			return true
 		}
@@ -377,11 +396,11 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 			s3err.WriteError(w, r, s3err.ErrNoSuchKey)
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return nil
-		case ifMatch != "" && ifMatch != "*" && !existing.MatchesETag(ifMatch):
+		case ifMatch != "" && ifMatch != "*" && !existing.MatchesETagHeader(ifMatch):
 			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return nil
-		case ifNoneMatch != "" && exists && (ifNoneMatch == "*" || existing.MatchesETag(ifNoneMatch)):
+		case ifNoneMatch != "" && exists && (ifNoneMatch == "*" || existing.MatchesETagHeader(ifNoneMatch)):
 			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return nil

@@ -665,7 +665,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// Routed through invalidateObject (like the pre-forward call) so a failure of this
 	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		s.convergeInvalidation(context.Background(), bucket, key)
 		teeHandled := requestRejectsCache
 		if teed != nil {
 			// writeThroughCache takes ownership of the reserved populate budget.
@@ -732,7 +732,7 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// Routed through invalidateObject (like the pre-forward call) so a failure of this
 	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		s.convergeInvalidation(context.Background(), bucket, key)
 	}
 
 	status := "success"
@@ -844,7 +844,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
 	// unchanged, so re-invalidating would only discard a valid racing refill.
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		s.convergeInvalidation(context.Background(), bucket, key)
 		s.warmOnWrite(r, bucket, key)
 		s.warmParquetFooterOnWrite(r, bucket, key)
 	}
@@ -891,6 +891,22 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 // authorized and confirmed the operation turns a rejected request into data
 // loss (and drops a live marker on a failed upstream-tier op). Tiered relies
 // solely on the post-success invalidation these handlers already perform.
+// convergeInvalidation is the POST-SUCCESS invalidation of the mutating
+// handlers. By the time it runs the client already holds its 2xx, and in
+// tiered mode it is the ONLY invalidation (preForwardInvalidate is a no-op
+// there), so a transient failure leaves a deleted or overwritten local-tier
+// object — or a stale marker — serving authoritatively until TTL with no
+// retry signal. One immediate retry absorbs the transient class cheaply; a
+// repeat failure stays visible as tag_cache_operations_total{operation=
+// "delete",result="error"} (the dashboard's invalidation-errors panel),
+// since the acked response cannot be recalled.
+func (s *Service) convergeInvalidation(ctx context.Context, bucket, key string) {
+	if s.invalidateObject(ctx, bucket, key) == nil {
+		return
+	}
+	_ = s.invalidateObject(ctx, bucket, key)
+}
+
 func (s *Service) preForwardInvalidate(ctx context.Context, bucket, key string) {
 	if s.config.IsTiered() {
 		return
@@ -1052,7 +1068,7 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// object unchanged, doesn't discard a valid racing refill.
 	completed := s3WriteSucceeded(capture)
 	if completed && s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		s.convergeInvalidation(context.Background(), bucket, key)
 		// Warm-on-write is the only way to make a multipart-completed object hot:
 		// TAG never sees its assembled body, so a write-through tee is impossible.
 		s.warmOnWrite(r, bucket, key)

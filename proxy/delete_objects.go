@@ -137,7 +137,7 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 			if parsed && reqN <= erroredCounts[key] {
 				continue // every requested entry for this key errored — object still present
 			}
-			s.invalidateObject(context.Background(), bucket, key)
+			s.convergeInvalidation(context.Background(), bucket, key)
 		}
 	}
 

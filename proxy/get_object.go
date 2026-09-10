@@ -95,9 +95,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	bypassCache := shouldBypassCache(r)
 	rangeHeader := r.Header.Get("Range")
 
-	// Conditional request headers
+	// Conditional request headers (evaluated by writeNotModifiedFromCache on
+	// the hit path; logged here for request tracing)
 	ifNoneMatch := r.Header.Get("If-None-Match")
-	ifModifiedSince := r.Header.Get("If-Modified-Since")
 
 	log.Debug().
 		Str("bucket", bucket).
@@ -199,28 +199,14 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start, XCacheMiss)
 				}
 
-				// Check conditional request: If-None-Match
-				if ifNoneMatch != "" && meta.MatchesETag(ifNoneMatch) {
-					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified")
-					writeCacheStatus(w, XCacheHit)
-					w.Header().Set("ETag", meta.ETag)
-					w.WriteHeader(http.StatusNotModified)
-					metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+				// Conditional 304s through the SHARED helper (its stated
+				// purpose): the inline version had drifted on RFC 7232 §3.3
+				// precedence — it fell through to If-Modified-Since when
+				// If-None-Match mismatched, answering 304 with stale bytes
+				// kept after a same-second overwrite; the helper ignores IMS
+				// whenever INM is present, and evaluates ETag LISTS.
+				if s.writeNotModifiedFromCache(w, r, meta, "GetObject", start) {
 					return nil
-				}
-
-				// Check conditional request: If-Modified-Since
-				if ifModifiedSince != "" {
-					if t, parseErr := http.ParseTime(ifModifiedSince); parseErr == nil {
-						if !meta.IsModifiedSince(t) {
-							log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified (time)")
-							writeCacheStatus(w, XCacheHit)
-							w.Header().Set("ETag", meta.ETag)
-							w.WriteHeader(http.StatusNotModified)
-							metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
-							return nil
-						}
-					}
 				}
 
 				// Serve full response from cache.
@@ -887,7 +873,7 @@ func (s *Service) handleRangeWithBackgroundCache(
 // path and the origin-less handler so the two cannot drift.
 func (s *Service) writeNotModifiedFromCache(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, operation string, start time.Time) bool {
 	if inm := r.Header.Get("If-None-Match"); inm != "" {
-		if !meta.MatchesETag(inm) {
+		if !meta.MatchesETagHeader(inm) {
 			return false
 		}
 	} else {
