@@ -2,8 +2,13 @@
 package s3err
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/xml"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/rs/zerolog/log"
 )
@@ -22,6 +27,8 @@ const (
 	ErrNoSuchKey                    ErrorCode = "NoSuchKey"
 	ErrEntityTooLarge               ErrorCode = "EntityTooLarge"
 	ErrPreconditionFailed           ErrorCode = "PreconditionFailed"
+	ErrInvalidDigest                ErrorCode = "InvalidDigest"
+	ErrBadDigest                    ErrorCode = "BadDigest"
 	ErrNoSuchUpload                 ErrorCode = "NoSuchUpload"
 	ErrInvalidAccessKeyId           ErrorCode = "InvalidAccessKeyId"
 	ErrSignatureDoesNotMatch        ErrorCode = "SignatureDoesNotMatch"
@@ -72,6 +79,8 @@ var errorMap = map[ErrorCode]errorInfo{
 	ErrNoSuchKey:                    {http.StatusNotFound, ErrNoSuchKey, "The specified key does not exist"},
 	ErrEntityTooLarge:               {http.StatusBadRequest, ErrEntityTooLarge, "Your proposed upload exceeds the maximum allowed size"},
 	ErrPreconditionFailed:           {http.StatusPreconditionFailed, ErrPreconditionFailed, "At least one of the pre-conditions you specified did not hold"},
+	ErrInvalidDigest:                {http.StatusBadRequest, ErrInvalidDigest, "The Content-MD5 you specified is not valid"},
+	ErrBadDigest:                    {http.StatusBadRequest, ErrBadDigest, "The Content-MD5 you specified did not match what we received"},
 	ErrNoSuchUpload:                 {http.StatusNotFound, ErrNoSuchUpload, "The specified multipart upload does not exist"},
 	ErrInvalidAccessKeyId:           {http.StatusForbidden, ErrInvalidAccessKeyId, "The AWS access key ID you provided does not exist in our records"},
 	ErrSignatureDoesNotMatch:        {http.StatusForbidden, ErrSignatureDoesNotMatch, "The request signature we calculated does not match the signature you provided"},
@@ -113,13 +122,16 @@ func WriteErrorWithMessage(w http.ResponseWriter, r *http.Request, code ErrorCod
 		info = errorInfo{http.StatusInternalServerError, ErrInternalError, message}
 	}
 
-	// The response's x-amz-request-id header (set by middleware) is the request's
-	// identity; the XML body must echo the SAME value, since clients cross-check
-	// them. The old X-Request-ID request-header read predates that middleware and
-	// never matched anything a client compared against.
+	// The response's x-amz-request-id header is the request's identity, and
+	// the XML body must echo the SAME value — clients cross-check them. In
+	// proxy mode forwarded responses carry upstream's id, but errors TAG
+	// answers itself (the origin-less/tiered engine's authoritative errors
+	// above all) had neither header nor body id: mint one here and set both.
+	// Header before body: WriteHeader below commits the headers.
 	requestID := w.Header().Get("x-amz-request-id")
 	if requestID == "" {
-		requestID = r.Header.Get("X-Request-ID")
+		requestID = newRequestID()
+		w.Header().Set("x-amz-request-id", requestID)
 	}
 	resp := ErrorResponse{
 		Code:      code,
@@ -146,4 +158,16 @@ func WriteErrorWithMessage(w http.ResponseWriter, r *http.Request, code ErrorCod
 func WriteInternalError(w http.ResponseWriter, r *http.Request, err error) {
 	log.Error().Err(err).Str("path", r.URL.Path).Msg("Internal error")
 	WriteError(w, r, ErrInternalError)
+}
+
+// newRequestID mints an S3-shaped request id (uppercase hex, 16 bytes of
+// entropy) for responses TAG originates itself. Falls back to a timestamp
+// when the system's entropy source fails — an id must always exist, unique
+// enough for log correlation.
+func newRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return strings.ToUpper(hex.EncodeToString(b[:]))
 }

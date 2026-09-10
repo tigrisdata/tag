@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -505,6 +506,29 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 
 	sum := md5.Sum(body)
 	etag := `"` + hex.EncodeToString(sum[:]) + `"`
+
+	// Content-MD5 validation (RFC 1864 base64 of the 16-byte digest). The
+	// proxying modes get this from upstream; here the engine IS the store,
+	// and skipping it would accept a corrupt upload the client asked to have
+	// integrity-checked. Malformed header = InvalidDigest; well-formed but
+	// wrong = BadDigest — S3's split, and the digest is already computed for
+	// the ETag, so the check costs one decode and one compare.
+	// Values, not Get: a PRESENT-but-empty Content-MD5 is InvalidDigest on
+	// real S3 (an empty string is not a valid digest), while an absent header
+	// skips the check — Get returns "" for both.
+	if md5Vals := r.Header.Values("Content-MD5"); len(md5Vals) > 0 {
+		want, decErr := base64.StdEncoding.DecodeString(md5Vals[0])
+		if decErr != nil || len(want) != md5.Size {
+			s3err.WriteError(w, r, s3err.ErrInvalidDigest)
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return nil
+		}
+		if !bytes.Equal(want, sum[:]) {
+			s3err.WriteError(w, r, s3err.ErrBadDigest)
+			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			return nil
+		}
+	}
 
 	// Same header→meta mapping as the proxying populate path, then override
 	// what a terminal store owns: the ETag is computed (never client-supplied),

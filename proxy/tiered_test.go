@@ -1,7 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -848,5 +851,62 @@ func TestTieredUnconditionalPutRetriesOverRacedCommit(t *testing.T) {
 	g := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil)
 	if g.Code != http.StatusOK || g.Body.String() != "client-new-bytes" {
 		t.Fatalf("GET after acked PUT = %d %q, want the client's bytes (acked write reverted?)", g.Code, g.Body.String())
+	}
+}
+
+// The engine validates Content-MD5 (it IS the store — no upstream will):
+// malformed = InvalidDigest, well-formed-but-wrong = BadDigest, matching
+// stores. And every error TAG originates carries an x-amz-request-id whose
+// body RequestId echoes it — clients cross-check the two.
+func TestTieredEngineContentMD5AndRequestID(t *testing.T) {
+	mock, _, _ := tieredMock()
+	svc, _ := newTieredTestService(mock, 1024)
+
+	put := func(md5hdr string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader("hello"))
+		if md5hdr != "" {
+			req.Header.Set("Content-MD5", md5hdr)
+		}
+		w := httptest.NewRecorder()
+		if err := svc.HandlePutObject(w, req); err != nil {
+			t.Fatalf("PUT: %v", err)
+		}
+		return w
+	}
+
+	if w := put("not-base64!"); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "InvalidDigest") {
+		t.Fatalf("malformed Content-MD5 = %d %q, want 400 InvalidDigest", w.Code, w.Body.String())
+	}
+	// PRESENT-but-empty is InvalidDigest on real S3; Header.Get cannot see it
+	// (returns "" for absent too), so the engine reads Values.
+	reqEmpty := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader("hello"))
+	reqEmpty.Header["Content-Md5"] = []string{""}
+	wEmpty := httptest.NewRecorder()
+	if err := svc.HandlePutObject(wEmpty, reqEmpty); err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	if wEmpty.Code != http.StatusBadRequest || !strings.Contains(wEmpty.Body.String(), "InvalidDigest") {
+		t.Fatalf("empty Content-MD5 = %d %q, want 400 InvalidDigest", wEmpty.Code, wEmpty.Body.String())
+	}
+	if w := put(base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 16))); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "BadDigest") {
+		t.Fatalf("wrong Content-MD5 = %d %q, want 400 BadDigest", w.Code, w.Body.String())
+	}
+	sum := md5.Sum([]byte("hello"))
+	if w := put(base64.StdEncoding.EncodeToString(sum[:])); w.Code != http.StatusOK {
+		t.Fatalf("matching Content-MD5 = %d, want 200", w.Code)
+	}
+
+	// Engine-originated error: header and body request ids exist and match.
+	req := httptest.NewRequest(http.MethodGet, "/b/definitely-absent", nil)
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, req); err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	rid := w.Header().Get("x-amz-request-id")
+	if w.Code != http.StatusNotFound || rid == "" {
+		t.Fatalf("engine 404 = %d request-id %q, want a minted id", w.Code, rid)
+	}
+	if !strings.Contains(w.Body.String(), "<RequestId>"+rid+"</RequestId>") {
+		t.Fatalf("body RequestId does not echo header %q: %s", rid, w.Body.String())
 	}
 }
