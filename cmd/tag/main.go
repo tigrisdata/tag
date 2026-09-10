@@ -92,6 +92,9 @@ func main() {
 		cfg = config.NewDefault()
 	}
 
+	// Stamp the operating mode on the request metrics before anything serves.
+	metrics.SetMode(cfg.ResolvedMode())
+
 	// Override cache enabled from command line flag
 	if *disableCache {
 		cfg.Cache.SetEnabled(false)

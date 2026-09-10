@@ -124,7 +124,7 @@ func (s *Service) forwardAfterCacheMiss(ctx context.Context, w http.ResponseWrit
 	if forwardErr != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return forwardErr
 }
 
@@ -248,7 +248,7 @@ func (s *Service) handleRevalidation200(
 		if copyErr != nil {
 			status = "error"
 		}
-		metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+		metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 		return copyErr
 	}
 
@@ -307,7 +307,7 @@ func (s *Service) handleRevalidation200(
 	if copyErr != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return copyErr
 }
 
@@ -338,7 +338,7 @@ func (s *Service) serveFromCache(
 			w.WriteHeader(meta.StatusCode)
 			n, _ := w.Write(bodyBuf.Bytes())
 			metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-			metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+			metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
 			putBuffer(bodyBuf)
 			return nil
 		}
@@ -374,7 +374,7 @@ func (s *Service) serveFromCache(
 	}
 
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, metrics.SourceLocal, time.Since(start).Seconds())
 	return nil
 }
 
@@ -412,7 +412,7 @@ func (s *Service) handleRevalidation206Range(
 	if copyErr != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 
 	// Trigger background full-object fetch to repopulate cache
 	if totalSize > 0 &&
@@ -483,7 +483,7 @@ func (s *Service) revalidateAndServeHead(
 		copyHeaders(w.Header(), resp.Header)
 		writeCacheStatus(w, XCacheRevalidated)
 		w.WriteHeader(resp.StatusCode)
-		metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
+		metrics.RecordRequest("HeadObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	}
 

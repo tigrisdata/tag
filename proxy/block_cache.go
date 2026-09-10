@@ -209,7 +209,7 @@ func (s *Service) serveRangeFromBlockCache(
 		return true, berr
 	}
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -374,7 +374,7 @@ func (s *Service) serveAssembledRange(
 		return true, werr
 	}
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
 	// A parquet reader's trailer probe is a few bytes, so it is served here rather
 	// than by streamBlockRange — this, not the streaming path, is where the footer
 	// signal actually arrives for a reader opening a file.
@@ -874,7 +874,7 @@ func (s *Service) serveFullObjectFromBlockCache(
 	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, 0, meta.ContentLength-1); berr != nil {
 		return true, berr
 	}
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -964,7 +964,7 @@ func (s *Service) serveCompleteFromBlocks(
 	if berr != nil {
 		return true, berr
 	}
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
 	return true, nil
 }
 

@@ -72,7 +72,7 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	if !s.cache.IsEnabled() {
 		writeCacheStatus(w, XCacheDisabled)
 		s3err.WriteError(w, r, s3err.ErrNoSuchKey)
-		metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+		metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	}
 
@@ -81,7 +81,7 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 		// A transient metadata failure is not absence: the miss below is
 		// authoritative, so it must never be minted from an error. 500-retry,
 		// matching the body-probe path below.
-		metrics.RecordRequest(operation, "error", time.Since(start).Seconds())
+		metrics.RecordRequest(operation, "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return cacheErr
 	}
 	if !found {
@@ -121,7 +121,7 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 	servable, servErr := s.entryServable(ctx, bucket, key, meta)
 	if servErr != nil {
 		// A transient probe failure is not absence: 500-retry, never a false miss.
-		metrics.RecordRequest(operation, "error", time.Since(start).Seconds())
+		metrics.RecordRequest(operation, "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return servErr
 	}
 	if !servable {
@@ -140,26 +140,11 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 		return nil
 	}
 
-	// The serve helpers below are shared with the proxying mode, and the
-	// block-mode ones stream OPTIMISTICALLY: they commit headers first and recover
-	// a mid-stream missing block from upstream (streamRemainderFromUpstream). With
-	// no origin that recovery fails after the 200/206 is already sent, leaving the
-	// client a truncated body instead of a miss. So block-mode serves are gated on
-	// a presence probe of every covering block — absent anything, this is a clean
-	// NoSuchKey before a single header is written. Whole-object (non-block) serves
-	// need no probe: they fail before committing.
+	// Whole-object serves only: this engine's modes force block caching off
+	// (tiered rejects it at validateMode), so every entry IT writes is a
+	// whole blob, and the serve helpers below fail before committing headers
+	// — a miss response is always still writable.
 	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
-		if meta.BlockSize > 0 {
-			// The existence gate above proved every block present, so a non-serve
-			// here is a budget shed or a probe-to-serve race, not routine absence.
-			// serveRangeFromBlockCache keeps ownership of the 416 for malformed,
-			// unsatisfiable, and multi-range requests.
-			served, rangeErr := s.serveRangeFromBlockCache(ctx, w, r, bucket, key, "", "", meta, rangeHeader, start)
-			if served {
-				return rangeErr
-			}
-			return s.originlessMiss(w, r, operation, start)
-		}
 		served, rangeErr := s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
 		if served {
 			return rangeErr
@@ -170,13 +155,6 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 		return s.originlessMiss(w, r, operation, start)
 	}
 
-	if meta.BlockSize > 0 {
-		served, assembleErr := s.serveFullObjectFromBlockCache(ctx, w, bucket, key, "", "", meta, start)
-		if served {
-			return assembleErr
-		}
-		return s.originlessMiss(w, r, operation, start)
-	}
 	if bodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); bodyErr != nil {
 		// serveFromCache fails before committing headers, so a miss response is
 		// still writable. Only a genuinely absent body orphans the metadata.
@@ -188,41 +166,21 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 	return nil
 }
 
-// allBlocksPresent probes every block in [b0,bK] before a block-mode serve
-// commits its headers. A probe is a point lookup, so even a large object costs
-// one read per covering block — the price of guaranteeing that this mode never
-// sends a 200/206 it cannot finish. A probe-to-serve race (eviction between the
-// probe and the read) is still possible and still truncates; the probe narrows
-// the window from "any evicted block" to "evicted in the microseconds between
-// probe and read", which is the strongest guarantee available without holding
-// every block in memory first.
-// A probe ERROR is not proof of absence (the BlockExistsErr contract): it
-// propagates, so a transient blip answers 500-retry, never a false NoSuchKey —
-// which conditional PUT would otherwise read as "safe to overwrite".
-func (s *Service) allBlocksPresent(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, b0, bK int64) (bool, error) {
-	for i := b0; i <= bK; i++ {
-		present, err := s.cache.BlockExistsErr(ctx, bucket, key, meta.ETag, meta.BlockSize, i)
-		if err != nil {
-			return false, err
-		}
-		if !present {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
 // entryServable is the handler's single existence answer: all blocks present for
 // a block-mode entry, the body present for a whole-object one. Everything the
 // handler says — 304, HEAD 200, a served body — flows from this one predicate, so
 // existence and serveability cannot disagree.
 func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) (bool, error) {
+	// A BLOCK-MODE entry cannot be this engine's: its modes force block
+	// caching off, so such metadata was written by a prior deployment mode
+	// sharing the cache directory (e.g. a proxy+blocks node flipped to
+	// tiered). Serving it would need the proxying block pipeline (optimistic
+	// streaming with upstream recovery) that an authoritative store must not
+	// use — so it is simply not servable here: an authoritative miss, the
+	// caller re-populates, and the stale entry ages out by TTL.
 	if meta.BlockSize > 0 {
-		if meta.ContentLength <= 0 {
-			return false, nil
-		}
-		b0, bK := coveringBlocks(0, meta.ContentLength-1, meta.BlockSize)
-		return s.allBlocksPresent(ctx, bucket, key, meta, b0, bK)
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Block-mode entry from a prior deployment mode - not servable by the local store")
+		return false, nil
 	}
 	// A zero-length object is vacuously servable: no byte can be missing, and the
 	// first-byte probe below cannot see one anyway — the embedded backend returns
@@ -239,7 +197,7 @@ func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *c
 func (s *Service) originlessMiss(w http.ResponseWriter, r *http.Request, operation string, start time.Time) error {
 	writeCacheStatus(w, XCacheMiss)
 	s3err.WriteError(w, r, s3err.ErrNoSuchKey)
-	metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+	metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
 	return nil
 }
 
@@ -332,7 +290,7 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	}
 	if !s.cache.IsEnabled() {
 		s3err.WriteError(w, r, s3err.ErrNotImplemented)
-		metrics.RecordRequest("PutObject", "unsupported", time.Since(start).Seconds())
+		metrics.RecordRequest("PutObject", "unsupported", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	}
 
@@ -356,7 +314,7 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// object exists.
 	existing, expected, found, merr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 	if merr != nil {
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return merr
 	}
 	conditional := false
@@ -375,7 +333,7 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 			var servErr error
 			exists, servErr = s.entryServable(ctx, bucket, key, existing)
 			if servErr != nil {
-				metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 				return servErr
 			}
 		}
@@ -388,15 +346,15 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		switch {
 		case ifMatch != "" && !exists:
 			s3err.WriteError(w, r, s3err.ErrNoSuchKey)
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
 		case ifMatch != "" && ifMatch != "*" && !existing.MatchesETagHeader(ifMatch, true):
 			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
 		case ifNoneMatch != "" && exists && (ifNoneMatch == "*" || existing.MatchesETagHeader(ifNoneMatch, false)):
 			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
 		}
 	}
@@ -413,12 +371,12 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	declaredSize, ok := originlessPutSize(r)
 	if !ok {
 		s3err.WriteError(w, r, s3err.ErrMissingContentLength)
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	}
 	if declaredSize > s.config.Cache.SizeThreshold {
 		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	}
 
@@ -437,25 +395,19 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// to EVER fit the configured budget is a configuration mismatch and answers
 	// EntityTooLarge up front rather than SlowDown forever.
 	streaming := IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256"))
-	blockBound := s.config.Cache.IsBlockCachingEnabled() && declaredSize >= s.config.Cache.BlockSize
 	bufSize := declaredSize + 1
 	weight := bufSize
 	if streaming {
 		weight += awsChunkedReaderBufSize
 	}
-	if blockBound {
-		// putBlocksFromStream stages one block-size buffer while the full body
-		// is still held; both are live at once, so both are reserved.
-		weight += s.config.Cache.BlockSize
-	}
 	if s.populateBudget != nil && weight > s.populateBudget.total {
 		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	}
 	if !s.acquireCacheSlot(ctx, weight, priorityReadMiss) {
 		s3err.WriteError(w, r, s3err.ErrSlowDown)
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	}
 	defer s.releaseCacheSlot(weight)
@@ -481,7 +433,7 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	case err == nil:
 		// Filled declared+1 bytes: the body is longer than declared.
 		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	// errors.Is, not equality: the chunked decoder WRAPS its errors ("reading
 	// chunk header: %w"), so a body truncated inside a chunk header carries a
@@ -489,17 +441,17 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
 		if int64(n) != declaredSize {
 			s3err.WriteError(w, r, s3err.ErrIncompleteBody)
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
 		}
 	case streaming:
 		// Any other failure reading a streaming body is the decoder rejecting
 		// the client's chunk framing — a malformed request, not a server fault.
 		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	default:
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
 	}
 	body := buf[:declaredSize]
@@ -520,12 +472,12 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		want, decErr := base64.StdEncoding.DecodeString(md5Vals[0])
 		if decErr != nil || len(want) != md5.Size {
 			s3err.WriteError(w, r, s3err.ErrInvalidDigest)
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
 		}
 		if !bytes.Equal(want, sum[:]) {
 			s3err.WriteError(w, r, s3err.ErrBadDigest)
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
 		}
 	}
@@ -551,34 +503,24 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	}
 	meta.LastModified = time.Now().Unix()
 
-	// Same whole-vs-block boundary as proxying mode (size, not access pattern),
-	// through the same writer: putBlocksFromStream is the shared full-object
-	// populate path, so block entries written here are indistinguishable from
-	// proxy-populated ones — one read path, one visibility gate.
-	// blockBound was decided at admission from the same size (declared ==
-	// len(body), enforced above), so the staging buffer reserved there is
-	// exactly the one this branch allocates.
+	// WHOLE-OBJECT store only: this engine's modes force block caching off,
+	// so there is no block boundary to route on (the block populate path,
+	// putBlocksFromStream, belongs to the proxying modes).
 	//
-	// Both branches commit under the handler-start decision token; a refused
+	// The store commits under the handler-start decision token; a refused
 	// commit is detected, never silent. Conditional writes answer the 412
 	// their precondition earned; unconditional writes retry under a fresh
 	// token (see below) so the client's 200 always means the bytes are
-	// stored — identically for both size branches.
+	// stored.
 	ttl := int(s.config.Cache.TTL.Seconds())
-	if blockBound {
-		meta.BlockSize = s.config.Cache.BlockSize
-	}
 	// One store shape for the first attempt and the retry loop below.
 	store := func(token uint64) (bool, error) {
-		if blockBound {
-			return s.putBlocksFromStream(ctx, bucket, key, meta, bytes.NewReader(body), ttl, token)
-		}
 		return s.cache.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, bytes.NewReader(body), ttl, token)
 	}
 	var wrote bool
 	wrote, err = store(expected)
 	if err != nil {
-		metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
 	}
 	if !wrote {
@@ -587,7 +529,7 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 			// store. The honest answer is the 412 the client would have gotten
 			// had the racer arrived a moment earlier.
 			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
 		}
 		// A refused UNCONDITIONAL client write is retried under a fresh token,
@@ -605,29 +547,29 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		// client never holds a 200 for bytes that were not stored.
 		for attempt := 0; attempt < 8 && !wrote; attempt++ {
 			if cerr := ctx.Err(); cerr != nil {
-				metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 				return cerr
 			}
 			_, retryToken, _, terr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 			if terr != nil {
-				metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 				return terr
 			}
 			wrote, err = store(retryToken)
 			if err != nil {
-				metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 				return err
 			}
 		}
 		if !wrote {
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return fmt.Errorf("put %s/%s: store refused %d retries under fresh tokens", bucket, key, 8)
 		}
 	}
 
 	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusOK)
-	metrics.RecordRequest("PutObject", "success", time.Since(start).Seconds())
+	metrics.RecordRequest("PutObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
 	return nil
 }
 
@@ -644,11 +586,11 @@ func (s *Service) HandleOriginlessDelete(w http.ResponseWriter, r *http.Request)
 	// The cache is the only store: an acked-but-failed delete would keep
 	// serving the object until TTL with no signal to retry on. 500, not 204.
 	if err := s.invalidateObject(r.Context(), bucket, key); err != nil {
-		metrics.RecordRequest("DeleteObject", "error", time.Since(start).Seconds())
+		metrics.RecordRequest("DeleteObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
 	}
 	w.WriteHeader(http.StatusNoContent)
-	metrics.RecordRequest("DeleteObject", "success", time.Since(start).Seconds())
+	metrics.RecordRequest("DeleteObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
 	return nil
 }
 
@@ -660,6 +602,6 @@ func (s *Service) HandleOriginlessDelete(w http.ResponseWriter, r *http.Request)
 func (s *Service) HandleOriginlessUnsupported(w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()
 	s3err.WriteError(w, r, s3err.ErrNotImplemented)
-	metrics.RecordRequest("Unsupported", "unsupported", time.Since(start).Seconds())
+	metrics.RecordRequest("Unsupported", "unsupported", metrics.SourceLocal, time.Since(start).Seconds())
 	return nil
 }

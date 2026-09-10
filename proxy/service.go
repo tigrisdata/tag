@@ -55,7 +55,7 @@ func serveMetaHit(w http.ResponseWriter, meta *cache.CachedObjectMeta, operation
 	meta.WriteHeaders(w)
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(meta.StatusCode)
-	metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+	metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
 }
 
 // answerConditionalsFromMeta evaluates the client's conditional headers
@@ -65,7 +65,7 @@ func serveMetaHit(w http.ResponseWriter, meta *cache.CachedObjectMeta, operation
 // decides. Returns true when it wrote; the caller serves normally otherwise.
 func (s *Service) answerConditionalsFromMeta(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, operation string, start time.Time) bool {
 	if writePreconditionFailed(w, r, meta) {
-		metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+		metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
 		return true
 	}
 	return s.writeNotModifiedFromCache(w, r, meta, operation, start)
@@ -713,7 +713,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("PutObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("PutObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 
 	return err
 }
@@ -763,7 +763,7 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("DeleteObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("DeleteObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 
 	return err
 }
@@ -786,7 +786,7 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	// Validate credentials before serving from cache
 	result, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil {
-		metrics.RecordRequest("HeadObject", "auth_error", time.Since(start).Seconds())
+		metrics.RecordRequest("HeadObject", "auth_error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
 	}
 
@@ -839,7 +839,7 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("HeadObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("HeadObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return err
 }
 

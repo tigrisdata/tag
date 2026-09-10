@@ -27,6 +27,8 @@ Total number of requests processed by TAG.
 | ----------- | -------------------------------------------------------------------- |
 | `operation` | S3 operation: `GetObject`, `PutObject`, `DeleteObject`, `HeadObject` |
 | `status`    | Result: `success`, `error`, `auth_error`, `range_not_satisfiable`    |
+| `mode`      | The process's operating mode (`transparent`, `signing`, `tiered`) — one constant value per instance, for fleet-wide splits |
+| `source`    | Where the response was produced: `local` (TAG's own store or knowledge — cache hits, revalidated-304 serves, authoritative misses, auth errors) or `upstream` (proxied) |
 
 **Example queries:**
 
@@ -36,6 +38,9 @@ rate(tag_requests_total[5m])
 
 # Error rate
 sum(rate(tag_requests_total{status="error"}[5m])) / sum(rate(tag_requests_total[5m]))
+
+# Share of traffic answered without touching upstream (per mode)
+sum(rate(tag_requests_total{source="local"}[5m])) by (mode) / sum(rate(tag_requests_total[5m])) by (mode)
 
 # GetObject success rate
 rate(tag_requests_total{operation="GetObject",status="success"}[5m]) /
@@ -51,6 +56,8 @@ Request duration in seconds.
 | Label       | Description  |
 | ----------- | ------------ |
 | `operation` | S3 operation |
+| `mode`      | Operating mode (constant per instance) |
+| `source`    | `local` or `upstream` — where the response was produced |
 
 **Buckets:** 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10 (the default Prometheus buckets plus extra tail resolution at 1.5, 2, 3, 4 and 7.5 seconds)
 

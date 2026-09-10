@@ -146,7 +146,7 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("DeleteObjects", status, time.Since(start).Seconds())
+	metrics.RecordRequest("DeleteObjects", status, metrics.SourceUpstream, time.Since(start).Seconds())
 
 	return err
 }

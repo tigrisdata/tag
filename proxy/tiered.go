@@ -74,7 +74,7 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 
 	result, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil {
-		metrics.RecordRequest(operation, "auth_error", time.Since(start).Seconds())
+		metrics.RecordRequest(operation, "auth_error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
 	}
 	if result != AuthValidated {
@@ -86,7 +86,7 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 		// A transient metadata failure is not absence. The miss below is
 		// authoritative — served for an existing object it would make the caller
 		// drop its cached copy — so this must surface as a retryable error.
-		metrics.RecordRequest(operation, "error", time.Since(start).Seconds())
+		metrics.RecordRequest(operation, "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return cacheErr
 	}
 	if found && meta != nil && meta.BodyUpstream {
@@ -138,7 +138,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 
 	result, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil {
-		metrics.RecordRequest("PutObject", "auth_error", time.Since(start).Seconds())
+		metrics.RecordRequest("PutObject", "auth_error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
 	}
 
@@ -156,7 +156,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 		// read as "no prior". Fail retryably instead.
 		prior, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
 		if cacheErr != nil {
-			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return cacheErr
 		}
 		if !found {
@@ -228,7 +228,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("PutObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("PutObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return err
 }
 
@@ -744,7 +744,7 @@ func (s *Service) handleTieredDeleteLocal(w http.ResponseWriter, r *http.Request
 	start := time.Now()
 	result, _, _, authErr := s.forwarder.ValidateAndGetCredentials(r)
 	if authErr != nil {
-		metrics.RecordRequest("DeleteObject", "auth_error", time.Since(start).Seconds())
+		metrics.RecordRequest("DeleteObject", "auth_error", metrics.SourceLocal, time.Since(start).Seconds())
 		return true, authErr
 	}
 	if result != AuthValidated || !originlessPlainObject(r) {
@@ -757,7 +757,7 @@ func (s *Service) handleTieredDeleteLocal(w http.ResponseWriter, r *http.Request
 	if cacheErr != nil {
 		// Falling through would forward the DELETE, ack 204 upstream, and leave
 		// a possibly local-tier copy being served. Fail retryably instead.
-		metrics.RecordRequest("DeleteObject", "error", time.Since(start).Seconds())
+		metrics.RecordRequest("DeleteObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return true, cacheErr
 	}
 	if !found || meta == nil || meta.BodyUpstream {

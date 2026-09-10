@@ -10,13 +10,18 @@ import (
 )
 
 var (
-	// RequestsTotal counts total requests by operation and status.
+	// RequestsTotal counts total requests by operation and status; mode is
+	// the process's operating mode (one constant value per instance — it
+	// exists so fleet-wide queries can split traffic by mode) and source is
+	// where the RESPONSE was produced: "local" when TAG answered from its own
+	// store or knowledge (cache hits, revalidated-304 serves, authoritative
+	// misses, auth errors), "upstream" when the response was proxied.
 	RequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "tag_requests_total",
 			Help: "Total number of requests processed",
 		},
-		[]string{"operation", "status"},
+		[]string{"operation", "status", "mode", "source"},
 	)
 
 	// RequestDuration tracks request latency by operation.
@@ -29,7 +34,7 @@ var (
 			// tail investigations — quantiles interpolate across whole seconds.
 			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10},
 		},
-		[]string{"operation"},
+		[]string{"operation", "mode", "source"},
 	)
 
 	// CacheHits counts cache hits.
@@ -453,9 +458,28 @@ var (
 )
 
 // RecordRequest records a request with its duration and status.
-func RecordRequest(operation, status string, durationSeconds float64) {
-	RequestsTotal.WithLabelValues(operation, status).Inc()
-	RequestDuration.WithLabelValues(operation).Observe(durationSeconds)
+// Source label values for RecordRequest: where the response was produced.
+const (
+	SourceLocal    = "local"    // answered from TAG's own store or knowledge
+	SourceUpstream = "upstream" // proxied from upstream
+)
+
+// processMode is the operating mode stamped on every request metric. One
+// value per process, set once at startup (SetMode) before the server serves —
+// not synchronized, so it must not change while requests flow.
+var processMode = "unknown"
+
+// SetMode records the process's operating mode (transparent/signing/tiered)
+// for the request metrics' mode label. Call once at startup.
+func SetMode(mode string) {
+	if mode != "" {
+		processMode = mode
+	}
+}
+
+func RecordRequest(operation, status, source string, durationSeconds float64) {
+	RequestsTotal.WithLabelValues(operation, status, processMode, source).Inc()
+	RequestDuration.WithLabelValues(operation, processMode, source).Observe(durationSeconds)
 }
 
 // RecordCacheHit records a cache hit.

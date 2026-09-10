@@ -110,7 +110,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// 1. Validate credentials FIRST (before any broadcast operations)
 	result, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil {
-		metrics.RecordRequest("GetObject", "auth_error", time.Since(start).Seconds())
+		metrics.RecordRequest("GetObject", "auth_error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
 	}
 
@@ -354,7 +354,7 @@ func (s *Service) fetchAndBroadcast(
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return err
 }
 
@@ -487,7 +487,7 @@ func (s *Service) receiveFromBroadcastListener(
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return err
 }
 
@@ -659,7 +659,7 @@ func writeRangeNotSatisfiable(w http.ResponseWriter, r *http.Request, meta *cach
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
 	writeCacheStatus(w, XCacheHit)
 	s3err.WriteError(w, r, s3err.ErrInvalidRange)
-	metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "range_not_satisfiable", metrics.SourceLocal, time.Since(startTime).Seconds())
 }
 
 // It returns served=true when it has produced a complete client response (a range
@@ -745,7 +745,7 @@ func (s *Service) serveRangeFromCache(
 	}
 
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -763,7 +763,7 @@ func (s *Service) handleRangeWithBackgroundCache(
 	// Forward the Range request directly to client (low latency)
 	resp, err := s.forwarder.DoRequestWithCreds(ctx, r, accessKey, secretKey)
 	if err != nil {
-		metrics.RecordRequest("GetObject", "error", time.Since(startTime).Seconds())
+		metrics.RecordRequest("GetObject", "error", metrics.SourceLocal, time.Since(startTime).Seconds())
 		return err
 	}
 	defer resp.Body.Close()
@@ -859,7 +859,7 @@ func (s *Service) handleRangeWithBackgroundCache(
 		return err
 	}
 
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "success", metrics.SourceUpstream, time.Since(startTime).Seconds())
 
 	return nil
 }
@@ -889,6 +889,6 @@ func (s *Service) writeNotModifiedFromCache(w http.ResponseWriter, r *http.Reque
 	writeCacheStatus(w, XCacheHit)
 	w.Header().Set("ETag", meta.ETag)
 	w.WriteHeader(http.StatusNotModified)
-	metrics.RecordRequest(operation, "success", time.Since(start).Seconds())
+	metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
 	return true
 }
