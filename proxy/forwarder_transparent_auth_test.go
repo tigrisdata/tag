@@ -38,6 +38,22 @@ func (p *transparentAuthTestKeyProvider) callCount() uint64 {
 	return atomic.LoadUint64(&p.calls)
 }
 
+type transparentAuthBlockingKeyProvider struct {
+	store   *auth.DerivedKeyStore
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *transparentAuthBlockingKeyProvider) GetSigningKey(accessKey, date, region string) ([]byte, error) {
+	close(p.started)
+	<-p.release
+	return p.store.GetSigningKey(accessKey, date, region)
+}
+
+func (p *transparentAuthBlockingKeyProvider) HasKey(accessKey string) bool {
+	return p.store.HasKey(accessKey)
+}
+
 func newTransparentAuthTestFixture(t *testing.T, authzTTL time.Duration) (*transparentForwarder, *transparentAuthTestKeyProvider) {
 	t.Helper()
 
@@ -183,6 +199,46 @@ func TestTransparentForwarderAuthzMissSkipsLocalValidation(t *testing.T) {
 				t.Fatalf("validator key lookups = %d, want 0 on authorization miss", got)
 			}
 		})
+	}
+}
+
+func TestTransparentForwarderGrantRevokedDuringValidationSkipsCache(t *testing.T) {
+	forwarder, keyProvider := newTransparentAuthTestFixture(t, time.Hour)
+	forwarder.authzCache.Grant(transparentAuthTestAccessKey, transparentAuthTestBucket)
+
+	blocking := &transparentAuthBlockingKeyProvider{
+		store:   keyProvider.store,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	forwarder.validator = auth.NewRequestValidator(blocking)
+
+	resultCh := make(chan AuthResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := forwarder.validateLocally(newTransparentAuthHeaderRequest(t))
+		resultCh <- result
+		errCh <- err
+	}()
+
+	select {
+	case <-blocking.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("local validation did not reach signing-key lookup")
+	}
+	forwarder.authzCache.Revoke(transparentAuthTestAccessKey, transparentAuthTestBucket)
+	close(blocking.release)
+
+	select {
+	case result := <-resultCh:
+		if result != AuthNotValidated {
+			t.Fatalf("validateLocally() result = %v, want AuthNotValidated after revocation", result)
+		}
+		if err := <-errCh; err != nil {
+			t.Fatalf("validateLocally() error = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("local validation did not finish")
 	}
 }
 

@@ -234,7 +234,8 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 	// A missing, expired, or revoked grant cannot serve the cache, so forward the
 	// request for authoritative upstream authentication instead.
 	bucket, _ := ParseBucketKey(r)
-	if !f.authzCache.IsAuthorized(authInfo.AccessKey, bucket) {
+	authzToken, authorized := f.authzCache.AuthorizationToken(authInfo.AccessKey, bucket)
+	if !authorized {
 		metrics.RecordLocalAuthValidation("authz_expired")
 		log.Debug().Str("bucket", bucket).Msg("Local auth: authz expired for bucket")
 		return AuthNotValidated, nil // AuthZ expired → forward to Tigris
@@ -246,6 +247,15 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 		// → skip cache, forward to Tigris to get authoritative decision + fresh keys
 		metrics.RecordLocalAuthValidation("signature_mismatch")
 		log.Debug().Err(err).Msg("Local auth: signature mismatch")
+		return AuthNotValidated, nil
+	}
+
+	// A grant may be revoked or expire while signature validation is running.
+	// Recheck the cheap token before allowing a cache read; the base path made
+	// the equivalent authorization check after validation.
+	if !f.authzCache.IsTokenCurrent(authzToken) {
+		metrics.RecordLocalAuthValidation("authz_expired")
+		log.Debug().Str("bucket", bucket).Msg("Local auth: authz expired during validation")
 		return AuthNotValidated, nil
 	}
 
