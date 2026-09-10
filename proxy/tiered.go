@@ -342,29 +342,51 @@ func (s *Service) stampUpstreamMarkerAfterCompletion(bucket, key, etag, accessKe
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Multipart completion carried no ETag - no tier marker; object reads as a miss until re-put")
 		return
 	}
-	var meta *cache.CachedObjectMeta
-	if accessKey != "" && secretKey != "" {
-		hctx, hcancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer hcancel()
-		if resp, herr := s.forwarder.DoConditionalHeadRequest(hctx, bucket, key, accessKey, secretKey, "", 0); herr == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				meta = cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
-				if hetag := resp.Header.Get("ETag"); hetag != "" {
-					etag = hetag // a write raced the HEAD: describe what upstream serves; the token still orders the commit
-				}
-			}
-		}
-	}
-	if meta == nil {
-		meta = &cache.CachedObjectMeta{Bucket: bucket, Key: key, StatusCode: http.StatusOK, CachedAt: time.Now().Unix(), ContentLength: -1}
-	}
-	meta.ETag = etag
-	meta.BodyUpstream = true
-	if meta.LastModified == 0 {
-		meta.LastModified = time.Now().Unix()
+	// TWO PHASES, because the client already holds its 200: the ETag-only
+	// marker commits IMMEDIATELY (one local cache op), so a read-after-write
+	// never sees an authoritative NoSuchKey while an upstream HEAD is in
+	// flight. The HEAD then runs in the background and upgrades the marker
+	// with real metadata (Content-Length above all, for range-reading
+	// callers) under an identity guard — GETs forward regardless, and the
+	// re-tier skips unknown-length markers, so the window is HEAD-omits-
+	// length, never wrong data.
+	meta := &cache.CachedObjectMeta{
+		Bucket: bucket, Key: key, ETag: etag, BodyUpstream: true,
+		StatusCode: http.StatusOK, CachedAt: time.Now().Unix(),
+		LastModified: time.Now().Unix(), ContentLength: -1,
 	}
 	s.commitUpstreamMarker(bucket, key, meta, prior, priorVersion, priorKnown)
+	if accessKey == "" || secretKey == "" {
+		return
+	}
+	go func() {
+		hctx, hcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer hcancel()
+		resp, herr := s.forwarder.DoConditionalHeadRequest(hctx, bucket, key, accessKey, secretKey, "", 0)
+		if herr != nil {
+			return
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != etag {
+			// Gone or replaced already; whatever state won the key stands.
+			return
+		}
+		// Identity-guarded upgrade: only the just-stamped unknown-length
+		// marker for THIS ETag is upgraded, under its observed version — a
+		// racing write refuses the commit and keeps the key.
+		cur, curVersion, found, gerr := s.cache.GetMetaWithVersion(hctx, bucket, key)
+		if gerr != nil || !found || cur == nil || !cur.BodyUpstream || cur.ETag != etag || cur.ContentLength >= 0 {
+			return
+		}
+		full := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
+		full.ETag = etag
+		full.BodyUpstream = true
+		ttl := int(s.config.Cache.TTL.Seconds())
+		if _, perr := s.cache.PutMetaIfVersion(hctx, bucket, key, full, ttl, curVersion); perr != nil {
+			log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Completion marker upgrade failed; unknown-length marker serves until TTL")
+		}
+	}()
 }
 
 // invalidateDisplacedTieredMeta converges a key on an authoritative miss

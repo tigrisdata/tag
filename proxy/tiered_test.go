@@ -940,12 +940,24 @@ func TestTieredMultipartCompletionStampsMarker(t *testing.T) {
 		t.Fatalf("completion status = %d", w.Code)
 	}
 
+	// Phase 1 (immediate): the ETag-only marker exists the moment the handler
+	// returns — no read-after-write NoSuchKey window while the HEAD runs.
 	meta, found, _ := c.GetMeta(context.Background(), "b", "mp-obj")
-	if !found || meta == nil || !meta.BodyUpstream {
+	if !found || meta == nil || !meta.BodyUpstream || meta.ETag != `"mp-etag-3"` {
 		t.Fatalf("no BodyUpstream marker after completion: %+v", meta)
 	}
-	if meta.ETag != `"mp-etag-3"` || meta.ContentLength != 5242880 {
-		t.Fatalf("marker = ETag %q CL %d, want the HEAD-sourced identity", meta.ETag, meta.ContentLength)
+	// Phase 2 (background): the HEAD upgrade lands the real length.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m, f2, _ := c.GetMeta(context.Background(), "b", "mp-obj")
+		if f2 && m != nil && m.ContentLength == 5242880 {
+			meta = m
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("marker never upgraded with the HEAD-sourced length: %+v", m)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	// HEAD from the marker, no forward; GET forwards for the body.
