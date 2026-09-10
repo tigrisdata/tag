@@ -382,6 +382,12 @@ func (s *Service) stampUpstreamMarkerAfterCompletion(bucket, key, etag, accessKe
 		full := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
 		full.ETag = etag
 		full.BodyUpstream = true
+		if full.LastModified == 0 {
+			// A HEAD without Last-Modified must not zero the phase-1 write
+			// stamp: If-Unmodified-Since fails closed on 0 and HEAD would
+			// omit the header.
+			full.LastModified = cur.LastModified
+		}
 		ttl := int(s.config.Cache.TTL.Seconds())
 		if _, perr := s.cache.PutMetaIfVersion(hctx, bucket, key, full, ttl, curVersion); perr != nil {
 			log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Completion marker upgrade failed; unknown-length marker serves until TTL")
