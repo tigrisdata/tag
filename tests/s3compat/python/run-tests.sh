@@ -402,8 +402,14 @@ test_copies=(
 # CLASS: object sub-resources — tagging/ACL calls addressed to an OBJECT.
 # Skipped in tiered: they forward to upstream, which answers NoSuchKey for a
 # local-tier object (docs/tiered-mode.md "Not implemented").
-test_object_subresources=(
+# The one header-validation-shaped member of this class lives in
+# test_headers.py, not test_s3.py — it gets its own array so each loop
+# targets the file its tests are defined in, while the tiered profile
+# empties both together.
+test_object_subresources_headers=(
     "test_object_acl_create_contentlength_none"
+)
+test_object_subresources=(
     "test_get_obj_tagging"
     "test_get_obj_head_tagging"
     "test_put_max_tags"
@@ -428,6 +434,7 @@ if [ "$S3TEST_PROFILE" = "tiered" ]; then
     test_listings=()
     test_copies=()
     test_object_subresources=()
+    test_object_subresources_headers=()
 fi
 
 # Header-validation tests live in test_headers.py; every other class in
@@ -468,6 +475,9 @@ fi
 
 if [ ${#test_object_subresources[@]} -gt 0 ]; then
     echo "Running object sub-resource tests..."
+    for test in "${test_object_subresources_headers[@]}"; do
+        run_test "test_headers.py" "$test"
+    done
     for test in "${test_object_subresources[@]}"; do
         run_test "test_s3.py" "$test"
     done
