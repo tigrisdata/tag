@@ -12,6 +12,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_UPSTREAM_REGION`             | Upstream region for SigV4 signing scope                                         | `auto`                   |
 | `TAG_MAX_IDLE_CONNS_PER_HOST`     | HTTP connection pool size per upstream host                                     | `100`                    |
 | `TAG_CACHE_TTL`                   | Default TTL for cached objects (Go duration, e.g. `12h`, `30m`)                 | `24h`                    |
+| `TAG_CACHE_BODY_READ_IDLE_TIMEOUT` | Maximum gap between non-empty writes while reading cached body or range streams (Go duration) | `60s`                   |
 | `TAG_CACHE_DISABLED`              | Disable caching (`true` or `1`)                                                 | `false`                  |
 | `TAG_CACHE_DISK_PATH`             | Path to cache data directory                                                    | `/var/cache/tag`         |
 | `TAG_CACHE_MAX_DISK_USAGE`        | Max disk usage in bytes (0 = unlimited)                                         | `0`                      |
@@ -117,6 +118,13 @@ cache:
   # Default: 24h
   # Override with TAG_CACHE_TTL env var
   ttl: 24h
+
+  # Maximum idle gap between non-empty writes while reading cached body or range streams.
+  # A stalled cache peer is canceled after this interval; the request context
+  # remains the parent cancellation signal. Must be positive.
+  # Default: 60s
+  # Override with TAG_CACHE_BODY_READ_IDLE_TIMEOUT env var
+  body_read_idle_timeout: 60s
 
   # Maximum object size to cache (in bytes)
   # Objects larger than this are not cached
@@ -393,6 +401,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | ----------------------- | -------- | ---------------- | ----------------------------------------------------------------------------------- |
 | `enabled`               | bool     | `true`           | Enable caching                                                                      |
 | `ttl`                   | duration | `24h`            | Default TTL for cached objects                                                      |
+| `body_read_idle_timeout` | duration | `60s`             | Maximum gap between non-empty writes while reading cached body or range streams; must be positive |
 | `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
 | `block_caching_enabled` | bool     | `true`           | Enable block-aligned caching for large objects (RFC 0001)                           |
 | `legacy_coordination`   | bool     | `true`           | Meta coordination mechanism: `true` = legacy tombstones (safe for any cluster mix, incl. direct ≤v1.20 upgrades); `false` = fenced CAS (all nodes must be CAS-capable before flipping) |

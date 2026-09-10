@@ -112,6 +112,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.Cache.SizeThreshold != DefaultCacheSizeThreshold {
 		t.Errorf("Cache.SizeThreshold = %d, want %d", cfg.Cache.SizeThreshold, DefaultCacheSizeThreshold)
 	}
+	if cfg.Cache.BodyReadIdleTimeout != DefaultCacheBodyReadIdleTimeout {
+		t.Errorf("Cache.BodyReadIdleTimeout = %v, want %v", cfg.Cache.BodyReadIdleTimeout, DefaultCacheBodyReadIdleTimeout)
+	}
 	if cfg.Log.Level != DefaultLogLevel {
 		t.Errorf("Log.Level = %q, want %q", cfg.Log.Level, DefaultLogLevel)
 	}
@@ -164,6 +167,42 @@ log:
 	}
 	if cfg.Log.Level != "warn" {
 		t.Errorf("Log.Level = %q, want warn", cfg.Log.Level)
+	}
+}
+
+func TestLoad_BodyReadIdleTimeoutFromYAMLAndEnv(t *testing.T) {
+	content := "cache:\n  enabled: true\n  body_read_idle_timeout: 12s\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.BodyReadIdleTimeout != 12*time.Second {
+		t.Fatalf("BodyReadIdleTimeout = %v, want 12s", cfg.Cache.BodyReadIdleTimeout)
+	}
+
+	t.Setenv("TAG_CACHE_BODY_READ_IDLE_TIMEOUT", "250ms")
+	cfg, err = Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() with env error = %v", err)
+	}
+	if cfg.Cache.BodyReadIdleTimeout != 250*time.Millisecond {
+		t.Fatalf("BodyReadIdleTimeout = %v, want 250ms from env", cfg.Cache.BodyReadIdleTimeout)
+	}
+}
+
+func TestLoad_BodyReadIdleTimeoutRejectsNegativeYAML(t *testing.T) {
+	content := "cache:\n  enabled: true\n  body_read_idle_timeout: -1s\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	if _, err := Load(tmpFile); err == nil {
+		t.Fatal("Load() accepted a negative body_read_idle_timeout")
 	}
 }
 

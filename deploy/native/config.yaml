@@ -34,6 +34,10 @@ cache:
   # Default: 24h (24 hours)
   ttl: 24h
 
+  # Maximum idle gap between non-empty writes while reading cached body or range streams
+  # Default: 60s
+  body_read_idle_timeout: 60s
+
   # Maximum object size to cache (in bytes)
   # Objects larger than this are not cached
   # Default: 1073741824 (1GB)

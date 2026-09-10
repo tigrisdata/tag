@@ -107,6 +107,12 @@ const (
 	// byte budget, not the count, is what actually bounds this memory.
 	DefaultCacheMaxPopulateMemoryBytes = 2 << 30
 
+	// DefaultCacheBodyReadIdleTimeout bounds how long a cache body or range stream may wait
+	// for its first or next non-empty write. It is deliberately shorter than the
+	// HTTP server's overall write timeout so a stalled cache peer cannot occupy a
+	// request indefinitely while the client remains connected.
+	DefaultCacheBodyReadIdleTimeout = 60 * time.Second
+
 	// DefaultWarmOnWriteReservedFraction is the default cap on the fraction of the
 	// cache-populate memory budget reserved for warm-on-write populates (when
 	// warm_on_write is enabled). The reservation is demand-driven and elastic:
@@ -181,6 +187,11 @@ type CacheConfig struct {
 	Enabled       *bool         `yaml:"enabled"`        // Enable caching (default: true when nil)
 	TTL           time.Duration `yaml:"ttl"`            // Default cache TTL (default: 24h)
 	SizeThreshold int64         `yaml:"size_threshold"` // Max object size to cache in bytes (default: 1GB)
+	// BodyReadIdleTimeout cancels a cached body or range read when the cache does not
+	// hand a non-empty chunk to the destination within this interval. 0 or unset uses
+	// the default; negative values are invalid. The request context remains the
+	// parent of this deadline.
+	BodyReadIdleTimeout time.Duration `yaml:"body_read_idle_timeout"`
 
 	// OCache embedded configuration (see github.com/tigrisdata/ocache/embedded)
 	DiskPath          string   `yaml:"disk_path"`            // Path to cache data directory (default: /var/cache/tag)
@@ -438,6 +449,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cache.SizeThreshold == 0 {
 		cfg.Cache.SizeThreshold = DefaultCacheSizeThreshold
 	}
+	if cfg.Cache.BodyReadIdleTimeout == 0 {
+		cfg.Cache.BodyReadIdleTimeout = DefaultCacheBodyReadIdleTimeout
+	}
 	// Block size must be positive (it is a divisor in block arithmetic, and the read-side
 	// whole-vs-block boundary); a zero or negative value — from YAML or a programmatic config —
 	// falls back to the default.
@@ -615,6 +629,13 @@ func applyEnvOverrides(cfg *Config) {
 				cfg.Cache.TTL = ttl
 			}
 		}
+		// Override the cache body-read idle timeout from environment. A non-positive
+		// or malformed value leaves the YAML/default policy intact.
+		if val := os.Getenv("TAG_CACHE_BODY_READ_IDLE_TIMEOUT"); val != "" {
+			if timeout, err := time.ParseDuration(strings.TrimSpace(val)); err == nil && timeout > 0 {
+				cfg.Cache.BodyReadIdleTimeout = timeout
+			}
+		}
 		// Override deletion-queue batch size from environment
 		if val := os.Getenv("TAG_CACHE_DELETE_BATCH_SIZE"); val != "" {
 			if size, err := strconv.Atoi(val); err == nil && size > 0 {
@@ -761,6 +782,9 @@ func validate(cfg *Config) error {
 	}
 	if err := validateEvictionPolicy(cfg.Cache.EvictionPolicy); err != nil {
 		return err
+	}
+	if cfg.Cache.BodyReadIdleTimeout <= 0 {
+		return fmt.Errorf("cache.body_read_idle_timeout must be positive")
 	}
 	return nil
 }

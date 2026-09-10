@@ -153,6 +153,7 @@ func main() {
 		Dict("cache", zerolog.Dict().
 			Bool("enabled", cfg.Cache.IsEnabled()).
 			Str("ttl", cfg.Cache.TTL.String()).
+			Str("body_read_idle_timeout", cfg.Cache.BodyReadIdleTimeout.String()).
 			Int64("size_threshold", cfg.Cache.SizeThreshold).
 			Str("disk_path", cfg.Cache.DiskPath).
 			Int64("max_disk_usage_bytes", cfg.Cache.MaxDiskUsageBytes).

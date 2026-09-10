@@ -40,10 +40,11 @@ var ErrCacheDisabled = errors.New("cache is disabled")
 
 // Cache wraps ocache client for TAG.
 type Cache struct {
-	client     cacheclient.CacheClient
-	defaultTTL int64 // seconds
-	enabled    bool
-	closed     bool // coord is the meta-key ordering strategy: legacy tombstones (default)
+	client              cacheclient.CacheClient
+	defaultTTL          int64 // seconds
+	bodyReadIdleTimeout time.Duration
+	enabled             bool
+	closed              bool // coord is the meta-key ordering strategy: legacy tombstones (default)
 	// or CAS fences/versions. Selected once at construction; see coordinator.go.
 	coord metaCoordinator
 }
@@ -52,12 +53,16 @@ type Cache struct {
 // This allows tests to use an in-memory cache implementation like cacheclient.NewMemoryCache().
 func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig) *Cache {
 	ttl := int64(config.DefaultCacheTTL.Seconds())
+	bodyReadIdleTimeout := config.DefaultCacheBodyReadIdleTimeout
 	enabled := true // Default to enabled
 	legacy := true  // Default to the legacy coordinator (see coordinator.go)
 	var sizeThreshold int64
 	if cfg != nil {
 		if cfg.TTL > 0 {
 			ttl = int64(cfg.TTL.Seconds())
+		}
+		if cfg.BodyReadIdleTimeout > 0 {
+			bodyReadIdleTimeout = cfg.BodyReadIdleTimeout
 		}
 		enabled = cfg.IsEnabled()
 		legacy = cfg.IsLegacyCoordination()
@@ -70,10 +75,11 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 		coord = &casCoordinator{client: client}
 	}
 	return &Cache{
-		client:     client,
-		defaultTTL: ttl,
-		enabled:    enabled,
-		coord:      coord,
+		client:              client,
+		defaultTTL:          ttl,
+		bodyReadIdleTimeout: bodyReadIdleTimeout,
+		enabled:             enabled,
+		coord:               coord,
 	}
 }
 
@@ -88,6 +94,13 @@ func NewDisabledCache() *Cache {
 // IsEnabled returns true if the cache is enabled.
 func (c *Cache) IsEnabled() bool {
 	return c.enabled && !c.closed
+}
+
+func (c *Cache) bodyReadTimeout() time.Duration {
+	if c.bodyReadIdleTimeout > 0 {
+		return c.bodyReadIdleTimeout
+	}
+	return config.DefaultCacheBodyReadIdleTimeout
 }
 
 // ============================================================================
@@ -312,8 +325,10 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w i
 
 	bodyKey := MakeBodyKey(bucket, key, etag)
 
-	// Stream body directly to writer - no intermediate buffer
-	err := c.client.GetStream(ctx, bodyKey, w)
+	// Stream body directly to writer - no intermediate buffer. The child context
+	// keeps a stalled peer from holding the request after the configured idle
+	// interval, while the caller's context remains the parent cancellation signal.
+	err := streamBodyWithIdleTimeout(ctx, c.client, bodyKey, w, c.bodyReadTimeout())
 	if err != nil {
 		if isNotFoundError(err) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (body stream)")
@@ -427,7 +442,8 @@ func (c *Cache) IsBlockLocal(bucket, key, etag string, blockSize, blockIdx int64
 // ============================================================================
 
 // GetRangeStream retrieves a byte range from the cached object body.
-// Uses ocache's GetRangeStream for efficient partial reads from disk.
+// Uses ocache's GetRangeStream for efficient partial reads from disk, with the
+// same cache-read idle policy as full-object streams.
 // start and end are inclusive byte positions (HTTP Range semantics).
 // Pass the meta's ETag so the range resolves to the exact cached version.
 // Returns ErrNotFound if the object is not in cache.
@@ -439,7 +455,8 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 }
 
 // GetBlockRangeStream streams an inclusive block-LOCAL byte range [start,end] of a single
-// block of a block-mode object to w. blockIdx identifies the block; start and end are
+// block of a block-mode object to w. It applies the cache-read idle policy while the remote
+// block stream is in flight. blockIdx identifies the block; start and end are
 // offsets WITHIN the block (0 = first byte of the block), not within the object. Pass the
 // meta's ETag so the block resolves to the exact cached version. Returns ErrNotFound if the
 // block is not in cache. See RFC 0001.
@@ -472,7 +489,7 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 	if start == 0 && end == 0 {
 		// Single byte at position 0 - need to read 2 bytes and discard last
 		var buf bytes.Buffer
-		err := c.client.GetRangeStream(ctx, cacheKey, 0, 1, &buf)
+		err := streamRangeWithIdleTimeout(ctx, c.client, cacheKey, 0, 1, &buf, c.bodyReadTimeout())
 		if err != nil {
 			if isNotFoundError(err) {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
@@ -503,7 +520,7 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 	// in-bounds read of a present block always yields at least one byte, so zero bytes with no
 	// error means the key is absent — not a legitimately empty read.
 	cw := &countingWriter{w: w}
-	err := c.client.GetRangeStream(ctx, cacheKey, start, end, cw)
+	err := streamRangeWithIdleTimeout(ctx, c.client, cacheKey, start, end, cw, c.bodyReadTimeout())
 	if err != nil {
 		if isNotFoundError(err) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
