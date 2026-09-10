@@ -248,7 +248,7 @@ func (s *Service) originlessMiss(w http.ResponseWriter, r *http.Request, operati
 // are evaluated separately, after these.
 func writePreconditionFailed(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta) bool {
 	if im := r.Header.Get("If-Match"); im != "" {
-		if im != "*" && !meta.MatchesETagHeader(im) {
+		if im != "*" && !meta.MatchesETagHeader(im, true) {
 			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
 			return true
 		}
@@ -389,11 +389,11 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 			s3err.WriteError(w, r, s3err.ErrNoSuchKey)
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return nil
-		case ifMatch != "" && ifMatch != "*" && !existing.MatchesETagHeader(ifMatch):
+		case ifMatch != "" && ifMatch != "*" && !existing.MatchesETagHeader(ifMatch, true):
 			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return nil
-		case ifNoneMatch != "" && exists && (ifNoneMatch == "*" || existing.MatchesETagHeader(ifNoneMatch)):
+		case ifNoneMatch != "" && exists && (ifNoneMatch == "*" || existing.MatchesETagHeader(ifNoneMatch, false)):
 			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
 			metrics.RecordRequest("PutObject", "error", time.Since(start).Seconds())
 			return nil

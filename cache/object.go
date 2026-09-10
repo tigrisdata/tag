@@ -265,7 +265,12 @@ func (m *CachedObjectMeta) MatchesETag(etag string) bool {
 // correctly instead: legal conditional writes 412 and valid 304s are lost.
 // Splitting on ',' is exact here because ETags are quoted strings whose only
 // legal inner characters exclude ',' (RFC 7232 §2.3).
-func (m *CachedObjectMeta) MatchesETagHeader(header string) bool {
+//
+// strong selects the comparison function (RFC 7232 §2.3.2): If-Match REQUIRES
+// strong comparison — a W/ weak validator never matches, so a conditional
+// overwrite gated on one is refused — while If-None-Match uses weak
+// comparison, where W/"x" and "x" match.
+func (m *CachedObjectMeta) MatchesETagHeader(header string, strong bool) bool {
 	if header == "" || m.ETag == "" {
 		return false
 	}
@@ -277,7 +282,13 @@ func (m *CachedObjectMeta) MatchesETagHeader(header string) bool {
 		if candidate == "*" {
 			return true
 		}
-		if candidate != "" && normalizeETag(candidate) == normalizeETag(m.ETag) {
+		if candidate == "" {
+			continue
+		}
+		if strong && (strings.HasPrefix(candidate, "W/") || strings.HasPrefix(m.ETag, "W/")) {
+			continue
+		}
+		if normalizeETag(candidate) == normalizeETag(m.ETag) {
 			return true
 		}
 	}

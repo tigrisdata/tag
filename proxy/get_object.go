@@ -873,7 +873,7 @@ func (s *Service) handleRangeWithBackgroundCache(
 // path and the origin-less handler so the two cannot drift.
 func (s *Service) writeNotModifiedFromCache(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, operation string, start time.Time) bool {
 	if inm := r.Header.Get("If-None-Match"); inm != "" {
-		if !meta.MatchesETagHeader(inm) {
+		if !meta.MatchesETagHeader(inm, false) {
 			return false
 		}
 	} else {

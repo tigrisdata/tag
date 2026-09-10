@@ -482,6 +482,13 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 				} else {
 					fresh := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
 					fresh.BodyUpstream = true
+					// A chunked response carries no Content-Length header;
+					// Go's parsed resp.ContentLength may still know it. A
+					// marker left unknown-length is honest but re-tier-
+					// ineligible, so prefer any real length available.
+					if fresh.ContentLength < 0 && resp.ContentLength >= 0 {
+						fresh.ContentLength = resp.ContentLength
+					}
 					if _, perr := s.cache.PutMetaIfVersion(ctx, bucket, key, fresh, int(s.config.Cache.TTL.Seconds()), decToken); perr != nil {
 						log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Re-tier converge: marker rewrite failed")
 					}
