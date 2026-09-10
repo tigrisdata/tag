@@ -2,12 +2,17 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync/atomic"
 	"time"
 
 	cacheclient "github.com/tigrisdata/ocache/client"
 )
+
+// ErrBodyReadIdleTimeout identifies a cache stream canceled because no non-empty
+// destination write completed during the configured idle interval.
+var ErrBodyReadIdleTimeout = errors.New("cache body read idle timeout")
 
 // bodyReadProgressWriter records non-empty chunks handed to the destination
 // without changing the writer's return values. The timestamp is relative to one stream so the
@@ -53,10 +58,11 @@ func (w *bodyReadProgressWriter) Write(p []byte) (int, error) {
 	}
 
 	if !w.beginWrite() {
-		// The watchdog already canceled the stream. Preserve the destination
-		// writer's behavior for any late cache-client callback without reviving
-		// the progress state.
-		return w.writer.Write(p)
+		// The watchdog already canceled the stream. Do not let a cache client
+		// that ignores cancellation commit a late chunk: before response headers
+		// this must remain eligible for the caller's upstream fallback, and after
+		// commitment it must remain a partial cache response.
+		return 0, context.Canceled
 	}
 
 	n, err := w.writer.Write(p)
@@ -150,8 +156,8 @@ func streamWithIdleTimeout(
 	timeout time.Duration,
 	stream func(context.Context, io.Writer) error,
 ) (err error) {
-	streamCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	streamCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 
 	progressWriter := newBodyReadProgressWriter(writer)
 	stopWatchdog := make(chan struct{})
@@ -171,7 +177,9 @@ func streamWithIdleTimeout(
 				return
 			case <-timer.C:
 				for {
-					inFlight, remaining, expired := progressWriter.idleState(time.Now(), timeout, cancel)
+					inFlight, remaining, expired := progressWriter.idleState(time.Now(), timeout, func() {
+						cancel(ErrBodyReadIdleTimeout)
+					})
 					if expired {
 						return
 					}
@@ -198,10 +206,18 @@ func streamWithIdleTimeout(
 	// The named error still returns the cache client's exact result on the normal path.
 	defer func() {
 		close(stopWatchdog)
-		cancel()
+		cancel(nil)
 		<-watchdogDone
 	}()
-	return stream(streamCtx, progressWriter)
+
+	err = stream(streamCtx, progressWriter)
+	if errors.Is(context.Cause(streamCtx), ErrBodyReadIdleTimeout) {
+		// Keep context.Canceled discoverable for existing callers while adding a
+		// stable cause for paths that must distinguish an idle cache read from a
+		// client cancellation (notably committed block-cache responses).
+		return errors.Join(ErrBodyReadIdleTimeout, context.Canceled, err)
+	}
+	return err
 }
 
 func streamBodyWithIdleTimeout(

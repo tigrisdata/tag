@@ -138,6 +138,28 @@ func TestCache_GetBodyStreamCancelsStalledRead(t *testing.T) {
 	}
 }
 
+func TestCache_GetBodyStreamRejectsLateWriteAfterIdleCancellation(t *testing.T) {
+	const idleTimeout = 20 * time.Millisecond
+	cache := newBodyReadTestCache(t, idleTimeout, func(ctx context.Context, _ string, w io.Writer) error {
+		<-ctx.Done()
+		if _, err := w.Write([]byte("late cache body")); !errors.Is(err, context.Canceled) {
+			t.Errorf("late write error = %v, want context.Canceled", err)
+		}
+		// Deliberately ignore the late write error. The cache wrapper must still
+		// report the idle cancellation and leave the destination untouched.
+		return nil
+	})
+
+	var body bytes.Buffer
+	err := cache.GetBodyStream(context.Background(), "bucket", "key", `"etag"`, &body)
+	if !errors.Is(err, ErrBodyReadIdleTimeout) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetBodyStream() error = %v, want idle timeout and context.Canceled", err)
+	}
+	if body.Len() != 0 {
+		t.Fatalf("body length = %d, want 0 after late write", body.Len())
+	}
+}
+
 func TestCache_GetBodyStreamResetsIdleTimeoutOnNonEmptyWrites(t *testing.T) {
 	const idleTimeout = 30 * time.Millisecond
 	want := []byte("firstsecondthird")

@@ -185,6 +185,50 @@ func TestHandleGetObject_RangeCacheHitIdleTimeoutFallsBackBeforeHeaders(t *testi
 	}
 }
 
+func TestHandleGetObject_LateCacheChunkAfterIdleTimeoutFallsBackBeforeHeaders(t *testing.T) {
+	const idleTimeout = 20 * time.Millisecond
+	body := bytes.Repeat([]byte("cached body"), 8192)
+	stream := func(ctx context.Context, _ string, w io.Writer) error {
+		<-ctx.Done()
+		// Ignore the writer error and return nil to prove that the cache wrapper,
+		// rather than the cache peer, owns the no-late-commit boundary.
+		_, _ = w.Write(body[:32768])
+		return nil
+	}
+	svc, _, _ := newLargeStreamCacheServiceWithTimeout(t, body, stream, idleTimeout)
+
+	var upstreamCalls atomic.Int32
+	svc.forwarder = &mockForwarder{
+		doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Length": []string{"14"},
+					"Content-Type":   []string{"text/plain"},
+					"ETag":           []string{`"upstream"`},
+				},
+				Body: io.NopCloser(bytes.NewReader([]byte("upstream body"))),
+			}, nil
+		},
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject() error = %v", err)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+	if w.Code != http.StatusOK || w.Header().Get(XCacheHeader) != XCacheMiss {
+		t.Fatalf("fallback response = status %d, X-Cache %q, want 200/MISS", w.Code, w.Header().Get(XCacheHeader))
+	}
+	if got := w.Body.String(); got != "upstream body" {
+		t.Fatalf("body = %q, want upstream body", got)
+	}
+}
+
 func TestHandleGetObject_SmallCacheHitIdleTimeoutFallsBackBeforeHeaders(t *testing.T) {
 	const idleTimeout = 20 * time.Millisecond
 	body := []byte("small cached body")
