@@ -28,15 +28,17 @@ jobs:
       contents: read
       packages: write
 
-    # Run the suite with the default (whole-object caching) config only. The blocks
-    # variant was dropped from CI to halve the duplicate compat runs; run it locally
-    # with `make s3-test-local-blocks` when touching block populate/assembly/range
-    # paths. The matrix form is kept so the job name (and any required-check
-    # reference to it) stays stable.
+    # default = the whole-object proxy config; tiered = TAG_MODE=tiered running the
+    # tiered PROFILE of the suite (the listings / server-side-copy / object-sub-
+    # resource classes are skipped — by-design limitations, see docs/tiered-mode.md
+    # and the class comments in run-tests.sh — so the job is a stable green-or-red
+    # signal for the paths tiered DOES implement). The blocks variant was dropped
+    # from CI to halve the duplicate compat runs; run it locally with
+    # `make s3-test-local-blocks` when touching block populate/assembly/range paths.
     strategy:
       fail-fast: false
       matrix:
-        cache_mode: [default]
+        cache_mode: [default, tiered]
 
     name: s3-compat-tests (${{ matrix.cache_mode }})
 
@@ -67,15 +69,19 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: make ${{ matrix.cache_mode == 'blocks' && 's3-test-local-blocks' || 's3-test-local' }}
+        run: make ${{ matrix.cache_mode == 'tiered' && 's3-test-local-tiered' || 's3-test-local' }}
 
       - name: Run S3 compatibility tests
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          S3TEST_PROFILE: ${{ matrix.cache_mode == 'tiered' && 'tiered' || 'default' }}
         run: make s3-tests
 
       - name: Run SDK tests
+        # Default config only: the Go SDK suite has no tiered profile yet — it
+        # exercises listings and copies that tiered punts by design.
+        if: matrix.cache_mode == 'default'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
