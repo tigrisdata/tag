@@ -261,9 +261,15 @@ func TestTransparentForwarderAuthzMissStatesSkipLocalValidation(t *testing.T) {
 			name: "expired",
 			prep: func(forwarder *transparentForwarder) {
 				forwarder.authzCache.Grant(transparentAuthTestAccessKey, transparentAuthTestBucket)
-				deadline := time.Now().Add(2 * time.Second)
-				for forwarder.authzCache.IsAuthorized(transparentAuthTestAccessKey, transparentAuthTestBucket) && time.Now().Before(deadline) {
-					time.Sleep(time.Millisecond)
+				timeout := time.After(2 * time.Second)
+				poll := time.NewTicker(time.Millisecond)
+				defer poll.Stop()
+				for forwarder.authzCache.IsAuthorized(transparentAuthTestAccessKey, transparentAuthTestBucket) {
+					select {
+					case <-timeout:
+						return
+					case <-poll.C:
+					}
 				}
 			},
 		},
