@@ -22,6 +22,13 @@ func newTieredTestService(forwarder RequestForwarder, threshold int64) (*Service
 	cfg.Mode = config.ModeTiered
 	cfg.Cache.SetBlockCachingEnabled(false)
 	cfg.Cache.SizeThreshold = threshold
+	// Re-validate AFTER setting Mode so the mode-derived defaults apply:
+	// production tiered mode auto-selects the CAS coordinator (validateMode),
+	// and this suite must exercise the coordinator it actually runs —
+	// under legacy the cleanup repair chain (DeleteMetaIfVersion) is a stub.
+	if err := cfg.Validate(); err != nil {
+		panic(err)
+	}
 
 	memCache := cacheclient.NewMemoryCache()
 	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
@@ -714,5 +721,59 @@ func TestTieredConditionalPutRacedPreconditionAnswers412(t *testing.T) {
 	}
 	if g := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); g.Body.String() != "racer!!" {
 		t.Fatalf("GET = %q, want the racer's body to survive", g.Body.String())
+	}
+}
+
+// The same-ETag cleanup race must REPAIR: a marker with the displaced prior's
+// ETag re-established while the cross-tier DELETE is in flight (an
+// identical-content large PUT — MD5 ETags collide on identical bytes) may
+// point at the body that DELETE just removed. The repair converges the key on
+// an authoritative miss via DeleteMetaIfVersion. Fails if the suite runs the
+// legacy coordinator (whose deleteMetaIfVersion is a refusing stub) — the
+// production tiered configuration is CAS.
+func TestTieredCleanupRepairsRacedSameETagMarker(t *testing.T) {
+	mock, _, _ := tieredMock()
+	var c *cache.Cache
+	raced := make(chan struct{})
+	mock.doObjectDeleteFunc = func(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error) {
+		// Mid-DELETE: an identical-content large PUT re-establishes the marker
+		// under the same ETag, exactly the interleaving the pre-check missed.
+		marker := &cache.CachedObjectMeta{
+			Bucket: bucket, Key: key, ETag: etag,
+			BodyUpstream: true, StatusCode: http.StatusOK, ContentLength: 18,
+		}
+		_, tok, _, _ := c.GetMetaWithVersion(ctx, bucket, key)
+		if wrote, err := c.PutMetaIfVersion(ctx, bucket, key, marker, 60, tok); err != nil || !wrote {
+			t.Errorf("raced marker re-establishment: wrote=%v err=%v", wrote, err)
+		}
+		close(raced)
+		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+	}
+	var svc *Service
+	svc, c = newTieredTestService(mock, 8)
+
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "way past threshold", nil); w.Code != http.StatusOK {
+		t.Fatalf("large PUT status = %d", w.Code)
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "tiny", nil); w.Code != http.StatusOK {
+		t.Fatalf("small PUT status = %d", w.Code)
+	}
+
+	select {
+	case <-raced:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup DELETE never issued")
+	}
+	// The repair runs after the DELETE returns; converge = authoritative miss.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, found, _ := c.GetMeta(context.Background(), "b", "obj")
+		if !found {
+			return // repaired: the raced-in marker is gone
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("raced-in same-ETag marker survived the cleanup repair (repair chain not exercised?)")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

@@ -433,6 +433,16 @@ func NewDefault() *Config {
 	return cfg
 }
 
+// Validate runs the full configuration validation and applies mode-derived
+// defaults (tiered mode selects CAS coordination and disables block caching).
+// Load and NewDefault call it automatically; call it again after mutating a
+// Config programmatically — in particular after setting Mode — or the
+// mode-derived defaults silently do not apply and forbidden combinations
+// (tiered + legacy coordination, tiered + block caching) go undetected.
+func (c *Config) Validate() error {
+	return validate(c)
+}
+
 // applyDefaults sets default values for unset configuration fields.
 func applyDefaults(cfg *Config) {
 	// Server defaults
