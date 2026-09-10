@@ -454,7 +454,10 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") != etag {
-			_, _ = io.Copy(io.Discard, resp.Body)
+			// Drain and COUNT: for a chunked 200 the discarded bytes are the
+			// replacement body itself — the one true length a headerless
+			// response can yield — consumed below by the converge rewrite.
+			drained, drainErr := io.Copy(io.Discard, resp.Body)
 			// Only a DEFINITIVE answer about the object counts as changed and
 			// enters the backoff: a 200 with a different ETag (replaced) or a
 			// 404 (gone). A transient status (5xx, 429, an auth blip) says
@@ -482,12 +485,14 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 				} else {
 					fresh := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
 					fresh.BodyUpstream = true
-					// A chunked response carries no Content-Length header;
-					// Go's parsed resp.ContentLength may still know it. A
-					// marker left unknown-length is honest but re-tier-
-					// ineligible, so prefer any real length available.
-					if fresh.ContentLength < 0 && resp.ContentLength >= 0 {
-						fresh.ContentLength = resp.ContentLength
+					// A chunked response carries no Content-Length header
+					// (and Go's resp.ContentLength is -1 for exactly those),
+					// but the drain above read the whole replacement body —
+					// its count is the true length. A marker left
+					// unknown-length is honest but re-tier-ineligible, so
+					// use it when the drain completed cleanly.
+					if fresh.ContentLength < 0 && drainErr == nil {
+						fresh.ContentLength = drained
 					}
 					if _, perr := s.cache.PutMetaIfVersion(ctx, bucket, key, fresh, int(s.config.Cache.TTL.Seconds()), decToken); perr != nil {
 						log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Re-tier converge: marker rewrite failed")
