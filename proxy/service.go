@@ -604,6 +604,10 @@ func (rec *statusRecorder) Flush() {
 	}
 }
 
+func (rec *statusRecorder) Unwrap() http.ResponseWriter {
+	return rec.ResponseWriter
+}
+
 // wroteSuccess reports whether upstream returned a 2xx status.
 func (rec *statusRecorder) wroteSuccess() bool {
 	return rec.status >= 200 && rec.status < 300
