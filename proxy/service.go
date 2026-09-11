@@ -782,8 +782,24 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// invalidation fails. Proxy modes only — see preForwardInvalidate; in
 	// tiered mode the key may hold a local-tier only-copy or a live marker
 	// that a rejected forward must leave intact (tiered relies on the
-	// post-success invalidation below).
+	// post-success converge below).
 	s.preForwardInvalidate(context.Background(), bucket, key)
+
+	// Tiered: the post-success converge must be ORDERED. The unconditional
+	// coordinator delete deliberately out-deletes racing writers — correct
+	// for a proxy cache, but here a small PUT acked during the forward is
+	// the local tier's only copy, and out-deleting it is data loss. Capture
+	// the pre-forward token; the converge below removes exactly the state
+	// this DELETE displaced, and anything newer keeps the key.
+	var (
+		delPrior      *cache.CachedObjectMeta
+		delPriorVer   uint64
+		delPriorKnown bool
+	)
+	if s.config.IsTiered() {
+		delPrior, delPriorVer, delPriorKnown = s.captureMarkerPrior(r.Context(), bucket, key)
+		_ = delPrior
+	}
 
 	// Forward to upstream, recording the upstream status.
 	rec := &statusRecorder{ResponseWriter: w}
@@ -795,10 +811,12 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// fence bump blocks that stale repopulation.
 	// Gated on a 2xx: a rejected DELETE leaves the object present, so re-invalidating
 	// would only discard a valid racing refill and cause an unnecessary later miss.
-	// Routed through invalidateObject (like the pre-forward call) so a failure of this
-	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.convergeInvalidation(context.Background(), bucket, key)
+		if s.config.IsTiered() {
+			s.convergeTieredDelete(bucket, key, delPriorVer, delPriorKnown)
+		} else {
+			s.convergeInvalidation(context.Background(), bucket, key)
+		}
 	}
 
 	status := "success"
@@ -847,16 +865,20 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 			// Client-triggered revalidation: Cache-Control: no-cache/max-age=0
 			if forceRevalidate && meta.ETag != "" {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD cache hit requires revalidation (client-triggered)")
-				return s.revalidateAndServeHead(ctx, w, bucket, key, accessKey, secretKey, meta, start)
+				return s.revalidateAndServeHead(ctx, w, r, bucket, key, accessKey, secretKey, meta, start)
 			}
 
 			if !forceRevalidate {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD served from cache")
-				// Client conditionals are evaluated BEFORE the serve: this
-				// path answered a conditional HEAD with a full 200 header
-				// set where the GET hit path (and the tiered/origin-less
-				// engine) correctly answer 304/412 from the same metadata.
-				if s.answerConditionalsFromMeta(w, r, meta, "HeadObject", start) {
+				// 304 conditionals only, exactly like the proxy GET hit path
+				// (writeNotModifiedFromCache): the 412 PRECONDITIONS
+				// (If-Match/If-Unmodified-Since) are origin-state questions
+				// RFC 9110 forbids answering from a possibly-stale cached
+				// response — a mixed-writer overwrite would make TAG return a
+				// hard 412 for an object whose live version matches. Those
+				// belong only where TAG is authoritative (tiered/origin-less),
+				// via answerConditionalsFromMeta.
+				if s.writeNotModifiedFromCache(w, r, meta, "HeadObject", start) {
 					return nil
 				}
 				serveMetaHit(w, meta, "HeadObject", start)
@@ -975,6 +997,30 @@ func (s *Service) convergeInvalidation(ctx context.Context, bucket, key string) 
 		return
 	}
 	_ = s.invalidateObject(ctx, bucket, key)
+}
+
+// convergeTieredDelete is the tiered post-success invalidation for the
+// forwarded DELETE paths: it removes exactly the state the DELETE displaced
+// (the pre-forward token), so a small PUT acked during the forward — the
+// local tier's only copy — is never out-deleted the way the proxy-mode
+// unconditional converge deliberately does. A refused removal means a newer
+// write owns the key, which is the correct outcome. With the prior unknown
+// (its read failed) nothing is removed: the possibly-stale marker serves
+// until TTL — an availability inconsistency, chosen over unguarded deletion
+// in the mode where the cache is the store.
+func (s *Service) convergeTieredDelete(bucket, key string, priorVersion uint64, priorKnown bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if !priorKnown {
+		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Tiered DELETE converge skipped - prior unknown; possibly-stale metadata serves until TTL")
+		return
+	}
+	if _, err := s.cache.DeleteMetaIfVersion(ctx, bucket, key, priorVersion); err != nil {
+		metrics.RecordCacheOperation("delete", "error")
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Tiered DELETE converge failed; stale metadata may serve until TTL")
+		return
+	}
+	metrics.RecordCacheOperation("delete", "success")
 }
 
 func (s *Service) preForwardInvalidate(ctx context.Context, bucket, key string) {

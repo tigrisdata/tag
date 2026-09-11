@@ -1374,3 +1374,65 @@ func TestTieredStreamedPutUnterminatedChunkingAnswersIncomplete(t *testing.T) {
 		t.Fatal("meta committed for an unterminated chunked body")
 	}
 }
+
+// A tiered DELETE forwarded (upstream-tier or unknown key) must converge the
+// cache under the PRE-FORWARD version — never the unconditional coordinator
+// delete that out-deletes racing writers. A small PUT acked DURING the
+// forward is the local tier's only copy and must survive.
+var svcForDelete *Service
+
+func TestTieredForwardedDeleteConvergeSparesRacingPut(t *testing.T) {
+	mock, _, _ := tieredMock()
+	var c *cache.Cache
+	// A large upstream-tier marker exists, so DELETE forwards (not local).
+	raced := make(chan struct{})
+	mock.doObjectDeleteFunc = func(ctx context.Context, bucket, key, etag, ak, sk string) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+	}
+	mock.forwardFunc = func(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+		if r.Method == http.MethodDelete {
+			// Mid-forward: a small client PUT commits a new local-tier object.
+			put := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader("racer-wins"))
+			if err := svcForDelete.HandlePutObject(httptest.NewRecorder(), put); err != nil {
+				t.Errorf("racing PUT: %v", err)
+			}
+			close(raced)
+			w.WriteHeader(http.StatusNoContent)
+			return nil
+		}
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 1024
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c = cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	svcForDelete = NewService(mock, c, cfg)
+
+	// Seed an upstream-tier marker so the DELETE forwards.
+	marker := &cache.CachedObjectMeta{Bucket: "b", Key: "obj", ETag: `"up-1"`, BodyUpstream: true, ContentLength: 5000, StatusCode: 200}
+	_, tok, _, _ := c.GetMetaWithVersion(context.Background(), "b", "obj")
+	if wrote, err := c.PutMetaIfVersion(context.Background(), "b", "obj", marker, 60, tok); err != nil || !wrote {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/b/obj", nil)
+	if err := svcForDelete.HandleDeleteObject(httptest.NewRecorder(), req); err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	<-raced
+
+	// The racing PUT's object must survive the converge.
+	cur, found, _ := c.GetMeta(context.Background(), "b", "obj")
+	if !found || cur == nil || cur.BodyUpstream {
+		t.Fatalf("racing PUT's local object was out-deleted by the DELETE converge: %+v", cur)
+	}
+	g := tieredDo(t, svcForDelete, http.MethodGet, "/b/obj", "", nil)
+	if g.Code != http.StatusOK || g.Body.String() != "racer-wins" {
+		t.Fatalf("GET = %d %q, want the racing PUT's bytes", g.Code, g.Body.String())
+	}
+}

@@ -385,7 +385,7 @@ func TestRevalidateAndServeHead_304(t *testing.T) {
 	_ = c.PutWithMeta(ctx, bucket, key, meta, make([]byte, 100), 0)
 
 	w := httptest.NewRecorder()
-	err := svc.revalidateAndServeHead(ctx, w, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServeHead(ctx, w, httptest.NewRequest(http.MethodHead, "/"+bucket+"/"+key, nil), bucket, key, "access", "secret", meta, time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServeHead() error = %v", err)
 	}
@@ -430,7 +430,7 @@ func TestRevalidateAndServeHead_200(t *testing.T) {
 	_ = c.PutWithMeta(ctx, bucket, key, meta, make([]byte, 100), 0)
 
 	w := httptest.NewRecorder()
-	err := svc.revalidateAndServeHead(ctx, w, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServeHead(ctx, w, httptest.NewRequest(http.MethodHead, "/"+bucket+"/"+key, nil), bucket, key, "access", "secret", meta, time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServeHead() error = %v", err)
 	}
@@ -472,7 +472,7 @@ func TestRevalidateAndServeHead_Error_ServesStale(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	err := svc.revalidateAndServeHead(ctx, w, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServeHead(ctx, w, httptest.NewRequest(http.MethodHead, "/"+bucket+"/"+key, nil), bucket, key, "access", "secret", meta, time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServeHead() error = %v", err)
 	}

@@ -461,6 +461,7 @@ func (s *Service) serveStaleFromCache(
 func (s *Service) revalidateAndServeHead(
 	ctx context.Context,
 	w http.ResponseWriter,
+	r *http.Request,
 	bucket, key, accessKey, secretKey string,
 	meta *cache.CachedObjectMeta,
 	start time.Time,
@@ -507,6 +508,13 @@ func (s *Service) revalidateAndServeHead(
 		}
 	}
 
+	// The client's own conditionals still apply to the served headers — a
+	// matching If-None-Match is a 304, not a 200 (the same 304-only rule as
+	// the non-revalidate HEAD hit path; the upstream revalidation validated
+	// TAG's cached ETag, not the client's request).
+	if s.writeNotModifiedFromCache(w, r, meta, "HeadObject", start) {
+		return nil
+	}
 	serveMetaHit(w, meta, "HeadObject", start)
 	return nil
 }

@@ -75,7 +75,7 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 		return nil
 	}
 
-	meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
+	meta, metaVersion, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 	if cacheErr != nil {
 		// A transient metadata failure is not absence: the miss below is
 		// authoritative, so it must never be minted from an error. 500-retry,
@@ -86,7 +86,7 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 	if !found {
 		meta = nil
 	}
-	return s.serveOriginlessObject(w, r, operation, start, meta)
+	return s.serveOriginlessObject(w, r, operation, start, meta, metaVersion)
 }
 
 // serveOriginlessObject serves GET/HEAD from an ALREADY-READ metadata
@@ -98,7 +98,7 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 // existed before, during, and after the overwrite. One read, one decision —
 // a read racing an overwrite serves the version its snapshot saw, the legal
 // atomic-replace answer (and the hottest path saves a doubled meta read).
-func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, operation string, start time.Time, meta *cache.CachedObjectMeta) error {
+func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, operation string, start time.Time, meta *cache.CachedObjectMeta, metaVersion uint64) error {
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
 
@@ -148,21 +148,44 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 		if served {
 			return rangeErr
 		}
-		if bodyGone(rangeErr) {
-			s.cache.Delete(ctx, bucket, key)
-		}
-		return s.originlessMiss(w, r, operation, start)
+		return s.finishServeBodyError(ctx, w, r, bucket, key, metaVersion, rangeErr, operation, start)
 	}
 
 	if bodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); bodyErr != nil {
 		// serveFromCache fails before committing headers, so a miss response is
-		// still writable. Only a genuinely absent body orphans the metadata.
-		if bodyGone(bodyErr) {
-			s.cache.Delete(ctx, bucket, key)
-		}
-		return s.originlessMiss(w, r, operation, start)
+		// still writable.
+		return s.finishServeBodyError(ctx, w, r, bucket, key, metaVersion, bodyErr, operation, start)
 	}
 	return nil
+}
+
+// finishServeBodyError disposes of a pre-commit body-serve failure. It
+// distinguishes two cases the mode must not conflate:
+//   - The body is GENUINELY GONE (evicted under a live meta): an
+//     authoritative miss, and the orphaned meta is invalidated — but
+//     ETag-GUARDED (DeleteIfETag), never an unconditional delete, so a
+//     concurrent PUT's just-committed newer version is never wiped. The
+//     guard resolves against the served snapshot's discriminator identity;
+//     a different current entry keeps the key.
+//   - Anything else is TRANSIENT (a cluster-peer gRPC blip, a deadline):
+//     NOT absence. Minting an authoritative NoSuchKey here would tell the
+//     caller a live object does not exist — so it propagates as a retryable
+//     5xx, matching this handler's meta-read and probe legs.
+func (s *Service) finishServeBodyError(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string, metaVersion uint64, serveErr error, operation string, start time.Time) error {
+	if !bodyGone(serveErr) {
+		metrics.RecordRequest(operation, "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return serveErr
+	}
+	// VERSION-guarded against the SERVED snapshot: a concurrent PUT's newer
+	// meta (even an identical-content one, which shares the ETag but not the
+	// version) is never wiped — only the exact orphaned entry this serve
+	// read is removed. The delete is best-effort cleanup anyway: entryServable
+	// already gates every subsequent read on body presence, so a surviving
+	// orphan reads as a miss regardless and ages out by TTL.
+	if _, derr := s.cache.DeleteMetaIfVersion(ctx, bucket, key, metaVersion); derr != nil {
+		log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Orphaned-meta invalidation failed; ages out by TTL")
+	}
+	return s.originlessMiss(w, r, operation, start)
 }
 
 // entryServable is the handler's single existence answer: all blocks present for
@@ -269,6 +292,20 @@ func originlessPlainObject(r *http.Request) bool {
 // mode's semantics: new meta points at the new ETag-keyed body; the old body
 // ages out by TTL.
 func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) error {
+	return s.handleOriginlessPut(w, r, nil)
+}
+
+// putPrior is a metadata snapshot the caller already read, threaded into the
+// engine PUT so a single GetMetaWithVersion serves both the caller's decision
+// and the engine's precondition/token — closing the double-read TOCTOU (a
+// marker committing between two reads) and the doubled hot-path meta read.
+type putPrior struct {
+	meta    *cache.CachedObjectMeta
+	version uint64
+	found   bool
+}
+
+func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, prior *putPrior) error {
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
@@ -300,10 +337,21 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// object answers NoSuchKey (there is nothing to match), a
 	// present-but-different ETag is the 412; If-None-Match refuses when the
 	// object exists.
-	existing, expected, found, merr := s.cache.GetMetaWithVersion(ctx, bucket, key)
-	if merr != nil {
-		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
-		return merr
+	var existing *cache.CachedObjectMeta
+	var expected uint64
+	var found bool
+	if prior != nil {
+		// The caller's snapshot IS the decision state: reuse it so the tier
+		// routing and this precondition evaluation cannot disagree across a
+		// racing marker commit, and the hot path reads meta once.
+		existing, expected, found = prior.meta, prior.version, prior.found
+	} else {
+		var merr error
+		existing, expected, found, merr = s.cache.GetMetaWithVersion(ctx, bucket, key)
+		if merr != nil {
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+			return merr
+		}
 	}
 	conditional := false
 	ifMatch := r.Header.Get("If-Match")

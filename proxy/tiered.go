@@ -60,6 +60,14 @@ import (
 // tieredCleanupTimeout bounds the background cross-tier DELETE.
 const tieredCleanupTimeout = 30 * time.Second
 
+// forwardStatus maps a Forward result to the request-metric status label.
+func forwardStatus(err error) string {
+	if err != nil {
+		return "error"
+	}
+	return "success"
+}
+
 // handleTieredObject serves GET and HEAD in tiered mode.
 func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()
@@ -77,10 +85,15 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 		return err
 	}
 	if result != AuthValidated {
-		return s.forwarder.Forward(ctx, w, r)
+		// Unvalidated requests forward to upstream (the auth authority) — an
+		// upstream-sourced response, recorded like every sibling path so the
+		// mode's traffic is visible in tag_requests_total.
+		ferr := s.forwarder.Forward(ctx, w, r)
+		metrics.RecordRequest(operation, forwardStatus(ferr), metrics.SourceUpstream, time.Since(start).Seconds())
+		return ferr
 	}
 
-	meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
+	meta, metaVersion, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 	if cacheErr != nil {
 		// A transient metadata failure is not absence. The miss below is
 		// authoritative — served for an existing object it would make the caller
@@ -109,7 +122,11 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 		if r.Method == http.MethodGet && originlessPlainObject(r) {
 			s.maybeRetierOnRead(bucket, key, accessKey, secretKey, meta)
 		}
-		return s.forwarder.Forward(ctx, w, r)
+		// The mode's principal body traffic — record it (upstream-sourced),
+		// or a forward-heavy tiered node reads as ~100% local.
+		ferr := s.forwarder.Forward(ctx, w, r)
+		metrics.RecordRequest(operation, forwardStatus(ferr), metrics.SourceUpstream, time.Since(start).Seconds())
+		return ferr
 	}
 
 	// Local tier, or no metadata at all: the engine serves it, and its miss is
@@ -123,7 +140,7 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 	if !found {
 		meta = nil
 	}
-	return s.serveOriginlessObject(w, r, operation, start, meta)
+	return s.serveOriginlessObject(w, r, operation, start, meta, metaVersion)
 }
 
 // handleTieredPut routes a PUT to its tier by declared size.
@@ -156,13 +173,14 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 		// The prior version's tier decides what an overwrite must clean up and
 		// where a conditional write is evaluated, so a failed lookup cannot be
 		// read as "no prior". Fail retryably instead.
-		prior, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
+		priorMeta, priorVersion, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 		if cacheErr != nil {
 			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return cacheErr
 		}
-		if !found {
-			prior = nil
+		var prior *cache.CachedObjectMeta
+		if found {
+			prior = priorMeta
 		}
 		conditional := r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != ""
 
@@ -171,7 +189,10 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 		// upstream owns that object's version.
 		if !(conditional && prior != nil && prior.BodyUpstream) {
 			rec := &statusRecorder{ResponseWriter: w}
-			err := s.HandleOriginlessPut(rec, r)
+			// Thread the SAME snapshot into the engine: the tier decision
+			// above and the engine's precondition/token now share one read,
+			// so a marker committing in between cannot make them disagree.
+			err := s.handleOriginlessPut(rec, r, &putPrior{meta: priorMeta, version: priorVersion, found: found})
 			if err == nil && rec.wroteSuccess() && prior != nil && prior.BodyUpstream {
 				// Small write displaced an upstream-tier version: remove the
 				// upstream copy so it doesn't linger as an orphan. Bound to the
@@ -274,7 +295,7 @@ func (s *Service) captureMarkerPrior(ctx context.Context, bucket, key string) (p
 
 func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
 	if etag == "" {
-		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
+		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorVersion, priorKnown)
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Upstream PUT response had no ETag - no tier marker; object reads as a miss until re-put")
 		return
 	}
@@ -321,13 +342,13 @@ func (s *Service) commitUpstreamMarker(bucket, key string, meta *cache.CachedObj
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if !priorKnown {
-		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
+		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorVersion, priorKnown)
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Prior lookup failed - no tier marker; object reads as a miss until re-put")
 		return
 	}
 	wrote, err := s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, priorVersion)
 	if err != nil {
-		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
+		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorVersion, priorKnown)
 		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Failed to write upstream tier marker; object reads as a miss until re-put")
 		return
 	}
@@ -337,7 +358,7 @@ func (s *Service) commitUpstreamMarker(bucket, key string, meta *cache.CachedObj
 		// or a newer write. The guarded sweep covers the case where a DELETE's
 		// removal failed after it won, so the stale prior cannot outlive it;
 		// a newer write keeps the key through the sweep's identity guard.
-		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
+		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorVersion, priorKnown)
 	}
 }
 
@@ -353,7 +374,7 @@ func (s *Service) commitUpstreamMarker(bucket, key string, meta *cache.CachedObj
 // large-PUT path's, under the same pre-forward token.
 func (s *Service) stampUpstreamMarkerAfterCompletion(bucket, key, etag, accessKey, secretKey string, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
 	if etag == "" {
-		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorKnown)
+		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorVersion, priorKnown)
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Multipart completion carried no ETag - no tier marker; object reads as a miss until re-put")
 		return
 	}
@@ -439,7 +460,7 @@ func (s *Service) headObjectMeta(ctx context.Context, bucket, key, accessKey, se
 // that path requires the metadata store to be failing already, and an
 // unguarded delete there would trade a bounded staleness window for the
 // unbounded loss of a racing local write that has no upstream copy.
-func (s *Service) invalidateDisplacedTieredMeta(bucket, key string, prior *cache.CachedObjectMeta, priorKnown bool) {
+func (s *Service) invalidateDisplacedTieredMeta(bucket, key string, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
 	if !priorKnown {
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Tier marker failed with unknown prior; possibly-stale metadata serves until TTL")
 		return
@@ -450,7 +471,12 @@ func (s *Service) invalidateDisplacedTieredMeta(bucket, key string, prior *cache
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := s.cache.DeleteIfETag(ctx, bucket, key, prior.ETag); err != nil {
+	// VERSION-guarded, not ETag-guarded: MD5 ETags collide on identical
+	// bytes, so an ETag guard could delete a same-content successor write
+	// that won the race (an idempotent client re-PUT) — an acked local-tier
+	// only-copy. The observed version is exactly the snapshot this sweep is
+	// entitled to remove; anything newer keeps the key.
+	if _, err := s.cache.DeleteMetaIfVersion(ctx, bucket, key, priorVersion); err != nil {
 		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Tier marker failed and displaced prior could not be invalidated; possibly-stale metadata serves until TTL")
 	}
 }
@@ -825,7 +851,9 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 		// exactly this ETag — that body is authoritative again, not an
 		// orphan. (A racer between this check and the DELETE narrows to the
 		// same-ETag re-establishment landing inside one round trip; the
-		// If-Match still guards every different-ETag interleaving.)
+		// If-Match still guards every different-ETag interleaving — Tigris
+		// enforces conditional DELETEs against the object's current version,
+		// so a different-ETag racer's body is provably left intact.)
 		if cur, found, gerr := s.cache.GetMeta(ctx, bucket, key); gerr == nil && found && cur != nil && cur.BodyUpstream && cur.ETag == etag {
 			metrics.RecordTieredCleanupSkipped("live_marker")
 			return
