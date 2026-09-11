@@ -171,7 +171,7 @@ const (
 	// A later flush is useful for incremental responses, but flushing every
 	// io.Copy write turns the reader's buffer boundaries into downstream writes.
 	// Keep later flushes bounded without making a fast response flush per read.
-	forwarderFlushBytes    = 64 * 1024
+	forwarderFlushBytes    = 256 * 1024
 	forwarderFlushInterval = 100 * time.Millisecond
 )
 
