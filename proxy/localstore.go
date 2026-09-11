@@ -438,9 +438,15 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	}
 	if putErr := s.cache.PutBodyStream(ctx, bucket, key, ref, src, int64(ttl)); putErr != nil {
 		discardStaged()
-		if src.err != nil && streaming {
-			// The chunked decoder rejecting the client's framing — a
-			// malformed request, not a server fault.
+		// The CLIENT's body problem — a streaming body's malformed or
+		// truncated chunk framing (any decoder error, wrapped EOFs
+		// included), or a body that ended mid-transfer in either mode — is
+		// the client misdescribing the request: 400 IncompleteBody, never a
+		// retryable 500. Only a reader failure that is neither (a transport
+		// fault on a plain body) or a cache-side write failure propagates.
+		clientBody := src.err != nil &&
+			(streaming || errors.Is(src.err, io.EOF) || errors.Is(src.err, io.ErrUnexpectedEOF))
+		if clientBody {
 			s3err.WriteError(w, r, s3err.ErrIncompleteBody)
 			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
@@ -622,7 +628,12 @@ type captureReader struct {
 func (c *captureReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += int64(n)
-	if err != nil && !errors.Is(err, io.EOF) && c.err == nil {
+	// The io.EOF SENTINEL (equality, not errors.Is) is clean termination and
+	// is never recorded. A WRAPPED EOF is different: the chunked decoder
+	// wraps its errors ("reading chunk header: %w"), so a body truncated
+	// mid-frame surfaces as a wrapped io.EOF that must be attributed to the
+	// client — errors.Is would swallow it and turn IncompleteBody into a 500.
+	if err != nil && err != io.EOF && c.err == nil {
 		c.err = err
 	}
 	return n, err

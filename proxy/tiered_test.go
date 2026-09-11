@@ -1167,3 +1167,66 @@ func TestTieredStreamedPutRetryIsMetaOnly(t *testing.T) {
 		t.Fatalf("GET = %q, want the client's bytes", g.Body.String())
 	}
 }
+
+// truncatedReader yields some bytes then a non-sentinel EOF-family error —
+// the shape of a client disconnect mid-body.
+type truncatedReader struct {
+	data []byte
+	done bool
+}
+
+func (t *truncatedReader) Read(p []byte) (int, error) {
+	if !t.done {
+		t.done = true
+		n := copy(p, t.data)
+		return n, nil
+	}
+	return 0, io.ErrUnexpectedEOF
+}
+
+// A truncated or malformed streamed body answers 400 IncompleteBody — the
+// client misdescribed the request — never a retryable 500, and the staged
+// body is reclaimed. Covers the chunk decoder's WRAPPED EOF (which a naive
+// errors.Is(err, io.EOF) exemption would swallow into a 500) and the
+// plain-body mid-transfer disconnect.
+func TestTieredStreamedPutTruncatedBodyAnswersIncomplete(t *testing.T) {
+	svc, c, ledger := newLedgerTieredService(t, 1<<20)
+
+	// Truncated aws-chunked framing: the header declares a 5-byte chunk but
+	// the body ends mid-chunk — the decoder reports a wrapped EOF.
+	chunked := "5;chunk-signature=deadbeef\r\nhel"
+	req := httptest.NewRequest(http.MethodPut, "/b/trunc-chunked", strings.NewReader(chunked))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	req.Header.Set("X-Amz-Decoded-Content-Length", "5")
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, req); err != nil {
+		t.Fatalf("chunked PUT: %v", err)
+	}
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "IncompleteBody") {
+		t.Fatalf("truncated chunked PUT = %d %q, want 400 IncompleteBody", w.Code, w.Body.String())
+	}
+
+	// Plain body that dies mid-transfer with ErrUnexpectedEOF.
+	req2 := httptest.NewRequest(http.MethodPut, "/b/trunc-plain", nil)
+	req2.Body = io.NopCloser(&truncatedReader{data: []byte("hel")})
+	req2.ContentLength = 10
+	w2 := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w2, req2); err != nil {
+		t.Fatalf("plain PUT: %v", err)
+	}
+	if w2.Code != http.StatusBadRequest || !strings.Contains(w2.Body.String(), "IncompleteBody") {
+		t.Fatalf("truncated plain PUT = %d %q, want 400 IncompleteBody", w2.Code, w2.Body.String())
+	}
+
+	// Nothing committed, every staged body reclaimed.
+	for _, k := range []string{"trunc-chunked", "trunc-plain"} {
+		if _, found, _ := c.GetMeta(context.Background(), "b", k); found {
+			t.Fatalf("meta committed for truncated body %s", k)
+		}
+	}
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	if len(ledger.puts) != len(ledger.deletes) {
+		t.Fatalf("staged lifecycle = puts %v deletes %v, want every staged key reclaimed", ledger.puts, ledger.deletes)
+	}
+}
