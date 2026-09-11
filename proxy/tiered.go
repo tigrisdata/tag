@@ -622,7 +622,12 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		src := &captureReader{r: io.LimitReader(resp.Body, marker.ContentLength+1)}
 		putBodyErr := s.cache.PutBodyStream(ctx, bucket, key, ref, src, int64(s.config.Cache.TTL.Seconds()))
 		discardRef := func() {
-			if derr := s.cache.DeleteBody(ctx, bucket, key, ref); derr != nil {
+			// Detached context: the fetch ctx is CANCELED by a racing PUT —
+			// precisely the interleaving whose staged body most needs
+			// reclaiming — so the delete must not ride it.
+			dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer dcancel()
+			if derr := s.cache.DeleteBody(dctx, bucket, key, ref); derr != nil {
 				log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Re-tier staged body delete failed; orphan ages out by TTL")
 			}
 		}
