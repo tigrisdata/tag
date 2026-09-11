@@ -365,18 +365,19 @@ func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	var dst io.Writer = w
-	var flushWriter *pacedFlushWriter
-	if inContentLength == 0 && resp.ContentLength < 0 && resp.Header.Get("Content-Type") != "" {
+	var n int64
+	var copyErr error
+	if resp.ContentLength < 0 && inContentLength == 0 && resp.Header.Get("Content-Type") != "" {
 		if flusher, ok := findResponseFlusher(w); ok {
 			flusher.Flush()
-			flushWriter = newPacedFlushWriter(w, flusher)
-			dst = flushWriter
+			flushWriter := newPacedFlushWriter(w, flusher)
+			n, copyErr = io.Copy(flushWriter, resp.Body)
+			flushWriter.stop()
+		} else {
+			n, copyErr = io.Copy(w, resp.Body)
 		}
-	}
-	n, copyErr := io.Copy(dst, resp.Body)
-	if flushWriter != nil {
-		flushWriter.stop()
+	} else {
+		n, copyErr = io.Copy(w, resp.Body)
 	}
 	if copyErr != nil {
 		log.Warn().Err(copyErr).Msg("Failed to copy response body to client")
