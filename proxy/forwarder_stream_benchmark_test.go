@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -31,6 +32,7 @@ func BenchmarkPassthroughBufferedBody(b *testing.B) {
 			payload := bytes.Repeat([]byte("x"), test.size)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
 				w.WriteHeader(http.StatusOK)
 				for offset := 0; offset < len(payload); offset += 8 * 1024 {
 					end := offset + 8*1024
