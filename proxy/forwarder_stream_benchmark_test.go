@@ -289,9 +289,15 @@ func BenchmarkPassthroughPacedFirstByte(b *testing.B) {
 			resp.Body.Close()
 			b.Fatal(err)
 		}
+		b.StopTimer()
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			resp.Body.Close()
+			b.Fatal(err)
+		}
 		if err := resp.Body.Close(); err != nil {
 			b.Fatal(err)
 		}
+		b.StartTimer()
 	}
 	reportPassthroughResponseMetrics(b, stats)
 }
