@@ -118,6 +118,12 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 				s.preForwardInvalidate(context.Background(), bucket, obj.Key)
 				if tieredPriors != nil {
 					if _, seen := tieredPriors[obj.Key]; !seen {
+						// Claim before capturing the token, held for the whole
+						// bulk delete: cancels and excludes re-tiers so a heal
+						// cannot resurrect a deleted key past the ordered
+						// converge (see HandleDeleteObject).
+						s.claimRetierWrite(bucket, obj.Key)
+						defer s.releaseRetierWrite(bucket, obj.Key)
 						_, v, known := s.captureMarkerPrior(context.Background(), bucket, obj.Key)
 						tieredPriors[obj.Key] = tieredPrior{version: v, known: known}
 					}

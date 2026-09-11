@@ -1436,3 +1436,73 @@ func TestTieredForwardedDeleteConvergeSparesRacingPut(t *testing.T) {
 		t.Fatalf("GET = %d %q, want the racing PUT's bytes", g.Code, g.Body.String())
 	}
 }
+
+// A forwarded DELETE must CANCEL an in-flight re-tier, so a heal cannot
+// commit a local-tier copy that the version-guarded converge then declines
+// to delete — resurrecting a deleted object behind a 204. The DELETE claims
+// the key (like a PUT), whose claim cancels the heal's context.
+func TestTieredForwardedDeleteCancelsInflightRetier(t *testing.T) {
+	mock, _, _ := tieredMock()
+	// The re-tier fetch blocks until we release it, giving the DELETE time to
+	// claim-and-cancel; the fetch then observes the canceled context.
+	fetchGate := make(chan struct{})
+	var fetchStarted sync.WaitGroup
+	fetchStarted.Add(1)
+	started := false
+	mock.doFullObjectFunc = func(ctx context.Context, bucket, key, ak, sk string) (*http.Response, error) {
+		if !started {
+			started = true
+			fetchStarted.Done()
+		}
+		select {
+		case <-fetchGate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: func() http.Header { h := http.Header{}; h.Set("ETag", `"up-1"`); return h }(), Body: io.NopCloser(strings.NewReader("healed"))}, nil
+	}
+	mock.doObjectDeleteFunc = func(ctx context.Context, bucket, key, etag, ak, sk string) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+	}
+	svc, c := newTieredTestService(mock, 1024)
+
+	marker := &cache.CachedObjectMeta{Bucket: "b", Key: "obj", ETag: `"up-1"`, BodyUpstream: true, ContentLength: 6, StatusCode: 200}
+	_, tok, _, _ := c.GetMetaWithVersion(context.Background(), "b", "obj")
+	if wrote, err := c.PutMetaIfVersion(context.Background(), "b", "obj", marker, 60, tok); err != nil || !wrote {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	// A validated GET triggers the re-tier (which blocks in the fetch).
+	go func() {
+		g := httptest.NewRequest(http.MethodGet, "/b/obj", nil)
+		_ = svc.HandleGetObject(httptest.NewRecorder(), g)
+	}()
+	fetchStarted.Wait()
+
+	// DELETE now: it claims the key (cancelling the re-tier's context), then
+	// forwards and converges.
+	req := httptest.NewRequest(http.MethodDelete, "/b/obj", nil)
+	if err := svc.HandleDeleteObject(httptest.NewRecorder(), req); err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	close(fetchGate) // let any surviving fetch proceed; its commit must fail on the canceled ctx
+
+	// The object stays deleted: no re-tier resurrection.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, found, _ := c.GetMeta(context.Background(), "b", "obj")
+		if !found {
+			return
+		}
+		m, _, _ := c.GetMeta(context.Background(), "b", "obj")
+		if m != nil && !m.BodyUpstream {
+			t.Fatal("re-tier resurrected the deleted object as a local-tier copy")
+		}
+		if time.Now().After(deadline) {
+			// Still the marker (upstream-tier) is acceptable only if the DELETE
+			// converge removed it; a surviving marker means converge missed.
+			t.Fatal("deleted object still present after DELETE + canceled re-tier")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

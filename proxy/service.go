@@ -768,6 +768,15 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// through to the ordinary invalidate-and-forward below, which also clears
 	// the local metadata marker.
 	if s.config.IsTiered() {
+		// Claim the key for the DELETE's whole duration, exactly as a PUT
+		// does: a re-tier heals the object being deleted, and its commit
+		// rides a context this cancels — so an in-flight heal cannot
+		// resurrect the object after the version-guarded converge (which
+		// only removes the pre-forward version) declines to out-delete the
+		// heal's newer commit. New re-tiers are excluded until release.
+		bucket, key := ParseBucketKey(r)
+		s.claimRetierWrite(bucket, key)
+		defer s.releaseRetierWrite(bucket, key)
 		if handled, err := s.handleTieredDeleteLocal(w, r); handled {
 			return err
 		}
