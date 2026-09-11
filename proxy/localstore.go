@@ -10,7 +10,6 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -318,7 +317,13 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		// A probe ERROR aborts: read as "absent" it would let If-None-Match:*
 		// overwrite a live object during a transient blip.
 		exists := found && existing != nil
-		if exists {
+		// A BodyUpstream tier marker IS an existing object — its body lives
+		// upstream, so the local-body servability probe below would read it
+		// as absent, letting If-None-Match:* overwrite a live object (and
+		// If-Match answer NoSuchKey for one). The steady-state tiered router
+		// forwards marker-prior conditionals upstream; this guard covers the
+		// race where a marker commits between the router's read and this one.
+		if exists && !existing.BodyUpstream {
 			var servErr error
 			exists, servErr = s.entryServable(ctx, bucket, key, existing)
 			if servErr != nil {
@@ -386,12 +391,12 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	if streaming {
 		weight += awsChunkedReaderBufSize
 	}
-	if !s.acquireCacheSlot(ctx, weight, priorityReadMiss) {
+	if !s.acquireEnginePutSlot(ctx, weight) {
 		s3err.WriteError(w, r, s3err.ErrSlowDown)
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	}
-	defer s.releaseCacheSlot(weight)
+	defer s.releaseEnginePutSlot(weight)
 
 	// Content-MD5 FORMAT is validated before a byte is accepted — a malformed
 	// digest (bad base64, wrong length, present-but-empty; Values, not Get,
@@ -429,24 +434,44 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	src := &captureReader{r: io.TeeReader(io.LimitReader(reader, declaredSize+1), hasher)}
 	ref := cache.NewBodyRef()
 	ttl := int(s.config.Cache.TTL.Seconds())
-	discardStaged := func() {
+	// ONE deferred, panic-safe reclamation for the staged body, in place of a
+	// discard call on every abort path (a forgotten call on a future path —
+	// or a panic between staging and commit — would leak a threshold-sized
+	// orphan until TTL). Two flags steer it:
+	//   committed — the meta commit landed; the body is referenced, keep it.
+	//   ambiguousCommit — a commit ATTEMPT errored without a definitive
+	//     verdict. In cluster mode PutMetaIfVersion is a non-idempotent
+	//     remote op: an error can mean the owner APPLIED the write and the
+	//     confirmation was lost, so deleting the staged body here could
+	//     destroy the object a now-visible meta references — erasing the
+	//     previously live version with it. Ambiguity keeps the body; a
+	//     genuinely uncommitted orphan is TTL's job (the documented
+	//     backstop). Only DEFINITIVE outcomes discard: refused conditional
+	//     (412), overrun, short body, digest mismatch, refused-retries
+	//     exhaustion (each refusal is the store answering "no").
+	committed := false
+	ambiguousCommit := false
+	defer func() {
+		if committed || ambiguousCommit {
+			return
+		}
 		dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer dcancel()
 		if derr := s.cache.DeleteBody(dctx, bucket, key, ref); derr != nil {
 			log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Staged body delete failed; orphan ages out by TTL")
 		}
-	}
+	}()
 	if putErr := s.cache.PutBodyStream(ctx, bucket, key, ref, src, int64(ttl)); putErr != nil {
-		discardStaged()
-		// The CLIENT's body problem — a streaming body's malformed or
-		// truncated chunk framing (any decoder error, wrapped EOFs
-		// included), or a body that ended mid-transfer in either mode — is
-		// the client misdescribing the request: 400 IncompleteBody, never a
-		// retryable 500. Only a reader failure that is neither (a transport
-		// fault on a plain body) or a cache-side write failure propagates.
-		clientBody := src.err != nil &&
-			(streaming || errors.Is(src.err, io.EOF) || errors.Is(src.err, io.ErrUnexpectedEOF))
-		if clientBody {
+		// ANY recorded reader error is the client's transfer: the capture
+		// wrapper sits over nothing but the request-body chain (net/http
+		// body, optionally the chunk decoder — whose truncations are all
+		// wrapped, never bare EOFs), so truncations, malformed framing,
+		// resets, and read-deadline expiries mid-body all classify as the
+		// client misdescribing or abandoning the request: 400
+		// IncompleteBody, never a retryable 500 (and never a server-error
+		// metric for a client fault). Only a cache-side write failure —
+		// putErr with no reader error — propagates.
+		if src.err != nil {
 			s3err.WriteError(w, r, s3err.ErrIncompleteBody)
 			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
@@ -460,14 +485,12 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	switch {
 	case src.n == declaredSize+1:
 		// The limit filled: the body is longer than declared.
-		discardStaged()
 		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	case src.n != declaredSize:
 		// Clean EOF before the declared size: the client misdescribed the
 		// request; not data to store under a wrong ETag.
-		discardStaged()
 		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
@@ -476,7 +499,6 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	sum := hasher.Sum(nil)
 	etag := `"` + hex.EncodeToString(sum) + `"`
 	if wantMD5 != nil && !bytes.Equal(wantMD5, sum) {
-		discardStaged()
 		s3err.WriteError(w, r, s3err.ErrBadDigest)
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
@@ -516,7 +538,7 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	var wrote bool
 	wrote, err := store(expected)
 	if err != nil {
-		discardStaged()
+		ambiguousCommit = true
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
 	}
@@ -526,7 +548,6 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 			// store. The honest answer is the 412 the client would have gotten
 			// had the racer arrived a moment earlier; the staged body will
 			// never be referenced.
-			discardStaged()
 			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
 			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
@@ -546,30 +567,28 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		// client never holds a 200 for bytes that were not stored.
 		for attempt := 0; attempt < 8 && !wrote; attempt++ {
 			if cerr := ctx.Err(); cerr != nil {
-				discardStaged()
 				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 				return cerr
 			}
 			_, retryToken, _, terr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 			if terr != nil {
-				discardStaged()
 				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 				return terr
 			}
 			wrote, err = store(retryToken)
 			if err != nil {
-				discardStaged()
+				ambiguousCommit = true
 				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 				return err
 			}
 		}
 		if !wrote {
-			discardStaged()
 			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return fmt.Errorf("put %s/%s: store refused %d retries under fresh tokens", bucket, key, 8)
 		}
 	}
 
+	committed = true
 	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusOK)
 	metrics.RecordRequest("PutObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
@@ -610,10 +629,15 @@ func (s *Service) HandleOriginlessUnsupported(w http.ResponseWriter, r *http.Req
 }
 
 // originlessPutStreamWeight is the fixed byte-budget weight of one streaming
-// engine PUT: the store's internal copy buffering, not the body — the body
-// never lives in memory. Deliberately generous versus the actual ~32 KiB
-// io.Copy buffer so small unaccounted allocations stay covered.
-const originlessPutStreamWeight = 64 * 1024
+// engine PUT — the store's pinned stream buffering, not the body (the body
+// never lives in TAG's memory). ocache's PutStream holds a ~64 KiB
+// first-chunk buffer plus a 1 MiB pooled copy buffer for the stream's whole
+// (client-paced) duration, and the cluster remote path pins a further 1 MiB
+// gRPC send buffer — mirrored here as a literal (like the storage defaults
+// in config) since TAG imports only the ocache client. Sized for the
+// cluster worst case; undercounting this is the unaccounted-margin class
+// that has OOM-killed pods before.
+const originlessPutStreamWeight = 2*1024*1024 + 128*1024
 
 // captureReader counts the bytes read through it and records the first
 // non-EOF error its inner reader returns, so a failed store can be

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -96,15 +97,27 @@ func (r *awsChunkedReader) Read(p []byte) (int, error) {
 
 	n, err := r.reader.Read(p[:toRead])
 	r.remaining -= n
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			// The body ended INSIDE a chunk's data. A bare io.EOF here would
+			// read as clean termination to callers — and one whose byte
+			// count happens to match the declared length would commit a
+			// never-terminated body. Clean EOF exists ONLY after the
+			// terminal 0-chunk (r.done above); every truncation shape
+			// surfaces as a wrapped, non-sentinel error.
+			return n, fmt.Errorf("aws-chunked body truncated mid-chunk: %w", io.ErrUnexpectedEOF)
+		}
+		return n, err
+	}
 
 	// When we've consumed the entire chunk, read the trailing \r\n.
-	if r.remaining == 0 && err == nil {
+	if r.remaining == 0 {
 		if err := r.readTrailingCRLF(); err != nil {
 			return n, err
 		}
 	}
 
-	return n, err
+	return n, nil
 }
 
 // maxChunkHeaderLen is the maximum allowed length of a chunk header line.

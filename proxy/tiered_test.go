@@ -1230,3 +1230,147 @@ func TestTieredStreamedPutTruncatedBodyAnswersIncomplete(t *testing.T) {
 		t.Fatalf("staged lifecycle = puts %v deletes %v, want every staged key reclaimed", ledger.puts, ledger.deletes)
 	}
 }
+
+// metaCommitErrClient makes the FIRST meta-key PutIfVersion return an error
+// AFTER forwarding it to the store — the ambiguous-commit shape: the write
+// may have landed, only the confirmation is lost.
+type metaCommitErrClient struct {
+	cacheclient.CacheClient
+	armed atomic.Bool
+}
+
+func (m *metaCommitErrClient) PutIfVersion(ctx context.Context, key string, value []byte, ttl int64, expected uint64) (uint64, error) {
+	v, err := m.CacheClient.PutIfVersion(ctx, key, value, ttl, expected)
+	if strings.HasPrefix(key, "meta|") && m.armed.CompareAndSwap(true, false) {
+		return v, errors.New("simulated lost confirmation")
+	}
+	return v, err
+}
+
+// An AMBIGUOUS meta-commit error must NOT delete the staged body: the write
+// may have landed (here it provably did), and deleting the body a visible
+// meta references would erase the object — a 500-answering PUT destroying
+// data. TTL reclaims genuine orphans.
+func TestTieredStreamedPutAmbiguousCommitKeepsStagedBody(t *testing.T) {
+	mock, _, _ := tieredMock()
+	inner := &bodyKeyLedger{CacheClient: cacheclient.NewMemoryCache()}
+	wrapper := &metaCommitErrClient{CacheClient: inner}
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 1024
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c := cache.NewCacheWithClient(wrapper, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	wrapper.armed.Store(true)
+	req := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader("hello"))
+	w := httptest.NewRecorder()
+	err := svc.HandlePutObject(w, req)
+	if err == nil && w.Code == http.StatusOK {
+		t.Fatal("ambiguous commit did not surface as an error")
+	}
+
+	// The commit actually landed (the wrapper forwarded before erroring):
+	// the entry must be fully servable — its staged body NOT deleted.
+	meta, found, _ := c.GetMeta(context.Background(), "b", "obj")
+	if !found || meta == nil || meta.BodyRef == "" {
+		t.Fatalf("landed meta missing: %+v", meta)
+	}
+	inner.mu.Lock()
+	deletes := len(inner.deletes)
+	inner.mu.Unlock()
+	if deletes != 0 {
+		t.Fatalf("staged body deleted on an ambiguous commit error (deletes=%v)", inner.deletes)
+	}
+	if g := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); g.Code != http.StatusOK || g.Body.String() != "hello" {
+		t.Fatalf("GET after ambiguous-commit PUT = %d %q, want the landed object", g.Code, g.Body.String())
+	}
+}
+
+// If-None-Match:* against a live upstream-tier MARKER is a 412: the object
+// EXISTS (its body upstream), and the local-body servability probe must not
+// read it as absent and let a create-only PUT overwrite it.
+func TestTieredConditionalPutMarkerCountsAsExisting(t *testing.T) {
+	svc, c, _ := newLedgerTieredService(t, 1024)
+	marker := &cache.CachedObjectMeta{
+		Bucket: "b", Key: "obj", ETag: `"up-1"`, BodyUpstream: true,
+		ContentLength: 5000, StatusCode: 200,
+	}
+	_, tok, _, _ := c.GetMetaWithVersion(context.Background(), "b", "obj")
+	if wrote, err := c.PutMetaIfVersion(context.Background(), "b", "obj", marker, 60, tok); err != nil || !wrote {
+		t.Fatalf("seed marker: wrote=%v err=%v", wrote, err)
+	}
+
+	// The steady-state router forwards marker-prior conditionals upstream;
+	// the ENGINE sees this shape only in the double-read race (a marker
+	// committing between the router's read and the engine's). Exercise the
+	// engine directly — the race's exact entry point.
+	req := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader("tiny"))
+	req.Header.Set("If-None-Match", "*")
+	w := httptest.NewRecorder()
+	if err := svc.HandleOriginlessPut(w, req); err != nil {
+		t.Fatalf("engine PUT: %v", err)
+	}
+	if w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("If-None-Match:* over a live marker = %d, want 412", w.Code)
+	}
+	cur, found, _ := c.GetMeta(context.Background(), "b", "obj")
+	if !found || cur == nil || !cur.BodyUpstream || cur.ETag != `"up-1"` {
+		t.Fatalf("marker disturbed by refused conditional: %+v", cur)
+	}
+}
+
+// A sub-resource GET (?tagging) against a small upstream-tier marker must
+// NOT trigger a re-tier heal: the full-body download would serve nothing the
+// triggering request needs.
+func TestTieredSubresourceGetDoesNotRetier(t *testing.T) {
+	mock, _, _ := tieredMock()
+	var fullFetches atomic.Int32
+	mock.doFullObjectFunc = func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error) {
+		fullFetches.Add(1)
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}
+	svc, c := newTieredTestService(mock, 1024)
+	marker := &cache.CachedObjectMeta{
+		Bucket: "b", Key: "obj", ETag: `"up-1"`, BodyUpstream: true,
+		ContentLength: 100, StatusCode: 200,
+	}
+	_, tok, _, _ := c.GetMetaWithVersion(context.Background(), "b", "obj")
+	if wrote, err := c.PutMetaIfVersion(context.Background(), "b", "obj", marker, 60, tok); err != nil || !wrote {
+		t.Fatalf("seed marker: wrote=%v err=%v", wrote, err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/b/obj?tagging", nil)
+	if err := svc.HandleGetObject(httptest.NewRecorder(), req); err != nil {
+		t.Fatalf("sub-resource GET: %v", err)
+	}
+	waitRetierDone(t, svc, "b", "obj")
+	if n := fullFetches.Load(); n != 0 {
+		t.Fatalf("sub-resource GET triggered %d re-tier fetches, want 0", n)
+	}
+}
+
+// A chunked body whose bytes match the declared length but whose framing was
+// never terminated (no data-CRLF, no terminal chunk) is TRUNCATED — the
+// decoder now surfaces every truncation shape as a wrapped error, so the
+// coincidental-length case answers IncompleteBody instead of committing 200.
+func TestTieredStreamedPutUnterminatedChunkingAnswersIncomplete(t *testing.T) {
+	svc, c, _ := newLedgerTieredService(t, 1<<20)
+	body := "5;chunk-signature=deadbeef\r\nhello" // 5 data bytes, then EOF: no CRLF, no 0-chunk
+	req := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader(body))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	req.Header.Set("X-Amz-Decoded-Content-Length", "5")
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, req); err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "IncompleteBody") {
+		t.Fatalf("unterminated chunked PUT = %d %q, want 400 IncompleteBody", w.Code, w.Body.String())
+	}
+	if _, found, _ := c.GetMeta(context.Background(), "b", "obj"); found {
+		t.Fatal("meta committed for an unterminated chunked body")
+	}
+}

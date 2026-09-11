@@ -45,7 +45,6 @@ package proxy
 // TAG until written again.
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -104,7 +103,10 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 		// The mode's one body forward. The forward itself never populates;
 		// a mis-tiered small object is healed by the background re-tier, which
 		// carries its own guards (see maybeRetierOnRead).
-		if r.Method == http.MethodGet {
+		// Plain-object GETs only: a sub-resource GET (?tagging, ?acl, …)
+		// forwards through this branch too, and healing on it would launch a
+		// full-body download the triggering request never serves.
+		if r.Method == http.MethodGet && originlessPlainObject(r) {
 			s.maybeRetierOnRead(bucket, key, accessKey, secretKey, meta)
 		}
 		return s.forwarder.Forward(ctx, w, r)
@@ -470,8 +472,9 @@ const (
 //
 // Guards, in order:
 //   - dedup: one re-tier in flight per key, others ride the existing marker;
-//   - budget: the buffer mirrors the engine's PUT (the allocation IS the
-//     reservation, size+1 to detect an overlong body), shed non-blocking;
+//   - budget: STREAMED like the engine's PUT — the body goes straight into
+//     the cache under a BodyRef, so the reservation is the fixed stream
+//     weight, never the object; shed non-blocking;
 //   - version: the fetched ETag must match the marker's — anything else means
 //     a concurrent write replaced the object, whose state must be left alone;
 //   - identity commit: the entry is re-written only if it still IS the marker
@@ -514,14 +517,11 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		return
 	}
 
-	bufSize := marker.ContentLength + 1
-	weight := bufSize
-	if s.populateBudget != nil && weight > s.populateBudget.total {
-		s.unregisterRetier(bucket, key)
-		cancel()
-		metrics.RecordTieredRetier("shed")
-		return
-	}
+	// STREAMING heal: the body goes straight from the upstream response into
+	// the cache under a per-write BodyRef (the engine PUT's pattern), so the
+	// weight is the fixed stream buffering, never the object — a threshold
+	// sized above the populate budget no longer makes markers unhealable.
+	weight := int64(originlessPutStreamWeight)
 	if !s.acquireCacheSlot(context.Background(), weight, priorityReadMiss) {
 		s.unregisterRetier(bucket, key)
 		cancel()
@@ -611,30 +611,45 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 			return
 		}
 
-		buf := make([]byte, bufSize)
-		n, err := io.ReadFull(resp.Body, buf)
-		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-			// Transport failure mid-body: transient, nothing safe to store —
-			// and no backoff, a blip must not suppress healing.
+		// Stream the body into the cache under a fresh BodyRef, limited to
+		// CL+1 (the extra byte detects a longer-than-declared body) and
+		// counted. The upstream ETag was verified above, so unlike the
+		// engine PUT no digest needs computing — the ref exists purely so
+		// the body can stream before the commit. A body that never commits
+		// is a TTL-reclaimed orphan; definitive mismatches also delete it
+		// eagerly below.
+		ref := cache.NewBodyRef()
+		src := &captureReader{r: io.LimitReader(resp.Body, marker.ContentLength+1)}
+		putBodyErr := s.cache.PutBodyStream(ctx, bucket, key, ref, src, int64(s.config.Cache.TTL.Seconds()))
+		discardRef := func() {
+			if derr := s.cache.DeleteBody(ctx, bucket, key, ref); derr != nil {
+				log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Re-tier staged body delete failed; orphan ages out by TTL")
+			}
+		}
+		if putBodyErr != nil {
+			// Transport failure mid-body or a cache write fault: transient,
+			// nothing safe to commit — and no backoff, a blip must not
+			// suppress healing.
+			discardRef()
 			metrics.RecordTieredRetier("error")
-			log.Debug().Err(err).Int("read", n).Str("bucket", bucket).Str("key", key).Msg("Re-tier body read failed")
+			log.Debug().Err(putBodyErr).Int64("read", src.n).Str("bucket", bucket).Str("key", key).Msg("Re-tier body stream failed")
 			return
 		}
-		if err == nil || int64(n) != marker.ContentLength {
-			// The body read COMPLETED and its length contradicts the marker
-			// (longer: err==nil means the CL+1-sized buffer filled; shorter:
-			// clean EOF before CL). That is as definitive as a changed ETag —
-			// this marker version can never re-tier — so it enters the same
+		if src.n != marker.ContentLength {
+			// The body streamed COMPLETELY and its length contradicts the
+			// marker (longer: the CL+1 limit filled; shorter: clean EOF
+			// before CL). That is as definitive as a changed ETag — this
+			// marker version can never re-tier — so it enters the same
 			// backoff; without it the doomed full download repeats on every
 			// validated GET for the marker's TTL.
+			discardRef()
 			if s.retierRecentMismatch != nil {
 				s.retierRecentMismatch.Add(bucket+"|"+key+"|"+etag, struct{}{})
 			}
 			metrics.RecordTieredRetier("changed")
-			log.Debug().Int("read", n).Int64("declared", marker.ContentLength).Str("bucket", bucket).Str("key", key).Msg("Re-tier body length contradicts marker")
+			log.Debug().Int64("read", src.n).Int64("declared", marker.ContentLength).Str("bucket", bucket).Str("key", key).Msg("Re-tier body length contradicts marker")
 			return
 		}
-		body := buf[:marker.ContentLength]
 
 		// Identity-guarded commit: only re-write the entry if it still IS the
 		// marker this re-tier was triggered by. The commit's expectation is
@@ -647,10 +662,12 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		// whatever the claim window cannot see.
 		cur, _, found, gerr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 		if gerr != nil || !found || cur == nil || cur.ETag != etag || !cur.BodyUpstream {
+			discardRef()
 			metrics.RecordTieredRetier("changed")
 			return
 		}
 		if cerr := ctx.Err(); cerr != nil {
+			discardRef()
 			// Distinguish a write's cancellation (coordination) from the
 			// 60-second deadline expiring (a genuine failure).
 			if errors.Is(cerr, context.Canceled) {
@@ -662,12 +679,17 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		}
 
 		meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
-		// The stored body is authoritative for length — a chunked response
-		// carries no Content-Length header for MetaFromHTTPHeaders to copy.
-		meta.ContentLength = int64(len(body))
+		meta.BodyRef = ref
+		// The streamed byte count is authoritative for length — a chunked
+		// response carries no Content-Length header for MetaFromHTTPHeaders
+		// to copy.
+		meta.ContentLength = src.n
 		ttl := int(s.config.Cache.TTL.Seconds())
-		wrote, werr := s.cache.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, bytes.NewReader(body), ttl, decToken)
+		wrote, werr := s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, decToken)
 		if werr != nil {
+			// AMBIGUOUS commit (see the engine PUT's rule): the owner may
+			// have applied it, so the staged body must not be deleted —
+			// TTL reclaims a genuine orphan.
 			metrics.RecordTieredRetier("error")
 			log.Debug().Err(werr).Str("bucket", bucket).Str("key", key).Msg("Re-tier store failed")
 			return
@@ -675,7 +697,8 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		if !wrote {
 			// A racer entered the store after the pre-fetch token: the object
 			// stays on its current state (marker, newer write, or deleted) —
-			// not a re-tier.
+			// not a re-tier. Definitive refusal: reclaim the staged body.
+			discardRef()
 			metrics.RecordTieredRetier("changed")
 			return
 		}

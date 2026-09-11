@@ -110,8 +110,15 @@ type Service struct {
 	// that is persistently stale versus the upstream object re-downloads and
 	// discards the full body on EVERY validated GET for the marker's TTL.
 	retierRecentMismatch *expirable.LRU[string, struct{}]
-	blockFetchMu         sync.Mutex                  // Guards blockFetches
-	blockFetches         map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
+	// enginePutSlots bounds concurrent local-store engine PUTs, SEPARATE
+	// from cacheSemaphore: engine PUTs are client-paced (a trickle upload
+	// holds its slot for the transfer's whole duration), and before this
+	// split 256 slow large uploads could pin every shared cache-write slot,
+	// shedding all read-miss populates and collapsing the hit rate. Same
+	// size as the shared pool — the point is isolation, not a lower count.
+	enginePutSlots chan struct{}
+	blockFetchMu   sync.Mutex                  // Guards blockFetches
+	blockFetches   map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
 	// recentFooterWork suppresses repeat footer scans for an object version that was
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
@@ -137,6 +144,10 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 	var cacheSem chan struct{}
 	if cfg.Cache.MaxConcurrentWrites > 0 {
 		cacheSem = make(chan struct{}, cfg.Cache.MaxConcurrentWrites)
+	}
+	var enginePutSlots chan struct{}
+	if cfg.IsTiered() && cfg.Cache.MaxConcurrentWrites > 0 {
+		enginePutSlots = make(chan struct{}, cfg.Cache.MaxConcurrentWrites)
 	}
 
 	perPopulateCap := perPopulateBufferBytes(cfg)
@@ -195,6 +206,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		cache:                       cache,
 		config:                      cfg,
 		cacheSemaphore:              cacheSem,
+		enginePutSlots:              enginePutSlots,
 		populateBudget:              populateBudget,
 		perPopulateCap:              perPopulateCap,
 		backgroundPopulateWriterCap: backgroundPopulateWriterCap,
@@ -553,6 +565,36 @@ func (s *Service) tryAcquireCacheBytes(weight int64, prio populatePriority) bool
 		return s.populateBudget.tryAcquireWarm(weight)
 	}
 	return s.populateBudget.tryAcquireReadMiss(weight)
+}
+
+// acquireEnginePutSlot admits one local-store engine PUT: a slot from the
+// engine's OWN pool (never the shared populate semaphore — see the field
+// comment) plus the fixed streaming weight against the byte budget.
+// Non-blocking: a client-facing PUT sheds with a retryable SlowDown.
+func (s *Service) acquireEnginePutSlot(ctx context.Context, weight int64) bool {
+	if s.enginePutSlots != nil {
+		select {
+		case s.enginePutSlots <- struct{}{}:
+		default:
+			return false
+		}
+	}
+	if !s.acquireCacheBytes(ctx, weight, priorityReadMiss) {
+		if s.enginePutSlots != nil {
+			<-s.enginePutSlots
+		}
+		return false
+	}
+	return true
+}
+
+func (s *Service) releaseEnginePutSlot(weight int64) {
+	if s.populateBudget != nil {
+		s.populateBudget.release(weight)
+	}
+	if s.enginePutSlots != nil {
+		<-s.enginePutSlots
+	}
 }
 
 // acquireCacheSlot tries to reserve a cache-populate slot without blocking,

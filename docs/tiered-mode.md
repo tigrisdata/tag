@@ -37,7 +37,9 @@ write-through of large bodies and no general read-populate: every unique read
 costs at most one upstream GET, and never an upstream write. The one
 exception is **re-tier-on-read**: a validated GET that hits an upstream-tier
 marker whose size fits the local tier triggers a one-shot background move of
-the body into the local tier. This heals objects mis-placed by the cold-start
+the body into the local tier — streamed like the engine's PUT, so a heal
+costs fixed memory regardless of object size and the threshold is never
+budget-capped. This heals objects mis-placed by the cold-start
 window below, capping the damage at one extra upstream fetch per object
 instead of one body forward per read until TTL. The displaced upstream copy
 is left for the upstream bucket's own expiry.
