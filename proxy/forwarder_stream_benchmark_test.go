@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,41 @@ import (
 )
 
 const passthroughPacedPause = 5 * time.Millisecond
+
+type passthroughResponseStats struct {
+	flushes atomic.Int64
+	bytes   atomic.Int64
+}
+
+type countingResponseWriter struct {
+	http.ResponseWriter
+	stats *passthroughResponseStats
+}
+
+func (w *countingResponseWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	w.stats.bytes.Add(int64(n))
+	return n, err
+}
+
+func (w *countingResponseWriter) Flush() {
+	w.stats.flushes.Add(1)
+	w.ResponseWriter.(http.Flusher).Flush()
+}
+
+func newCountingPassthroughServer(service *Service, stats *passthroughResponseStats) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := service.HandlePassthrough(&countingResponseWriter{ResponseWriter: w, stats: stats}, r); err != nil {
+			log.Error().Err(err).Msg("passthrough benchmark request failed")
+		}
+	}))
+}
+
+func reportPassthroughResponseMetrics(b *testing.B, stats *passthroughResponseStats) {
+	b.StopTimer()
+	b.ReportMetric(float64(stats.flushes.Load())/float64(b.N), "flushes/op")
+	b.ReportMetric(float64(stats.bytes.Load())/float64(b.N), "bytes/op")
+}
 
 // BenchmarkPassthroughBufferedBody measures complete body passthrough at two
 // response sizes while the upstream emits 8 KiB chunks without a pause.
@@ -123,11 +159,8 @@ func BenchmarkPassthroughStreamingBody(b *testing.B) {
 		nil,
 	)
 	service := NewService(forwarder, cache.NewDisabledCache(), config.NewDefault())
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := service.HandlePassthrough(w, r); err != nil {
-			b.Error(err)
-		}
-	}))
+	stats := &passthroughResponseStats{}
+	proxy := newCountingPassthroughServer(service, stats)
 	defer proxy.Close()
 
 	client := proxy.Client()
@@ -149,6 +182,7 @@ func BenchmarkPassthroughStreamingBody(b *testing.B) {
 			b.Fatalf("body bytes = %d, want %d", n, len(payload))
 		}
 	}
+	reportPassthroughResponseMetrics(b, stats)
 }
 
 // BenchmarkPassthroughPacedHeaders measures time to response headers while the
@@ -182,11 +216,8 @@ func BenchmarkPassthroughPacedHeaders(b *testing.B) {
 		nil,
 	)
 	service := NewService(forwarder, cache.NewDisabledCache(), config.NewDefault())
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := service.HandlePassthrough(w, r); err != nil {
-			b.Error(err)
-		}
-	}))
+	stats := &passthroughResponseStats{}
+	proxy := newCountingPassthroughServer(service, stats)
 	defer proxy.Close()
 
 	client := proxy.Client()
@@ -206,6 +237,7 @@ func BenchmarkPassthroughPacedHeaders(b *testing.B) {
 		}
 		b.StartTimer()
 	}
+	reportPassthroughResponseMetrics(b, stats)
 }
 
 // BenchmarkPassthroughPacedFirstByte measures a client reading the first byte of
@@ -241,11 +273,8 @@ func BenchmarkPassthroughPacedFirstByte(b *testing.B) {
 		nil,
 	)
 	service := NewService(forwarder, cache.NewDisabledCache(), config.NewDefault())
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := service.HandlePassthrough(w, r); err != nil {
-			b.Error(err)
-		}
-	}))
+	stats := &passthroughResponseStats{}
+	proxy := newCountingPassthroughServer(service, stats)
 	defer proxy.Close()
 
 	client := proxy.Client()
@@ -264,4 +293,5 @@ func BenchmarkPassthroughPacedFirstByte(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+	reportPassthroughResponseMetrics(b, stats)
 }
