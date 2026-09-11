@@ -235,7 +235,9 @@ func (w *pacedFlushWriter) Write(p []byte) (int, error) {
 		w.flushLocked()
 	} else if !w.flushPending {
 		w.flushPending = true
-		w.timer = time.AfterFunc(forwarderFlushInterval, w.delayedFlush)
+		if w.timer == nil {
+			w.timer = time.AfterFunc(forwarderFlushInterval, w.delayedFlush)
+		}
 	}
 	return n, err
 }
