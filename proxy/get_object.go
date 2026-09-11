@@ -700,7 +700,7 @@ func (s *Service) serveRangeFromCache(
 	// client cannot distinguish from a valid short read.
 	pr, pw := io.Pipe()
 	go func() {
-		streamErr := s.cache.GetRangeStream(ctx, bucket, key, meta.ETag, rng.start, rng.end, pw)
+		streamErr := s.cache.GetRangeStream(ctx, bucket, key, meta.BodyDiscriminator(), rng.start, rng.end, pw)
 		if streamErr != nil {
 			pw.CloseWithError(streamErr)
 		} else {

@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1001,5 +1003,167 @@ func TestTieredMultipartCompletionMarkerWithoutHead(t *testing.T) {
 	}
 	if gw := tieredDo(t, svc, http.MethodGet, "/b/mp-obj", "", nil); gw.Code != http.StatusOK || gw.Body.String() != "upstream body" {
 		t.Fatalf("GET via fallback marker = %d %q", gw.Code, gw.Body.String())
+	}
+}
+
+// bodyKeyLedger records body-key writes and deletes so tests can assert the
+// staged-body lifecycle: exactly one stream per PUT, staged keys reclaimed on
+// abort, and meta-only retries never re-streaming.
+type bodyKeyLedger struct {
+	cacheclient.CacheClient
+	mu      sync.Mutex
+	puts    []string
+	deletes []string
+}
+
+func (b *bodyKeyLedger) PutStream(ctx context.Context, key string, r io.Reader, ttl int64) error {
+	if strings.HasPrefix(key, "body|") {
+		b.mu.Lock()
+		b.puts = append(b.puts, key)
+		b.mu.Unlock()
+	}
+	return b.CacheClient.PutStream(ctx, key, r, ttl)
+}
+
+func (b *bodyKeyLedger) Delete(ctx context.Context, key string) error {
+	if strings.HasPrefix(key, "body|") {
+		b.mu.Lock()
+		b.deletes = append(b.deletes, key)
+		b.mu.Unlock()
+	}
+	return b.CacheClient.Delete(ctx, key)
+}
+
+func newLedgerTieredService(t *testing.T, threshold int64) (*Service, *cache.Cache, *bodyKeyLedger) {
+	t.Helper()
+	mock, _, _ := tieredMock()
+	ledger := &bodyKeyLedger{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = threshold
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c := cache.NewCacheWithClient(ledger, &cfg.Cache)
+	return NewService(mock, c, cfg), c, ledger
+}
+
+// A streamed engine PUT stores the body under its BodyRef — never under the
+// ETag — with the correct MD5 ETag, and serves back through the discriminator
+// on both the small buffered path and the large streaming path.
+func TestTieredStreamedPutBodyRefRoundTrip(t *testing.T) {
+	svc, c, ledger := newLedgerTieredService(t, 1<<20)
+
+	big := strings.Repeat("0123456789abcdef", 8192) // 128 KiB > smallObjectThreshold
+	if w := tieredDo(t, svc, http.MethodPut, "/b/big", big, nil); w.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d", w.Code)
+	}
+	meta, found, _ := c.GetMeta(context.Background(), "b", "big")
+	if !found || meta == nil || meta.BodyRef == "" {
+		t.Fatalf("engine entry missing BodyRef: %+v", meta)
+	}
+	sum := md5.Sum([]byte(big))
+	if meta.ETag != `"`+hex.EncodeToString(sum[:])+`"` {
+		t.Fatalf("ETag = %q, want streamed MD5", meta.ETag)
+	}
+	if len(ledger.puts) != 1 || ledger.puts[0] != cache.MakeBodyKey("b", "big", meta.BodyRef) {
+		t.Fatalf("body writes = %v, want exactly one under the BodyRef", ledger.puts)
+	}
+	if w := tieredDo(t, svc, http.MethodGet, "/b/big", "", nil); w.Code != http.StatusOK || w.Body.String() != big {
+		t.Fatalf("large GET = %d len %d, want the streamed body", w.Code, w.Body.Len())
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/small", "tiny", nil); w.Code != http.StatusOK {
+		t.Fatalf("small PUT status = %d", w.Code)
+	}
+	if w := tieredDo(t, svc, http.MethodGet, "/b/small", "", nil); w.Code != http.StatusOK || w.Body.String() != "tiny" {
+		t.Fatalf("small GET = %d %q", w.Code, w.Body.String())
+	}
+}
+
+// A pre-existing content-addressed entry (proxy-written shape: body keyed by
+// ETag, BodyRef null) serves through the same engine unchanged — the
+// discriminator falls back to the ETag.
+func TestTieredServesETagKeyedEntryFromPriorMode(t *testing.T) {
+	svc, c, _ := newLedgerTieredService(t, 1<<20)
+	meta := &cache.CachedObjectMeta{Bucket: "b", Key: "old", ETag: `"v1"`, ContentLength: 5, StatusCode: 200}
+	if err := c.PutWithMeta(context.Background(), "b", "old", meta, []byte("hello"), 60); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if w := tieredDo(t, svc, http.MethodGet, "/b/old", "", nil); w.Code != http.StatusOK || w.Body.String() != "hello" {
+		t.Fatalf("GET of ETag-keyed entry = %d %q", w.Code, w.Body.String())
+	}
+}
+
+// A body longer than its declared size aborts after the stream and reclaims
+// the staged body: no orphan, no meta.
+func TestTieredStreamedPutOverrunDiscardsStagedBody(t *testing.T) {
+	svc, c, ledger := newLedgerTieredService(t, 1<<20)
+	req := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader("0123456789"))
+	req.ContentLength = 4 // declares 4, sends 10
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, req); err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "IncompleteBody") {
+		t.Fatalf("overrun PUT = %d %q, want 400 IncompleteBody", w.Code, w.Body.String())
+	}
+	if _, found, _ := c.GetMeta(context.Background(), "b", "obj"); found {
+		t.Fatal("meta committed for an overrun body")
+	}
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	if len(ledger.puts) != 1 || len(ledger.deletes) != 1 || ledger.puts[0] != ledger.deletes[0] {
+		t.Fatalf("staged lifecycle = puts %v deletes %v, want the one staged key reclaimed", ledger.puts, ledger.deletes)
+	}
+}
+
+// A refused unconditional commit retries METADATA ONLY: one body stream
+// total, no staged-body churn, and the client's bytes win. The racer commits
+// between the handler-start token read and the meta commit (fired from the
+// conditional-read hook), so the first PutMetaIfVersion is refused.
+func TestTieredStreamedPutRetryIsMetaOnly(t *testing.T) {
+	mock, _, _ := tieredMock()
+	ledger := &bodyKeyLedger{CacheClient: cacheclient.NewMemoryCache()}
+	wrapper := &raceOnConditionalReadClient{CacheClient: ledger}
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 1024
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c := cache.NewCacheWithClient(wrapper, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "old-content", nil); w.Code != http.StatusOK {
+		t.Fatalf("seed PUT status = %d", w.Code)
+	}
+	oldMeta, _, _ := c.GetMeta(context.Background(), "b", "obj")
+
+	wrapper.replace = func() {
+		ctx := context.Background()
+		_, tok, _, _ := c.GetMetaWithVersion(ctx, "b", "obj")
+		redo := *oldMeta
+		if wrote, err := c.PutMetaIfVersion(ctx, "b", "obj", &redo, 60, tok); err != nil || !wrote {
+			t.Errorf("racer commit: wrote=%v err=%v", wrote, err)
+		}
+	}
+	ledger.mu.Lock()
+	before := len(ledger.puts)
+	ledger.mu.Unlock()
+	wrapper.armed = true
+
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "client-new-bytes", nil); w.Code != http.StatusOK {
+		t.Fatalf("client PUT status = %d", w.Code)
+	}
+	ledger.mu.Lock()
+	streamed := len(ledger.puts) - before
+	ledger.mu.Unlock()
+	if streamed != 1 {
+		t.Fatalf("body streams during retried PUT = %d, want exactly 1 (meta-only retries)", streamed)
+	}
+	if g := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); g.Body.String() != "client-new-bytes" {
+		t.Fatalf("GET = %q, want the client's bytes", g.Body.String())
 	}
 }

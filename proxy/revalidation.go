@@ -331,7 +331,7 @@ func (s *Service) serveFromCache(
 		bodyBuf := bufferPool.Get().(*bytes.Buffer)
 		bodyBuf.Reset()
 
-		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.ETag, bodyBuf)
+		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), bodyBuf)
 		if bodyErr == nil && bodyBuf.Len() > 0 {
 			meta.WriteHeaders(w)
 			writeCacheStatus(w, XCacheHit)
@@ -355,7 +355,7 @@ func (s *Service) serveFromCache(
 	// fallback for an absent or empty body without staging the stream through a
 	// pipe and a second copy.
 	cw := &lazyCommitWriter{w: w, meta: meta}
-	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.ETag, cw)
+	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), cw)
 	status := "success"
 	if bodyErr != nil {
 		if !cw.committed {

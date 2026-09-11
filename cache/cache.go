@@ -305,6 +305,34 @@ func (c *Cache) GetMeta(ctx context.Context, bucket, key string) (*CachedObjectM
 // Use this after GetMeta(), passing the meta's ETag so the body read resolves to
 // the exact version the metadata describes. Returns ErrNotFound if the body for
 // that version is not in cache.
+// PutBodyStream streams a whole-object body into the cache under the given
+// discriminator (an ETag for content-addressed entries, a NewBodyRef id for
+// the engine's streamed writes, where the ETag is unknown until EOF). Body
+// only — the entry becomes visible when its metadata commits; a body whose
+// meta never commits is an orphan that ages out by TTL, the same lifecycle
+// as a displaced version.
+func (c *Cache) PutBodyStream(ctx context.Context, bucket, key, discriminator string, r io.Reader, ttl int64) error {
+	if !c.IsEnabled() {
+		_, _ = io.Copy(io.Discard, r) // drain so a pipe producer never blocks
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = c.defaultTTL
+	}
+	return c.client.PutStream(ctx, MakeBodyKey(bucket, key, discriminator), r, ttl)
+}
+
+// DeleteBody removes one staged or orphaned body by its discriminator. Used
+// by the engine's PUT abort paths (overrun, digest mismatch, refused
+// conditional) to reclaim a body whose metadata will never commit; TTL is
+// the backstop when this best-effort delete fails.
+func (c *Cache) DeleteBody(ctx context.Context, bucket, key, discriminator string) error {
+	if !c.IsEnabled() {
+		return nil
+	}
+	return c.client.Delete(ctx, MakeBodyKey(bucket, key, discriminator))
+}
+
 func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w io.Writer) error {
 	if !c.IsEnabled() {
 		return ErrCacheDisabled

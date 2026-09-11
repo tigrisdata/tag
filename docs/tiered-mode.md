@@ -12,10 +12,14 @@ object it holds, stamped with the tier the body lives in. A metadata miss
 answers `NoSuchKey` immediately — no upstream request, in either tier.
 
 **Small objects (declared size ≤ `cache.size_threshold`) are the local tier.**
-PUT stores the whole object in the local cache (MD5 ETag over the decoded
-body, honoring `If-Match`/`If-None-Match`); GET, HEAD, and DELETE are served
-entirely locally. Reads and writes of small objects generate zero upstream
-traffic.
+PUT STREAMS the object into the local cache — the body is never buffered in
+memory, so the threshold can be sized to the workload without a per-request
+memory cost. The MD5 ETag is computed over the decoded bytes as they stream;
+because the ETag cannot exist before the last byte, the body is keyed by a
+per-write id carried in the metadata (`BodyRef`), and the metadata commit is
+what makes the entry visible. `If-Match`/`If-None-Match` are honored; GET,
+HEAD, and DELETE are served entirely locally. Reads and writes of small
+objects generate zero upstream traffic.
 
 **Large objects are the upstream tier.** The PUT passes through to upstream and
 TAG stores a metadata marker locally. HEAD answers from the marker; GET

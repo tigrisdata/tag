@@ -179,7 +179,7 @@ func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *c
 	if meta.ContentLength == 0 {
 		return true, nil
 	}
-	return s.cache.BodyExistsErr(ctx, bucket, key, meta.ETag)
+	return s.cache.BodyExistsErr(ctx, bucket, key, meta.BodyDiscriminator())
 }
 
 // originlessMiss answers the one thing a miss can be in this mode.
@@ -369,30 +369,22 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		return nil
 	}
 
-	// The memory below is held for the duration of the store, so it draws on the
-	// same populate budget and count ceiling as every other cache write. The
-	// reservation is EXACTLY what the request allocates — the declared size plus
-	// the one detection byte, plus the chunked decoder's bufio buffer when the
-	// body is streaming-framed — never a clamped or nominal figure: a
-	// reservation smaller than the real allocation re-creates the OOM the budget
-	// prevents, one small unaccounted buffer at a time.
+	// STREAMING store — the body is never buffered. It streams through an MD5
+	// tee into the cache under a per-write BodyRef (the ETag IS the body's
+	// MD5, so it cannot exist before the last byte; the ref stands in as the
+	// body key discriminator, see cache.NewBodyRef), and the metadata that
+	// makes the entry visible commits afterwards carrying both. Memory per
+	// PUT is the fixed streaming buffers below regardless of object size, so
+	// admission is the write-count ceiling plus that fixed weight — the
+	// populate BYTE budget no longer carries PUT bodies at all.
 	//
-	// Admission is NON-BLOCKING (the read-miss path): a client-facing PUT must
-	// shed with a retryable SlowDown immediately, not park on the budget's
-	// condition variable — a reservation larger than the whole budget would
-	// otherwise wait out the server timeout before failing. An object too large
-	// to EVER fit the configured budget is a configuration mismatch and answers
-	// EntityTooLarge up front rather than SlowDown forever.
+	// Admission is NON-BLOCKING (the read-miss path): a client-facing PUT
+	// must shed with a retryable SlowDown immediately, not park on the
+	// budget's condition variable.
 	streaming := IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256"))
-	bufSize := declaredSize + 1
-	weight := bufSize
+	weight := int64(originlessPutStreamWeight)
 	if streaming {
 		weight += awsChunkedReaderBufSize
-	}
-	if s.populateBudget != nil && weight > s.populateBudget.total {
-		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
-		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
-		return nil
 	}
 	if !s.acquireCacheSlot(ctx, weight, priorityReadMiss) {
 		s3err.WriteError(w, r, s3err.ErrSlowDown)
@@ -400,6 +392,23 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		return nil
 	}
 	defer s.releaseCacheSlot(weight)
+
+	// Content-MD5 FORMAT is validated before a byte is accepted — a malformed
+	// digest (bad base64, wrong length, present-but-empty; Values, not Get,
+	// because Get cannot distinguish empty from absent) rejects without
+	// paying for the upload. The VALUE is compared after the stream, when
+	// the digest exists. Malformed = InvalidDigest, wrong = BadDigest —
+	// S3's split; the engine IS the store, nothing upstream checks this.
+	var wantMD5 []byte
+	if md5Vals := r.Header.Values("Content-MD5"); len(md5Vals) > 0 {
+		want, decErr := base64.StdEncoding.DecodeString(md5Vals[0])
+		if decErr != nil || len(want) != md5.Size {
+			s3err.WriteError(w, r, s3err.ErrInvalidDigest)
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+			return nil
+		}
+		wantMD5 = want
+	}
 
 	// Unwrap AWS chunked framing so the stored bytes — and the ETag computed over
 	// them — are the object, not the wire encoding. Storing the framing serves
@@ -409,66 +418,62 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		reader = io.NopCloser(newAWSChunkedReader(r.Body))
 	}
 
-	// The allocation IS the reservation: one buffer of exactly declared+1 bytes,
-	// filled with ReadFull (the reservation additionally covers the decoder's
-	// bufio buffer for streaming bodies). io.ReadAll would grow its backing array
-	// geometrically and could retain up to ~2x the reservation — the undercount
-	// the budget exists to prevent. The extra byte detects a body longer than
-	// declared; a shorter one is an IncompleteBody. Both are the client
-	// misdescribing the request, not data to store under a wrong ETag.
-	buf := make([]byte, bufSize)
-	n, err := io.ReadFull(reader, buf)
-	switch {
-	case err == nil:
-		// Filled declared+1 bytes: the body is longer than declared.
-		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
-		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
-		return nil
-	// errors.Is, not equality: the chunked decoder WRAPS its errors ("reading
-	// chunk header: %w"), so a body truncated inside a chunk header carries a
-	// wrapped io.EOF that == would miss.
-	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
-		if int64(n) != declaredSize {
+	// The stream is limited to declared+1 bytes (the extra byte detects a
+	// body longer than declared), teed through the digest, and counted; the
+	// capture wrapper records a reader-side failure so a failed store can be
+	// attributed to the client's body rather than the cache. On ANY
+	// non-success below, the staged body is deleted best-effort — a body
+	// whose meta never commits is an orphan, and TTL is the backstop when
+	// the delete itself fails.
+	hasher := md5.New()
+	src := &captureReader{r: io.TeeReader(io.LimitReader(reader, declaredSize+1), hasher)}
+	ref := cache.NewBodyRef()
+	ttl := int(s.config.Cache.TTL.Seconds())
+	discardStaged := func() {
+		dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer dcancel()
+		if derr := s.cache.DeleteBody(dctx, bucket, key, ref); derr != nil {
+			log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Staged body delete failed; orphan ages out by TTL")
+		}
+	}
+	if putErr := s.cache.PutBodyStream(ctx, bucket, key, ref, src, int64(ttl)); putErr != nil {
+		discardStaged()
+		if src.err != nil && streaming {
+			// The chunked decoder rejecting the client's framing — a
+			// malformed request, not a server fault.
 			s3err.WriteError(w, r, s3err.ErrIncompleteBody)
 			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
 		}
-	case streaming:
-		// Any other failure reading a streaming body is the decoder rejecting
-		// the client's chunk framing — a malformed request, not a server fault.
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		if src.err != nil {
+			return src.err
+		}
+		return putErr
+	}
+	switch {
+	case src.n == declaredSize+1:
+		// The limit filled: the body is longer than declared.
+		discardStaged()
 		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
-	default:
+	case src.n != declaredSize:
+		// Clean EOF before the declared size: the client misdescribed the
+		// request; not data to store under a wrong ETag.
+		discardStaged()
+		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
-		return err
+		return nil
 	}
-	body := buf[:declaredSize]
 
-	sum := md5.Sum(body)
-	etag := `"` + hex.EncodeToString(sum[:]) + `"`
-
-	// Content-MD5 validation (RFC 1864 base64 of the 16-byte digest). The
-	// proxying modes get this from upstream; here the engine IS the store,
-	// and skipping it would accept a corrupt upload the client asked to have
-	// integrity-checked. Malformed header = InvalidDigest; well-formed but
-	// wrong = BadDigest — S3's split, and the digest is already computed for
-	// the ETag, so the check costs one decode and one compare.
-	// Values, not Get: a PRESENT-but-empty Content-MD5 is InvalidDigest on
-	// real S3 (an empty string is not a valid digest), while an absent header
-	// skips the check — Get returns "" for both.
-	if md5Vals := r.Header.Values("Content-MD5"); len(md5Vals) > 0 {
-		want, decErr := base64.StdEncoding.DecodeString(md5Vals[0])
-		if decErr != nil || len(want) != md5.Size {
-			s3err.WriteError(w, r, s3err.ErrInvalidDigest)
-			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
-			return nil
-		}
-		if !bytes.Equal(want, sum[:]) {
-			s3err.WriteError(w, r, s3err.ErrBadDigest)
-			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
-			return nil
-		}
+	sum := hasher.Sum(nil)
+	etag := `"` + hex.EncodeToString(sum) + `"`
+	if wantMD5 != nil && !bytes.Equal(wantMD5, sum) {
+		discardStaged()
+		s3err.WriteError(w, r, s3err.ErrBadDigest)
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
 	}
 
 	// Same header→meta mapping as the proxying populate path, then override
@@ -479,7 +484,8 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	// object), and LastModified is the write time, not a client header.
 	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, r.Header)
 	meta.ETag = etag
-	meta.ContentLength = int64(len(body))
+	meta.BodyRef = ref
+	meta.ContentLength = declaredSize
 	// Values, not Get: repeated Content-Encoding field lines are legal HTTP and
 	// equivalent to one comma-joined list ("aws-chunked" + "gzip" ≡
 	// "aws-chunked,gzip"); Get would keep only the first and lose the rest.
@@ -492,23 +498,19 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 	}
 	meta.LastModified = time.Now().Unix()
 
-	// WHOLE-OBJECT store only: this engine's modes force block caching off,
-	// so there is no block boundary to route on (the block populate path,
-	// putBlocksFromStream, belongs to the proxying modes).
-	//
-	// The store commits under the handler-start decision token; a refused
-	// commit is detected, never silent. Conditional writes answer the 412
-	// their precondition earned; unconditional writes retry under a fresh
-	// token (see below) so the client's 200 always means the bytes are
-	// stored.
-	ttl := int(s.config.Cache.TTL.Seconds())
-	// One store shape for the first attempt and the retry loop below.
+	// The body is already durable under its ref, so the commit — and every
+	// retry — is METADATA ONLY: the store closure is one PutMetaIfVersion,
+	// never a body re-stream. A refused commit is detected, never silent:
+	// conditional writes answer the 412 their precondition earned (and
+	// reclaim the staged body), unconditional writes retry under a fresh
+	// token so the client's 200 always means the entry is visible.
 	store := func(token uint64) (bool, error) {
-		return s.cache.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, bytes.NewReader(body), ttl, token)
+		return s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, token)
 	}
 	var wrote bool
-	wrote, err = store(expected)
+	wrote, err := store(expected)
 	if err != nil {
+		discardStaged()
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
 	}
@@ -516,7 +518,9 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		if conditional {
 			// The conditional's precondition raced away between evaluation and
 			// store. The honest answer is the 412 the client would have gotten
-			// had the racer arrived a moment earlier.
+			// had the racer arrived a moment earlier; the staged body will
+			// never be referenced.
+			discardStaged()
 			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
 			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
@@ -536,21 +540,25 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 		// client never holds a 200 for bytes that were not stored.
 		for attempt := 0; attempt < 8 && !wrote; attempt++ {
 			if cerr := ctx.Err(); cerr != nil {
+				discardStaged()
 				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 				return cerr
 			}
 			_, retryToken, _, terr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 			if terr != nil {
+				discardStaged()
 				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 				return terr
 			}
 			wrote, err = store(retryToken)
 			if err != nil {
+				discardStaged()
 				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 				return err
 			}
 		}
 		if !wrote {
+			discardStaged()
 			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return fmt.Errorf("put %s/%s: store refused %d retries under fresh tokens", bucket, key, 8)
 		}
@@ -593,4 +601,29 @@ func (s *Service) HandleOriginlessUnsupported(w http.ResponseWriter, r *http.Req
 	s3err.WriteError(w, r, s3err.ErrNotImplemented)
 	metrics.RecordRequest("Unsupported", "unsupported", metrics.SourceLocal, time.Since(start).Seconds())
 	return nil
+}
+
+// originlessPutStreamWeight is the fixed byte-budget weight of one streaming
+// engine PUT: the store's internal copy buffering, not the body — the body
+// never lives in memory. Deliberately generous versus the actual ~32 KiB
+// io.Copy buffer so small unaccounted allocations stay covered.
+const originlessPutStreamWeight = 64 * 1024
+
+// captureReader counts the bytes read through it and records the first
+// non-EOF error its inner reader returns, so a failed store can be
+// attributed to the client's body (truncated, malformed chunk framing)
+// rather than the cache write.
+type captureReader struct {
+	r   io.Reader
+	n   int64
+	err error
+}
+
+func (c *captureReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	if err != nil && !errors.Is(err, io.EOF) && c.err == nil {
+		c.err = err
+	}
+	return n, err
 }

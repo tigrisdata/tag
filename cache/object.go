@@ -2,6 +2,8 @@
 package cache
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -59,6 +61,16 @@ type CachedObjectMeta struct {
 	// hint, not an invariant: false (including on entries written before the field existed)
 	// only means the probe-first path is used.
 	BlocksComplete bool `json:"blocks_complete,omitempty"`
+	// BodyRef, when set, is the body key discriminator for this entry —
+	// a per-write unique id minted by the LOCAL-STORE ENGINE, which streams
+	// the body into the cache before its MD5 (the ETag) is known and so
+	// cannot key the body by content. Null on every proxy-written entry:
+	// proxy populates learn the ETag from upstream headers before the body
+	// streams and keep content-addressed keys (and their convergent
+	// double-write dedup). This is a WRITER-OWNERSHIP invariant, not a
+	// migration state — readers resolve through BodyDiscriminator and never
+	// care who wrote the entry.
+	BodyRef string `json:"body_ref,omitempty"`
 	// ContentLengthKnown records that ContentLength carries a real declared or
 	// measured length — including a genuine 0 for an empty object. Encode sets
 	// it automatically from ContentLength >= 0; DecodeMeta treats a row
@@ -371,6 +383,31 @@ func MakeMetaKey(bucket, key string) string {
 // resolved. The ETag is normalized with etagKeyComponent, which keeps the
 // weak/strong distinction so different validators never collide on one key. Objects
 // with no ETag fall back to the unversioned key (no version discriminator exists).
+// BodyDiscriminator returns the string this entry's body key is derived
+// from: BodyRef when set (engine-written entries, whose bodies are keyed by
+// a per-write id), else the ETag (proxy-written entries, content-addressed).
+// Every body read, probe, or targeted delete for an entry must resolve
+// through this — deriving from the ETag directly serves the wrong (absent)
+// key for engine entries.
+func (m *CachedObjectMeta) BodyDiscriminator() string {
+	if m.BodyRef != "" {
+		return m.BodyRef
+	}
+	return m.ETag
+}
+
+// NewBodyRef mints a per-write body key discriminator for entries whose
+// ETag is not known until the body has fully streamed (the local-store
+// engine's PUT). Uniqueness is what matters; the timestamp fallback keeps a
+// usable id even if the entropy source fails.
+func NewBodyRef() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "ref-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b[:])
+}
+
 func MakeBodyKey(bucket, key, etag string) string {
 	if etag == "" {
 		return bodyKeyPrefix + bucket + "|" + key
