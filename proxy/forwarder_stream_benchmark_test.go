@@ -126,10 +126,10 @@ func BenchmarkPassthroughBufferedBody(b *testing.B) {
 	}
 }
 
-// BenchmarkPassthroughStreamingBody measures a complete unknown-length
+// BenchmarkPassthroughStreamingBody measures a complete 32 MiB unknown-length
 // passthrough response while the upstream emits 8 KiB chunks without a pause.
 func BenchmarkPassthroughStreamingBody(b *testing.B) {
-	payload := bytes.Repeat([]byte("x"), 1024*1024)
+	payload := bytes.Repeat([]byte("x"), 32*1024*1024)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.WriteHeader(http.StatusOK)
