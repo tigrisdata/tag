@@ -1,6 +1,6 @@
 #!/bin/bash
 # S3 Compatibility Tests Runner for TAG
-# Modeled after tigris-os gateway/tests/tests.sh
+# Runs a curated selection of the ceph s3-tests suite against a local TAG.
 
 # Track test failures
 FAILED_TESTS=()
@@ -147,8 +147,8 @@ run_test() {
     fi
 }
 
-# Test arrays — curated list of tests relevant for TAG, based on
-# tigris-os gateway/tests/tests.sh, STRUCTURED BY SEMANTIC CLASS.
+# Test arrays — curated list of tests relevant for TAG, STRUCTURED BY
+# SEMANTIC CLASS.
 #
 # The class an operation belongs to decides whether it can pass in TIERED
 # mode (S3TEST_PROFILE=tiered), where the local metadata is authoritative and
