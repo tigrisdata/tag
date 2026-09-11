@@ -68,7 +68,6 @@ func BenchmarkPassthroughBufferedBody(b *testing.B) {
 			defer proxy.Close()
 
 			client := proxy.Client()
-			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
 				resp, err := client.Get(proxy.URL + "/bucket/key")
@@ -132,7 +131,6 @@ func BenchmarkPassthroughStreamingBody(b *testing.B) {
 	defer proxy.Close()
 
 	client := proxy.Client()
-	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
 		resp, err := client.Get(proxy.URL + "/bucket/key")
@@ -194,7 +192,6 @@ func BenchmarkPassthroughPacedFirstByte(b *testing.B) {
 	defer proxy.Close()
 
 	client := proxy.Client()
-	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
 		resp, err := client.Get(proxy.URL + "/bucket/key")
