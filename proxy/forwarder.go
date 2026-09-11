@@ -185,6 +185,7 @@ type pacedFlushWriter struct {
 
 	mu              sync.Mutex
 	timer           *time.Timer
+	flushDeadline   time.Time
 	flushPending    bool
 	bytesSinceFlush int64
 	firstBodyWrite  bool
@@ -236,6 +237,7 @@ func (w *pacedFlushWriter) Write(p []byte) (int, error) {
 	} else if !w.flushPending {
 		w.flushPending = true
 		if w.timer == nil {
+			w.flushDeadline = time.Now().Add(forwarderFlushInterval)
 			w.timer = time.AfterFunc(forwarderFlushInterval, w.delayedFlush)
 		}
 	}
@@ -246,8 +248,17 @@ func (w *pacedFlushWriter) delayedFlush() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.stopped {
+		w.timer = nil
+		return
+	}
+	if time.Now().Before(w.flushDeadline) {
+		w.timer.Reset(time.Until(w.flushDeadline))
+		return
+	}
 	w.timer = nil
-	if w.stopped || !w.flushPending {
+	w.flushDeadline = time.Time{}
+	if !w.flushPending {
 		return
 	}
 	w.flushPending = false
@@ -256,6 +267,9 @@ func (w *pacedFlushWriter) delayedFlush() {
 }
 
 func (w *pacedFlushWriter) flushLocked() {
+	if w.timer != nil {
+		w.flushDeadline = time.Now().Add(forwarderFlushInterval)
+	}
 	w.flushPending = false
 	w.bytesSinceFlush = 0
 	w.flusher.Flush()
@@ -270,6 +284,7 @@ func (w *pacedFlushWriter) stop() {
 		w.timer.Stop()
 		w.timer = nil
 	}
+	w.flushDeadline = time.Time{}
 	w.flushPending = false
 	if w.bytesSinceFlush > 0 {
 		w.bytesSinceFlush = 0
