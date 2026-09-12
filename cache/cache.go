@@ -504,6 +504,25 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// firstByteWriter accepts the complete range response while retaining only its
+// first byte. Range backends may write in multiple chunks, and must receive the
+// full count back so streaming implementations do not report a short write.
+type firstByteWriter struct {
+	first   [1]byte
+	written int
+}
+
+func (w *firstByteWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if w.written == 0 {
+		w.first[0] = p[0]
+	}
+	w.written += len(p)
+	return len(p), nil
+}
+
 // getRangeStreamByKey streams an inclusive byte range [start,end] of the blob at cacheKey to
 // w, mapping ocache's not-found to ErrNotFound and handling ocache's read-byte-0 quirk.
 // bucket/key are used for logging only.
@@ -511,9 +530,10 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 	// Handle ocache quirk: reading byte 0 alone requires reading 2 bytes
 	// and discarding the last byte
 	if start == 0 && end == 0 {
-		// Single byte at position 0 - need to read 2 bytes and discard last
-		var buf bytes.Buffer
-		err := c.client.GetRangeStream(ctx, cacheKey, 0, 1, &buf)
+		// Single byte at position 0 - need to read 2 bytes and discard last.
+		// Keep only the first byte while reporting each backend write in full.
+		var first firstByteWriter
+		err := c.client.GetRangeStream(ctx, cacheKey, 0, 1, &first)
 		if err != nil {
 			if isNotFoundError(err) {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
@@ -528,13 +548,13 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 		// which reads [0,0]) treats a never-stored block as present, so fetchOneBlock skips the
 		// fetch (the block is never stored) yet the block-mode meta is still written, and a later
 		// serve streams an empty body. See RFC 0001.
-		if buf.Len() == 0 {
+		if first.written == 0 {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
 			return ErrNotFound
 		}
 		c.recordServeLocality(cacheKey)
 		// Write only the first byte
-		_, err = w.Write(buf.Bytes()[:1])
+		_, err = w.Write(first.first[:])
 		return err
 	}
 
