@@ -85,6 +85,9 @@ func (cw *lazyCommitWriter) Write(p []byte) (int, error) {
 // Supports conditional requests (If-None-Match, If-Modified-Since).
 // Supports client-triggered cache revalidation via Cache-Control: no-cache/max-age=0.
 func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error {
+	if s.config.IsTiered() {
+		return s.handleTieredObject(w, r)
+	}
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
@@ -92,9 +95,9 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	bypassCache := shouldBypassCache(r)
 	rangeHeader := r.Header.Get("Range")
 
-	// Conditional request headers
+	// Conditional request headers (evaluated by writeNotModifiedFromCache on
+	// the hit path; logged here for request tracing)
 	ifNoneMatch := r.Header.Get("If-None-Match")
-	ifModifiedSince := r.Header.Get("If-Modified-Since")
 
 	log.Debug().
 		Str("bucket", bucket).
@@ -107,7 +110,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// 1. Validate credentials FIRST (before any broadcast operations)
 	result, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil {
-		metrics.RecordRequest("GetObject", "auth_error", time.Since(start).Seconds())
+		metrics.RecordRequest("GetObject", "auth_error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
 	}
 
@@ -196,28 +199,14 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start, XCacheMiss)
 				}
 
-				// Check conditional request: If-None-Match
-				if ifNoneMatch != "" && meta.MatchesETag(ifNoneMatch) {
-					log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified")
-					writeCacheStatus(w, XCacheHit)
-					w.Header().Set("ETag", meta.ETag)
-					w.WriteHeader(http.StatusNotModified)
-					metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+				// Conditional 304s through the SHARED helper (its stated
+				// purpose): the inline version had drifted on RFC 7232 §3.3
+				// precedence — it fell through to If-Modified-Since when
+				// If-None-Match mismatched, answering 304 with stale bytes
+				// kept after a same-second overwrite; the helper ignores IMS
+				// whenever INM is present, and evaluates ETag LISTS.
+				if s.writeNotModifiedFromCache(w, r, meta, "GetObject", start) {
 					return nil
-				}
-
-				// Check conditional request: If-Modified-Since
-				if ifModifiedSince != "" {
-					if t, parseErr := http.ParseTime(ifModifiedSince); parseErr == nil {
-						if !meta.IsModifiedSince(t) {
-							log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit - 304 Not Modified (time)")
-							writeCacheStatus(w, XCacheHit)
-							w.Header().Set("ETag", meta.ETag)
-							w.WriteHeader(http.StatusNotModified)
-							metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
-							return nil
-						}
-					}
 				}
 
 				// Serve full response from cache.
@@ -365,7 +354,7 @@ func (s *Service) fetchAndBroadcast(
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return err
 }
 
@@ -498,7 +487,7 @@ func (s *Service) receiveFromBroadcastListener(
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return err
 }
 
@@ -670,7 +659,7 @@ func writeRangeNotSatisfiable(w http.ResponseWriter, r *http.Request, meta *cach
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", meta.ContentLength))
 	writeCacheStatus(w, XCacheHit)
 	s3err.WriteError(w, r, s3err.ErrInvalidRange)
-	metrics.RecordRequest("GetObject", "range_not_satisfiable", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "range_not_satisfiable", metrics.SourceLocal, time.Since(startTime).Seconds())
 }
 
 // It returns served=true when it has produced a complete client response (a range
@@ -711,7 +700,7 @@ func (s *Service) serveRangeFromCache(
 	// client cannot distinguish from a valid short read.
 	pr, pw := io.Pipe()
 	go func() {
-		streamErr := s.cache.GetRangeStream(ctx, bucket, key, meta.ETag, rng.start, rng.end, pw)
+		streamErr := s.cache.GetRangeStream(ctx, bucket, key, meta.BodyDiscriminator(), rng.start, rng.end, pw)
 		if streamErr != nil {
 			pw.CloseWithError(streamErr)
 		} else {
@@ -756,7 +745,7 @@ func (s *Service) serveRangeFromCache(
 	}
 
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -774,7 +763,7 @@ func (s *Service) handleRangeWithBackgroundCache(
 	// Forward the Range request directly to client (low latency)
 	resp, err := s.forwarder.DoRequestWithCreds(ctx, r, accessKey, secretKey)
 	if err != nil {
-		metrics.RecordRequest("GetObject", "error", time.Since(startTime).Seconds())
+		metrics.RecordRequest("GetObject", "error", metrics.SourceUpstream, time.Since(startTime).Seconds())
 		return err
 	}
 	defer resp.Body.Close()
@@ -870,7 +859,36 @@ func (s *Service) handleRangeWithBackgroundCache(
 		return err
 	}
 
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "success", metrics.SourceUpstream, time.Since(startTime).Seconds())
 
 	return nil
+}
+
+// writeNotModifiedFromCache answers a conditional request with 304 when the
+// cached entry satisfies the request's validators. Per RFC 7232 §3.3, a
+// request carrying If-None-Match is judged by it ALONE — If-Modified-Since is
+// ignored, matching or not: LastModified is second-granular, so falling back
+// to it could 304 a client across a same-second overwrite it should see.
+// Returns true when it wrote the response. Shared by the proxying GET hit
+// path and the origin-less handler so the two cannot drift.
+func (s *Service) writeNotModifiedFromCache(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, operation string, start time.Time) bool {
+	if inm := r.Header.Get("If-None-Match"); inm != "" {
+		if !meta.MatchesETagHeader(inm, false) {
+			return false
+		}
+	} else {
+		ims := r.Header.Get("If-Modified-Since")
+		if ims == "" {
+			return false
+		}
+		t, parseErr := http.ParseTime(ims)
+		if parseErr != nil || meta.IsModifiedSince(t) {
+			return false
+		}
+	}
+	writeCacheStatus(w, XCacheHit)
+	w.Header().Set("ETag", meta.ETag)
+	w.WriteHeader(http.StatusNotModified)
+	metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
+	return true
 }

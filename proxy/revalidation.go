@@ -124,7 +124,7 @@ func (s *Service) forwardAfterCacheMiss(ctx context.Context, w http.ResponseWrit
 	if forwardErr != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return forwardErr
 }
 
@@ -248,7 +248,7 @@ func (s *Service) handleRevalidation200(
 		if copyErr != nil {
 			status = "error"
 		}
-		metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+		metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 		return copyErr
 	}
 
@@ -265,7 +265,7 @@ func (s *Service) handleRevalidation200(
 		var cacheErr error
 		if s.isBlockEligibleSize(newMeta.ContentLength) {
 			newMeta.BlockSize = s.config.Cache.BlockSize
-			cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, expected)
+			_, cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, expected)
 		} else {
 			_, cacheErr = s.cache.PutWithMetaStreamIfVersion(
 				context.Background(), bucket, key, newMeta, pr, ttl, expected,
@@ -307,7 +307,7 @@ func (s *Service) handleRevalidation200(
 	if copyErr != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return copyErr
 }
 
@@ -322,10 +322,7 @@ func (s *Service) serveFromCache(
 ) error {
 	// Zero-byte objects: no body to serve
 	if meta.ContentLength == 0 {
-		meta.WriteHeaders(w)
-		writeCacheStatus(w, XCacheHit)
-		w.WriteHeader(meta.StatusCode)
-		metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+		serveMetaHit(w, meta, "GetObject", start)
 		return nil
 	}
 
@@ -334,14 +331,14 @@ func (s *Service) serveFromCache(
 		bodyBuf := bufferPool.Get().(*bytes.Buffer)
 		bodyBuf.Reset()
 
-		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.ETag, bodyBuf)
+		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), bodyBuf)
 		if bodyErr == nil && bodyBuf.Len() > 0 {
 			meta.WriteHeaders(w)
 			writeCacheStatus(w, XCacheHit)
 			w.WriteHeader(meta.StatusCode)
 			n, _ := w.Write(bodyBuf.Bytes())
 			metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-			metrics.RecordRequest("GetObject", "success", time.Since(start).Seconds())
+			metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
 			putBuffer(bodyBuf)
 			return nil
 		}
@@ -358,7 +355,7 @@ func (s *Service) serveFromCache(
 	// fallback for an absent or empty body without staging the stream through a
 	// pipe and a second copy.
 	cw := &lazyCommitWriter{w: w, meta: meta}
-	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.ETag, cw)
+	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), cw)
 	status := "success"
 	if bodyErr != nil {
 		if !cw.committed {
@@ -377,7 +374,7 @@ func (s *Service) serveFromCache(
 	}
 
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, metrics.SourceLocal, time.Since(start).Seconds())
 	return nil
 }
 
@@ -415,7 +412,7 @@ func (s *Service) handleRevalidation206Range(
 	if copyErr != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("GetObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 
 	// Trigger background full-object fetch to repopulate cache
 	if totalSize > 0 &&
@@ -464,6 +461,7 @@ func (s *Service) serveStaleFromCache(
 func (s *Service) revalidateAndServeHead(
 	ctx context.Context,
 	w http.ResponseWriter,
+	r *http.Request,
 	bucket, key, accessKey, secretKey string,
 	meta *cache.CachedObjectMeta,
 	start time.Time,
@@ -486,7 +484,9 @@ func (s *Service) revalidateAndServeHead(
 		copyHeaders(w.Header(), resp.Header)
 		writeCacheStatus(w, XCacheRevalidated)
 		w.WriteHeader(resp.StatusCode)
-		metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
+		// The response headers came from upstream's 200 — this is an upstream
+		// answer, unlike the 304 path below that serves the cached metadata.
+		metrics.RecordRequest("HeadObject", "success", metrics.SourceUpstream, time.Since(start).Seconds())
 		return nil
 	}
 
@@ -508,10 +508,14 @@ func (s *Service) revalidateAndServeHead(
 		}
 	}
 
-	meta.WriteHeaders(w)
-	writeCacheStatus(w, XCacheHit)
-	w.WriteHeader(meta.StatusCode)
-	metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
+	// The client's own conditionals still apply to the served headers — a
+	// matching If-None-Match is a 304, not a 200 (the same 304-only rule as
+	// the non-revalidate HEAD hit path; the upstream revalidation validated
+	// TAG's cached ETag, not the client's request).
+	if s.writeNotModifiedFromCache(w, r, meta, "HeadObject", start) {
+		return nil
+	}
+	serveMetaHit(w, meta, "HeadObject", start)
 	return nil
 }
 

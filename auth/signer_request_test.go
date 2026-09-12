@@ -377,3 +377,36 @@ func TestRequestSignerSignRequestCopiesEndpointTemplate(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// SignObjectRequest takes the key LITERALLY: '?' is a legal S3 key character
+// and must never be read as a query separator — for the tiered cleanup DELETE
+// that split aimed a destructive request at a truncated sibling key.
+func TestSignObjectRequest_QueryCharsInKeyStayInPath(t *testing.T) {
+	signer := NewRequestSigner("https://s3.amazonaws.com", "us-east-1")
+	req, err := signer.SignObjectRequest(context.Background(), "DELETE", "b", "reports?2026.pq", nil, "", "AK", "SK", nil)
+	if err != nil {
+		t.Fatalf("SignObjectRequest: %v", err)
+	}
+	if req.URL.Path != "/b/reports?2026.pq" {
+		t.Fatalf("Path = %q, want the literal key", req.URL.Path)
+	}
+	if req.URL.RawQuery != "" {
+		t.Fatalf("RawQuery = %q, want empty (no split)", req.URL.RawQuery)
+	}
+	if got := req.URL.EscapedPath(); got != "/b/reports%3F2026.pq" {
+		t.Fatalf("EscapedPath = %q, want %%3F-encoded '?'", got)
+	}
+	if req.Header.Get("Authorization") == "" {
+		t.Fatal("request not signed")
+	}
+
+	// Contrast: SignRequest's combined-path parameter still splits — that is
+	// its contract for forwarded request targets.
+	req2, err := signer.SignRequest(context.Background(), "GET", "/b/reports?2026.pq", nil, "", "AK", "SK", nil)
+	if err != nil {
+		t.Fatalf("SignRequest: %v", err)
+	}
+	if req2.URL.Path != "/b/reports" || req2.URL.RawQuery != "2026.pq" {
+		t.Fatalf("SignRequest split = %q / %q, want /b/reports + 2026.pq", req2.URL.Path, req2.URL.RawQuery)
+	}
+}

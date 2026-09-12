@@ -47,6 +47,30 @@ func writeCacheStatus(w http.ResponseWriter, status string) {
 	}
 }
 
+// serveMetaHit commits a metadata-only cache-hit response: the entry's
+// headers, the HIT status, the original status code, and the success metric.
+// The one shape for every "answer from metadata" site — HEADs, marker serves,
+// empty bodies — so a header added to one is added to all.
+func serveMetaHit(w http.ResponseWriter, meta *cache.CachedObjectMeta, operation string, start time.Time) {
+	meta.WriteHeaders(w)
+	writeCacheStatus(w, XCacheHit)
+	w.WriteHeader(meta.StatusCode)
+	metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
+}
+
+// answerConditionalsFromMeta evaluates the client's conditional headers
+// against cached metadata in RFC 7232 order — the 412 preconditions
+// (If-Match / If-Unmodified-Since) before the 304 conditionals
+// (If-None-Match / If-Modified-Since) — and writes the response when one
+// decides. Returns true when it wrote; the caller serves normally otherwise.
+func (s *Service) answerConditionalsFromMeta(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, operation string, start time.Time) bool {
+	if writePreconditionFailed(w, r, meta) {
+		metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
+		return true
+	}
+	return s.writeNotModifiedFromCache(w, r, meta, operation, start)
+}
+
 // cacheMissStatus returns the X-Cache status for a request not served from cache:
 // DISABLED when caching is off, BYPASS when the client opted out (Cache-Control:
 // no-store), otherwise MISS. Only MISS counts as a cache miss.
@@ -66,14 +90,35 @@ type Service struct {
 	forwarder                   RequestForwarder
 	cache                       *cache.Cache
 	config                      *config.Config
-	cacheSemaphore              chan struct{}               // Count ceiling on concurrent cache-populate ops (nil = unlimited)
-	populateBudget              *byteBudget                 // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
-	perPopulateCap              int64                       // Max bytes a foreground broadcast populate can buffer
-	backgroundPopulateWriterCap int64                       // Bytes reserved for direct writer buffers before response inspection
-	broadcastManager            *broadcast.Manager          // For streaming request coalescing
-	activeBackgroundFetches     sync.Map                    // Dedup for background full-object fetches (range caching)
-	blockFetchMu                sync.Mutex                  // Guards blockFetches
-	blockFetches                map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
+	cacheSemaphore              chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
+	populateBudget              *byteBudget        // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
+	perPopulateCap              int64              // Max bytes a foreground broadcast populate can buffer
+	backgroundPopulateWriterCap int64              // Bytes reserved for direct writer buffers before response inspection
+	broadcastManager            *broadcast.Manager // For streaming request coalescing
+	activeBackgroundFetches     sync.Map           // Dedup for background full-object fetches (range caching)
+	// retier coordinates tiered-mode re-tier-on-read populates with writes:
+	// claims[key] counts PUTs in flight (a claim cancels and excludes re-tiers
+	// for the key), inflight[key] is the running re-tier's cancel func. One
+	// mutex serializes claim/registration, so the PUT-vs-re-tier handshake is
+	// ordering-free: a re-tier either registers before the claim (and is
+	// canceled by it) or sees the claim and refuses to start.
+	retierMu       sync.Mutex
+	retierClaims   map[string]int
+	retierInflight map[string]context.CancelFunc
+	// retierRecentMismatch backs off re-tier attempts for a marker version
+	// whose upstream fetch came back changed or gone: without it a marker
+	// that is persistently stale versus the upstream object re-downloads and
+	// discards the full body on EVERY validated GET for the marker's TTL.
+	retierRecentMismatch *expirable.LRU[string, struct{}]
+	// enginePutSlots bounds concurrent local-store engine PUTs, SEPARATE
+	// from cacheSemaphore: engine PUTs are client-paced (a trickle upload
+	// holds its slot for the transfer's whole duration), and before this
+	// split 256 slow large uploads could pin every shared cache-write slot,
+	// shedding all read-miss populates and collapsing the hit rate. Same
+	// size as the shared pool — the point is isolation, not a lower count.
+	enginePutSlots chan struct{}
+	blockFetchMu   sync.Mutex                  // Guards blockFetches
+	blockFetches   map[string]*blockFetchState // Coalesce block fetches while a detached remote write is pending
 	// recentFooterWork suppresses repeat footer scans for an object version that was
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
@@ -99,6 +144,10 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 	var cacheSem chan struct{}
 	if cfg.Cache.MaxConcurrentWrites > 0 {
 		cacheSem = make(chan struct{}, cfg.Cache.MaxConcurrentWrites)
+	}
+	var enginePutSlots chan struct{}
+	if cfg.IsTiered() && cfg.Cache.MaxConcurrentWrites > 0 {
+		enginePutSlots = make(chan struct{}, cfg.Cache.MaxConcurrentWrites)
 	}
 
 	perPopulateCap := perPopulateBufferBytes(cfg)
@@ -157,15 +206,21 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		cache:                       cache,
 		config:                      cfg,
 		cacheSemaphore:              cacheSem,
+		enginePutSlots:              enginePutSlots,
 		populateBudget:              populateBudget,
 		perPopulateCap:              perPopulateCap,
 		backgroundPopulateWriterCap: backgroundPopulateWriterCap,
 		broadcastManager:            broadcast.NewManager(channelBuf),
 		blockFetches:                make(map[string]*blockFetchState),
+		retierClaims:                make(map[string]int),
+		retierInflight:              make(map[string]context.CancelFunc),
 	}
 	// Allocated only when the feature that uses it is on.
 	if cfg.Cache.ParquetOptimization {
 		svc.recentFooterWork = expirable.NewLRU[string, struct{}](maxFooterWorkTracking, nil, footerWorkCooldown)
+	}
+	if cfg.IsTiered() {
+		svc.retierRecentMismatch = expirable.NewLRU[string, struct{}](maxRetierMismatchTracking, nil, retierMismatchCooldown)
 	}
 	return svc
 }
@@ -512,6 +567,36 @@ func (s *Service) tryAcquireCacheBytes(weight int64, prio populatePriority) bool
 	return s.populateBudget.tryAcquireReadMiss(weight)
 }
 
+// acquireEnginePutSlot admits one local-store engine PUT: a slot from the
+// engine's OWN pool (never the shared populate semaphore — see the field
+// comment) plus the fixed streaming weight against the byte budget.
+// Non-blocking: a client-facing PUT sheds with a retryable SlowDown.
+func (s *Service) acquireEnginePutSlot(ctx context.Context, weight int64) bool {
+	if s.enginePutSlots != nil {
+		select {
+		case s.enginePutSlots <- struct{}{}:
+		default:
+			return false
+		}
+	}
+	if !s.acquireCacheBytes(ctx, weight, priorityReadMiss) {
+		if s.enginePutSlots != nil {
+			<-s.enginePutSlots
+		}
+		return false
+	}
+	return true
+}
+
+func (s *Service) releaseEnginePutSlot(weight int64) {
+	if s.populateBudget != nil {
+		s.populateBudget.release(weight)
+	}
+	if s.enginePutSlots != nil {
+		<-s.enginePutSlots
+	}
+}
+
 // acquireCacheSlot tries to reserve a cache-populate slot without blocking,
 // reserving `weight` bytes against the memory budget. It returns true (and must be
 // paired with releaseCacheSlot passing the SAME weight) when both the count slot
@@ -612,14 +697,21 @@ func (rec *statusRecorder) wroteSuccess() bool {
 // HandlePutObject handles PUT requests for objects.
 // Invalidates cache BEFORE forwarding to ensure consistency.
 func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error {
+	if s.config.IsTiered() {
+		return s.handleTieredPut(w, r)
+	}
 	start := time.Now()
 	bucket, key := ParseBucketKey(r)
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandlePutObject")
 
-	// Invalidate cache BEFORE forwarding to ensure consistency
-	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
-	s.invalidateObject(context.Background(), bucket, key)
+	// Invalidate cache BEFORE forwarding to ensure consistency: it prevents
+	// stale data from being served if forwarding succeeds but cache
+	// invalidation fails. Proxy modes only — see preForwardInvalidate; in
+	// tiered mode the key may hold a local-tier only-copy or a live marker
+	// that a rejected forward must leave intact (tiered relies on the
+	// post-success invalidation below).
+	s.preForwardInvalidate(context.Background(), bucket, key)
 
 	// Forward to Tigris, recording the upstream status. When eligible, forwardPutMaybeTee
 	// tees the decoded body so we can populate the cache directly (write-through) instead of
@@ -639,7 +731,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// Routed through invalidateObject (like the pre-forward call) so a failure of this
 	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		s.convergeInvalidation(context.Background(), bucket, key)
 		teeHandled := requestRejectsCache
 		if teed != nil {
 			// writeThroughCache takes ownership of the reserved populate budget.
@@ -663,7 +755,7 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("PutObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("PutObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 
 	return err
 }
@@ -671,14 +763,52 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 // HandleDeleteObject handles DELETE requests for objects.
 // Invalidates cache BEFORE forwarding to ensure consistency.
 func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) error {
+	// Tiered mode: a local-tier object is deleted without touching upstream.
+	// Anything else (upstream tier, no metadata, unvalidated caller) falls
+	// through to the ordinary invalidate-and-forward below, which also clears
+	// the local metadata marker.
+	if s.config.IsTiered() {
+		// Claim the key for the DELETE's whole duration, exactly as a PUT
+		// does: a re-tier heals the object being deleted, and its commit
+		// rides a context this cancels — so an in-flight heal cannot
+		// resurrect the object after the version-guarded converge (which
+		// only removes the pre-forward version) declines to out-delete the
+		// heal's newer commit. New re-tiers are excluded until release.
+		bucket, key := ParseBucketKey(r)
+		s.claimRetierWrite(bucket, key)
+		defer s.releaseRetierWrite(bucket, key)
+		if handled, err := s.handleTieredDeleteLocal(w, r); handled {
+			return err
+		}
+	}
 	start := time.Now()
 	bucket, key := ParseBucketKey(r)
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleDeleteObject")
 
-	// Invalidate cache BEFORE forwarding to ensure consistency
-	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
-	s.invalidateObject(context.Background(), bucket, key)
+	// Invalidate cache BEFORE forwarding to ensure consistency: it prevents
+	// stale data from being served if forwarding succeeds but cache
+	// invalidation fails. Proxy modes only — see preForwardInvalidate; in
+	// tiered mode the key may hold a local-tier only-copy or a live marker
+	// that a rejected forward must leave intact (tiered relies on the
+	// post-success converge below).
+	s.preForwardInvalidate(context.Background(), bucket, key)
+
+	// Tiered: the post-success converge must be ORDERED. The unconditional
+	// coordinator delete deliberately out-deletes racing writers — correct
+	// for a proxy cache, but here a small PUT acked during the forward is
+	// the local tier's only copy, and out-deleting it is data loss. Capture
+	// the pre-forward token; the converge below removes exactly the state
+	// this DELETE displaced, and anything newer keeps the key.
+	var (
+		delPrior      *cache.CachedObjectMeta
+		delPriorVer   uint64
+		delPriorKnown bool
+	)
+	if s.config.IsTiered() {
+		delPrior, delPriorVer, delPriorKnown = s.captureMarkerPrior(r.Context(), bucket, key)
+		_ = delPrior
+	}
 
 	// Forward to upstream, recording the upstream status.
 	rec := &statusRecorder{ResponseWriter: w}
@@ -690,17 +820,19 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// fence bump blocks that stale repopulation.
 	// Gated on a 2xx: a rejected DELETE leaves the object present, so re-invalidating
 	// would only discard a valid racing refill and cause an unnecessary later miss.
-	// Routed through invalidateObject (like the pre-forward call) so a failure of this
-	// read-after-write-critical invalidation is recorded and logged, not discarded.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		if s.config.IsTiered() {
+			s.convergeTieredDelete(bucket, key, delPriorVer, delPriorKnown)
+		} else {
+			s.convergeInvalidation(context.Background(), bucket, key)
+		}
 	}
 
 	status := "success"
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("DeleteObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("DeleteObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 
 	return err
 }
@@ -709,6 +841,9 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 // Serves from cached metadata when available (no body fetch needed).
 // Supports cache revalidation via Cache-Control: no-cache/max-age=0.
 func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error {
+	if s.config.IsTiered() {
+		return s.handleTieredObject(w, r)
+	}
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
@@ -720,7 +855,7 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	// Validate credentials before serving from cache
 	result, accessKey, secretKey, err := s.forwarder.ValidateAndGetCredentials(r)
 	if err != nil {
-		metrics.RecordRequest("HeadObject", "auth_error", time.Since(start).Seconds())
+		metrics.RecordRequest("HeadObject", "auth_error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
 	}
 
@@ -739,15 +874,23 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 			// Client-triggered revalidation: Cache-Control: no-cache/max-age=0
 			if forceRevalidate && meta.ETag != "" {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD cache hit requires revalidation (client-triggered)")
-				return s.revalidateAndServeHead(ctx, w, bucket, key, accessKey, secretKey, meta, start)
+				return s.revalidateAndServeHead(ctx, w, r, bucket, key, accessKey, secretKey, meta, start)
 			}
 
 			if !forceRevalidate {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("HEAD served from cache")
-				meta.WriteHeaders(w)
-				writeCacheStatus(w, XCacheHit)
-				w.WriteHeader(meta.StatusCode)
-				metrics.RecordRequest("HeadObject", "success", time.Since(start).Seconds())
+				// 304 conditionals only, exactly like the proxy GET hit path
+				// (writeNotModifiedFromCache): the 412 PRECONDITIONS
+				// (If-Match/If-Unmodified-Since) are origin-state questions
+				// RFC 9110 forbids answering from a possibly-stale cached
+				// response — a mixed-writer overwrite would make TAG return a
+				// hard 412 for an object whose live version matches. Those
+				// belong only where TAG is authoritative (tiered/origin-less),
+				// via answerConditionalsFromMeta.
+				if s.writeNotModifiedFromCache(w, r, meta, "HeadObject", start) {
+					return nil
+				}
+				serveMetaHit(w, meta, "HeadObject", start)
 				return nil
 			}
 			// forceRevalidate but no ETag — fall through to upstream
@@ -769,7 +912,7 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("HeadObject", status, time.Since(start).Seconds())
+	metrics.RecordRequest("HeadObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return err
 }
 
@@ -780,10 +923,13 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleCopyObject")
 
-	// Invalidate cache for destination object BEFORE forwarding to ensure consistency
-	// This prevents stale data from being served if forwarding succeeds but cache invalidation fails
+	// Invalidate cache for destination object BEFORE forwarding to ensure
+	// consistency: it prevents stale data from being served if forwarding
+	// succeeds but cache invalidation fails. Proxy modes only — see
+	// preForwardInvalidate; in tiered mode the destination may be a
+	// local-tier only-copy that a failed copy must leave intact.
 	if s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		s.preForwardInvalidate(context.Background(), bucket, key)
 	}
 
 	// Forward to upstream, capturing the response so we can confirm the copy
@@ -799,7 +945,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
 	// unchanged, so re-invalidating would only discard a valid racing refill.
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
+		s.convergeInvalidation(context.Background(), bucket, key)
 		s.warmOnWrite(r, bucket, key)
 		s.warmParquetFooterOnWrite(r, bucket, key)
 	}
@@ -832,25 +978,88 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 // as an error rather than success: a false-green delete metric would hide the very
 // read-after-write hazard the invalidation exists to prevent, since the stale entry
 // is still in place. It is a no-op when the cache is disabled.
-func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
-	if !s.cache.IsEnabled() {
+// The error return matters only to origin-less callers, where the cache is the
+// only store and an acked-but-failed delete keeps serving until TTL. Proxy-mode
+// callers ignore it: there the origin is authoritative and the upstream DELETE
+// already succeeded, so a failed local invalidation is a stale-cache blip.
+// preForwardInvalidate is the proxy-mode "invalidate BEFORE forwarding"
+// consistency step, shared by the mutating handlers (DELETE, CopyObject,
+// CompleteMultipartUpload, bulk DeleteObjects). In proxy mode dropping a
+// cache entry is always safe, and doing it up front means a forward that
+// succeeds but whose post-invalidation fails cannot leave stale data served.
+// In TIERED mode it is the opposite of safe: the cache is authoritative and a
+// local-tier entry is the ONLY copy, so destroying it before upstream has
+// authorized and confirmed the operation turns a rejected request into data
+// loss (and drops a live marker on a failed upstream-tier op). Tiered relies
+// solely on the post-success invalidation these handlers already perform.
+// convergeInvalidation is the POST-SUCCESS invalidation of the mutating
+// handlers. By the time it runs the client already holds its 2xx, and in
+// tiered mode it is the ONLY invalidation (preForwardInvalidate is a no-op
+// there), so a transient failure leaves a deleted or overwritten local-tier
+// object — or a stale marker — serving authoritatively until TTL with no
+// retry signal. One immediate retry absorbs the transient class cheaply; a
+// repeat failure stays visible as tag_cache_operations_total{operation=
+// "delete",result="error"} (the dashboard's invalidation-errors panel),
+// since the acked response cannot be recalled.
+func (s *Service) convergeInvalidation(ctx context.Context, bucket, key string) {
+	if s.invalidateObject(ctx, bucket, key) == nil {
 		return
+	}
+	_ = s.invalidateObject(ctx, bucket, key)
+}
+
+// convergeTieredDelete is the tiered post-success invalidation for the
+// forwarded DELETE paths: it removes exactly the state the DELETE displaced
+// (the pre-forward token), so a small PUT acked during the forward — the
+// local tier's only copy — is never out-deleted the way the proxy-mode
+// unconditional converge deliberately does. A refused removal means a newer
+// write owns the key, which is the correct outcome. With the prior unknown
+// (its read failed) nothing is removed: the possibly-stale marker serves
+// until TTL — an availability inconsistency, chosen over unguarded deletion
+// in the mode where the cache is the store.
+func (s *Service) convergeTieredDelete(bucket, key string, priorVersion uint64, priorKnown bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if !priorKnown {
+		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Tiered DELETE converge skipped - prior unknown; possibly-stale metadata serves until TTL")
+		return
+	}
+	if _, err := s.cache.DeleteMetaIfVersion(ctx, bucket, key, priorVersion); err != nil {
+		metrics.RecordCacheOperation("delete", "error")
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Tiered DELETE converge failed; stale metadata may serve until TTL")
+		return
+	}
+	metrics.RecordCacheOperation("delete", "success")
+}
+
+func (s *Service) preForwardInvalidate(ctx context.Context, bucket, key string) {
+	if s.config.IsTiered() {
+		return
+	}
+	s.invalidateObject(ctx, bucket, key)
+}
+
+func (s *Service) invalidateObject(ctx context.Context, bucket, key string) error {
+
+	if !s.cache.IsEnabled() {
+		return nil
 	}
 	if err := s.cache.Delete(ctx, bucket, key); err != nil {
 		metrics.RecordCacheOperation("delete", "error")
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache invalidation failed")
-		return
+		return err
 	}
 	metrics.RecordCacheOperation("delete", "success")
+	return nil
 }
 
 // warmOnWrite repopulates the cache after a successful write by triggering a
 // background full-object fetch, so a read soon after the write hits cache
 // (cache-warm-on-write; see cache.warm_on_write). It is best-effort and fully
 // detached: triggerBackgroundCacheFetch deduplicates concurrent warms, sheds under
-// the populate byte budget, and stamps its own writeStartTime before the GET so an
-// invalidation racing the warm is provably newer and blocks it. Safe to call on
-// every successful write.
+// the populate byte budget, and reads its own decision-time token before the GET
+// so an invalidation racing the warm refuses the commit. Safe to call on every
+// successful write.
 //
 // Credentials and public-read handling depend on how the write was authenticated,
 // because a write proves nothing about who may READ the object:
@@ -879,6 +1088,14 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) {
 // populate is the read-after-write guard.
 func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
+		return
+	}
+	// Never in tiered mode: a warm is a populate with none of tiered's guards
+	// (no write claim, no tier decision), and it would establish a local-tier
+	// entry for an object the mode documents as read-as-miss (copies,
+	// multipart completions). The re-tier is tiered's one read-triggered
+	// populate.
+	if s.config.IsTiered() {
 		return
 	}
 
@@ -958,7 +1175,32 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// upload overwrites the object, so any previously cached version is now stale;
 	// like PutObject/DeleteObject/CopyObject, invalidate up front so a forward that
 	// succeeds but whose post-invalidation fails can't leave stale data served.
-	s.invalidateObject(context.Background(), bucket, key)
+	// Proxy modes only — see preForwardInvalidate; in tiered mode the key may
+	// hold a local-tier only-copy that a failed completion must leave intact.
+	s.preForwardInvalidate(context.Background(), bucket, key)
+
+	// Tiered: the completed object assembles UPSTREAM, so on success it gets a
+	// BodyUpstream marker — like a large PUT — instead of the old read-as-miss
+	// punt. Same discipline as handleTieredPut: the key is claimed for the
+	// handler's duration (cancels and excludes re-tiers), and the prior + its
+	// decision token are captured BEFORE the forward so the marker commit is
+	// ordered against anything racing the completion. Credentials (when the
+	// request validates) let the marker be built from an upstream HEAD with a
+	// real Content-Length.
+	var (
+		mpPrior      *cache.CachedObjectMeta
+		mpPriorVer   uint64
+		mpPriorKnown bool
+		mpAK, mpSK   string
+	)
+	if s.config.IsTiered() {
+		s.claimRetierWrite(bucket, key)
+		defer s.releaseRetierWrite(bucket, key)
+		mpPrior, mpPriorVer, mpPriorKnown = s.captureMarkerPrior(ctx, bucket, key)
+		if result, ak, sk, aerr := s.forwarder.ValidateAndGetCredentials(r); aerr == nil && result == AuthValidated {
+			mpAK, mpSK = ak, sk
+		}
+	}
 
 	// Forward to upstream with response capture
 	capture, err := s.forwarder.ForwardWithCapture(ctx, w, r)
@@ -974,17 +1216,25 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// object unchanged, doesn't discard a valid racing refill.
 	completed := s3WriteSucceeded(capture)
 	if completed && s.cache.IsEnabled() {
-		s.invalidateObject(context.Background(), bucket, key)
-		// Warm-on-write is the only way to make a multipart-completed object hot:
-		// TAG never sees its assembled body, so a write-through tee is impossible.
-		s.warmOnWrite(r, bucket, key)
-		// The path that matters for parquet: ingestors write via multipart, so this
-		// is where a freshly written file's metadata gets warmed (RFC 0002).
-		s.warmParquetFooterOnWrite(r, bucket, key)
-		// Prototype: establish the metadata entry so the first read does not pay an
-		// upstream round trip to discover it. Multipart is the gap — write-through
-		// cannot tee a body TAG never sees.
-		s.cacheBlockMetaOnWrite(r, bucket, key, completedMultipartETag(capture))
+		if s.config.IsTiered() {
+			// The marker IS the post-completion cache state: stamping it under
+			// the pre-forward token replaces the proxy-mode invalidate (which
+			// would bump the version and refuse the marker), and the object is
+			// immediately readable — HEAD from the marker, GET forwarded.
+			s.stampUpstreamMarkerAfterCompletion(bucket, key, completedMultipartETag(capture), mpAK, mpSK, mpPrior, mpPriorVer, mpPriorKnown)
+		} else {
+			s.convergeInvalidation(context.Background(), bucket, key)
+			// Warm-on-write is the only way to make a multipart-completed object hot:
+			// TAG never sees its assembled body, so a write-through tee is impossible.
+			s.warmOnWrite(r, bucket, key)
+			// The path that matters for parquet: ingestors write via multipart, so this
+			// is where a freshly written file's metadata gets warmed (RFC 0002).
+			s.warmParquetFooterOnWrite(r, bucket, key)
+			// Prototype: establish the metadata entry so the first read does not pay an
+			// upstream round trip to discover it. Multipart is the gap — write-through
+			// cannot tee a body TAG never sees.
+			s.cacheBlockMetaOnWrite(r, bucket, key, completedMultipartETag(capture))
+		}
 	}
 
 	// Cache successful completions in ocache for idempotent replays. Only cache a

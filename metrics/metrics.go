@@ -10,13 +10,18 @@ import (
 )
 
 var (
-	// RequestsTotal counts total requests by operation and status.
+	// RequestsTotal counts total requests by operation and status; mode is
+	// the process's operating mode (one constant value per instance — it
+	// exists so fleet-wide queries can split traffic by mode) and source is
+	// where the RESPONSE was produced: "local" when TAG answered from its own
+	// store or knowledge (cache hits, revalidated-304 serves, authoritative
+	// misses, auth errors), "upstream" when the response was proxied.
 	RequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "tag_requests_total",
 			Help: "Total number of requests processed",
 		},
-		[]string{"operation", "status"},
+		[]string{"operation", "status", "mode", "source"},
 	)
 
 	// RequestDuration tracks request latency by operation.
@@ -29,7 +34,7 @@ var (
 			// tail investigations — quantiles interpolate across whole seconds.
 			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10},
 		},
-		[]string{"operation"},
+		[]string{"operation", "mode", "source"},
 	)
 
 	// CacheHits counts cache hits.
@@ -74,6 +79,34 @@ var (
 			Help: "Total number of upstream errors",
 		},
 		[]string{"method"},
+	)
+
+	// TieredCleanup counts tiered mode's cross-tier cleanup deletes by outcome:
+	// deleted, already_gone (404), replaced (412 — a newer version took the key),
+	// rejected (any other upstream refusal), error (request failed), and
+	// no_etag (marker had no ETag to bind the delete to, cleanup skipped).
+	// Failures are Debug-logged per the repo's log policy, so this counter is
+	// the rollout-visibility signal for orphaned upstream copies.
+	TieredCleanup = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_tiered_cleanup_total",
+			Help: "Tiered-mode cross-tier cleanup deletes by outcome",
+		},
+		[]string{"outcome"},
+	)
+
+	// TieredRetier counts tiered mode's re-tier-on-read attempts by outcome:
+	// retiered (moved into the local tier), shed (populate budget refused the
+	// buffer), changed (the object was replaced, deleted, or no longer the
+	// marker by commit time — its newer state wins), canceled (a concurrent
+	// write claimed the key — coordination, not failure), error (fetch or
+	// store failed). Per-key dedup and claim-refused skips are not counted.
+	TieredRetier = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_tiered_retier_total",
+			Help: "Tiered-mode re-tier-on-read attempts by outcome",
+		},
+		[]string{"outcome"},
 	)
 
 	// AuthFailures counts authentication/signature validation failures.
@@ -425,9 +458,28 @@ var (
 )
 
 // RecordRequest records a request with its duration and status.
-func RecordRequest(operation, status string, durationSeconds float64) {
-	RequestsTotal.WithLabelValues(operation, status).Inc()
-	RequestDuration.WithLabelValues(operation).Observe(durationSeconds)
+// Source label values for RecordRequest: where the response was produced.
+const (
+	SourceLocal    = "local"    // answered from TAG's own store or knowledge
+	SourceUpstream = "upstream" // proxied from upstream
+)
+
+// processMode is the operating mode stamped on every request metric. One
+// value per process, set once at startup (SetMode) before the server serves —
+// not synchronized, so it must not change while requests flow.
+var processMode = "unknown"
+
+// SetMode records the process's operating mode (transparent/signing/tiered)
+// for the request metrics' mode label. Call once at startup.
+func SetMode(mode string) {
+	if mode != "" {
+		processMode = mode
+	}
+}
+
+func RecordRequest(operation, status, source string, durationSeconds float64) {
+	RequestsTotal.WithLabelValues(operation, status, processMode, source).Inc()
+	RequestDuration.WithLabelValues(operation, processMode, source).Observe(durationSeconds)
 }
 
 // RecordCacheHit records a cache hit.
@@ -569,4 +621,35 @@ func SampleCacheSize(ctx context.Context, interval time.Duration, size func() in
 			CacheSizeBytes.Set(float64(size()))
 		}
 	}
+}
+
+// RecordTieredCleanup classifies a cross-tier cleanup delete's outcome from
+// its transport error or HTTP status and records it — classification lives
+// here, not at call sites. 404 means the displaced copy was already gone; 412
+// means the If-Match lost because a newer version took the key (left alone);
+// both are completed outcomes, not failures.
+func RecordTieredCleanup(status int, err error) {
+	outcome := "deleted"
+	switch {
+	case err != nil:
+		outcome = "error"
+	case status == 404:
+		outcome = "already_gone"
+	case status == 412:
+		outcome = "replaced"
+	case status >= 300:
+		outcome = "rejected"
+	}
+	TieredCleanup.WithLabelValues(outcome).Inc()
+}
+
+// RecordTieredCleanupSkipped records a cleanup that was never attempted
+// (e.g. no displaced ETag to bind the delete to).
+func RecordTieredCleanupSkipped(reason string) {
+	TieredCleanup.WithLabelValues(reason).Inc()
+}
+
+// RecordTieredRetier records a re-tier-on-read attempt's outcome.
+func RecordTieredRetier(outcome string) {
+	TieredRetier.WithLabelValues(outcome).Inc()
 }

@@ -305,6 +305,34 @@ func (c *Cache) GetMeta(ctx context.Context, bucket, key string) (*CachedObjectM
 // Use this after GetMeta(), passing the meta's ETag so the body read resolves to
 // the exact version the metadata describes. Returns ErrNotFound if the body for
 // that version is not in cache.
+// PutBodyStream streams a whole-object body into the cache under the given
+// discriminator (an ETag for content-addressed entries, a NewBodyRef id for
+// the engine's streamed writes, where the ETag is unknown until EOF). Body
+// only — the entry becomes visible when its metadata commits; a body whose
+// meta never commits is an orphan that ages out by TTL, the same lifecycle
+// as a displaced version.
+func (c *Cache) PutBodyStream(ctx context.Context, bucket, key, discriminator string, r io.Reader, ttl int64) error {
+	if !c.IsEnabled() {
+		_, _ = io.Copy(io.Discard, r) // drain so a pipe producer never blocks
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = c.defaultTTL
+	}
+	return c.client.PutStream(ctx, MakeBodyKey(bucket, key, discriminator), r, ttl)
+}
+
+// DeleteBody removes one staged or orphaned body by its discriminator. Used
+// by the engine's PUT abort paths (overrun, digest mismatch, refused
+// conditional) to reclaim a body whose metadata will never commit; TTL is
+// the backstop when this best-effort delete fails.
+func (c *Cache) DeleteBody(ctx context.Context, bucket, key, discriminator string) error {
+	if !c.IsEnabled() {
+		return nil
+	}
+	return c.client.Delete(ctx, MakeBodyKey(bucket, key, discriminator))
+}
+
 func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w io.Writer) error {
 	if !c.IsEnabled() {
 		return ErrCacheDisabled
@@ -381,6 +409,19 @@ func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
 	}
 
 	return c.DeleteWithMeta(ctx, bucket, key)
+}
+
+// DeleteMetaIfVersion invalidates the object's metadata only while it still
+// carries the observed version token (from GetMetaWithVersion): the guard is
+// the exact snapshot the caller examined, so an entry replaced in between —
+// even by identical content reusing the same MD5 ETag — refuses the delete.
+// Returns (false, nil) when replaced or absent. CAS-coordinator strength; the
+// legacy coordinator refuses (see coordinator.go).
+func (c *Cache) DeleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error) {
+	if !c.IsEnabled() {
+		return false, nil
+	}
+	return c.coord.deleteMetaIfVersion(ctx, bucket, key, version)
 }
 
 // DeleteIfETag invalidates the object's metadata only while it still carries
@@ -531,6 +572,23 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 		Int64("length", end-start+1).
 		Msg("Cache hit (range)")
 	return nil
+}
+
+// BodyExistsErr reports whether a whole-object body is present, with the same
+// error contract as BlockExistsErr: genuine absence is (false, nil), a transient
+// probe failure is (false, err). Same first-byte probe, on the body key.
+func (c *Cache) BodyExistsErr(ctx context.Context, bucket, key, etag string) (present bool, err error) {
+	if !c.IsEnabled() || etag == "" {
+		return false, nil
+	}
+	e := c.getRangeStreamByKey(ctx, MakeBodyKey(bucket, key, etag), bucket, key, 0, 0, io.Discard)
+	if e == nil {
+		return true, nil
+	}
+	if errors.Is(e, ErrNotFound) {
+		return false, nil // genuinely absent
+	}
+	return false, e // transient failure — not proof of absence
 }
 
 // BlockExists reports whether the given block of a block-mode object is present in cache.

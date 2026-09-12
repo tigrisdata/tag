@@ -32,6 +32,7 @@ type mockForwarder struct {
 	doFullObjectFunc func(ctx context.Context, bucket, key, accessKey, secretKey string) (*http.Response, error)
 	// Optional DoAnonymousFullObjectRequest implementation for anonymous-warm tests
 	doAnonymousFullObjectFunc func(ctx context.Context, bucket, key string) (*http.Response, error)
+	doObjectDeleteFunc        func(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error)
 	// Optional ValidateAndGetCredentials implementation (e.g. to simulate an
 	// anonymous/unvalidated request that yields no credentials).
 	validateFunc func(r *http.Request) (AuthResult, string, string, error)
@@ -70,6 +71,13 @@ func (m *mockForwarder) DoFullObjectRequest(ctx context.Context, bucket, key, ac
 		return m.doFullObjectFunc(ctx, bucket, key, accessKey, secretKey)
 	}
 	return nil, errors.New("mock: DoFullObjectRequest not implemented")
+}
+
+func (m *mockForwarder) DoObjectDeleteRequest(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error) {
+	if m.doObjectDeleteFunc != nil {
+		return m.doObjectDeleteFunc(ctx, bucket, key, etag, accessKey, secretKey)
+	}
+	return nil, errors.New("mock: DoObjectDeleteRequest not implemented")
 }
 
 func (m *mockForwarder) DoAnonymousFullObjectRequest(ctx context.Context, bucket, key string) (*http.Response, error) {
@@ -377,7 +385,7 @@ func TestRevalidateAndServeHead_304(t *testing.T) {
 	_ = c.PutWithMeta(ctx, bucket, key, meta, make([]byte, 100), 0)
 
 	w := httptest.NewRecorder()
-	err := svc.revalidateAndServeHead(ctx, w, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServeHead(ctx, w, httptest.NewRequest(http.MethodHead, "/"+bucket+"/"+key, nil), bucket, key, "access", "secret", meta, time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServeHead() error = %v", err)
 	}
@@ -422,7 +430,7 @@ func TestRevalidateAndServeHead_200(t *testing.T) {
 	_ = c.PutWithMeta(ctx, bucket, key, meta, make([]byte, 100), 0)
 
 	w := httptest.NewRecorder()
-	err := svc.revalidateAndServeHead(ctx, w, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServeHead(ctx, w, httptest.NewRequest(http.MethodHead, "/"+bucket+"/"+key, nil), bucket, key, "access", "secret", meta, time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServeHead() error = %v", err)
 	}
@@ -464,7 +472,7 @@ func TestRevalidateAndServeHead_Error_ServesStale(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	err := svc.revalidateAndServeHead(ctx, w, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServeHead(ctx, w, httptest.NewRequest(http.MethodHead, "/"+bucket+"/"+key, nil), bucket, key, "access", "secret", meta, time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServeHead() error = %v", err)
 	}
@@ -823,5 +831,42 @@ func TestRevalidation304_CacheBodyUnavailable_FallsThrough(t *testing.T) {
 	}
 	if w.Body.String() != freshBody {
 		t.Errorf("body = %q, want %q", w.Body.String(), freshBody)
+	}
+}
+
+// A conditional HEAD answered from cache must evaluate the client's
+// conditionals: If-None-Match carrying the cached ETag is a 304, a stale one
+// a 200 — the same RFC 7232 answers the GET hit path and the origin-less
+// engine give from identical metadata. This path used to serve an
+// unconditional 200 header set.
+func TestHeadCacheHit_EvaluatesClientConditionals(t *testing.T) {
+	mock := &mockForwarder{}
+	svc, c := newTestService(mock, true)
+
+	meta := &cache.CachedObjectMeta{
+		Bucket: "b", Key: "k", ETag: `"v1"`, ContentLength: 2, StatusCode: 200,
+	}
+	if err := c.PutWithMeta(context.Background(), "b", "k", meta, []byte("hi"), 60); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodHead, "/b/k", nil)
+	req.Header.Set("If-None-Match", `"v1"`)
+	w := httptest.NewRecorder()
+	if err := svc.HandleHeadObject(w, req); err != nil {
+		t.Fatalf("HEAD: %v", err)
+	}
+	if w.Code != http.StatusNotModified {
+		t.Fatalf("matching If-None-Match HEAD = %d, want 304", w.Code)
+	}
+
+	req2 := httptest.NewRequest(http.MethodHead, "/b/k", nil)
+	req2.Header.Set("If-None-Match", `"stale"`)
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleHeadObject(w2, req2); err != nil {
+		t.Fatalf("HEAD: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Header().Get("ETag") != `"v1"` {
+		t.Fatalf("mismatched If-None-Match HEAD = %d ETag %q, want 200 with the cached ETag", w2.Code, w2.Header().Get("ETag"))
 	}
 }

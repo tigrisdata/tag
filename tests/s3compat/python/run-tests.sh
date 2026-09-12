@@ -1,6 +1,6 @@
 #!/bin/bash
 # S3 Compatibility Tests Runner for TAG
-# Modeled after tigris-os gateway/tests/tests.sh
+# Runs a curated selection of the ceph s3-tests suite against a local TAG.
 
 # Track test failures
 FAILED_TESTS=()
@@ -147,10 +147,24 @@ run_test() {
     fi
 }
 
-# Test arrays - curated list of tests relevant for TAG
-# Based on tigris-os gateway/tests/tests.sh
+# Test arrays — curated list of tests relevant for TAG, STRUCTURED BY
+# SEMANTIC CLASS.
+#
+# The class an operation belongs to decides whether it can pass in TIERED
+# mode (S3TEST_PROFILE=tiered), where the local metadata is authoritative and
+# small objects never exist upstream (docs/tiered-mode.md):
+#   - test_headers / test_objects / test_buckets / test_multipart run in
+#     EVERY profile — they exercise paths every mode implements.
+#   - test_listings, test_copies, and test_object_subresources are SKIPPED in
+#     the tiered profile: forwarded listings cannot see local-tier objects,
+#     server-side copies (and UploadPartCopy) cannot read a local-tier
+#     source, and object sub-resource calls (tagging, ACL) forward to an
+#     upstream that answers NoSuchKey for local-tier objects. When one of
+#     those limitations is implemented (e.g. a listings merge), move its
+#     class back into the tiered profile.
 
-# Header validation tests
+# CLASS: header validation — request-shape rejections, evaluated by whichever
+# layer owns the write (upstream in proxy modes, the engine in tiered).
 test_headers=(
     "test_object_create_bad_md5_invalid_short"
     "test_object_create_bad_md5_bad"
@@ -166,7 +180,6 @@ test_headers=(
     "test_object_create_date_and_amz_date"
     "test_object_create_amz_date_and_no_date"
     "test_bucket_create_contentlength_none"
-    "test_object_acl_create_contentlength_none"
     "test_bucket_create_bad_expect_empty"
     "test_bucket_create_bad_contentlength_negative"
     "test_bucket_create_bad_contentlength_none"
@@ -182,8 +195,11 @@ test_headers=(
     # "test_bucket_create_bad_authorization_none"
 )
 
-# Core S3 operations tests
-test_s3=(
+# CLASS: listings — every ListObjects/ListObjectsV2 shape, plus the tests that
+# VERIFY through a listing (the multi-delete pair). Skipped in tiered:
+# local-tier objects never exist upstream, so the forwarded listing is empty —
+# not merely unmerged (docs/tiered-mode.md "Not implemented").
+test_listings=(
     "test_bucket_list_empty"
     "test_bucket_list_distinct"
     "test_bucket_list_many"
@@ -239,9 +255,18 @@ test_s3=(
     "test_bucket_listv2_maxkeys_none"
     "test_bucket_list_marker_none"
     "test_bucket_list_marker_empty"
+    # Special prefix handling
+    "test_bucket_list_special_prefix"
+    # Deletes whose ASSERTION is a listing of the surviving keys.
+    "test_multi_object_delete"
+    "test_multi_objectv2_delete"
+    # "test_multi_object_delete_key_limit"  # Tigris doesn't support object versioning yet
+    # "test_multi_objectv2_delete_key_limit"  # Tigris doesn't support object versioning yet
 )
 
-# Object operations tests
+# CLASS: single-object operations — CRUD, ranges, conditionals, error shape.
+# The core of what every mode (proxy, origin-less, tiered) must answer
+# identically.
 test_objects=(
     "test_object_write_to_nonexist_bucket"
     "test_object_head_zero_bytes"
@@ -257,10 +282,6 @@ test_objects=(
     "test_object_read_not_exist"
     # "test_object_read_unreadable"
     "test_object_requestid_matches_header_on_error"
-    "test_multi_object_delete"
-    "test_multi_objectv2_delete"
-    # "test_multi_object_delete_key_limit"  # Tigris doesn't support object versioning yet
-    # "test_multi_objectv2_delete_key_limit"  # Tigris doesn't support object versioning yet
     # Range requests
     "test_ranged_request_response_code"
     "test_ranged_big_request_response_code"
@@ -279,16 +300,14 @@ test_objects=(
     "test_get_object_ifunmodifiedsince_failed"
     # Conditional PUT operations
     "test_put_object_ifmatch_failed"
-    # Large object copy
-    "test_object_copy_16m"
-    # Special prefix handling
-    "test_bucket_list_special_prefix"
     # Chunked encoding tests
     # "test_object_write_with_chunked_transfer_encoding"  # Requires HTTP Transfer-Encoding: chunked (Ceph RGW-specific, not supported by S3/Tigris)
     # "test_object_content_encoding_aws_chunked"  # Tigris stores aws-chunked in Content-Encoding as-is; stripping it in TAG breaks signatures in transparent mode
 )
 
-# Bucket operations tests
+# CLASS: bucket operations — naming, head, create/delete lifecycle. Bucket
+# calls pass through in every mode (tiered included); bucket-level tagging
+# lives here too, since no object is involved.
 test_buckets=(
     "test_bucket_create_naming_bad_starts_nonalpha"
     "test_bucket_create_naming_bad_short_one"
@@ -330,9 +349,14 @@ test_buckets=(
     # "test_bucket_list_return_data"
     "test_bucket_head"
     "test_bucket_head_notexist"
+    # Bucket-level tagging: no object involved, passes through in every mode.
+    "test_set_bucket_tagging"
 )
 
-# Multipart upload tests
+# CLASS: multipart uploads — initiate/part/complete/abort/list-parts pass
+# through in every mode; in tiered the COMPLETION stamps an upstream-tier
+# marker, so the assembled object is readable (the completed object's tagging
+# test rides here for the same reason: it exists upstream).
 test_multipart=(
     "test_multipart_upload_empty"
     "test_multipart_upload_small"
@@ -342,22 +366,19 @@ test_multipart=(
     "test_abort_multipart_upload"
     "test_abort_multipart_upload_not_found"
     "test_list_multipart_upload"
-    # Additional multipart tests
-    "test_multipart_copy_small"
-    "test_multipart_copy_invalid_range"
-    # "test_multipart_copy_improper_range"
-    "test_multipart_copy_without_range"
-    # "test_multipart_copy_special_names"
-    "test_multipart_copy_multiple_sizes"
     "test_multipart_upload_multiple_sizes"
     # "test_multipart_upload_size_too_small"
     "test_multipart_upload_missing_part"
     "test_multipart_upload_incorrect_etag"
     # "test_multipart_resend_first_finishes_last"
+    "test_set_multipart_tagging"
 )
 
-# Copy object tests
-test_copy=(
+# CLASS: server-side copies — CopyObject and UploadPartCopy. Skipped in
+# tiered: the copy SOURCE may be a local-tier object that does not exist
+# upstream, so upstream's copy answers NoSuchKey; copy destinations also get
+# no marker (docs/tiered-mode.md "Not implemented").
+test_copies=(
     "test_object_copy_zero_size"
     "test_object_copy_same_bucket"
     "test_object_copy_verify_contenttype"
@@ -367,11 +388,28 @@ test_copy=(
     "test_object_copy_canned_acl"
     "test_object_copy_retaining_metadata"
     "test_object_copy_replacing_metadata"
+    # Large object copy
+    "test_object_copy_16m"
+    # UploadPartCopy — a multipart whose parts are server-side copies.
+    "test_multipart_copy_small"
+    "test_multipart_copy_invalid_range"
+    # "test_multipart_copy_improper_range"
+    "test_multipart_copy_without_range"
+    # "test_multipart_copy_special_names"
+    "test_multipart_copy_multiple_sizes"
 )
 
-# Tagging tests
-test_tagging=(
-    "test_set_bucket_tagging"
+# CLASS: object sub-resources — tagging/ACL calls addressed to an OBJECT.
+# Skipped in tiered: they forward to upstream, which answers NoSuchKey for a
+# local-tier object (docs/tiered-mode.md "Not implemented").
+# The one header-validation-shaped member of this class lives in
+# test_headers.py, not test_s3.py — it gets its own array so each loop
+# targets the file its tests are defined in, while the tiered profile
+# empties both together.
+test_object_subresources_headers=(
+    "test_object_acl_create_contentlength_none"
+)
+test_object_subresources=(
     "test_get_obj_tagging"
     "test_get_obj_head_tagging"
     "test_put_max_tags"
@@ -382,53 +420,68 @@ test_tagging=(
     "test_put_modify_tags"
     "test_put_delete_tags"
     "test_put_obj_with_tags"
-    "test_set_multipart_tagging"
     # "test_get_tags_acl_public"
     # "test_put_tags_acl_public"
     # "test_delete_tags_obj_public"
 )
 
-# Run header validation tests
+# Profile selection. The tiered profile empties the classes whose semantics
+# tiered mode does not implement, so the job is a stable green-or-red signal
+# for the paths it DOES implement — never a triage of known failures.
+S3TEST_PROFILE="${S3TEST_PROFILE:-default}"
+if [ "$S3TEST_PROFILE" = "tiered" ]; then
+    echo "Profile 'tiered': skipping listings (${#test_listings[@]}), copies (${#test_copies[@]}), and object sub-resources (${#test_object_subresources[@]}) — by-design limitations, see docs/tiered-mode.md"
+    test_listings=()
+    test_copies=()
+    test_object_subresources=()
+    test_object_subresources_headers=()
+fi
+
+# Header-validation tests live in test_headers.py; every other class in
+# test_s3.py. (Plain loops, not a name-ref helper: macOS ships bash 3.2.)
 echo "Running header validation tests..."
 for test in "${test_headers[@]}"; do
     run_test "test_headers.py" "$test"
 done
 
-# Run core S3 operations tests
-echo "Running core S3 operations tests..."
-for test in "${test_s3[@]}"; do
-    run_test "test_s3.py" "$test"
-done
+if [ ${#test_listings[@]} -gt 0 ]; then
+    echo "Running listing tests..."
+    for test in "${test_listings[@]}"; do
+        run_test "test_s3.py" "$test"
+    done
+fi
 
-# Run object operations tests
-echo "Running object operations tests..."
+echo "Running single-object tests..."
 for test in "${test_objects[@]}"; do
     run_test "test_s3.py" "$test"
 done
 
-# Run bucket operations tests
-echo "Running bucket operations tests..."
+echo "Running bucket tests..."
 for test in "${test_buckets[@]}"; do
     run_test "test_s3.py" "$test"
 done
 
-# Run multipart upload tests
 echo "Running multipart upload tests..."
 for test in "${test_multipart[@]}"; do
     run_test "test_s3.py" "$test"
 done
 
-# Run copy object tests
-echo "Running copy object tests..."
-for test in "${test_copy[@]}"; do
-    run_test "test_s3.py" "$test"
-done
+if [ ${#test_copies[@]} -gt 0 ]; then
+    echo "Running server-side copy tests..."
+    for test in "${test_copies[@]}"; do
+        run_test "test_s3.py" "$test"
+    done
+fi
 
-# Run tagging tests
-echo "Running tagging tests..."
-for test in "${test_tagging[@]}"; do
-    run_test "test_s3.py" "$test"
-done
+if [ ${#test_object_subresources[@]} -gt 0 ]; then
+    echo "Running object sub-resource tests..."
+    for test in "${test_object_subresources_headers[@]}"; do
+        run_test "test_headers.py" "$test"
+    done
+    for test in "${test_object_subresources[@]}"; do
+        run_test "test_s3.py" "$test"
+    done
+fi
 
 # Report results
 echo ""

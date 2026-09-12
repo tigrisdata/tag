@@ -27,6 +27,8 @@ Total number of requests processed by TAG.
 | ----------- | -------------------------------------------------------------------- |
 | `operation` | S3 operation: `GetObject`, `PutObject`, `DeleteObject`, `HeadObject` |
 | `status`    | Result: `success`, `error`, `auth_error`, `range_not_satisfiable`    |
+| `mode`      | The process's operating mode (`transparent`, `signing`, `tiered`) — one constant value per instance, for fleet-wide splits |
+| `source`    | Where the response was produced: `local` (TAG's own store or knowledge — cache hits, revalidated-304 serves, authoritative misses, auth errors) or `upstream` (proxied) |
 
 **Example queries:**
 
@@ -36,6 +38,9 @@ rate(tag_requests_total[5m])
 
 # Error rate
 sum(rate(tag_requests_total{status="error"}[5m])) / sum(rate(tag_requests_total[5m]))
+
+# Share of traffic answered without touching upstream (per mode)
+sum(rate(tag_requests_total{source="local"}[5m])) by (mode) / sum(rate(tag_requests_total[5m])) by (mode)
 
 # GetObject success rate
 rate(tag_requests_total{operation="GetObject",status="success"}[5m]) /
@@ -51,6 +56,8 @@ Request duration in seconds.
 | Label       | Description  |
 | ----------- | ------------ |
 | `operation` | S3 operation |
+| `mode`      | Operating mode (constant per instance) |
+| `source`    | `local` or `upstream` — where the response was produced |
 
 **Buckets:** 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10 (the default Prometheus buckets plus extra tail resolution at 1.5, 2, 3, 4 and 7.5 seconds)
 
@@ -448,6 +455,43 @@ rate(tag_cache_populate_skipped_total{source="warm_on_write"}[5m])
 # Total populate shed rate
 sum(rate(tag_cache_populate_skipped_total[5m]))
 ```
+
+#### tag_tiered_cleanup_total
+
+**Type:** Counter
+
+Tiered mode's cross-tier cleanup deletes (issued when a small local write
+displaces an upstream-tier version), by outcome — exactly one per cleanup.
+Cleanup is best-effort: anything other than `deleted` / `already_gone` /
+`replaced` / `marker_repaired` leaves an orphan for the upstream bucket's own
+expiry — failures are Debug-logged, so this counter is the rollout-visibility
+signal.
+
+| Label     | Description                                                              |
+| --------- | ------------------------------------------------------------------------ |
+| `outcome` | `deleted`, `already_gone` (404), `replaced` (412 — a newer version took the key, left alone), `rejected` (other upstream refusal), `error` (request failed), `no_etag` (no displaced ETag to bind to; skipped), `live_marker` (skipped: the key's current metadata is a live marker for this ETag — the body is authoritative again), `marker_repaired` (a same-ETag marker raced in during the delete; the repair removed it, converging on an authoritative miss the caller re-populates), `repair_failed` (the repair could not run or could not remove the raced-in marker — it may stay authoritative over a deleted body until TTL) |
+
+```promql
+# Orphan-producing cleanup rate (should be ~0)
+sum(rate(tag_tiered_cleanup_total{outcome=~"rejected|error|no_etag|repair_failed"}[5m]))
+```
+
+#### tag_tiered_retier_total
+
+**Type:** Counter
+
+Tiered mode's re-tier-on-read attempts: a validated GET that hits an
+upstream-tier marker whose size fits the local tier triggers a one-shot
+background move of the body into the local tier (healing objects mis-placed
+by, e.g., a cold-start PUT forwarded before its key was learned).
+
+| Label     | Description                                                              |
+| --------- | ------------------------------------------------------------------------ |
+| `outcome` | `retiered` (moved into the local tier), `shed` (populate budget refused the buffer), `changed` (object replaced/deleted mid-flight; its newer state wins), `canceled` (a concurrent write claimed the key — normal coordination), `error` (fetch or store failed) |
+
+A sustained `retiered` rate outside restart windows means writes keep landing
+in the wrong tier — check key learning. Per-key dedup skips are not counted.
+
 
 ### Revalidation Metrics
 

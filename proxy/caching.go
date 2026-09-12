@@ -258,7 +258,7 @@ func (s *Service) setupCacheListener(
 			// last-write-winning stale bytes over it.
 			if s.isBlockEligibleSize(meta.ContentLength) {
 				meta.BlockSize = s.config.Cache.BlockSize
-				cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, expected)
+				_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, expected)
 			} else {
 				_, cacheErr = s.cache.PutWithMetaStreamIfVersion(cacheCtx, bucket, key, meta, sigReader, ttl, expected)
 			}
@@ -555,7 +555,7 @@ func (s *Service) fetchFullObjectToCache(
 		// read a token does not fire.
 		if blockMode {
 			meta.BlockSize = s.config.Cache.BlockSize
-			cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, expected)
+			_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, expected)
 		} else {
 			_, cacheErr = s.cache.PutWithMetaStreamIfVersion(
 				cacheCtx, bucket, key, meta, body, ttl, expected,

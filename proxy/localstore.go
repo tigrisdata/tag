@@ -1,0 +1,712 @@
+package proxy
+
+// The local-store engine: whole-object PUT/GET/HEAD/DELETE served entirely from
+// the cache with authoritative misses. In tiered mode this engine is the small
+// tier, and everything else forwards.
+
+import (
+	"bytes"
+	"context"
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/rs/zerolog/log"
+	"github.com/tigrisdata/tag/cache"
+	"github.com/tigrisdata/tag/metrics"
+	"github.com/tigrisdata/tag/s3err"
+)
+
+// The local-store engine: TAG serving and storing on its own, with no
+// upstream involved. Its sole consumer is TIERED MODE's local tier — the
+// handlers keep their HandleOriginless names from the abandoned stand-alone
+// origin-less mode, whose branch is deleted; the engine itself is what
+// survived it.
+//
+// The engine is reached only through the tiered dispatch (handleTieredObject
+// / handleTieredPut / handleTieredDeleteLocal), so every path that assumes
+// an upstream — revalidation, broadcast coalescing, background fetch, the
+// proxy mutation handlers with their invalidate-before-forward ordering — is
+// unreachable by construction. Requests arrive already validated by the
+// tiered handlers (unvalidated requests forward upstream before the engine
+// is consulted).
+//
+// Reads:  GET/HEAD of one object from cache; a miss is NoSuchKey, the caller's
+//         cue to fall back to its authoritative store.
+// Writes: PUT stores the object in the local cache under cache.ttl; DELETE
+//         invalidates. This is how the tier is populated — by its callers,
+//         directly.
+// Everything else — listings, multipart, copies, tagging, ACLs — answers 501
+// or forwards at the tiered layer above.
+
+// HandleOriginlessObject serves GET and HEAD for a single object from cache
+// alone. A miss is the final answer: NoSuchKey — the caller's cue to fall back
+// to its authoritative store.
+func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request) error {
+	start := time.Now()
+	ctx := r.Context()
+	bucket, key := ParseBucketKey(r)
+
+	// Plain reads only: a query parameter (beyond the SDK's no-op x-id tag)
+	// selects a representation or operation this mode does not implement —
+	// ?versionId, ?partNumber, ?tagging — and serving the current full object for
+	// those would be silently wrong data.
+	if !originlessPlainObject(r) {
+		return s.HandleOriginlessUnsupported(w, r)
+	}
+
+	operation := "GetObject"
+	if r.Method == http.MethodHead {
+		operation = "HeadObject"
+	}
+
+	log.Debug().Str("bucket", bucket).Str("key", key).Str("op", operation).Msg("HandleOriginlessObject")
+
+	if !s.cache.IsEnabled() {
+		writeCacheStatus(w, XCacheDisabled)
+		s3err.WriteError(w, r, s3err.ErrNoSuchKey)
+		metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
+	}
+
+	meta, metaVersion, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+	if cacheErr != nil {
+		// A transient metadata failure is not absence: the miss below is
+		// authoritative, so it must never be minted from an error. 500-retry,
+		// matching the body-probe path below.
+		metrics.RecordRequest(operation, "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return cacheErr
+	}
+	if !found {
+		meta = nil
+	}
+	return s.serveOriginlessObject(w, r, operation, start, meta, metaVersion)
+}
+
+// serveOriginlessObject serves GET/HEAD from an ALREADY-READ metadata
+// snapshot (nil = authoritative miss). Tiered mode calls it with the meta its
+// tier decision was made from: re-reading here opened a window where a large
+// PUT committing its BodyUpstream marker between the two reads made the
+// engine treat the marker as a local-tier entry, probe the body under the NEW
+// upstream ETag, and answer an authoritative NoSuchKey for an object that
+// existed before, during, and after the overwrite. One read, one decision —
+// a read racing an overwrite serves the version its snapshot saw, the legal
+// atomic-replace answer (and the hottest path saves a doubled meta read).
+func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, operation string, start time.Time, meta *cache.CachedObjectMeta, metaVersion uint64) error {
+	ctx := r.Context()
+	bucket, key := ParseBucketKey(r)
+
+	if meta == nil {
+		return s.originlessMiss(w, r, operation, start)
+	}
+
+	// ONE existence gate for the whole handler: an entry is visible only when its
+	// data is fully present — every block of a block-mode entry, the body of a
+	// whole-object one. Every answer below (304, HEAD 200, any serve) implies
+	// existence, and each of HEAD, conditionals, and the serve paths independently
+	// answering that question is exactly how three review rounds of
+	// existence-vs-serveability disagreements happened. An incomplete entry is
+	// simply invisible: metadata alone cannot be served, and claiming existence
+	// from it makes HEAD-as-existence callers — anything that skips re-population
+	// when a HEAD says the object exists — skip the healing that would make the
+	// entry servable again. A probe-to-serve race can still truncate a
+	// concurrent eviction; the gate narrows the window, nothing can close it.
+	servable, servErr := s.entryServable(ctx, bucket, key, meta)
+	if servErr != nil {
+		// A transient probe failure is not absence: 500-retry, never a false miss.
+		metrics.RecordRequest(operation, "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return servErr
+	}
+	if !servable {
+		return s.originlessMiss(w, r, operation, start)
+	}
+
+	// Conditional requests are answered from the cached metadata; there is no
+	// upstream for a client's Cache-Control to revalidate against, so no-cache and
+	// no-store are simply not consulted — the cached copy is the only copy.
+	if s.answerConditionalsFromMeta(w, r, meta, operation, start) {
+		return nil
+	}
+
+	if r.Method == http.MethodHead {
+		serveMetaHit(w, meta, operation, start)
+		return nil
+	}
+
+	// Whole-object serves only: this engine's modes force block caching off
+	// (tiered rejects it at validateMode), so every entry IT writes is a
+	// whole blob, and the serve helpers below fail before committing headers
+	// — a miss response is always still writable.
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		served, rangeErr := s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		if served {
+			return rangeErr
+		}
+		return s.finishServeBodyError(ctx, w, r, bucket, key, metaVersion, rangeErr, operation, start)
+	}
+
+	if bodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); bodyErr != nil {
+		// serveFromCache fails before committing headers, so a miss response is
+		// still writable.
+		return s.finishServeBodyError(ctx, w, r, bucket, key, metaVersion, bodyErr, operation, start)
+	}
+	return nil
+}
+
+// finishServeBodyError disposes of a pre-commit body-serve failure. It
+// distinguishes two cases the mode must not conflate:
+//   - The body is GENUINELY GONE (evicted under a live meta): an
+//     authoritative miss, and the orphaned meta is invalidated — but
+//     ETag-GUARDED (DeleteIfETag), never an unconditional delete, so a
+//     concurrent PUT's just-committed newer version is never wiped. The
+//     guard resolves against the served snapshot's discriminator identity;
+//     a different current entry keeps the key.
+//   - Anything else is TRANSIENT (a cluster-peer gRPC blip, a deadline):
+//     NOT absence. Minting an authoritative NoSuchKey here would tell the
+//     caller a live object does not exist — so it propagates as a retryable
+//     5xx, matching this handler's meta-read and probe legs.
+func (s *Service) finishServeBodyError(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string, metaVersion uint64, serveErr error, operation string, start time.Time) error {
+	if !bodyGone(serveErr) {
+		metrics.RecordRequest(operation, "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return serveErr
+	}
+	// VERSION-guarded against the SERVED snapshot: a concurrent PUT's newer
+	// meta (even an identical-content one, which shares the ETag but not the
+	// version) is never wiped — only the exact orphaned entry this serve
+	// read is removed. The delete is best-effort cleanup anyway: entryServable
+	// already gates every subsequent read on body presence, so a surviving
+	// orphan reads as a miss regardless and ages out by TTL.
+	if _, derr := s.cache.DeleteMetaIfVersion(ctx, bucket, key, metaVersion); derr != nil {
+		log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Orphaned-meta invalidation failed; ages out by TTL")
+	}
+	return s.originlessMiss(w, r, operation, start)
+}
+
+// entryServable is the handler's single existence answer: all blocks present for
+// a block-mode entry, the body present for a whole-object one. Everything the
+// handler says — 304, HEAD 200, a served body — flows from this one predicate, so
+// existence and serveability cannot disagree.
+func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) (bool, error) {
+	// A zero-length object is vacuously servable: no byte can be missing, and the
+	// first-byte probe below cannot see one anyway — the embedded backend returns
+	// nil + zero bytes for a present-but-empty body and an absent one alike (the
+	// quirk countingWriter exists for). Serving from metadata alone is exact for an
+	// empty body, evicted or not.
+	if meta.ContentLength == 0 {
+		return true, nil
+	}
+	return s.cache.BodyExistsErr(ctx, bucket, key, meta.BodyDiscriminator())
+}
+
+// originlessMiss answers the one thing a miss can be in this mode.
+func (s *Service) originlessMiss(w http.ResponseWriter, r *http.Request, operation string, start time.Time) error {
+	writeCacheStatus(w, XCacheMiss)
+	s3err.WriteError(w, r, s3err.ErrNoSuchKey)
+	metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
+	return nil
+}
+
+// writePreconditionFailed answers the 412 preconditions (RFC 7232 order:
+// If-Match before If-Unmodified-Since) from cached metadata. Returns true when
+// it wrote the response. The 304 conditionals (If-None-Match/If-Modified-Since)
+// are evaluated separately, after these.
+func writePreconditionFailed(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta) bool {
+	if im := r.Header.Get("If-Match"); im != "" {
+		if im != "*" && !meta.MatchesETagHeader(im, true) {
+			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+			return true
+		}
+		// RFC 7232 §3.4: when If-Match is present, If-Unmodified-Since is ignored
+		// — a matching ETag with a stale date must serve, not 412.
+		return false
+	}
+	if ius := r.Header.Get("If-Unmodified-Since"); ius != "" {
+		if t, err := http.ParseTime(ius); err == nil && meta.IsModifiedSince(t) {
+			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+			return true
+		}
+	}
+	return false
+}
+
+// originlessPutSize returns the number of body bytes a PUT declares. For a
+// streaming (aws-chunked) payload that is X-Amz-Decoded-Content-Length —
+// REQUIRED, and zero is valid (the SDK's empty-body default); sizing a framed
+// body by its wire Content-Length would reject valid uploads as IncompleteBody.
+// For a plain payload it is Content-Length, which Go reports as -1 when absent.
+func originlessPutSize(r *http.Request) (int64, bool) {
+	if IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) {
+		dcl := r.Header.Get("X-Amz-Decoded-Content-Length")
+		if dcl == "" {
+			return 0, false
+		}
+		n, err := strconv.ParseInt(dcl, 10, 64)
+		return n, err == nil && n >= 0
+	}
+	if r.ContentLength < 0 {
+		return 0, false
+	}
+	return r.ContentLength, true
+}
+
+// originlessPlainObject reports whether the request is a plain single-object
+// operation: no query parameters beyond the SDK's no-op x-id tag, and no
+// copy-source header (server-side copy needs a source read this mode does not
+// implement as an operation).
+// originlessIgnoredParams are query parameters that select no operation or
+// representation: the SDK's no-op tag, and the auth parameters presigned URLs
+// attach (SigV4 and SigV2). Auth is ignored in this mode — the network is the
+// boundary — so a presigned request is served exactly like its header-signed
+// twin: the signature is stripped, not evaluated.
+var originlessIgnoredParams = []string{
+	"x-id",
+	"X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires",
+	"X-Amz-SignedHeaders", "X-Amz-Signature", "X-Amz-Security-Token",
+	"AWSAccessKeyId", "Signature", "Expires",
+}
+
+func originlessPlainObject(r *http.Request) bool {
+	if r.Header.Get("X-Amz-Copy-Source") != "" {
+		return false
+	}
+	if r.URL.RawQuery == "" {
+		return true
+	}
+	q := r.URL.Query()
+	for _, p := range originlessIgnoredParams {
+		q.Del(p)
+	}
+	return len(q) == 0
+}
+
+// HandleOriginlessPut stores an object directly into the local cache — the
+// population path for this tier. The body is buffered to compute the ETag
+// (bodies are keyed by ETag so each version is immutable), bounded by the cache
+// size threshold, and stored under cache.ttl. Overwrites follow the proxying
+// mode's semantics: new meta points at the new ETag-keyed body; the old body
+// ages out by TTL.
+func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) error {
+	return s.handleOriginlessPut(w, r, nil)
+}
+
+// putPrior is a metadata snapshot the caller already read, threaded into the
+// engine PUT so a single GetMetaWithVersion serves both the caller's decision
+// and the engine's precondition/token — closing the double-read TOCTOU (a
+// marker committing between two reads) and the doubled hot-path meta read.
+type putPrior struct {
+	meta    *cache.CachedObjectMeta
+	version uint64
+	found   bool
+}
+
+func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, prior *putPrior) error {
+	start := time.Now()
+	ctx := r.Context()
+	bucket, key := ParseBucketKey(r)
+
+	if !originlessPlainObject(r) {
+		return s.HandleOriginlessUnsupported(w, r)
+	}
+	if !s.cache.IsEnabled() {
+		s3err.WriteError(w, r, s3err.ErrNotImplemented)
+		metrics.RecordRequest("PutObject", "unsupported", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
+	}
+
+	// EVERY store commits under a decision-time token read here, before the
+	// body is consumed: a DELETE (or competing PUT) that lands after this
+	// instant refuses the commit — the ordering the pre-coordinator engine got
+	// from stamping writeStartTime at handler start, now expressed as the
+	// opaque token the selected coordinator orders by (fenced version under
+	// CAS, wall-clock stamp under legacy). For an absent key the token is the
+	// nonzero absence token, never 0 (ocache v1.13 contract).
+	//
+	// Conditional writes additionally evaluate the precondition here and then
+	// ENFORCE it at the store: a concurrent write between check and store
+	// surfaces as a refused store (answered 412) instead of a silent lost
+	// update. That closure is CAS-coordinator strength; under legacy
+	// coordination the token orders against DELETEs only, and write-vs-write
+	// remains the check-then-store race the pre-CAS engine documented as
+	// accepted. Semantics follow the ceph suite: If-Match against a MISSING
+	// object answers NoSuchKey (there is nothing to match), a
+	// present-but-different ETag is the 412; If-None-Match refuses when the
+	// object exists.
+	var existing *cache.CachedObjectMeta
+	var expected uint64
+	var found bool
+	if prior != nil {
+		// The caller's snapshot IS the decision state: reuse it so the tier
+		// routing and this precondition evaluation cannot disagree across a
+		// racing marker commit, and the hot path reads meta once.
+		existing, expected, found = prior.meta, prior.version, prior.found
+	} else {
+		var merr error
+		existing, expected, found, merr = s.cache.GetMetaWithVersion(ctx, bucket, key)
+		if merr != nil {
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+			return merr
+		}
+	}
+	conditional := false
+	ifMatch := r.Header.Get("If-Match")
+	ifNoneMatch := r.Header.Get("If-None-Match")
+	if ifMatch != "" || ifNoneMatch != "" {
+		conditional = true
+		// Existence means SERVABLE existence — the same gate every read uses. An
+		// incomplete entry (orphaned meta, missing blocks) is invisible on every
+		// request shape, so If-None-Match:* must store over it (that IS the
+		// healing put-if-absent) and If-Match must answer NoSuchKey, not 412.
+		// A probe ERROR aborts: read as "absent" it would let If-None-Match:*
+		// overwrite a live object during a transient blip.
+		exists := found && existing != nil
+		// A BodyUpstream tier marker IS an existing object — its body lives
+		// upstream, so the local-body servability probe below would read it
+		// as absent, letting If-None-Match:* overwrite a live object (and
+		// If-Match answer NoSuchKey for one). The steady-state tiered router
+		// forwards marker-prior conditionals upstream; this guard covers the
+		// race where a marker commits between the router's read and this one.
+		if exists && !existing.BodyUpstream {
+			var servErr error
+			exists, servErr = s.entryServable(ctx, bucket, key, existing)
+			if servErr != nil {
+				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+				return servErr
+			}
+		}
+		// The store applies against exactly the state this evaluation saw: the
+		// token above is the observed row's version when present (an unservable
+		// row still occupies the meta key, and the healing overwrite must
+		// replace that exact orphan), and the absence token when not — either
+		// way, whatever appears between this evaluation and the store refuses
+		// the commit.
+		switch {
+		case ifMatch != "" && !exists:
+			s3err.WriteError(w, r, s3err.ErrNoSuchKey)
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+			return nil
+		case ifMatch != "" && ifMatch != "*" && !existing.MatchesETagHeader(ifMatch, true):
+			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+			return nil
+		case ifNoneMatch != "" && exists && (ifNoneMatch == "*" || existing.MatchesETagHeader(ifNoneMatch, false)):
+			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+			return nil
+		}
+	}
+
+	// Decoded size, not wire size: a streaming-signed SDK upload frames the body
+	// (aws-chunked) and declares the real length in X-Amz-Decoded-Content-Length.
+	// Judging the threshold by wire length would reject payloads that fit.
+	//
+	// The declared size is REQUIRED, as on real S3 (411 without one): the budget
+	// reservation below must equal the bytes this handler can actually hold, and
+	// with no declared size the only safe reservation would be the full threshold
+	// for every request. Zero is a valid declaration — an empty object is the AWS
+	// SDK's default for empty bodies and must not be sized by its wire framing.
+	declaredSize, ok := originlessPutSize(r)
+	if !ok {
+		s3err.WriteError(w, r, s3err.ErrMissingContentLength)
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
+	}
+	if declaredSize > s.config.Cache.SizeThreshold {
+		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
+	}
+
+	// STREAMING store — the body is never buffered. It streams through an MD5
+	// tee into the cache under a per-write BodyRef (the ETag IS the body's
+	// MD5, so it cannot exist before the last byte; the ref stands in as the
+	// body key discriminator, see cache.NewBodyRef), and the metadata that
+	// makes the entry visible commits afterwards carrying both. Memory per
+	// PUT is the fixed streaming buffers below regardless of object size, so
+	// admission is the write-count ceiling plus that fixed weight — the
+	// populate BYTE budget no longer carries PUT bodies at all.
+	//
+	// Admission is NON-BLOCKING (the read-miss path): a client-facing PUT
+	// must shed with a retryable SlowDown immediately, not park on the
+	// budget's condition variable.
+	streaming := IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256"))
+	weight := int64(originlessPutStreamWeight)
+	if streaming {
+		weight += awsChunkedReaderBufSize
+	}
+	if !s.acquireEnginePutSlot(ctx, weight) {
+		s3err.WriteError(w, r, s3err.ErrSlowDown)
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
+	}
+	defer s.releaseEnginePutSlot(weight)
+
+	// Content-MD5 FORMAT is validated before a byte is accepted — a malformed
+	// digest (bad base64, wrong length, present-but-empty; Values, not Get,
+	// because Get cannot distinguish empty from absent) rejects without
+	// paying for the upload. The VALUE is compared after the stream, when
+	// the digest exists. Malformed = InvalidDigest, wrong = BadDigest —
+	// S3's split; the engine IS the store, nothing upstream checks this.
+	var wantMD5 []byte
+	if md5Vals := r.Header.Values("Content-MD5"); len(md5Vals) > 0 {
+		want, decErr := base64.StdEncoding.DecodeString(md5Vals[0])
+		if decErr != nil || len(want) != md5.Size {
+			s3err.WriteError(w, r, s3err.ErrInvalidDigest)
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+			return nil
+		}
+		wantMD5 = want
+	}
+
+	// Unwrap AWS chunked framing so the stored bytes — and the ETag computed over
+	// them — are the object, not the wire encoding. Storing the framing serves
+	// corrupt bytes with a 200, which the caller cannot detect as a miss.
+	reader := r.Body
+	if streaming {
+		reader = io.NopCloser(newAWSChunkedReader(r.Body))
+	}
+
+	// The stream is limited to declared+1 bytes (the extra byte detects a
+	// body longer than declared), teed through the digest, and counted; the
+	// capture wrapper records a reader-side failure so a failed store can be
+	// attributed to the client's body rather than the cache. On ANY
+	// non-success below, the staged body is deleted best-effort — a body
+	// whose meta never commits is an orphan, and TTL is the backstop when
+	// the delete itself fails.
+	hasher := md5.New()
+	src := &captureReader{r: io.TeeReader(io.LimitReader(reader, declaredSize+1), hasher)}
+	ref := cache.NewBodyRef()
+	ttl := int(s.config.Cache.TTL.Seconds())
+	// ONE deferred, panic-safe reclamation for the staged body, in place of a
+	// discard call on every abort path (a forgotten call on a future path —
+	// or a panic between staging and commit — would leak a threshold-sized
+	// orphan until TTL). Two flags steer it:
+	//   committed — the meta commit landed; the body is referenced, keep it.
+	//   ambiguousCommit — a commit ATTEMPT errored without a definitive
+	//     verdict. In cluster mode PutMetaIfVersion is a non-idempotent
+	//     remote op: an error can mean the owner APPLIED the write and the
+	//     confirmation was lost, so deleting the staged body here could
+	//     destroy the object a now-visible meta references — erasing the
+	//     previously live version with it. Ambiguity keeps the body; a
+	//     genuinely uncommitted orphan is TTL's job (the documented
+	//     backstop). Only DEFINITIVE outcomes discard: refused conditional
+	//     (412), overrun, short body, digest mismatch, refused-retries
+	//     exhaustion (each refusal is the store answering "no").
+	committed := false
+	ambiguousCommit := false
+	defer func() {
+		if committed || ambiguousCommit {
+			return
+		}
+		dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer dcancel()
+		if derr := s.cache.DeleteBody(dctx, bucket, key, ref); derr != nil {
+			log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Staged body delete failed; orphan ages out by TTL")
+		}
+	}()
+	if putErr := s.cache.PutBodyStream(ctx, bucket, key, ref, src, int64(ttl)); putErr != nil {
+		// ANY recorded reader error is the client's transfer: the capture
+		// wrapper sits over nothing but the request-body chain (net/http
+		// body, optionally the chunk decoder — whose truncations are all
+		// wrapped, never bare EOFs), so truncations, malformed framing,
+		// resets, and read-deadline expiries mid-body all classify as the
+		// client misdescribing or abandoning the request: 400
+		// IncompleteBody, never a retryable 500 (and never a server-error
+		// metric for a client fault). Only a cache-side write failure —
+		// putErr with no reader error — propagates.
+		if src.err != nil {
+			s3err.WriteError(w, r, s3err.ErrIncompleteBody)
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+			return nil
+		}
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		if src.err != nil {
+			return src.err
+		}
+		return putErr
+	}
+	switch {
+	case src.n == declaredSize+1:
+		// The limit filled: the body is longer than declared.
+		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
+	case src.n != declaredSize:
+		// Clean EOF before the declared size: the client misdescribed the
+		// request; not data to store under a wrong ETag.
+		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
+	}
+
+	sum := hasher.Sum(nil)
+	etag := `"` + hex.EncodeToString(sum) + `"`
+	if wantMD5 != nil && !bytes.Equal(wantMD5, sum) {
+		s3err.WriteError(w, r, s3err.ErrBadDigest)
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
+	}
+
+	// Same header→meta mapping as the proxying populate path, then override
+	// what a terminal store owns: the ETag is computed (never client-supplied),
+	// ContentLength is the decoded body (the wire length counts chunk framing),
+	// Content-Encoding drops the aws-chunked token (that layer was decoded above;
+	// dropping the header entirely would serve gzip bytes read as the raw
+	// object), and LastModified is the write time, not a client header.
+	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, r.Header)
+	meta.ETag = etag
+	meta.BodyRef = ref
+	meta.ContentLength = declaredSize
+	// Values, not Get: repeated Content-Encoding field lines are legal HTTP and
+	// equivalent to one comma-joined list ("aws-chunked" + "gzip" ≡
+	// "aws-chunked,gzip"); Get would keep only the first and lose the rest.
+	meta.ContentEncoding = strings.Join(r.Header.Values("Content-Encoding"), ",")
+	if streaming {
+		// Strip only what was actually decoded: the aws-chunked layer is
+		// removed above only for streaming-marked bodies, and advertising a
+		// non-streaming body as decoded would mislabel stored bytes.
+		meta.ContentEncoding = stripAWSChunkedToken(meta.ContentEncoding)
+	}
+	meta.LastModified = time.Now().Unix()
+
+	// The body is already durable under its ref, so the commit — and every
+	// retry — is METADATA ONLY: the store closure is one PutMetaIfVersion,
+	// never a body re-stream. A refused commit is detected, never silent:
+	// conditional writes answer the 412 their precondition earned (and
+	// reclaim the staged body), unconditional writes retry under a fresh
+	// token so the client's 200 always means the entry is visible.
+	store := func(token uint64) (bool, error) {
+		return s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, token)
+	}
+	var wrote bool
+	wrote, err := store(expected)
+	if err != nil {
+		ambiguousCommit = true
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return err
+	}
+	if !wrote {
+		if conditional {
+			// The conditional's precondition raced away between evaluation and
+			// store. The honest answer is the 412 the client would have gotten
+			// had the racer arrived a moment earlier; the staged body will
+			// never be referenced.
+			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+			return nil
+		}
+		// A refused UNCONDITIONAL client write is retried under a fresh token,
+		// never acked without storing: the racer that bumped the version may be
+		// TAG's OWN re-tier heal committing the PRE-PUT version (the write
+		// claim is process-local, so a re-tier on another node — or one whose
+		// cancellation landed after its last context check — can slip in), and
+		// treating that as "the racer's state keeps the key" would silently
+		// revert an acknowledged client write in the mode's authoritative
+		// store. A client write is by definition the newest state for the key;
+		// re-reading and retrying serializes it after whatever won the round.
+		// A genuine concurrent client racer (PUT or DELETE) just loses the
+		// last-writer race to this PUT — a legal S3 serialization either way.
+		// Bounded: exhaustion or an error answers retryably (500), so the
+		// client never holds a 200 for bytes that were not stored.
+		for attempt := 0; attempt < 8 && !wrote; attempt++ {
+			if cerr := ctx.Err(); cerr != nil {
+				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+				return cerr
+			}
+			_, retryToken, _, terr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+			if terr != nil {
+				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+				return terr
+			}
+			wrote, err = store(retryToken)
+			if err != nil {
+				ambiguousCommit = true
+				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+				return err
+			}
+		}
+		if !wrote {
+			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+			return fmt.Errorf("put %s/%s: store refused %d retries under fresh tokens", bucket, key, 8)
+		}
+	}
+
+	committed = true
+	w.Header().Set("ETag", etag)
+	w.WriteHeader(http.StatusOK)
+	metrics.RecordRequest("PutObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
+	return nil
+}
+
+// HandleOriginlessDelete invalidates the object. Deletion is not required for
+// correctness — entries lapse by cache.ttl — but a caller that expires objects
+// explicitly (a caller expiring objects on its own schedule) gets prompt removal.
+func (s *Service) HandleOriginlessDelete(w http.ResponseWriter, r *http.Request) error {
+	start := time.Now()
+	bucket, key := ParseBucketKey(r)
+
+	if !originlessPlainObject(r) {
+		return s.HandleOriginlessUnsupported(w, r)
+	}
+	// The cache is the only store: an acked-but-failed delete would keep
+	// serving the object until TTL with no signal to retry on. 500, not 204.
+	if err := s.invalidateObject(r.Context(), bucket, key); err != nil {
+		metrics.RecordRequest("DeleteObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
+	metrics.RecordRequest("DeleteObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
+	return nil
+}
+
+// HandleOriginlessUnsupported rejects every operation this mode does not
+// implement — listings, mutations, multipart, tagging, ACLs. Recorded under a
+// distinct status so a client persistently writing to an origin-less tier (a
+// misconfigured caller, for instance) is visible on the dashboard instead of
+// blending into the success rate.
+func (s *Service) HandleOriginlessUnsupported(w http.ResponseWriter, r *http.Request) error {
+	start := time.Now()
+	s3err.WriteError(w, r, s3err.ErrNotImplemented)
+	metrics.RecordRequest("Unsupported", "unsupported", metrics.SourceLocal, time.Since(start).Seconds())
+	return nil
+}
+
+// originlessPutStreamWeight is the fixed byte-budget weight of one streaming
+// engine PUT — the store's pinned stream buffering, not the body (the body
+// never lives in TAG's memory). ocache's PutStream holds a ~64 KiB
+// first-chunk buffer plus a 1 MiB pooled copy buffer for the stream's whole
+// (client-paced) duration, and the cluster remote path pins a further 1 MiB
+// gRPC send buffer — mirrored here as a literal (like the storage defaults
+// in config) since TAG imports only the ocache client. Sized for the
+// cluster worst case; undercounting this is the unaccounted-margin class
+// that has OOM-killed pods before.
+const originlessPutStreamWeight = 2*1024*1024 + 128*1024
+
+// captureReader counts the bytes read through it and records the first
+// non-EOF error its inner reader returns, so a failed store can be
+// attributed to the client's body (truncated, malformed chunk framing)
+// rather than the cache write.
+type captureReader struct {
+	r   io.Reader
+	n   int64
+	err error
+}
+
+func (c *captureReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	// The io.EOF SENTINEL (equality, not errors.Is) is clean termination and
+	// is never recorded. A WRAPPED EOF is different: the chunked decoder
+	// wraps its errors ("reading chunk header: %w"), so a body truncated
+	// mid-frame surfaces as a wrapped io.EOF that must be attributed to the
+	// client — errors.Is would swallow it and turn IncompleteBody into a 500.
+	if err != nil && err != io.EOF && c.err == nil {
+		c.err = err
+	}
+	return n, err
+}
