@@ -147,9 +147,9 @@ func (s *Service) handleRevalidation304(
 	metrics.RecordRevalidationNotModified()
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Revalidation 304 - object unchanged")
 
-	// Serve range or full body from cache. Both serveRangeFromCache (via its
-	// pre-header probe) and serveFromCache report an unresolvable body without
-	// writing headers, so the caller can safely forward to upstream.
+	// Serve range or full body from cache. Both helpers commit only after a
+	// nonempty body write and report an unresolvable body before committing, so
+	// the caller can safely forward to upstream.
 	if rangeHeader != "" {
 		return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
 	}
