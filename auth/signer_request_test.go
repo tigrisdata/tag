@@ -410,3 +410,221 @@ func TestSignObjectRequest_QueryCharsInKeyStayInPath(t *testing.T) {
 		t.Fatalf("SignRequest split = %q / %q, want /b/reports + 2026.pq", req2.URL.Path, req2.URL.RawQuery)
 	}
 }
+
+func genericConditionalObjectRequestAt(t *testing.T, signer *RequestSigner, method, bucket, key, etag string, lastModified int64, rangeHeader string, signingTime time.Time) *http.Request {
+	t.Helper()
+
+	extraHeaders := make(http.Header, 3)
+	if etag != "" {
+		extraHeaders.Set("If-None-Match", etag)
+	}
+	if lastModified > 0 {
+		extraHeaders.Set("If-Modified-Since", time.Unix(lastModified, 0).UTC().Format(http.TimeFormat))
+	}
+	if rangeHeader != "" {
+		extraHeaders.Set("Range", rangeHeader)
+	}
+	req, err := signer.SignObjectRequest(
+		t.Context(),
+		method,
+		bucket,
+		key,
+		nil,
+		unsignedPayload,
+		requestSignerTestAccessKey,
+		requestSignerTestSecretKey,
+		extraHeaders,
+	)
+	if err != nil {
+		t.Fatalf("SignObjectRequest() error = %v", err)
+	}
+	resignRequestAt(t, signer, req, signingTime, false)
+	return req
+}
+
+func resignRequestAt(t *testing.T, signer *RequestSigner, req *http.Request, signingTime time.Time, conditional bool) {
+	t.Helper()
+
+	const bodyHash = unsignedPayload
+	req.Header.Set("X-Amz-Date", signingTime.Format(TimeFormat))
+	req.Header.Set("X-Amz-Content-Sha256", bodyHash)
+	req.Header.Set("Host", req.URL.Host)
+	var err error
+	if conditional {
+		canonicalHeaders, signedHeaders := buildConditionalCanonicalHeaders(req)
+		err = signer.signHTTPWithCanonicalHeaders(req, requestSignerTestAccessKey, requestSignerTestSecretKey, bodyHash, signingTime, canonicalHeaders, signedHeaders)
+	} else {
+		err = signer.signHTTP(req, requestSignerTestAccessKey, requestSignerTestSecretKey, bodyHash, signingTime)
+	}
+	if err != nil {
+		t.Fatalf("resign request: %v", err)
+	}
+}
+
+func TestSignConditionalObjectRequestMatchesGeneric(t *testing.T) {
+	const (
+		bucket = "escaped-bucket"
+		key    = "object/with space+and%25?literal"
+	)
+	lastModified := time.Date(2024, time.January, 2, 3, 4, 5, 0, time.UTC).Unix()
+	tests := []struct {
+		name         string
+		method       string
+		etag         string
+		lastModified int64
+		rangeHeader  string
+	}{
+		{name: "get none", method: http.MethodGet},
+		{name: "get etag", method: http.MethodGet, etag: `W/"etag with space"`},
+		{name: "get date", method: http.MethodGet, lastModified: lastModified},
+		{name: "get range", method: http.MethodGet, rangeHeader: "bytes=7-19"},
+		{name: "get etag and date", method: http.MethodGet, etag: `"etag"`, lastModified: lastModified},
+		{name: "get etag and range", method: http.MethodGet, etag: `"etag"`, rangeHeader: "bytes=7-19"},
+		{name: "get date and range", method: http.MethodGet, lastModified: lastModified, rangeHeader: "bytes=7-19"},
+		{name: "get all", method: http.MethodGet, etag: `W/"etag with space"`, lastModified: lastModified, rangeHeader: "bytes=7-19"},
+		{name: "head range", method: http.MethodHead, rangeHeader: "bytes=7-19"},
+		{name: "head conditions", method: http.MethodHead, etag: `W/"etag with space"`, lastModified: lastModified},
+		{name: "head all", method: http.MethodHead, etag: `W/"etag with space"`, lastModified: lastModified, rangeHeader: "bytes=7-19"},
+	}
+
+	signer := NewRequestSigner("https://upstream.example.com", "us-east-1")
+	store := NewCredentialStore()
+	store.AddCredential(requestSignerTestAccessKey, requestSignerTestSecretKey)
+	validator := NewRequestValidator(store)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := signer.SignConditionalObjectRequest(
+				t.Context(),
+				tt.method,
+				bucket,
+				key,
+				requestSignerTestAccessKey,
+				requestSignerTestSecretKey,
+				tt.etag,
+				tt.lastModified,
+				tt.rangeHeader,
+			)
+			if err != nil {
+				t.Fatalf("SignConditionalObjectRequest() error = %v", err)
+			}
+			signingTime := time.Now().UTC().Truncate(time.Second)
+			resignRequestAt(t, signer, got, signingTime, true)
+			want := genericConditionalObjectRequestAt(t, signer, tt.method, bucket, key, tt.etag, tt.lastModified, tt.rangeHeader, signingTime)
+
+			if got.Method != want.Method {
+				t.Errorf("method = %q, want %q", got.Method, want.Method)
+			}
+			if gotURL, wantURL := got.URL.String(), want.URL.String(); gotURL != wantURL {
+				t.Errorf("URL = %q, want %q", gotURL, wantURL)
+			}
+			if gotURL, wantURL := got.URL.EscapedPath(), want.URL.EscapedPath(); gotURL != wantURL {
+				t.Errorf("EscapedPath = %q, want %q", gotURL, wantURL)
+			}
+			if got.Host != want.Host {
+				t.Errorf("Host = %q, want %q", got.Host, want.Host)
+			}
+			if !reflect.DeepEqual(got.Header, want.Header) {
+				t.Errorf("headers = %#v, want %#v", got.Header, want.Header)
+			}
+			if signed := got.Header.Get("Authorization"); !strings.Contains(signed, "SignedHeaders="+conditionalSignedHeaders) {
+				t.Errorf("Authorization = %q, want fixed signed headers", signed)
+			}
+			if got := got.Header.Get("Range"); got != tt.rangeHeader {
+				t.Errorf("Range = %q, want %q", got, tt.rangeHeader)
+			}
+			if got := got.Header.Get("If-None-Match"); got != tt.etag {
+				t.Errorf("If-None-Match = %q, want %q", got, tt.etag)
+			}
+			wantDate := ""
+			if tt.lastModified > 0 {
+				wantDate = time.Unix(tt.lastModified, 0).UTC().Format(http.TimeFormat)
+			}
+			if got := got.Header.Get("If-Modified-Since"); got != wantDate {
+				t.Errorf("If-Modified-Since = %q, want %q", got, wantDate)
+			}
+			if _, err := validator.ValidateRequest(got); err != nil {
+				t.Errorf("ValidateRequest() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestSignConditionalObjectRequestRejectsOtherMethods(t *testing.T) {
+	signer := NewRequestSigner("https://upstream.example.com", "us-east-1")
+	if _, err := signer.SignConditionalObjectRequest(t.Context(), http.MethodPut, "bucket", "key", "access", "secret", "", 0, ""); err == nil {
+		t.Fatal("SignConditionalObjectRequest() error = nil, want unsupported-method error")
+	}
+}
+
+func TestSignRequestKeepsArbitrarySignedHeadersGeneric(t *testing.T) {
+	signer := NewRequestSigner("https://upstream.example.com", "us-east-1")
+	req, err := signer.SignRequest(
+		t.Context(),
+		http.MethodGet,
+		"/bucket/key",
+		nil,
+		unsignedPayload,
+		requestSignerTestAccessKey,
+		requestSignerTestSecretKey,
+		http.Header{
+			"Content-Type":          {"application/octet-stream"},
+			"X-Amz-Meta-Request-Id": {"request-id"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("SignRequest() error = %v", err)
+	}
+	wantSignedHeaders := "content-type;host;x-amz-content-sha256;x-amz-date;x-amz-meta-request-id"
+	if got := req.Header.Get("Authorization"); !strings.Contains(got, "SignedHeaders="+wantSignedHeaders) {
+		t.Errorf("Authorization = %q, want arbitrary signed headers %q", got, wantSignedHeaders)
+	}
+}
+
+func TestSignConditionalObjectRequestConcurrent(t *testing.T) {
+	signer := NewRequestSigner("https://upstream.example.com", "us-east-1")
+	const workers = 16
+	errs := make(chan error, workers)
+	var ready, done sync.WaitGroup
+	ready.Add(workers)
+	done.Add(workers)
+	start := make(chan struct{})
+	for i := range workers {
+		go func(i int) {
+			defer done.Done()
+			ready.Done()
+			<-start
+			method := http.MethodGet
+			if i%2 == 1 {
+				method = http.MethodHead
+			}
+			req, err := signer.SignConditionalObjectRequest(
+				context.Background(),
+				method,
+				"bucket",
+				"object/with space+and%25?literal",
+				requestSignerTestAccessKey,
+				requestSignerTestSecretKey,
+				`W/"concurrent-etag"`,
+				1704164645,
+				"bytes=0-1048575",
+			)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if got := req.Header.Get("Range"); got != "bytes=0-1048575" {
+				errs <- fmt.Errorf("Range = %q", got)
+			}
+			if got := req.Header.Get("If-None-Match"); got != `W/"concurrent-etag"` {
+				errs <- fmt.Errorf("If-None-Match = %q", got)
+			}
+		}(i)
+	}
+	ready.Wait()
+	close(start)
+	done.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}

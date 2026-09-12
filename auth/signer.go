@@ -134,10 +134,62 @@ func (s *RequestSigner) SignObjectRequest(ctx context.Context, method, bucket, k
 	return s.signURL(ctx, method, &baseURL, body, bodyHash, accessKey, secretKey, headers)
 }
 
+// SignConditionalObjectRequest signs the synthetic GET or HEAD requests TAG
+// uses for cache validation. The object key is taken literally, like
+// SignObjectRequest, while Range and conditional headers are copied unchanged.
+// Only the fixed host, payload hash, and date headers are signed, so this path
+// can skip generic header discovery and sorting.
+func (s *RequestSigner) SignConditionalObjectRequest(ctx context.Context, method, bucket, key string,
+	accessKey, secretKey, etag string, lastModified int64, rangeHeader string) (*http.Request, error) {
+
+	if method != http.MethodGet && method != http.MethodHead {
+		return nil, fmt.Errorf("conditional request method %q is not supported", method)
+	}
+	if s.endpointErr != nil {
+		return nil, fmt.Errorf("failed to parse endpoint: %w", s.endpointErr)
+	}
+
+	extraHeaders := make(http.Header, 3)
+	if etag != "" {
+		extraHeaders.Set("If-None-Match", etag)
+	}
+	if lastModified > 0 {
+		extraHeaders.Set("If-Modified-Since", time.Unix(lastModified, 0).UTC().Format(http.TimeFormat))
+	}
+	if rangeHeader != "" {
+		extraHeaders.Set("Range", rangeHeader)
+	}
+
+	baseURL := *s.endpointURL
+	baseURL.Path = "/" + bucket + "/" + key
+	baseURL.RawQuery = ""
+	return s.signURLWithCanonicalHeaders(
+		ctx,
+		method,
+		&baseURL,
+		nil,
+		unsignedPayload,
+		accessKey,
+		secretKey,
+		extraHeaders,
+		buildConditionalCanonicalHeaders,
+	)
+}
+
 // signURL finishes request construction and SigV4 signing for an already-built
 // URL (path and query set as their decoded forms).
 func (s *RequestSigner) signURL(ctx context.Context, method string, baseURL *url.URL,
 	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header) (*http.Request, error) {
+	return s.signURLWithCanonicalHeaders(ctx, method, baseURL, body, bodyHash, accessKey, secretKey, headers, nil)
+}
+
+// signURLWithCanonicalHeaders is the shared request-construction path for
+// generic and fixed-header signatures. A non-nil builder supplies the complete
+// canonical header string and signed-header list after the request headers have
+// been populated.
+func (s *RequestSigner) signURLWithCanonicalHeaders(ctx context.Context, method string, baseURL *url.URL,
+	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header,
+	canonicalHeaderBuilder func(*http.Request) (string, string)) (*http.Request, error) {
 
 	if baseURL.Opaque != "" {
 		// URL.String ignores Path for opaque URLs, so the old stringify-and-parse
@@ -200,9 +252,17 @@ func (s *RequestSigner) signURL(ctx context.Context, method string, baseURL *url
 	req.Header.Set("X-Amz-Content-Sha256", bodyHash)
 	req.Header.Set("Host", req.URL.Host)
 
-	// Sign the request
-	if err := s.signHTTP(req, accessKey, secretKey, bodyHash, now); err != nil {
-		return nil, fmt.Errorf("failed to sign request: %w", err)
+	// Sign the request. Conditional requests provide their complete canonical
+	// header set; all other callers use generic header discovery.
+	var signErr error
+	if canonicalHeaderBuilder == nil {
+		signErr = s.signHTTP(req, accessKey, secretKey, bodyHash, now)
+	} else {
+		canonicalHeaders, signedHeaders := canonicalHeaderBuilder(req)
+		signErr = s.signHTTPWithCanonicalHeaders(req, accessKey, secretKey, bodyHash, now, canonicalHeaders, signedHeaders)
+	}
+	if signErr != nil {
+		return nil, fmt.Errorf("failed to sign request: %w", signErr)
 	}
 
 	return req, nil
@@ -210,12 +270,21 @@ func (s *RequestSigner) signURL(ctx context.Context, method string, baseURL *url
 
 // signHTTP signs an HTTP request using AWS SigV4.
 func (s *RequestSigner) signHTTP(req *http.Request, accessKey, secretKey, bodyHash string, signingTime time.Time) error {
+	canonicalRequest, signedHeaders := s.buildCanonicalRequest(req, bodyHash)
+	return s.signCanonicalRequest(req, accessKey, secretKey, signingTime, canonicalRequest, signedHeaders)
+}
+
+// signHTTPWithCanonicalHeaders signs an HTTP request when the complete
+// canonical header set is already known by the caller.
+func (s *RequestSigner) signHTTPWithCanonicalHeaders(req *http.Request, accessKey, secretKey, bodyHash string, signingTime time.Time, canonicalHeaders, signedHeaders string) error {
+	canonicalRequest := s.buildCanonicalRequestWithHeaders(req, bodyHash, canonicalHeaders, signedHeaders)
+	return s.signCanonicalRequest(req, accessKey, secretKey, signingTime, canonicalRequest, signedHeaders)
+}
+
+func (s *RequestSigner) signCanonicalRequest(req *http.Request, accessKey, secretKey string, signingTime time.Time, canonicalRequest, signedHeaders string) error {
 	// Build credential scope
 	dateStr := signingTime.Format(shortTimeFormat)
 	credentialScope := fmt.Sprintf("%s/%s/%s/%s", dateStr, s.region, service, terminationString)
-
-	// Build canonical request
-	canonicalRequest, signedHeaders := s.buildCanonicalRequest(req, bodyHash)
 
 	// Build string to sign
 	stringToSign := s.buildStringToSign(signingTime, credentialScope, canonicalRequest)
@@ -234,6 +303,14 @@ func (s *RequestSigner) signHTTP(req *http.Request, accessKey, secretKey, bodyHa
 
 // buildCanonicalRequest builds the canonical request string for signing.
 func (s *RequestSigner) buildCanonicalRequest(req *http.Request, bodyHash string) (string, string) {
+	canonicalHeaders, signedHeaders := s.buildCanonicalHeaders(req)
+	return s.buildCanonicalRequestWithHeaders(req, bodyHash, canonicalHeaders, signedHeaders), signedHeaders
+}
+
+// buildCanonicalRequestWithHeaders builds a canonical request from a complete,
+// already ordered canonical header string. Conditional requests use this to
+// avoid discovering and sorting a header set that their API fixes in advance.
+func (s *RequestSigner) buildCanonicalRequestWithHeaders(req *http.Request, bodyHash, canonicalHeaders, signedHeaders string) string {
 	// Canonical URI - use AWS SigV4 encoding which encodes more characters than Go's EscapedPath
 	// Specifically, + must be encoded as %2B per AWS spec, but Go's EscapedPath leaves it unencoded
 	canonicalURI := awsURIEncode(req.URL.Path, false)
@@ -244,11 +321,8 @@ func (s *RequestSigner) buildCanonicalRequest(req *http.Request, bodyHash string
 	// Canonical query string (sorted parameters)
 	canonicalQueryString := s.buildCanonicalQueryString(req.URL.Query())
 
-	// Canonical headers (sorted, lowercase)
-	canonicalHeaders, signedHeaders := s.buildCanonicalHeaders(req)
-
 	// Build the canonical request
-	canonicalRequest := strings.Join([]string{
+	return strings.Join([]string{
 		req.Method,
 		canonicalURI,
 		canonicalQueryString,
@@ -256,8 +330,33 @@ func (s *RequestSigner) buildCanonicalRequest(req *http.Request, bodyHash string
 		signedHeaders,
 		bodyHash,
 	}, "\n")
+}
 
-	return canonicalRequest, signedHeaders
+const conditionalSignedHeaders = "host;x-amz-content-sha256;x-amz-date"
+
+// buildConditionalCanonicalHeaders emits the fixed canonical header values used
+// by SignConditionalObjectRequest. These values are set by the signer itself,
+// so no generic trimming, multi-value joining, or header sorting is needed.
+func buildConditionalCanonicalHeaders(req *http.Request) (string, string) {
+	host := req.Header.Get("Host")
+	bodyHash := req.Header.Get("X-Amz-Content-Sha256")
+	date := req.Header.Get("X-Amz-Date")
+
+	const hostPrefix = "host:"
+	const bodyHashPrefix = "x-amz-content-sha256:"
+	const datePrefix = "x-amz-date:"
+	var headers strings.Builder
+	headers.Grow(len(hostPrefix) + len(bodyHashPrefix) + len(datePrefix) + len(host) + len(bodyHash) + len(date) + 3)
+	headers.WriteString(hostPrefix)
+	headers.WriteString(host)
+	headers.WriteByte('\n')
+	headers.WriteString(bodyHashPrefix)
+	headers.WriteString(bodyHash)
+	headers.WriteByte('\n')
+	headers.WriteString(datePrefix)
+	headers.WriteString(date)
+	headers.WriteByte('\n')
+	return headers.String(), conditionalSignedHeaders
 }
 
 // buildCanonicalQueryString builds the canonical query string from URL parameters.

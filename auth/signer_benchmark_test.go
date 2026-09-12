@@ -85,24 +85,19 @@ const (
 	signerConditionalBenchmarkRange  = "bytes=0-1048575"
 )
 
-// benchmarkConditionalGeneric signs the range-only synthetic request through
-// the production generic object signer. Building the header map inside the
-// operation keeps the comparison inclusive of the work removed by a
-// specialized conditional path.
-func benchmarkConditionalGeneric(signer *RequestSigner, ctx context.Context) error {
-	headers := http.Header{
-		"Range": {signerConditionalBenchmarkRange},
-	}
-	_, err := signer.SignObjectRequest(
+// benchmarkConditionalFast signs the range-only synthetic request through
+// the dedicated conditional object signer.
+func benchmarkConditionalFast(signer *RequestSigner, ctx context.Context) error {
+	_, err := signer.SignConditionalObjectRequest(
 		ctx,
 		http.MethodGet,
 		signerConditionalBenchmarkBucket,
 		signerConditionalBenchmarkKey,
-		nil,
-		unsignedPayload,
 		requestSignerTestAccessKey,
 		requestSignerTestSecretKey,
-		headers,
+		"",
+		0,
+		signerConditionalBenchmarkRange,
 	)
 	return err
 }
@@ -145,8 +140,7 @@ func runFourWorkerBenchmark(b *testing.B, work func(worker, workers, iterations 
 }
 
 // BenchmarkRequestSignerConditional measures the range-only conditional
-// workload at the block fan-out sizes used by the cache path. The comparison
-// revision intentionally calls the generic object signer.
+// workload at the block fan-out sizes used by the cache path.
 func BenchmarkRequestSignerConditional(b *testing.B) {
 	for _, count := range []int{1, 2, 4, 32} {
 		count := count
@@ -156,7 +150,7 @@ func BenchmarkRequestSignerConditional(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				for range count {
-					if err := benchmarkConditionalGeneric(signer, ctx); err != nil {
+					if err := benchmarkConditionalFast(signer, ctx); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -170,7 +164,7 @@ func BenchmarkRequestSignerConditional(b *testing.B) {
 			runFourWorkerBenchmark(b, func(worker, workers, iterations int) error {
 				for i := worker; i < iterations; i += workers {
 					for range count {
-						if err := benchmarkConditionalGeneric(signer, ctx); err != nil {
+						if err := benchmarkConditionalFast(signer, ctx); err != nil {
 							return err
 						}
 					}
