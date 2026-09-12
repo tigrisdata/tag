@@ -3,6 +3,8 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -75,4 +77,100 @@ func BenchmarkRequestSignerSignRequestParallel(b *testing.B) {
 			}
 		}
 	})
+}
+
+const (
+	signerConditionalBenchmarkBucket = "benchmark-bucket"
+	signerConditionalBenchmarkKey    = "object/with space+and%25/key"
+	signerConditionalBenchmarkRange  = "bytes=0-1048575"
+)
+
+// benchmarkConditionalFast signs the range-only synthetic request through
+// the dedicated conditional object signer.
+func benchmarkConditionalFast(signer *RequestSigner, ctx context.Context) error {
+	_, err := signer.SignConditionalObjectRequest(
+		ctx,
+		http.MethodGet,
+		signerConditionalBenchmarkBucket,
+		signerConditionalBenchmarkKey,
+		requestSignerTestAccessKey,
+		requestSignerTestSecretKey,
+		"",
+		0,
+		signerConditionalBenchmarkRange,
+	)
+	return err
+}
+
+// runFourWorkerBenchmark runs exactly four benchmark workers, independent of
+// GOMAXPROCS. The callback receives the worker index, worker count, and the
+// aggregate iteration count so it can keep one logical operation per iteration.
+func runFourWorkerBenchmark(b *testing.B, work func(worker, workers, iterations int) error) {
+	b.Helper()
+
+	const workers = 4
+	b.StopTimer()
+	start := make(chan struct{})
+	var ready, done sync.WaitGroup
+	ready.Add(workers)
+	done.Add(workers)
+	var firstErr error
+	var errOnce sync.Once
+
+	for worker := 0; worker < workers; worker++ {
+		go func(worker int) {
+			defer done.Done()
+			ready.Done()
+			<-start
+			if err := work(worker, workers, b.N); err != nil {
+				errOnce.Do(func() { firstErr = err })
+			}
+		}(worker)
+	}
+
+	ready.Wait()
+	b.ResetTimer()
+	b.StartTimer()
+	close(start)
+	done.Wait()
+	b.StopTimer()
+	if firstErr != nil {
+		b.Fatal(firstErr)
+	}
+}
+
+// BenchmarkRequestSignerConditional measures the range-only conditional
+// workload at the block fan-out sizes used by the cache path.
+func BenchmarkRequestSignerConditional(b *testing.B) {
+	for _, count := range []int{1, 2, 4, 32} {
+		count := count
+		b.Run("Serial/"+strconv.Itoa(count), func(b *testing.B) {
+			signer := newSignerBenchmark()
+			ctx := context.Background()
+			b.ReportAllocs()
+			for b.Loop() {
+				for range count {
+					if err := benchmarkConditionalFast(signer, ctx); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
+
+		b.Run("Parallel/"+strconv.Itoa(count), func(b *testing.B) {
+			signer := newSignerBenchmark()
+			ctx := context.Background()
+			b.ReportAllocs()
+			runFourWorkerBenchmark(b, func(worker, workers, iterations int) error {
+				for i := worker; i < iterations; i += workers {
+					for range count {
+						if err := benchmarkConditionalFast(signer, ctx); err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			})
+		})
+	}
 }

@@ -431,22 +431,10 @@ func (b *baseForwarder) DoConditionalHeadRequest(ctx context.Context, bucket, ke
 
 // doConditionalRequest is the shared implementation for conditional GET/HEAD requests.
 // Sends If-None-Match and/or If-Modified-Since headers for cache revalidation.
-// Uses standard SigV4 signing because these are synthetic requests initiated by TAG.
+// The dedicated signer preserves the literal object key and avoids generic
+// canonical-header discovery for this fixed signed-header set.
 func (b *baseForwarder) doConditionalRequest(ctx context.Context, method, bucket, key, accessKey, secretKey, etag string, lastModified int64, rangeHeader string) (*http.Response, error) {
-	extraHeaders := http.Header{}
-	if etag != "" {
-		extraHeaders.Set("If-None-Match", etag)
-	}
-	if lastModified > 0 {
-		t := time.Unix(lastModified, 0).UTC()
-		extraHeaders.Set("If-Modified-Since", t.Format(http.TimeFormat))
-	}
-	if rangeHeader != "" {
-		extraHeaders.Set("Range", rangeHeader)
-	}
-
-	// SignObjectRequest takes the key literally — see DoObjectDeleteRequest.
-	fwdReq, err := b.signer.SignObjectRequest(ctx, method, bucket, key, nil, "UNSIGNED-PAYLOAD", accessKey, secretKey, extraHeaders)
+	fwdReq, err := b.signer.SignConditionalObjectRequest(ctx, method, bucket, key, accessKey, secretKey, etag, lastModified, rangeHeader)
 	if err != nil {
 		return nil, err
 	}
