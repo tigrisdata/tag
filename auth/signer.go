@@ -149,47 +149,76 @@ func (s *RequestSigner) SignConditionalObjectRequest(ctx context.Context, method
 		return nil, fmt.Errorf("failed to parse endpoint: %w", s.endpointErr)
 	}
 
-	extraHeaders := make(http.Header, 3)
-	if etag != "" {
-		extraHeaders.Set("If-None-Match", etag)
-	}
-	if lastModified > 0 {
-		extraHeaders.Set("If-Modified-Since", time.Unix(lastModified, 0).UTC().Format(http.TimeFormat))
-	}
-	if rangeHeader != "" {
-		extraHeaders.Set("Range", rangeHeader)
-	}
-
 	baseURL := *s.endpointURL
 	baseURL.Path = "/" + bucket + "/" + key
 	baseURL.RawQuery = ""
-	return s.signURLWithCanonicalHeaders(
-		ctx,
-		method,
-		&baseURL,
-		nil,
-		unsignedPayload,
-		accessKey,
-		secretKey,
-		extraHeaders,
-		buildConditionalCanonicalHeaders,
-	)
+	req, err := s.newURLRequest(ctx, method, &baseURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Preserve conditional values exactly as supplied by the caller. They are
+	// forwarded but deliberately excluded from the fixed SigV4 header set.
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+	if lastModified > 0 {
+		req.Header.Set("If-Modified-Since", time.Unix(lastModified, 0).UTC().Format(http.TimeFormat))
+	}
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+
+	bodyHash := unsignedPayload
+	now := time.Now().UTC()
+	date := now.Format(TimeFormat)
+	req.Header.Set("X-Amz-Date", date)
+	req.Header.Set("X-Amz-Content-Sha256", bodyHash)
+	req.Header.Set("Host", req.URL.Host)
+	canonicalHeaders, signedHeaders := buildConditionalCanonicalHeadersValues(req.URL.Host, bodyHash, date)
+	if err := s.signHTTPWithCanonicalHeaders(req, accessKey, secretKey, bodyHash, now, canonicalHeaders, signedHeaders); err != nil {
+		return nil, fmt.Errorf("failed to sign request: %w", err)
+	}
+	return req, nil
 }
 
 // signURL finishes request construction and SigV4 signing for an already-built
 // URL (path and query set as their decoded forms).
 func (s *RequestSigner) signURL(ctx context.Context, method string, baseURL *url.URL,
 	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header) (*http.Request, error) {
-	return s.signURLWithCanonicalHeaders(ctx, method, baseURL, body, bodyHash, accessKey, secretKey, headers, nil)
+	req, err := s.newURLRequest(ctx, method, baseURL, body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy relevant headers (content headers and user metadata)
+	for k, v := range headers {
+		if shouldCopyHeader(k) {
+			req.Header[k] = v
+		}
+	}
+
+	// Use provided body hash or default to empty body hash for requests without body
+	if bodyHash == "" {
+		bodyHash = emptyBodyHash
+	}
+
+	// Set required headers for signing
+	now := time.Now().UTC()
+	req.Header.Set("X-Amz-Date", now.Format(TimeFormat))
+	req.Header.Set("X-Amz-Content-Sha256", bodyHash)
+	req.Header.Set("Host", req.URL.Host)
+
+	if signErr := s.signHTTP(req, accessKey, secretKey, bodyHash, now); signErr != nil {
+		return nil, fmt.Errorf("failed to sign request: %w", signErr)
+	}
+
+	return req, nil
 }
 
-// signURLWithCanonicalHeaders is the shared request-construction path for
-// generic and fixed-header signatures. A non-nil builder supplies the complete
-// canonical header string and signed-header list after the request headers have
-// been populated.
-func (s *RequestSigner) signURLWithCanonicalHeaders(ctx context.Context, method string, baseURL *url.URL,
-	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header,
-	canonicalHeaderBuilder func(*http.Request) (string, string)) (*http.Request, error) {
+// newURLRequest creates a request from an already-built URL without copying
+// or signing its headers.
+func (s *RequestSigner) newURLRequest(ctx context.Context, method string, baseURL *url.URL, body io.Reader) (*http.Request, error) {
 
 	if baseURL.Opaque != "" {
 		// URL.String ignores Path for opaque URLs, so the old stringify-and-parse
@@ -232,37 +261,6 @@ func (s *RequestSigner) signURLWithCanonicalHeaders(ctx context.Context, method 
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Copy relevant headers (content headers and user metadata)
-	for k, v := range headers {
-		if shouldCopyHeader(k) {
-			req.Header[k] = v
-		}
-	}
-
-	// Use provided body hash or default to empty body hash for requests without body
-	if bodyHash == "" {
-		bodyHash = emptyBodyHash
-	}
-
-	// Set required headers for signing
-	now := time.Now().UTC()
-	req.Header.Set("X-Amz-Date", now.Format(TimeFormat))
-	req.Header.Set("X-Amz-Content-Sha256", bodyHash)
-	req.Header.Set("Host", req.URL.Host)
-
-	// Sign the request. Conditional requests provide their complete canonical
-	// header set; all other callers use generic header discovery.
-	var signErr error
-	if canonicalHeaderBuilder == nil {
-		signErr = s.signHTTP(req, accessKey, secretKey, bodyHash, now)
-	} else {
-		canonicalHeaders, signedHeaders := canonicalHeaderBuilder(req)
-		signErr = s.signHTTPWithCanonicalHeaders(req, accessKey, secretKey, bodyHash, now, canonicalHeaders, signedHeaders)
-	}
-	if signErr != nil {
-		return nil, fmt.Errorf("failed to sign request: %w", signErr)
 	}
 
 	return req, nil
@@ -318,8 +316,12 @@ func (s *RequestSigner) buildCanonicalRequestWithHeaders(req *http.Request, body
 		canonicalURI = "/"
 	}
 
-	// Canonical query string (sorted parameters)
-	canonicalQueryString := s.buildCanonicalQueryString(req.URL.Query())
+	// Canonical query string (sorted parameters). Conditional requests always
+	// have an empty RawQuery, so avoid parsing an empty query on that path.
+	canonicalQueryString := ""
+	if req.URL.RawQuery != "" {
+		canonicalQueryString = s.buildCanonicalQueryString(req.URL.Query())
+	}
 
 	// Build the canonical request
 	return strings.Join([]string{
@@ -338,10 +340,14 @@ const conditionalSignedHeaders = "host;x-amz-content-sha256;x-amz-date"
 // by SignConditionalObjectRequest. These values are set by the signer itself,
 // so no generic trimming, multi-value joining, or header sorting is needed.
 func buildConditionalCanonicalHeaders(req *http.Request) (string, string) {
-	host := req.Header.Get("Host")
-	bodyHash := req.Header.Get("X-Amz-Content-Sha256")
-	date := req.Header.Get("X-Amz-Date")
+	return buildConditionalCanonicalHeadersValues(
+		req.Header.Get("Host"),
+		req.Header.Get("X-Amz-Content-Sha256"),
+		req.Header.Get("X-Amz-Date"),
+	)
+}
 
+func buildConditionalCanonicalHeadersValues(host, bodyHash, date string) (string, string) {
 	const hostPrefix = "host:"
 	const bodyHashPrefix = "x-amz-content-sha256:"
 	const datePrefix = "x-amz-date:"
