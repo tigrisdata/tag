@@ -525,9 +525,6 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 			return nil
 		}
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
-		if src.err != nil {
-			return src.err
-		}
 		return putErr
 	}
 	switch {

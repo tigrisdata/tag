@@ -932,6 +932,22 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 		s.preForwardInvalidate(context.Background(), bucket, key)
 	}
 
+	// Tiered: the post-success converge must be ORDERED, exactly as for a
+	// forwarded DELETE. The unconditional converge out-deletes racing
+	// writers — a small PUT acked while the copy is in flight is the local
+	// tier's only copy, and out-deleting it is data loss. Claim the key
+	// (cancels/excludes re-tiers) and capture the pre-forward token; the
+	// converge removes only the state this copy displaced.
+	var (
+		cpPriorVer   uint64
+		cpPriorKnown bool
+	)
+	if s.config.IsTiered() {
+		s.claimRetierWrite(bucket, key)
+		defer s.releaseRetierWrite(bucket, key)
+		_, cpPriorVer, cpPriorKnown = s.captureMarkerPrior(r.Context(), bucket, key)
+	}
+
 	// Forward to upstream, capturing the response so we can confirm the copy
 	// actually succeeded. CopyObject signals failure either with a non-2xx status
 	// or — famously — a 200 OK carrying an <Error> body, and Forward would report
@@ -945,9 +961,16 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
 	// unchanged, so re-invalidating would only discard a valid racing refill.
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
-		s.convergeInvalidation(context.Background(), bucket, key)
-		s.warmOnWrite(r, bucket, key)
-		s.warmParquetFooterOnWrite(r, bucket, key)
+		if s.config.IsTiered() {
+			// The copied object lives upstream and reads as a miss until
+			// re-put (documented v1 limitation); converge the displaced
+			// destination state under its pre-forward token only.
+			s.convergeTieredDelete(bucket, key, cpPriorVer, cpPriorKnown)
+		} else {
+			s.convergeInvalidation(context.Background(), bucket, key)
+			s.warmOnWrite(r, bucket, key)
+			s.warmParquetFooterOnWrite(r, bucket, key)
+		}
 	}
 
 	return err
@@ -1024,9 +1047,20 @@ func (s *Service) convergeTieredDelete(bucket, key string, priorVersion uint64, 
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Tiered DELETE converge skipped - prior unknown; possibly-stale metadata serves until TTL")
 		return
 	}
-	if _, err := s.cache.DeleteMetaIfVersion(ctx, bucket, key, priorVersion); err != nil {
+	// One immediate retry absorbs the transient class (the discipline
+	// convergeInvalidation already applies): the client holds its 2xx, and
+	// a converge that never lands leaves the old metadata AUTHORITATIVE —
+	// a marker makes HEAD report the deleted object present, a surviving
+	// local-tier entry keeps serving the deleted body — until TTL. The
+	// version guard is kept on the retry; a repeat failure stays visible on
+	// the invalidation-errors metric.
+	_, err := s.cache.DeleteMetaIfVersion(ctx, bucket, key, priorVersion)
+	if err != nil {
+		_, err = s.cache.DeleteMetaIfVersion(ctx, bucket, key, priorVersion)
+	}
+	if err != nil {
 		metrics.RecordCacheOperation("delete", "error")
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Tiered DELETE converge failed; stale metadata may serve until TTL")
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Tiered DELETE converge failed after retry; stale metadata may serve until TTL")
 		return
 	}
 	metrics.RecordCacheOperation("delete", "success")

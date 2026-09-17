@@ -1506,3 +1506,55 @@ func TestTieredForwardedDeleteCancelsInflightRetier(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A tiered CopyObject must converge the destination under its PRE-FORWARD
+// version — the same rule as a forwarded DELETE. A small PUT acked while the
+// copy is in flight is the local tier's only copy and must survive; the old
+// unconditional converge out-deleted it behind the copy's 200.
+func TestTieredCopyConvergeSparesRacingPut(t *testing.T) {
+	mock, _, _ := tieredMock()
+	var svc *Service
+	raced := make(chan struct{})
+	mock.captureFunc = func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+		// Mid-copy: a small client PUT commits a new local-tier object.
+		put := httptest.NewRequest(http.MethodPut, "/b/dst", strings.NewReader("racer-wins"))
+		if err := svc.HandlePutObject(httptest.NewRecorder(), put); err != nil {
+			t.Errorf("racing PUT: %v", err)
+		}
+		close(raced)
+		body := `<CopyObjectResult><ETag>"copied"</ETag></CopyObjectResult>`
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+		return &ResponseCapture{StatusCode: http.StatusOK, Body: []byte(body), Complete: true, Headers: http.Header{}}, nil
+	}
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 1024
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	svc = NewService(mock, c, cfg)
+
+	// Seed a prior local-tier destination so the copy has state to displace.
+	if w := tieredDo(t, svc, http.MethodPut, "/b/dst", "old", nil); w.Code != http.StatusOK {
+		t.Fatalf("seed PUT: %d", w.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/b/dst", nil)
+	req.Header.Set("X-Amz-Copy-Source", "/b/src")
+	if err := svc.HandleCopyObject(httptest.NewRecorder(), req); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	<-raced
+
+	// The racing PUT's object must survive the converge.
+	cur, found, _ := c.GetMeta(context.Background(), "b", "dst")
+	if !found || cur == nil || cur.BodyUpstream {
+		t.Fatalf("racing PUT's local object was out-deleted by the copy converge: %+v", cur)
+	}
+	if g := tieredDo(t, svc, http.MethodGet, "/b/dst", "", nil); g.Code != http.StatusOK || g.Body.String() != "racer-wins" {
+		t.Fatalf("GET = %d %q, want the racing PUT's bytes", g.Code, g.Body.String())
+	}
+}
