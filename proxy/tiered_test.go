@@ -1558,3 +1558,81 @@ func TestTieredCopyConvergeSparesRacingPut(t *testing.T) {
 		t.Fatalf("GET = %d %q, want the racing PUT's bytes", g.Code, g.Body.String())
 	}
 }
+
+// deleteIfVersionFlakeClient fails the first N meta-key DeleteIfVersion calls
+// with a transient error (after recording each attempt's version) and lets
+// later ones through — the transient-converge shape.
+type deleteIfVersionFlakeClient struct {
+	cacheclient.CacheClient
+	mu       sync.Mutex
+	failN    int
+	versions []uint64
+}
+
+func (d *deleteIfVersionFlakeClient) DeleteIfVersion(ctx context.Context, key string, version uint64) error {
+	if !strings.HasPrefix(key, "meta|") {
+		return d.CacheClient.DeleteIfVersion(ctx, key, version)
+	}
+	d.mu.Lock()
+	d.versions = append(d.versions, version)
+	n := len(d.versions)
+	d.mu.Unlock()
+	if n <= d.failN {
+		return errors.New("transient converge failure")
+	}
+	return d.CacheClient.DeleteIfVersion(ctx, key, version)
+}
+
+// The tiered converge retries ONCE on a transient error, under the SAME
+// version token (the guard must not weaken across the retry), and attempts
+// exactly twice on persistent failure — a client holds its 2xx, so a
+// converge that never lands leaves deleted metadata authoritative until TTL.
+func TestTieredConvergeRetriesOnceUnderSameVersion(t *testing.T) {
+	newSvc := func(failN int) (*Service, *cache.Cache, *deleteIfVersionFlakeClient) {
+		mock, _, _ := tieredMock()
+		flake := &deleteIfVersionFlakeClient{CacheClient: cacheclient.NewMemoryCache(), failN: failN}
+		cfg := config.NewDefault()
+		cfg.Mode = config.ModeTiered
+		cfg.Cache.SetBlockCachingEnabled(false)
+		cfg.Cache.SizeThreshold = 1024
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		c := cache.NewCacheWithClient(flake, &cfg.Cache)
+		return NewService(mock, c, cfg), c, flake
+	}
+	seedMarker := func(c *cache.Cache) uint64 {
+		marker := &cache.CachedObjectMeta{Bucket: "b", Key: "obj", ETag: `"up-1"`, BodyUpstream: true, ContentLength: 5000, StatusCode: 200}
+		_, tok, _, _ := c.GetMetaWithVersion(context.Background(), "b", "obj")
+		if wrote, err := c.PutMetaIfVersion(context.Background(), "b", "obj", marker, 60, tok); err != nil || !wrote {
+			t.Fatalf("seed marker: %v", err)
+		}
+		_, v, _, _ := c.GetMetaWithVersion(context.Background(), "b", "obj")
+		return v
+	}
+
+	// Transient: first attempt fails, retry succeeds under the same version.
+	svc, c, flake := newSvc(1)
+	v := seedMarker(c)
+	svc.convergeTieredDelete("b", "obj", v, true)
+	if len(flake.versions) != 2 {
+		t.Fatalf("attempts = %d, want 2 (one retry)", len(flake.versions))
+	}
+	if flake.versions[0] != v || flake.versions[1] != v {
+		t.Fatalf("retry changed the version guard: %v, want both == %d", flake.versions, v)
+	}
+	if _, found, _ := c.GetMeta(context.Background(), "b", "obj"); found {
+		t.Fatal("converge did not land on the retry")
+	}
+
+	// Persistent: exactly two attempts, then give up (metadata stays until TTL).
+	svc2, c2, flake2 := newSvc(99)
+	v2 := seedMarker(c2)
+	svc2.convergeTieredDelete("b", "obj", v2, true)
+	if len(flake2.versions) != 2 {
+		t.Fatalf("persistent-failure attempts = %d, want exactly 2", len(flake2.versions))
+	}
+	if _, found, _ := c2.GetMeta(context.Background(), "b", "obj"); !found {
+		t.Fatal("metadata vanished despite every converge attempt failing")
+	}
+}
