@@ -890,7 +890,7 @@ func TestPutBlocksFromStream_ExactMultipleNoPhantomBlock(t *testing.T) {
 	meta := cache.MetaFromHTTPHeaders(wowBucket, wowKey, http.StatusOK, h)
 	meta.BlockSize = 4
 
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEFGH"), 60, cache.VersionAny); err != nil {
+	if _, err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEFGH"), 60, cache.VersionAny); err != nil {
 		t.Fatalf("putBlocksFromStream: %v", err)
 	}
 	for i := int64(0); i <= 1; i++ {
@@ -920,7 +920,7 @@ func TestPutBlocksFromStream_MidStreamErrorLeavesMetaUnwritten(t *testing.T) {
 
 	// One full block, then a read error before the second.
 	r := &errAfterReader{data: []byte("ABCD")}
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, r, 60, cache.VersionAny); err == nil {
+	if _, err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, r, 60, cache.VersionAny); err == nil {
 		t.Fatal("expected an error from the mid-stream read failure")
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
@@ -943,7 +943,7 @@ func TestPutBlocksFromStream_TruncatedStreamLeavesNoShortBlockOrMeta(t *testing.
 	meta.BlockSize = 4
 
 	// ...but the body carries only 6 bytes, ending cleanly (no read error).
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, cache.VersionAny); err == nil {
+	if _, err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, cache.VersionAny); err == nil {
 		t.Fatal("expected an error from the truncated body")
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
@@ -968,7 +968,7 @@ func TestPutBlocksFromStream_OversizedStreamLeavesMetaUnwritten(t *testing.T) {
 	meta.BlockSize = 4
 
 	// ...but the body carries 6 bytes.
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, cache.VersionAny); err == nil {
+	if _, err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, cache.VersionAny); err == nil {
 		t.Fatal("expected an error from the oversized body")
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {

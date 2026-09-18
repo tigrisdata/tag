@@ -117,8 +117,21 @@ const (
 	DefaultWarmOnWriteReservedFraction = 0.5
 )
 
+// Operating modes. Mode selects how TAG relates to its upstream:
+// transparent forwards client signatures as-is with proxy headers (default),
+// signing validates client signatures and re-signs for upstream, and tiered
+// serves small objects entirely from the local cache — metadata is
+// authoritative, misses are answered locally — while large objects pass
+// through to upstream.
+const (
+	ModeTransparent = "transparent"
+	ModeSigning     = "signing"
+	ModeTiered      = "tiered"
+)
+
 // Config holds all configuration for TAG.
 type Config struct {
+	Mode        string            `yaml:"mode"` // transparent (default) | signing | tiered
 	Server      ServerConfig      `yaml:"server"`
 	Upstream    UpstreamConfig    `yaml:"upstream"`
 	Credentials CredentialsConfig `yaml:"credentials"`
@@ -146,6 +159,21 @@ type ServerConfig struct {
 func (s *ServerConfig) TLSEnabled() bool {
 	return s.TLSCertFile != "" && s.TLSKeyFile != ""
 }
+
+// ResolvedMode returns the operating mode, folding in the deprecated
+// upstream.transparent_proxy flag when mode is unset.
+func (c *Config) ResolvedMode() string {
+	if c.Mode != "" {
+		return c.Mode
+	}
+	if !c.Upstream.IsTransparentProxy() {
+		return ModeSigning
+	}
+	return ModeTransparent
+}
+
+// IsTiered returns whether TAG runs in tiered store mode.
+func (c *Config) IsTiered() bool { return c.ResolvedMode() == ModeTiered }
 
 // UpstreamConfig holds Tigris endpoint configuration.
 type UpstreamConfig struct {
@@ -269,7 +297,9 @@ type CacheConfig struct {
 	// EVERY node in the cluster runs a CAS-capable release, and flip via a
 	// brisk rolling restart (nodes in different modes order writes with
 	// different mechanisms during that window). Standalone nodes may flip
-	// immediately after upgrading.
+	// immediately after upgrading. Tiered mode requires CAS and selects it
+	// automatically when this is unset; an explicit true there is rejected
+	// at startup (see validateMode).
 	LegacyCoordination *bool `yaml:"legacy_coordination"`
 
 	// BlockCachingEnabled turns on block-aligned caching for large objects (RFC 0001):
@@ -401,6 +431,16 @@ func NewDefault() *Config {
 		panic(fmt.Sprintf("invalid default configuration: %v", err))
 	}
 	return cfg
+}
+
+// Validate runs the full configuration validation and applies mode-derived
+// defaults (tiered mode selects CAS coordination and disables block caching).
+// Load and NewDefault call it automatically; call it again after mutating a
+// Config programmatically — in particular after setting Mode — or the
+// mode-derived defaults silently do not apply and forbidden combinations
+// (tiered + legacy coordination, tiered + block caching) go undetected.
+func (c *Config) Validate() error {
+	return validate(c)
 }
 
 // applyDefaults sets default values for unset configuration fields.
@@ -737,7 +777,12 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Server.TLSKeyFile = keyFile
 	}
 
-	// Override transparent proxy from environment (enabled by default)
+	// Override operating mode from environment
+	if val := os.Getenv("TAG_MODE"); val != "" {
+		cfg.Mode = val
+	}
+
+	// Override transparent proxy from environment (deprecated: use TAG_MODE)
 	if val := os.Getenv("TAG_TRANSPARENT_PROXY"); val != "" {
 		enabled := val == "true" || val == "1"
 		cfg.Upstream.SetTransparentProxy(enabled)
@@ -753,7 +798,10 @@ func applyEnvOverrides(cfg *Config) {
 
 // validate checks that the final configuration is valid.
 func validate(cfg *Config) error {
-	if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint, cfg.Upstream.IsTransparentProxy()); err != nil {
+	if err := validateMode(cfg); err != nil {
+		return err
+	}
+	if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint, cfg.ResolvedMode() != ModeSigning); err != nil {
 		return err
 	}
 	if err := validateTLS(&cfg.Server); err != nil {
@@ -761,6 +809,50 @@ func validate(cfg *Config) error {
 	}
 	if err := validateEvictionPolicy(cfg.Cache.EvictionPolicy); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateMode checks the operating mode and its interaction with the
+// deprecated transparent_proxy flag and with block caching. Tiered mode is
+// whole-object only (block caching would let individual blocks of a cached
+// object expire, which breaks authoritative local misses), so an explicit
+// block_caching_enabled=true is rejected and the block-caching default flips
+// to off.
+func validateMode(cfg *Config) error {
+	switch cfg.Mode {
+	case "", ModeTransparent, ModeSigning, ModeTiered:
+	default:
+		return fmt.Errorf("invalid mode %q: must be %q, %q, or %q", cfg.Mode, ModeTransparent, ModeSigning, ModeTiered)
+	}
+	if cfg.Mode != "" && cfg.Upstream.TransparentProxy != nil {
+		tp := *cfg.Upstream.TransparentProxy
+		if cfg.Mode == ModeTiered || (cfg.Mode == ModeTransparent) != tp {
+			return fmt.Errorf("mode %q conflicts with deprecated transparent_proxy=%v: remove transparent_proxy", cfg.Mode, tp)
+		}
+	}
+	if cfg.IsTiered() {
+		if cfg.Cache.BlockCachingEnabled != nil && *cfg.Cache.BlockCachingEnabled {
+			return fmt.Errorf("tiered mode requires whole-object caching: remove cache.block_caching_enabled")
+		}
+		cfg.Cache.SetBlockCachingEnabled(false)
+		if !cfg.Cache.IsEnabled() {
+			return fmt.Errorf("tiered mode requires the cache to be enabled")
+		}
+		// Tiered mode REQUIRES CAS-strength meta coordination: the cache is
+		// authoritative and the local tier holds the only copy, so an ordering
+		// race that would be transient staleness in proxy mode (legacy
+		// coordination's accepted write-vs-write window) is permanent data
+		// loss here — a re-tier or populate could overwrite an acknowledged
+		// write. Every node running tiered is CAS-capable by construction (the
+		// mode ships with the coordinator), so the legacy default's
+		// mixed-cluster rationale does not apply: unset selects CAS
+		// automatically, and an explicit legacy_coordination=true is a
+		// contradiction rejected like the other tiered conflicts above.
+		if cfg.Cache.LegacyCoordination != nil && *cfg.Cache.LegacyCoordination {
+			return fmt.Errorf("tiered mode requires CAS meta coordination: remove cache.legacy_coordination")
+		}
+		cfg.Cache.SetLegacyCoordination(false)
 	}
 	return nil
 }

@@ -3,13 +3,24 @@ name: Warp Benchmarks
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "TAG operating mode. tiered = local-tier store (block caching forced off, objects up to size_threshold stored locally)."
+        type: choice
+        options:
+          - transparent # proxy cache in front of upstream (default)
+          - tiered # two-tier store; small objects served entirely locally
+        default: transparent
       cache_mode:
-        description: "Cache mode to benchmark"
+        description: "Cache mode to benchmark (ignored in tiered mode, which is whole-object only)"
         type: choice
         options:
           - blocks # block-aligned caching (RFC 0001) — the product default
           - whole # whole-object caching (block caching disabled) — baseline
         default: blocks
+      size_threshold:
+        description: "Max cacheable object size in bytes (empty = 1 GiB default; tiered defaults to 16 MiB when empty)."
+        type: string
+        default: ""
       block_size:
         description: "Block size in bytes for blocks mode (empty = 1 MiB default). e.g. 65536 to match the 64 KiB GET RANGE size."
         type: string
@@ -36,10 +47,18 @@ on:
         default: ""
   workflow_call:
     inputs:
+      mode:
+        description: "TAG operating mode: transparent (default) | tiered"
+        type: string
+        default: transparent
       cache_mode:
-        description: "Cache mode to benchmark: blocks (default) | whole"
+        description: "Cache mode to benchmark: blocks (default) | whole (ignored in tiered)"
         type: string
         default: blocks
+      size_threshold:
+        description: "Max cacheable object size in bytes (empty = 1 GiB; tiered defaults to 16 MiB)"
+        type: string
+        default: ""
       block_size:
         description: "Block size in bytes for blocks mode (empty = 1 MiB default)"
         type: string
@@ -115,12 +134,25 @@ jobs:
       # uses the 1 MiB default. warp GET RANGE reads 64 KiB ranges from 256 MiB objects (the SlateDB
       # pattern), so at 1 MiB blocks each 64 KiB read pulls a 1 MiB block (~16x read amplification);
       # pass block_size=65536 to size blocks to the range (1:1) and measure where block caching wins.
+      #
+      # mode=tiered benchmarks the local-tier store: block caching is FORCED off (tiered rejects it
+      # at startup), and size_threshold defaults to 16 MiB so the benchmark's objects (kept <= that,
+      # see the Run step) are stored and served entirely locally — zero upstream traffic, which is
+      # the tiered path worth measuring. TAG_MODE/TAG_CACHE_SIZE_THRESHOLD are read from the
+      # environment the binary inherits (like TAG_CACHE_MAX_POPULATE_MEMORY), so no Makefile change
+      # is needed.
       - name: Start TAG (local mode)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          TAG_CACHE_BLOCK_CACHING_ENABLED: ${{ inputs.cache_mode == 'whole' && 'false' || 'true' }}
+          TAG_MODE: ${{ inputs.mode }}
+          # Tiered is whole-object only (tiered + block caching is a fatal config), so force it off
+          # regardless of cache_mode; otherwise the whole/blocks choice stands.
+          TAG_CACHE_BLOCK_CACHING_ENABLED: ${{ (inputs.mode == 'tiered' || inputs.cache_mode == 'whole') && 'false' || 'true' }}
           TAG_CACHE_BLOCK_SIZE: ${{ inputs.block_size }}
+          # Explicit size_threshold wins; else tiered defaults to 16 MiB (16777216) and other modes
+          # keep TAG's 1 GiB default.
+          TAG_CACHE_SIZE_THRESHOLD: ${{ inputs.size_threshold != '' && inputs.size_threshold || (inputs.mode == 'tiered' && '16777216' || '') }}
           TAG_CACHE_MAX_POPULATE_MEMORY: ${{ inputs.max_populate_memory }}
         run: make s3-test-local
 
@@ -129,6 +161,12 @@ jobs:
       # warm-hit-dominated GET RANGE run: range_objects=1 range_obj_size=64MiB shrinks the
       # block working set to ~1k blocks, so a standard-duration run's ~25k random reads hit
       # warm blocks almost entirely — measuring the serve path instead of upstream fetches.
+      #
+      # In tiered mode the objects must fit the local tier (<= size_threshold, 16 MiB by default)
+      # or they forward upstream and the local-tier path is not measured. The full-object obj_size
+      # default (4 MiB) already fits; only the GET RANGE object (256 MiB default) is too big, so it
+      # defaults to 16 MiB in tiered when not explicitly set. An explicit override still wins — a
+      # size above the threshold deliberately exercises the upstream-tier forward.
       - name: Run warp benchmarks
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -137,7 +175,7 @@ jobs:
           WARP_DURATION: ${{ inputs.duration }}
           WARP_OBJ_SIZE: ${{ inputs.obj_size }}
           WARP_RANGE_OBJECTS: ${{ inputs.range_objects }}
-          WARP_RANGE_OBJ_SIZE: ${{ inputs.range_obj_size }}
+          WARP_RANGE_OBJ_SIZE: ${{ inputs.range_obj_size != '' && inputs.range_obj_size || (inputs.mode == 'tiered' && '16MiB' || '') }}
         run: make bench-warp
 
       - name: Upload benchmark results

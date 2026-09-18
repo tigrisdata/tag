@@ -308,6 +308,10 @@ run: build
 run-verbose: build
 	TAG_LOG_LEVEL=debug ./$(BINARY_NAME)
 
+.PHONY: run-tiered
+run-tiered: build
+	TAG_MODE=tiered ./$(BINARY_NAME)
+
 # Clean targets
 .PHONY: clean
 clean:
@@ -364,10 +368,12 @@ help:
 	@echo "Run targets:"
 	@echo "  run           - Run TAG with default options (use --help for CLI flags)"
 	@echo "  run-verbose   - Run TAG with debug logging (use --version for version info)"
+	@echo "  run-tiered    - Run TAG in tiered store mode (TAG_MODE=tiered)"
 	@echo ""
 	@echo "S3 compatibility test targets:"
 	@echo "  s3-test-local          - Start TAG locally with embedded cache"
 	@echo "  s3-test-local-blocks   - Start TAG locally with block-aligned caching on (small block_size)"
+	@echo "  s3-test-local-tiered   - Start TAG locally in tiered store mode (TAG_MODE=tiered)"
 	@echo "  s3-test-local-cluster  - Start TAG locally as a 2-node cluster"
 	@echo "  s3-test-local-cluster-blocks - Start a 2-node cluster with block-aligned caching on"
 	@echo "  s3-tests               - Run S3 compatibility tests (Python s3-tests)"
@@ -466,6 +472,18 @@ s3-test-local-blocks:
 	@TAG_CACHE_BLOCK_CACHING_ENABLED=true \
 		TAG_CACHE_BLOCK_SIZE=$(TAG_TEST_BLOCK_SIZE) \
 		$(MAKE) s3-test-local
+
+# Same single-node setup as s3-test-local but in tiered store mode (TAG_MODE=tiered): the
+# local metadata is authoritative, small objects are served entirely from the local tier,
+# large ones pass through with a marker. Tiered auto-selects CAS coordination and forces
+# block caching off. Expect BY-DESIGN failures from the ceph suite's multipart/copy
+# read-backs (v1 punts: no marker is stamped, so they read as authoritative misses) and
+# from request shapes the local engine answers 501 (see docs/tiered-mode.md). Stop it with
+# s3-test-local-down (same process, ports, and data dir).
+.PHONY: s3-test-local-tiered
+s3-test-local-tiered:
+	@echo "Starting TAG in tiered store mode..."
+	@TAG_MODE=tiered 		$(MAKE) s3-test-local
 
 # Local development: Run a 2-node TAG cluster on host with embedded cache
 # Uses non-default ports to avoid macOS conflicts (AirPlay uses 7000)

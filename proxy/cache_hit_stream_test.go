@@ -195,7 +195,9 @@ func requestCount(t *testing.T, status string) float64 {
 	t.Helper()
 
 	var metric dto.Metric
-	if err := metrics.RequestsTotal.WithLabelValues("GetObject", status).Write(&metric); err != nil {
+	// mode defaults to "unknown" in tests (SetMode is a main.go concern); the
+	// cache-hit paths this test exercises record source=local.
+	if err := metrics.RequestsTotal.WithLabelValues("GetObject", status, "unknown", metrics.SourceLocal).Write(&metric); err != nil {
 		t.Fatalf("read %s request count: %v", status, err)
 	}
 	return metric.GetCounter().GetValue()

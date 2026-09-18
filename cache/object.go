@@ -2,6 +2,8 @@
 package cache
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -43,6 +45,10 @@ type CachedObjectMeta struct {
 	PartsCount           string            `json:"parts_count,omitempty"`            // x-amz-mp-parts-count
 	UserMetadata         map[string]string `json:"user_metadata,omitempty"`          // x-amz-meta-*
 	StatusCode           int               `json:"status_code"`                      // Original HTTP status (200, etc.)
+	// BodyUpstream marks a tiered-mode entry whose body lives upstream (the large
+	// tier): this metadata is authoritative for existence, HEAD, and conditionals,
+	// while GET bodies are forwarded. False means the body is stored locally.
+	BodyUpstream bool `json:"body_upstream,omitempty"`
 	// BlockSize records the block granularity for a block-mode entry (RFC 0001). 0 means
 	// the body is stored as a single whole blob (MakeBodyKey); >0 means the body is stored
 	// as fixed-size blocks (MakeBlockKey) of this size. Captured at populate time so an
@@ -55,6 +61,26 @@ type CachedObjectMeta struct {
 	// hint, not an invariant: false (including on entries written before the field existed)
 	// only means the probe-first path is used.
 	BlocksComplete bool `json:"blocks_complete,omitempty"`
+	// BodyRef, when set, is the body key discriminator for this entry —
+	// a per-write unique id minted by the LOCAL-STORE ENGINE, which streams
+	// the body into the cache before its MD5 (the ETag) is known and so
+	// cannot key the body by content. Null on every proxy-written entry:
+	// proxy populates learn the ETag from upstream headers before the body
+	// streams and keep content-addressed keys (and their convergent
+	// double-write dedup). This is a WRITER-OWNERSHIP invariant, not a
+	// migration state — readers resolve through BodyDiscriminator and never
+	// care who wrote the entry.
+	BodyRef string `json:"body_ref,omitempty"`
+	// ContentLengthKnown records that ContentLength carries a real declared or
+	// measured length — including a genuine 0 for an empty object. Encode sets
+	// it automatically from ContentLength >= 0; DecodeMeta treats a row
+	// WITHOUT it whose ContentLength is 0 as UNKNOWN (-1): rows persisted
+	// before the -1 sentinel existed stored 0 for both "empty" and "unknown"
+	// (no Content-Length on the upstream response), and re-reading that
+	// ambiguous 0 as an affirmative zero length would serve non-empty cached
+	// objects as empty. Those legacy rows revert to their pre-upgrade
+	// omit-the-header behavior until TTL replaces them.
+	ContentLengthKnown bool `json:"content_length_known,omitempty"`
 	// CachedAt is the Unix time (seconds) this meta was built from a live upstream response.
 	// Rewrites of an existing meta that do NOT consult upstream (the blocks-complete
 	// promotion) use it to compute the entry's remaining TTL so they never extend its
@@ -86,9 +112,15 @@ func MetaFromHTTPHeaders(bucket, key string, statusCode int, headers http.Header
 		UserMetadata:         make(map[string]string),
 	}
 
-	// Parse Content-Length
+	// Parse Content-Length. Absent means UNKNOWN (a chunked upstream
+	// response), recorded as -1 — never 0, which is a real length (an empty
+	// object) that WriteHeaders must advertise. Producers that know the exact
+	// body length (the local-store engine, block populates) overwrite this
+	// with the measured value.
 	if cl := headers.Get("Content-Length"); cl != "" {
 		meta.ContentLength, _ = strconv.ParseInt(cl, 10, 64)
+	} else {
+		meta.ContentLength = -1
 	}
 
 	// Parse Last-Modified to Unix timestamp
@@ -133,7 +165,13 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter, opts ...WriteHead
 	if m.ContentType != "" {
 		w.Header().Set("Content-Type", m.ContentType)
 	}
-	if m.ContentLength > 0 {
+	if m.ContentLength >= 0 {
+		// Zero included: S3 sends Content-Length: 0 for an empty object, and a HEAD
+		// without it makes clients read the length as unknown rather than zero.
+		// Negative means genuinely unknown (a chunked upstream response,
+		// recorded as -1 by MetaFromHTTPHeaders) and the header is omitted —
+		// an affirmative 0 there would make clients read a non-empty object
+		// as zero bytes.
 		w.Header().Set("Content-Length", strconv.FormatInt(m.ContentLength, 10))
 	}
 	if m.LastModified > 0 {
@@ -172,8 +210,12 @@ func (m *CachedObjectMeta) WriteHeaders(w http.ResponseWriter, opts ...WriteHead
 	}
 	// Write user metadata with lowercase keys per S3 convention
 	for k, v := range m.UserMetadata {
+		// Written via the map directly so the wire name stays lowercase, as S3
+		// sends it. Header.Set would canonicalize to X-Amz-Meta-..., and botocore
+		// derives its Metadata keys from the case-preserved wire name — canonical
+		// casing turns the user's key "meta1" into "Meta1" on the client.
 		lk := strings.ToLower(k)
-		w.Header().Set(lk, v)
+		w.Header()[lk] = []string{v}
 	}
 
 	// Apply options (may override headers like Content-Length for range responses)
@@ -227,6 +269,44 @@ func (m *CachedObjectMeta) MatchesETag(etag string) bool {
 	return normalizeETag(etag) == normalizeETag(m.ETag)
 }
 
+// MatchesETagHeader evaluates a full If-Match / If-None-Match header value
+// against the object's ETag. RFC 7232 allows a comma-separated LIST of
+// entity-tags ("e1", "e2"), and matching the header as one opaque tag makes a
+// list that contains the live ETag never match — fatal on the authoritative
+// paths (origin-less and tiered), where there is no upstream to answer
+// correctly instead: legal conditional writes 412 and valid 304s are lost.
+// Splitting on ',' is exact here because ETags are quoted strings whose only
+// legal inner characters exclude ',' (RFC 7232 §2.3).
+//
+// strong selects the comparison function (RFC 7232 §2.3.2): If-Match REQUIRES
+// strong comparison — a W/ weak validator never matches, so a conditional
+// overwrite gated on one is refused — while If-None-Match uses weak
+// comparison, where W/"x" and "x" match.
+func (m *CachedObjectMeta) MatchesETagHeader(header string, strong bool) bool {
+	if header == "" || m.ETag == "" {
+		return false
+	}
+	if header == "*" {
+		return true
+	}
+	for _, candidate := range strings.Split(header, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" {
+			return true
+		}
+		if candidate == "" {
+			continue
+		}
+		if strong && (strings.HasPrefix(candidate, "W/") || strings.HasPrefix(m.ETag, "W/")) {
+			continue
+		}
+		if normalizeETag(candidate) == normalizeETag(m.ETag) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsModifiedSince returns true if the object was modified after the given time.
 // Used for If-Modified-Since conditional requests.
 func (m *CachedObjectMeta) IsModifiedSince(since time.Time) bool {
@@ -261,16 +341,26 @@ func etagKeyComponent(etag string) string {
 	return etag
 }
 
-// Encode serializes metadata to JSON bytes for cache storage.
+// Encode serializes metadata to JSON bytes for cache storage. It stamps
+// ContentLengthKnown from the length itself, so every producer — engine
+// writes, markers, block finalizes — gets the disambiguation without
+// having to remember the field exists.
 func (m *CachedObjectMeta) Encode() ([]byte, error) {
+	m.ContentLengthKnown = m.ContentLength >= 0
 	return json.Marshal(m)
 }
 
-// DecodeMeta deserializes JSON bytes to CachedObjectMeta.
+// DecodeMeta deserializes JSON bytes to CachedObjectMeta. A row without
+// ContentLengthKnown whose ContentLength is 0 predates the -1 unknown
+// sentinel, where 0 was ambiguous between "empty" and "unknown" — it decodes
+// as unknown so a non-empty cached object is never served as empty.
 func DecodeMeta(data []byte) (*CachedObjectMeta, error) {
 	var meta CachedObjectMeta
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, err
+	}
+	if !meta.ContentLengthKnown && meta.ContentLength == 0 {
+		meta.ContentLength = -1
 	}
 	return &meta, nil
 }
@@ -293,6 +383,31 @@ func MakeMetaKey(bucket, key string) string {
 // resolved. The ETag is normalized with etagKeyComponent, which keeps the
 // weak/strong distinction so different validators never collide on one key. Objects
 // with no ETag fall back to the unversioned key (no version discriminator exists).
+// BodyDiscriminator returns the string this entry's body key is derived
+// from: BodyRef when set (engine-written entries, whose bodies are keyed by
+// a per-write id), else the ETag (proxy-written entries, content-addressed).
+// Every body read, probe, or targeted delete for an entry must resolve
+// through this — deriving from the ETag directly serves the wrong (absent)
+// key for engine entries.
+func (m *CachedObjectMeta) BodyDiscriminator() string {
+	if m.BodyRef != "" {
+		return m.BodyRef
+	}
+	return m.ETag
+}
+
+// NewBodyRef mints a per-write body key discriminator for entries whose
+// ETag is not known until the body has fully streamed (the local-store
+// engine's PUT). Uniqueness is what matters; the timestamp fallback keeps a
+// usable id even if the entropy source fails.
+func NewBodyRef() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "ref-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b[:])
+}
+
 func MakeBodyKey(bucket, key, etag string) string {
 	if etag == "" {
 		return bodyKeyPrefix + bucket + "|" + key

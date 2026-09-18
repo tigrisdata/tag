@@ -96,12 +96,38 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	// requestedCounts tracks how many entries each key was requested under (the same
 	// key may appear multiple times with different version IDs).
 	var requestedCounts map[string]int
+	// Tiered: pre-forward tokens per key, so the post-success converge is
+	// ordered — see convergeTieredDelete.
+	type tieredPrior struct {
+		version uint64
+		known   bool
+	}
+	var tieredPriors map[string]tieredPrior
+	if s.config.IsTiered() {
+		tieredPriors = make(map[string]tieredPrior)
+	}
 	if s.cache.IsEnabled() {
 		var deleteReq deleteObjectsRequest
 		if xmlErr := xml.Unmarshal(bodyBytes, &deleteReq); xmlErr == nil {
 			requestedCounts = make(map[string]int)
 			for _, obj := range deleteReq.Objects {
-				s.invalidateObject(context.Background(), bucket, obj.Key)
+				// Proxy modes only — see preForwardInvalidate; in tiered
+				// mode a listed key may be a local-tier only-copy that a
+				// rejected bulk delete must leave intact (the per-key
+				// post-success converge below carries tiered).
+				s.preForwardInvalidate(context.Background(), bucket, obj.Key)
+				if tieredPriors != nil {
+					if _, seen := tieredPriors[obj.Key]; !seen {
+						// Claim before capturing the token, held for the whole
+						// bulk delete: cancels and excludes re-tiers so a heal
+						// cannot resurrect a deleted key past the ordered
+						// converge (see HandleDeleteObject).
+						s.claimRetierWrite(bucket, obj.Key)
+						defer s.releaseRetierWrite(bucket, obj.Key)
+						_, v, known := s.captureMarkerPrior(context.Background(), bucket, obj.Key)
+						tieredPriors[obj.Key] = tieredPrior{version: v, known: known}
+					}
+				}
 				requestedCounts[obj.Key]++
 				log.Debug().
 					Str("bucket", bucket).
@@ -133,7 +159,12 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 			if parsed && reqN <= erroredCounts[key] {
 				continue // every requested entry for this key errored — object still present
 			}
-			s.invalidateObject(context.Background(), bucket, key)
+			if tieredPriors != nil {
+				p := tieredPriors[key]
+				s.convergeTieredDelete(bucket, key, p.version, p.known)
+				continue
+			}
+			s.convergeInvalidation(context.Background(), bucket, key)
 		}
 	}
 
@@ -142,7 +173,7 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordRequest("DeleteObjects", status, time.Since(start).Seconds())
+	metrics.RecordRequest("DeleteObjects", status, metrics.SourceUpstream, time.Since(start).Seconds())
 
 	return err
 }
