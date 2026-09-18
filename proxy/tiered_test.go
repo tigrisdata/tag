@@ -1506,3 +1506,133 @@ func TestTieredForwardedDeleteCancelsInflightRetier(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A tiered CopyObject must converge the destination under its PRE-FORWARD
+// version — the same rule as a forwarded DELETE. A small PUT acked while the
+// copy is in flight is the local tier's only copy and must survive; the old
+// unconditional converge out-deleted it behind the copy's 200.
+func TestTieredCopyConvergeSparesRacingPut(t *testing.T) {
+	mock, _, _ := tieredMock()
+	var svc *Service
+	raced := make(chan struct{})
+	mock.captureFunc = func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+		// Mid-copy: a small client PUT commits a new local-tier object.
+		put := httptest.NewRequest(http.MethodPut, "/b/dst", strings.NewReader("racer-wins"))
+		if err := svc.HandlePutObject(httptest.NewRecorder(), put); err != nil {
+			t.Errorf("racing PUT: %v", err)
+		}
+		close(raced)
+		body := `<CopyObjectResult><ETag>"copied"</ETag></CopyObjectResult>`
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+		return &ResponseCapture{StatusCode: http.StatusOK, Body: []byte(body), Complete: true, Headers: http.Header{}}, nil
+	}
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 1024
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	svc = NewService(mock, c, cfg)
+
+	// Seed a prior local-tier destination so the copy has state to displace.
+	if w := tieredDo(t, svc, http.MethodPut, "/b/dst", "old", nil); w.Code != http.StatusOK {
+		t.Fatalf("seed PUT: %d", w.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/b/dst", nil)
+	req.Header.Set("X-Amz-Copy-Source", "/b/src")
+	if err := svc.HandleCopyObject(httptest.NewRecorder(), req); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	<-raced
+
+	// The racing PUT's object must survive the converge.
+	cur, found, _ := c.GetMeta(context.Background(), "b", "dst")
+	if !found || cur == nil || cur.BodyUpstream {
+		t.Fatalf("racing PUT's local object was out-deleted by the copy converge: %+v", cur)
+	}
+	if g := tieredDo(t, svc, http.MethodGet, "/b/dst", "", nil); g.Code != http.StatusOK || g.Body.String() != "racer-wins" {
+		t.Fatalf("GET = %d %q, want the racing PUT's bytes", g.Code, g.Body.String())
+	}
+}
+
+// deleteIfVersionFlakeClient fails the first N meta-key DeleteIfVersion calls
+// with a transient error (after recording each attempt's version) and lets
+// later ones through — the transient-converge shape.
+type deleteIfVersionFlakeClient struct {
+	cacheclient.CacheClient
+	mu       sync.Mutex
+	failN    int
+	versions []uint64
+}
+
+func (d *deleteIfVersionFlakeClient) DeleteIfVersion(ctx context.Context, key string, version uint64) error {
+	if !strings.HasPrefix(key, "meta|") {
+		return d.CacheClient.DeleteIfVersion(ctx, key, version)
+	}
+	d.mu.Lock()
+	d.versions = append(d.versions, version)
+	n := len(d.versions)
+	d.mu.Unlock()
+	if n <= d.failN {
+		return errors.New("transient converge failure")
+	}
+	return d.CacheClient.DeleteIfVersion(ctx, key, version)
+}
+
+// The tiered converge retries ONCE on a transient error, under the SAME
+// version token (the guard must not weaken across the retry), and attempts
+// exactly twice on persistent failure — a client holds its 2xx, so a
+// converge that never lands leaves deleted metadata authoritative until TTL.
+func TestTieredConvergeRetriesOnceUnderSameVersion(t *testing.T) {
+	newSvc := func(failN int) (*Service, *cache.Cache, *deleteIfVersionFlakeClient) {
+		mock, _, _ := tieredMock()
+		flake := &deleteIfVersionFlakeClient{CacheClient: cacheclient.NewMemoryCache(), failN: failN}
+		cfg := config.NewDefault()
+		cfg.Mode = config.ModeTiered
+		cfg.Cache.SetBlockCachingEnabled(false)
+		cfg.Cache.SizeThreshold = 1024
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		c := cache.NewCacheWithClient(flake, &cfg.Cache)
+		return NewService(mock, c, cfg), c, flake
+	}
+	seedMarker := func(c *cache.Cache) uint64 {
+		marker := &cache.CachedObjectMeta{Bucket: "b", Key: "obj", ETag: `"up-1"`, BodyUpstream: true, ContentLength: 5000, StatusCode: 200}
+		_, tok, _, _ := c.GetMetaWithVersion(context.Background(), "b", "obj")
+		if wrote, err := c.PutMetaIfVersion(context.Background(), "b", "obj", marker, 60, tok); err != nil || !wrote {
+			t.Fatalf("seed marker: %v", err)
+		}
+		_, v, _, _ := c.GetMetaWithVersion(context.Background(), "b", "obj")
+		return v
+	}
+
+	// Transient: first attempt fails, retry succeeds under the same version.
+	svc, c, flake := newSvc(1)
+	v := seedMarker(c)
+	svc.convergeTieredDelete("b", "obj", v, true)
+	if len(flake.versions) != 2 {
+		t.Fatalf("attempts = %d, want 2 (one retry)", len(flake.versions))
+	}
+	if flake.versions[0] != v || flake.versions[1] != v {
+		t.Fatalf("retry changed the version guard: %v, want both == %d", flake.versions, v)
+	}
+	if _, found, _ := c.GetMeta(context.Background(), "b", "obj"); found {
+		t.Fatal("converge did not land on the retry")
+	}
+
+	// Persistent: exactly two attempts, then give up (metadata stays until TTL).
+	svc2, c2, flake2 := newSvc(99)
+	v2 := seedMarker(c2)
+	svc2.convergeTieredDelete("b", "obj", v2, true)
+	if len(flake2.versions) != 2 {
+		t.Fatalf("persistent-failure attempts = %d, want exactly 2", len(flake2.versions))
+	}
+	if _, found, _ := c2.GetMeta(context.Background(), "b", "obj"); !found {
+		t.Fatal("metadata vanished despite every converge attempt failing")
+	}
+}
