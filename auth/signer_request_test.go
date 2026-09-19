@@ -133,6 +133,39 @@ func TestRequestSignerSignRequestMatchesLegacyURLAndSignature(t *testing.T) {
 	}
 }
 
+func TestRequestSignerSignRequestPreservesHeaderValueSlices(t *testing.T) {
+	values := []string{"application/octet-stream", "text/plain"}
+	signer := NewRequestSigner("https://upstream.example.com", "us-east-1")
+	req, err := signer.SignRequest(
+		t.Context(),
+		http.MethodPut,
+		"/bucket/object",
+		strings.NewReader("body"),
+		"",
+		requestSignerTestAccessKey,
+		requestSignerTestSecretKey,
+		http.Header{
+			"Content-Type":              values,
+			"X-Tigris-Proxy-Access-Key": {"must-not-forward"},
+			"X-Request-Id":              {"must-not-forward"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("SignRequest() error = %v", err)
+	}
+
+	gotValues := req.Header["Content-Type"]
+	if len(gotValues) != len(values) || &gotValues[0] != &values[0] {
+		t.Fatalf("forwarded values do not preserve the input slice: got %#v want %#v", gotValues, values)
+	}
+	if req.Header.Get("X-Tigris-Proxy-Access-Key") != "" {
+		t.Error("proxy header was forwarded")
+	}
+	if req.Header.Get("X-Request-Id") != "" {
+		t.Error("unrelated header was forwarded")
+	}
+}
+
 func TestRequestSignerSignRequestMatchesLegacyURLFields(t *testing.T) {
 	tests := []struct {
 		name     string

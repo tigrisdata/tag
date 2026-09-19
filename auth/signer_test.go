@@ -241,6 +241,12 @@ func TestShouldCopyHeader(t *testing.T) {
 		// Conditional request headers
 		{"If-None-Match", true},
 		{"If-Modified-Since", true},
+		// Non-ASCII names retain the lowercasing fallback used by the previous classifier.
+		{"X-Amz-日本", true},
+		{"X-Tigris-Proxy-日本", false},
+		{"İF-MATCH", true},
+		{"日本-X-Amz-Meta", false},
+		{"\xffX-Amz-Meta", false},
 		// Not copied
 		{"Authorization", false},
 		{"Host", false},
