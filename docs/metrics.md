@@ -469,7 +469,7 @@ signal.
 
 | Label     | Description                                                              |
 | --------- | ------------------------------------------------------------------------ |
-| `outcome` | `deleted`, `already_gone` (404), `replaced` (412 — a newer version took the key, left alone), `rejected` (other upstream refusal), `error` (request failed), `no_etag` (no displaced ETag to bind to; skipped), `live_marker` (skipped: the key's current metadata is a live marker for this ETag — the body is authoritative again), `marker_repaired` (a same-ETag marker raced in during the delete; the repair removed it, converging on an authoritative miss the caller re-populates), `repair_failed` (the repair could not run or could not remove the raced-in marker — it may stay authoritative over a deleted body until TTL) |
+| `outcome` | `deleted`, `already_gone` (404), `replaced` (412 — a newer version took the key, left alone), `rejected` (other upstream refusal), `error` (request failed), `no_etag` (no displaced ETag to bind to; skipped), `unverified_backend` (skipped: non-Tigris endpoint, where If-Match enforcement on DELETE is unverified — cleanup is disabled by construction), `live_marker` (skipped: the key's current metadata is a live marker for this ETag — the body is authoritative again), `marker_repaired` (a same-ETag marker raced in during the delete; the repair removed it, converging on an authoritative miss the caller re-populates), `repair_failed` (the repair could not run or could not remove the raced-in marker — it may stay authoritative over a deleted body until TTL) |
 
 ```promql
 # Orphan-producing cleanup rate (should be ~0)
