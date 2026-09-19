@@ -57,21 +57,23 @@ on their first validated read.
 
 **Forwarding flavor is decided by the endpoint.** Tiering is a caching
 topology, not a forwarding flavor: a tiered deployment fronting a Tigris
-endpoint (`*.tigris.dev`, `*.storage.dev`, localhost) forwards the transparent
-way (client signature preserved, `X-Tigris-Proxy-*` identity headers, keys
-learned from Tigris); one fronting any other S3-compatible endpoint forwards
-the signing way (TAG validates the caller against its credential store and
-re-signs). Only transparent mode itself is pinned to Tigris. The startup log
-states which flavor was selected.
+domain (`*.tigris.dev`, `*.storage.dev`) forwards the transparent way (client
+signature preserved, `X-Tigris-Proxy-*` identity headers, keys learned from
+Tigris); one fronting any other endpoint — including `localhost`, which
+transparent mode allows for local testing but which earns no trust claim
+about the backend behind it — forwards the signing way (TAG validates the
+caller against its credential store and re-signs). The startup log states
+which flavor was selected.
 
-**Credential requirement**: unlike proxy mode's read-only guidance (which
-targets customer buckets), tiered mode's upstream is the operator's own cache
-bucket, and the credentials TAG forwards with — the validated caller's key on
-Tigris, the credential-store key otherwise — must have **delete** permission
-there: the cross-tier cleanup DELETE and the re-tier fetch are signed with
-them. With read-only credentials every cleanup is rejected (visible as
-`tag_tiered_cleanup_total{outcome="rejected"}`) and displaced upstream copies
-accumulate until bucket expiry.
+**Credential requirement** (Tigris-backed tiered deployments): unlike proxy
+mode's read-only guidance (which targets customer buckets), tiered mode's
+upstream is the operator's own cache bucket, and the validated caller's key
+must have **delete** permission there — the cross-tier cleanup DELETE is
+signed with it. With read-only credentials every cleanup is rejected (visible
+as `tag_tiered_cleanup_total{outcome="rejected"}`) and displaced upstream
+copies accumulate until bucket expiry. On any other endpoint the cleanup is
+never issued (next paragraph), so the credential-store key needs **read**
+permission only — the re-tier fetch is a GET — and `rejected` cannot occur.
 
 **Non-Tigris endpoints: cross-tier cleanup is disabled.** The cleanup DELETE
 carries `If-Match` so a racing replacement is never deleted, and that safety
