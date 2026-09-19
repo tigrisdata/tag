@@ -191,10 +191,11 @@ func main() {
 		log.Warn().Err(err).Msg("Failed to load credentials from environment")
 	}
 
-	// Initialize proxy signer unless running in signing mode. Transparent and
-	// tiered modes both forward with proxy headers and need TAG's own creds.
+	// Initialize the proxy signer for transparent forwarding (proxy headers,
+	// TAG's own creds). Whether tiered forwards transparently or by signing
+	// is decided by its endpoint — see Config.ForwardsTransparently.
 	var proxySigner *auth.ProxySigner
-	if cfg.ResolvedMode() != config.ModeSigning {
+	if cfg.ForwardsTransparently() {
 		accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
 		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 		if accessKey == "" || secretKey == "" {
@@ -203,14 +204,22 @@ func main() {
 		proxySigner = auth.NewProxySigner(accessKey, secretKey)
 		log.Info().Str("mode", cfg.ResolvedMode()).Msg("Proxy mode enabled")
 	} else {
-		log.Info().Str("endpoint", cfg.Upstream.Endpoint).Msg("Signing mode enabled")
+		log.Info().Str("mode", cfg.ResolvedMode()).Str("endpoint", cfg.Upstream.Endpoint).Msg("Signing forwarding enabled")
 		if !config.IsTigrisEndpoint(cfg.Upstream.Endpoint) {
 			log.Warn().Str("endpoint", cfg.Upstream.Endpoint).
 				Msg("Running against a non-Tigris S3 endpoint; transparent-proxy features are unavailable and third-party backends are community-supported")
+			if cfg.IsTiered() {
+				// The cross-tier cleanup DELETE carries If-Match so a racing
+				// replacement is never deleted; that ordering is verified on
+				// Tigris only. Say so once at startup rather than let a
+				// silently-ignored precondition surprise an operator.
+				log.Warn().Str("endpoint", cfg.Upstream.Endpoint).
+					Msg("Tiered mode on a non-Tigris endpoint: If-Match on the cross-tier cleanup DELETE is verified on Tigris only; if this backend ignores it, an overwrite racing a cleanup can lose the replacement's upstream copy")
+			}
 		}
 	}
 
-	if credStore.Count() == 0 && cfg.ResolvedMode() == config.ModeSigning {
+	if credStore.Count() == 0 && !cfg.ForwardsTransparently() {
 		log.Warn().Msg("No credentials loaded - TAG will reject all requests")
 	}
 
@@ -315,9 +324,11 @@ func main() {
 		objectCache = cache.NewDisabledCache()
 	}
 
-	// 3. Initialize local auth (transparent and tiered modes)
+	// 3. Initialize local auth (transparent forwarding: derived signing keys
+	// learned from Tigris). Signing forwarding validates against the
+	// credential store inside the forwarder instead.
 	var localAuth *proxy.LocalAuthConfig
-	if cfg.ResolvedMode() != config.ModeSigning {
+	if cfg.ForwardsTransparently() {
 		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 		derivedKeyStore := auth.NewDerivedKeyStore(auth.DefaultDerivedKeyTTL)
 		keyUnwrapper, err := auth.NewKeyUnwrapper(secretKey)

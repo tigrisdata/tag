@@ -55,13 +55,30 @@ marker, so they stay readable) — the first such write's 2xx is itself what
 teaches the keys, and re-tier-on-read moves those objects into the local tier
 on their first validated read.
 
+**Forwarding flavor is decided by the endpoint.** Tiering is a caching
+topology, not a forwarding flavor: a tiered deployment fronting a Tigris
+endpoint (`*.tigris.dev`, `*.storage.dev`, localhost) forwards the transparent
+way (client signature preserved, `X-Tigris-Proxy-*` identity headers, keys
+learned from Tigris); one fronting any other S3-compatible endpoint forwards
+the signing way (TAG validates the caller against its credential store and
+re-signs). Only transparent mode itself is pinned to Tigris. The startup log
+states which flavor was selected.
+
 **Credential requirement**: unlike proxy mode's read-only guidance (which
 targets customer buckets), tiered mode's upstream is the operator's own cache
-bucket, and TAG's `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` must have
-**delete** permission there — the cross-tier cleanup DELETE and the re-tier
-fetch are signed with TAG's own credentials. With read-only credentials every
-cleanup is rejected (visible as `tag_tiered_cleanup_total{outcome="rejected"}`)
-and displaced upstream copies accumulate until bucket expiry.
+bucket, and the credentials TAG forwards with — the validated caller's key on
+Tigris, the credential-store key otherwise — must have **delete** permission
+there: the cross-tier cleanup DELETE and the re-tier fetch are signed with
+them. With read-only credentials every cleanup is rejected (visible as
+`tag_tiered_cleanup_total{outcome="rejected"}`) and displaced upstream copies
+accumulate until bucket expiry.
+
+**Non-Tigris endpoint caveat**: the cleanup DELETE carries `If-Match` so a
+racing replacement is never deleted. Tigris enforces that precondition; other
+backends may ignore it, in which case an overwrite racing a cleanup can lose
+the replacement's upstream copy (the pre-DELETE live-marker check narrows this
+to a same-round-trip race). TAG warns at startup. Deployments whose keys are
+never overwritten (content- or version-addressed) are unaffected.
 
 ## Configuration
 

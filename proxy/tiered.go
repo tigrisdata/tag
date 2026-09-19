@@ -851,9 +851,10 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 		// exactly this ETag — that body is authoritative again, not an
 		// orphan. (A racer between this check and the DELETE narrows to the
 		// same-ETag re-establishment landing inside one round trip; the
-		// If-Match still guards every different-ETag interleaving — Tigris
-		// enforces conditional DELETEs against the object's current version,
-		// so a different-ETag racer's body is provably left intact.)
+		// If-Match still guards every different-ETag interleaving on Tigris,
+		// which enforces conditional DELETEs against the object's current
+		// version; a non-Tigris backend that ignores If-Match narrows the
+		// guard to this pre-check alone — main.go warns at startup.)
 		if cur, found, gerr := s.cache.GetMeta(ctx, bucket, key); gerr == nil && found && cur != nil && cur.BodyUpstream && cur.ETag == etag {
 			metrics.RecordTieredCleanupSkipped("live_marker")
 			return
