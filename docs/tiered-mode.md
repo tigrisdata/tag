@@ -72,8 +72,12 @@ must have **delete** permission there — the cross-tier cleanup DELETE is
 signed with it. With read-only credentials every cleanup is rejected (visible
 as `tag_tiered_cleanup_total{outcome="rejected"}`) and displaced upstream
 copies accumulate until bucket expiry. On any other endpoint the cleanup is
-never issued (next paragraph), so the credential-store key needs **read**
-permission only — the re-tier fetch is a GET — and `rejected` cannot occur.
+never issued (next paragraph), so TAG's *background* operations need only
+**read** on the key (the re-tier fetch is a GET) and `rejected` cannot occur.
+That is not the key's overall requirement: on the signing flavor the same
+credential-store key re-signs every forwarded client operation — large-object
+PUTs, upstream-tier DELETEs, multipart, copies — so it must carry whatever
+those operations need.
 
 **Non-Tigris endpoints: cross-tier cleanup is disabled.** The cleanup DELETE
 carries `If-Match` so a racing replacement is never deleted, and that safety
