@@ -49,7 +49,8 @@ const (
 		"000000000000000000000000000000000000000000000000000000000000" +
 		"?uploadId=benchmark%2Fupload%20id%25-with-a-longer-opaque-upload-token-" +
 		"000000000000000000000000000000000000000000000000000000000000&partNumber=9999"
-	signingForwarderBenchmarkUploadPartBody = "benchmark upload part body with escaped-key coverage"
+	signingForwarderBenchmarkUploadPartBody  = "benchmark upload part body with escaped-key coverage"
+	signingForwarderBenchmarkMetadataPutBody = "benchmark metadata put body"
 )
 
 type signingForwarderBenchmarkTransport struct {
@@ -276,4 +277,114 @@ func BenchmarkServiceHandlePassthroughSigningUploadPartParallel(b *testing.B) {
 			}
 		}
 	})
+}
+
+// BenchmarkServiceHandlePassthroughSigningMetadataPutParallel measures a signed PUT
+// carrying a metadata-heavy header set through the same controlled upstream path.
+func BenchmarkServiceHandlePassthroughSigningMetadataPutParallel(b *testing.B) {
+	service, incomingRequest := newSigningPassthroughBenchmark(
+		b,
+		http.MethodPut,
+		signingForwarderBenchmarkUploadPartPath,
+		signingForwarderBenchmarkMetadataPutBody,
+		http.Header{
+			"Content-Type":                {"application/octet-stream"},
+			"X-Amz-Expected-Bucket-Owner": {"123456789012"},
+			"X-Amz-Meta-Customer":         {"customer-123"},
+			"X-Amz-Meta-Project":          {"analytics"},
+			"X-Amz-Meta-Region":           {"us-east-1"},
+			"X-Amz-Meta-Owner":            {"platform"},
+			"X-Amz-Meta-Purpose":          {"benchmark"},
+			"X-Amz-Meta-Retention":        {"30d"},
+			"X-Amz-Meta-Source":           {"ingest"},
+			"X-Amz-Meta-Team":             {"storage"},
+			"X-Amz-Meta-Tier":             {"hot"},
+		},
+	)
+	b.SetParallelism(1)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		req := incomingRequest.Clone(context.Background())
+		body := newSigningForwarderBenchmarkBody(signingForwarderBenchmarkMetadataPutBody)
+		req.Body = body
+		writer := signingForwarderBenchmarkResponseWriter{header: make(http.Header)}
+		for pb.Next() {
+			body.Reset(signingForwarderBenchmarkMetadataPutBody)
+			if err := service.HandlePassthrough(&writer, req); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func benchmarkValidateAndGetCredentialsParallel(b *testing.B, service *Service, incomingRequest *http.Request) {
+	b.Helper()
+	forwarder := service.forwarder
+	b.SetParallelism(1)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		req := incomingRequest.Clone(context.Background())
+		for pb.Next() {
+			result, accessKey, secretKey, err := forwarder.ValidateAndGetCredentials(req)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if result != AuthValidated || accessKey != signingForwarderBenchmarkAccessKey || secretKey != signingForwarderBenchmarkSecretKey {
+				b.Fatalf("validated credentials = (%d, %q, %q), want valid benchmark credentials", result, accessKey, secretKey)
+			}
+		}
+	})
+}
+
+// BenchmarkSigningForwarderValidateAndGetCredentialsPutParallel measures the
+// validation seam for ordinary and metadata-heavy signed PUT requests.
+func BenchmarkSigningForwarderValidateAndGetCredentialsPutParallel(b *testing.B) {
+	cases := []struct {
+		name    string
+		body    string
+		headers http.Header
+	}{
+		{
+			name: "ordinary",
+			body: signingForwarderBenchmarkUploadPartBody,
+			headers: http.Header{
+				"Content-Type":                {"application/octet-stream"},
+				"X-Amz-Expected-Bucket-Owner": {"123456789012"},
+			},
+		},
+		{
+			name: "metadata-heavy",
+			body: signingForwarderBenchmarkMetadataPutBody,
+			headers: http.Header{
+				"Content-Type":                {"application/octet-stream"},
+				"X-Amz-Expected-Bucket-Owner": {"123456789012"},
+				"X-Amz-Meta-Customer":         {"customer-123"},
+				"X-Amz-Meta-Project":          {"analytics"},
+				"X-Amz-Meta-Region":           {"us-east-1"},
+				"X-Amz-Meta-Owner":            {"platform"},
+				"X-Amz-Meta-Purpose":          {"benchmark"},
+				"X-Amz-Meta-Retention":        {"30d"},
+				"X-Amz-Meta-Source":           {"ingest"},
+				"X-Amz-Meta-Team":             {"storage"},
+				"X-Amz-Meta-Tier":             {"hot"},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			service, incomingRequest := newSigningPassthroughBenchmark(
+				b,
+				http.MethodPut,
+				signingForwarderBenchmarkUploadPartPath,
+				tc.body,
+				tc.headers,
+			)
+			benchmarkValidateAndGetCredentialsParallel(b, service, incomingRequest)
+		})
+	}
 }
