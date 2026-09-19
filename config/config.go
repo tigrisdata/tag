@@ -175,6 +175,28 @@ func (c *Config) ResolvedMode() string {
 // IsTiered returns whether TAG runs in tiered store mode.
 func (c *Config) IsTiered() bool { return c.ResolvedMode() == ModeTiered }
 
+// ForwardsTransparently reports whether upstream requests are forwarded the
+// transparent way — client signature preserved, X-Tigris-Proxy-* identity
+// headers added, credentials learned from Tigris — as opposed to the signing
+// way (TAG validates against its credential store and re-signs). Transparent
+// mode always does; signing mode never does; TIERED derives it from the
+// endpoint: the proxy-header path is meaningful only to Tigris, so a tiered
+// deployment fronting a Tigris endpoint forwards transparently and one
+// fronting any other S3-compatible endpoint forwards by signing. Tiering is a
+// caching topology, not a forwarding flavor — this is the one place the two
+// are joined, so every transparent-vs-signing fork must key on it rather than
+// on the mode name.
+func (c *Config) ForwardsTransparently() bool {
+	switch c.ResolvedMode() {
+	case ModeTransparent:
+		return true
+	case ModeTiered:
+		return IsTigrisEndpoint(c.Upstream.Endpoint)
+	default:
+		return false
+	}
+}
+
 // UpstreamConfig holds Tigris endpoint configuration.
 type UpstreamConfig struct {
 	Endpoint            string `yaml:"endpoint"`                // Tigris S3 endpoint (e.g., https://fly.storage.tigris.dev)
@@ -801,7 +823,10 @@ func validate(cfg *Config) error {
 	if err := validateMode(cfg); err != nil {
 		return err
 	}
-	if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint, cfg.ResolvedMode() != ModeSigning); err != nil {
+	// Only TRANSPARENT mode is pinned to Tigris (its proxy headers are
+	// Tigris-specific). Tiered is allowed on any S3-compatible endpoint — it
+	// derives its forwarding flavor from the endpoint (ForwardsTransparently).
+	if err := validateUpstreamEndpoint(cfg.Upstream.Endpoint, cfg.ResolvedMode() == ModeTransparent); err != nil {
 		return err
 	}
 	if err := validateTLS(&cfg.Server); err != nil {
@@ -898,6 +923,9 @@ func IsTigrisEndpoint(endpoint string) bool {
 	if host == "localhost" {
 		return true
 	}
+	// Hostnames are case-insensitive (RFC 4343); this predicate now selects
+	// the forwarding flavor, so a mixed-case URL must not fall into signing.
+	host = strings.ToLower(host)
 	return strings.HasSuffix(host, ".tigris.dev") || strings.HasSuffix(host, ".storage.dev")
 }
 

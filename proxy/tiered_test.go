@@ -1636,3 +1636,48 @@ func TestTieredConvergeRetriesOnceUnderSameVersion(t *testing.T) {
 		t.Fatal("metadata vanished despite every converge attempt failing")
 	}
 }
+
+// On a non-Tigris endpoint the cross-tier cleanup DELETE is disabled by
+// construction: If-Match enforcement on DELETE is verified on Tigris only, and
+// a backend that ignored it could delete a racing replacement. The displaced
+// upstream copy is left for bucket expiry. (The gate returns synchronously
+// before any goroutine is spawned, so a delete that was going to happen would
+// already be in flight by the time the PUT returns.)
+func TestTieredCleanupDisabledOnNonTigrisEndpoint(t *testing.T) {
+	mock, _, _ := tieredMock()
+	var deletes atomic.Int32
+	mock.doObjectDeleteFunc = func(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error) {
+		deletes.Add(1)
+		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+	}
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Upstream.Endpoint = "https://ns.compat.objectstorage.us-ashburn-1.oraclecloud.com"
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 8
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("tiered on a non-Tigris endpoint must validate: %v", err)
+	}
+	if cfg.ForwardsTransparently() {
+		t.Fatal("fixture: expected signing flavor")
+	}
+	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// Large PUT stamps an upstream-tier marker; the small overwrite displaces it —
+	// the exact trigger for cross-tier cleanup on Tigris.
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "way past threshold", nil); w.Code != http.StatusOK {
+		t.Fatalf("large PUT status = %d", w.Code)
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "tiny", nil); w.Code != http.StatusOK {
+		t.Fatalf("small PUT status = %d", w.Code)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := deletes.Load(); n != 0 {
+		t.Fatalf("cleanup DELETE issued %d time(s) on a non-Tigris endpoint, want 0", n)
+	}
+	// The small object is the live, servable local-tier entry regardless.
+	if g := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); g.Code != http.StatusOK || g.Body.String() != "tiny" {
+		t.Fatalf("GET = %d %q, want the local-tier object", g.Code, g.Body.String())
+	}
+}

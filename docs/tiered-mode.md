@@ -55,13 +55,35 @@ marker, so they stay readable) — the first such write's 2xx is itself what
 teaches the keys, and re-tier-on-read moves those objects into the local tier
 on their first validated read.
 
+**Forwarding flavor is decided by the endpoint.** Tiering is a caching
+topology, not a forwarding flavor: a tiered deployment fronting a Tigris
+endpoint (`*.tigris.dev`, `*.storage.dev`, localhost) forwards the transparent
+way (client signature preserved, `X-Tigris-Proxy-*` identity headers, keys
+learned from Tigris); one fronting any other S3-compatible endpoint forwards
+the signing way (TAG validates the caller against its credential store and
+re-signs). Only transparent mode itself is pinned to Tigris. The startup log
+states which flavor was selected.
+
 **Credential requirement**: unlike proxy mode's read-only guidance (which
 targets customer buckets), tiered mode's upstream is the operator's own cache
-bucket, and TAG's `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` must have
-**delete** permission there — the cross-tier cleanup DELETE and the re-tier
-fetch are signed with TAG's own credentials. With read-only credentials every
-cleanup is rejected (visible as `tag_tiered_cleanup_total{outcome="rejected"}`)
-and displaced upstream copies accumulate until bucket expiry.
+bucket, and the credentials TAG forwards with — the validated caller's key on
+Tigris, the credential-store key otherwise — must have **delete** permission
+there: the cross-tier cleanup DELETE and the re-tier fetch are signed with
+them. With read-only credentials every cleanup is rejected (visible as
+`tag_tiered_cleanup_total{outcome="rejected"}`) and displaced upstream copies
+accumulate until bucket expiry.
+
+**Non-Tigris endpoints: cross-tier cleanup is disabled.** The cleanup DELETE
+carries `If-Match` so a racing replacement is never deleted, and that safety
+rests on the backend *enforcing* the precondition — verified on Tigris only.
+A backend that accepts but ignores `If-Match` would let the delete remove a
+replacement that landed after the pre-check, a durable loss no metadata repair
+can undo. So on any other endpoint TAG does not issue the delete at all: the
+displaced upstream copy ages out by bucket expiry (the same outcome as
+read-only credentials), counted as
+`tag_tiered_cleanup_total{outcome="unverified_backend"}`, and the startup log
+says so. Deployments whose keys are never overwritten (content- or
+version-addressed) never trigger cleanup in the first place.
 
 ## Configuration
 

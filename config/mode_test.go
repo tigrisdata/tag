@@ -181,3 +181,58 @@ upstream:
 		t.Fatal("block caching enabled in tiered mode")
 	}
 }
+
+// Tiering is a caching topology, not a forwarding flavor: a tiered deployment
+// may front any S3-compatible endpoint, forwarding by signing there and
+// transparently on Tigris. Only transparent mode itself is pinned to Tigris.
+func TestMode_TieredAllowsNonTigrisEndpoint(t *testing.T) {
+	var cfg Config
+	applyDefaults(&cfg)
+	cfg.Mode = ModeTiered
+	cfg.Upstream.Endpoint = "https://ns.compat.objectstorage.us-ashburn-1.oraclecloud.com"
+	if err := validate(&cfg); err != nil {
+		t.Fatalf("validate rejected tiered mode on a non-Tigris endpoint: %v", err)
+	}
+	if cfg.ForwardsTransparently() {
+		t.Fatal("tiered on a non-Tigris endpoint must forward by signing")
+	}
+}
+
+func TestMode_TransparentRejectsNonTigrisEndpoint(t *testing.T) {
+	var cfg Config
+	applyDefaults(&cfg)
+	cfg.Mode = ModeTransparent
+	cfg.Upstream.Endpoint = "https://ns.compat.objectstorage.us-ashburn-1.oraclecloud.com"
+	if err := validate(&cfg); err == nil {
+		t.Fatal("validate accepted transparent mode on a non-Tigris endpoint")
+	}
+}
+
+func TestMode_ForwardsTransparently(t *testing.T) {
+	tigris, oci := "https://t3.storage.dev", "https://ns.compat.objectstorage.us-ashburn-1.oraclecloud.com"
+	cases := []struct {
+		name     string
+		mode     string
+		endpoint string
+		want     bool
+	}{
+		{"transparent/tigris", ModeTransparent, tigris, true},
+		{"signing/tigris", ModeSigning, tigris, false},
+		{"signing/oci", ModeSigning, oci, false},
+		{"tiered/tigris", ModeTiered, tigris, true},
+		{"tiered/oci", ModeTiered, oci, false},
+		{"default(transparent)/tigris", "", tigris, true},
+		{"tiered/tigris mixed-case host", ModeTiered, "https://T3.Storage.Dev", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg Config
+			applyDefaults(&cfg)
+			cfg.Mode = tc.mode
+			cfg.Upstream.Endpoint = tc.endpoint
+			if got := cfg.ForwardsTransparently(); got != tc.want {
+				t.Fatalf("ForwardsTransparently() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
