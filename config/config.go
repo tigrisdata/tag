@@ -191,6 +191,10 @@ func (c *Config) ForwardsTransparently() bool {
 	case ModeTransparent:
 		return true
 	case ModeTiered:
+		// Strict Tigris-domain check, NOT the transparent allowlist: the
+		// transparent flavor re-enables the cross-tier cleanup DELETE, whose
+		// safety needs a backend verified to enforce If-Match. A localhost
+		// stand-in (a local MinIO) earns no such trust and forwards by signing.
 		return IsTigrisEndpoint(c.Upstream.Endpoint)
 	default:
 		return false
@@ -909,24 +913,37 @@ func validateTLS(server *ServerConfig) error {
 	return nil
 }
 
-// IsTigrisEndpoint reports whether the endpoint host is localhost or a Tigris
-// domain (*.tigris.dev, *.storage.dev). Transparent proxy mode requires a Tigris
-// endpoint; signing mode works with any S3-compatible endpoint. Returns false if
-// the endpoint cannot be parsed.
+// IsTigrisEndpoint reports whether the endpoint host is a Tigris domain
+// (*.tigris.dev, *.storage.dev) — the backends whose behavior TAG has
+// verified: X-Tigris-Proxy-* headers understood, keys learnable, If-Match on
+// DELETE enforced. It selects tiered mode's forwarding flavor and therefore
+// whether the cross-tier cleanup may run, so it is deliberately STRICT:
+// localhost is not Tigris (a local MinIO is not), see IsTransparentEndpoint
+// for the transparent-mode allowlist. Hostnames are case-insensitive
+// (RFC 4343). Returns false if the endpoint cannot be parsed.
 func IsTigrisEndpoint(endpoint string) bool {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return false
 	}
+	host := strings.ToLower(u.Hostname()) // strips port if present
+	return strings.HasSuffix(host, ".tigris.dev") || strings.HasSuffix(host, ".storage.dev")
+}
 
-	host := u.Hostname() // strips port if present
-	if host == "localhost" {
+// IsTransparentEndpoint reports whether transparent proxy mode may target the
+// endpoint: a Tigris domain, or localhost for local testing against a Tigris
+// stand-in. This is an ALLOWLIST for the transparent-mode validator only — it
+// carries no trust claim about the backend, which is why tiered mode's flavor
+// selection uses IsTigrisEndpoint instead.
+func IsTransparentEndpoint(endpoint string) bool {
+	if IsTigrisEndpoint(endpoint) {
 		return true
 	}
-	// Hostnames are case-insensitive (RFC 4343); this predicate now selects
-	// the forwarding flavor, so a mixed-case URL must not fall into signing.
-	host = strings.ToLower(host)
-	return strings.HasSuffix(host, ".tigris.dev") || strings.HasSuffix(host, ".storage.dev")
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+	return strings.ToLower(u.Hostname()) == "localhost"
 }
 
 // validateUpstreamEndpoint ensures the upstream endpoint is a well-formed
@@ -946,7 +963,7 @@ func validateUpstreamEndpoint(endpoint string, transparent bool) error {
 	if u.Hostname() == "" {
 		return fmt.Errorf("upstream endpoint %q must include a host", endpoint)
 	}
-	if transparent && !IsTigrisEndpoint(endpoint) {
+	if transparent && !IsTransparentEndpoint(endpoint) {
 		return fmt.Errorf("upstream endpoint %q is not allowed in transparent proxy mode: host must be localhost, *.tigris.dev, or *.storage.dev (use signing mode for other S3-compatible services)", endpoint)
 	}
 	return nil

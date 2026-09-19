@@ -223,6 +223,8 @@ func TestMode_ForwardsTransparently(t *testing.T) {
 		{"tiered/oci", ModeTiered, oci, false},
 		{"default(transparent)/tigris", "", tigris, true},
 		{"tiered/tigris mixed-case host", ModeTiered, "https://T3.Storage.Dev", true},
+		{"tiered/localhost is NOT trusted → signing", ModeTiered, "http://localhost:9000", false},
+		{"tiered/Localhost mixed-case → signing", ModeTiered, "http://Localhost:9000", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -234,5 +236,20 @@ func TestMode_ForwardsTransparently(t *testing.T) {
 				t.Fatalf("ForwardsTransparently() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// Transparent mode keeps its localhost allowance for local testing; tiered
+// treats the same endpoint as untrusted (signing flavor, cleanup disabled).
+func TestMode_TransparentAllowsLocalhost(t *testing.T) {
+	var cfg Config
+	applyDefaults(&cfg)
+	cfg.Mode = ModeTransparent
+	cfg.Upstream.Endpoint = "http://Localhost:9000"
+	if err := validate(&cfg); err != nil {
+		t.Fatalf("validate rejected transparent mode on localhost: %v", err)
+	}
+	if !cfg.ForwardsTransparently() {
+		t.Fatal("transparent mode on localhost must forward transparently")
 	}
 }
