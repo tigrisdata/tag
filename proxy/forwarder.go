@@ -384,10 +384,9 @@ func (b *baseForwarder) DoAnonymousFullObjectRequest(ctx context.Context, bucket
 // SigV4 signing, like every TAG-initiated request. A non-empty etag becomes an
 // If-Match precondition: a 412 means the object was already replaced and must
 // be left alone. Tigris enforces If-Match on DELETE (conditional deletes are
-// ordered against the object's current version). Other S3-compatible
-// endpoints may silently ignore it — tiered mode warns at startup on a
-// non-Tigris endpoint, and the caller's live-marker pre-check bounds the
-// residual to a same-round-trip race.
+// ordered against the object's current version); because other backends may
+// silently ignore it, tiered mode issues this delete on Tigris only (the
+// cleanup is disabled elsewhere — see deleteUpstreamObjectAsync).
 func (b *baseForwarder) DoObjectDeleteRequest(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error) {
 	var extraHeaders http.Header
 	if etag != "" {

@@ -923,6 +923,9 @@ func IsTigrisEndpoint(endpoint string) bool {
 	if host == "localhost" {
 		return true
 	}
+	// Hostnames are case-insensitive (RFC 4343); this predicate now selects
+	// the forwarding flavor, so a mixed-case URL must not fall into signing.
+	host = strings.ToLower(host)
 	return strings.HasSuffix(host, ".tigris.dev") || strings.HasSuffix(host, ".storage.dev")
 }
 

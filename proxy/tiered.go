@@ -839,6 +839,17 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 		metrics.RecordTieredCleanupSkipped("no_etag")
 		return
 	}
+	if !s.config.ForwardsTransparently() {
+		// The delete's safety rests on the backend ENFORCING If-Match: a
+		// backend that accepts but ignores it would let this delete remove a
+		// replacement that landed after the pre-check — durable loss a
+		// metadata repair cannot undo. That enforcement is verified on
+		// Tigris only, so on any other endpoint the cleanup is disabled by
+		// construction (not merely warned about): the displaced copy ages
+		// out by bucket expiry, the same outcome as read-only credentials.
+		metrics.RecordTieredCleanupSkipped("unverified_backend")
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), tieredCleanupTimeout)
 		defer cancel()
@@ -851,10 +862,10 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 		// exactly this ETag — that body is authoritative again, not an
 		// orphan. (A racer between this check and the DELETE narrows to the
 		// same-ETag re-establishment landing inside one round trip; the
-		// If-Match still guards every different-ETag interleaving on Tigris,
-		// which enforces conditional DELETEs against the object's current
-		// version; a non-Tigris backend that ignores If-Match narrows the
-		// guard to this pre-check alone — main.go warns at startup.)
+		// If-Match still guards every different-ETag interleaving: Tigris
+		// enforces conditional DELETEs against the object's current version,
+		// and this path runs only on Tigris — see the unverified_backend gate
+		// above.)
 		if cur, found, gerr := s.cache.GetMeta(ctx, bucket, key); gerr == nil && found && cur != nil && cur.BodyUpstream && cur.ETag == etag {
 			metrics.RecordTieredCleanupSkipped("live_marker")
 			return

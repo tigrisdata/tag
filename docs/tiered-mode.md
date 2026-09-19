@@ -73,12 +73,17 @@ them. With read-only credentials every cleanup is rejected (visible as
 `tag_tiered_cleanup_total{outcome="rejected"}`) and displaced upstream copies
 accumulate until bucket expiry.
 
-**Non-Tigris endpoint caveat**: the cleanup DELETE carries `If-Match` so a
-racing replacement is never deleted. Tigris enforces that precondition; other
-backends may ignore it, in which case an overwrite racing a cleanup can lose
-the replacement's upstream copy (the pre-DELETE live-marker check narrows this
-to a same-round-trip race). TAG warns at startup. Deployments whose keys are
-never overwritten (content- or version-addressed) are unaffected.
+**Non-Tigris endpoints: cross-tier cleanup is disabled.** The cleanup DELETE
+carries `If-Match` so a racing replacement is never deleted, and that safety
+rests on the backend *enforcing* the precondition — verified on Tigris only.
+A backend that accepts but ignores `If-Match` would let the delete remove a
+replacement that landed after the pre-check, a durable loss no metadata repair
+can undo. So on any other endpoint TAG does not issue the delete at all: the
+displaced upstream copy ages out by bucket expiry (the same outcome as
+read-only credentials), counted as
+`tag_tiered_cleanup_total{outcome="unverified_backend"}`, and the startup log
+says so. Deployments whose keys are never overwritten (content- or
+version-addressed) never trigger cleanup in the first place.
 
 ## Configuration
 

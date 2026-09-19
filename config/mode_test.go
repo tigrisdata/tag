@@ -222,6 +222,7 @@ func TestMode_ForwardsTransparently(t *testing.T) {
 		{"tiered/tigris", ModeTiered, tigris, true},
 		{"tiered/oci", ModeTiered, oci, false},
 		{"default(transparent)/tigris", "", tigris, true},
+		{"tiered/tigris mixed-case host", ModeTiered, "https://T3.Storage.Dev", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

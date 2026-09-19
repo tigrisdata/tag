@@ -209,12 +209,12 @@ func main() {
 			log.Warn().Str("endpoint", cfg.Upstream.Endpoint).
 				Msg("Running against a non-Tigris S3 endpoint; transparent-proxy features are unavailable and third-party backends are community-supported")
 			if cfg.IsTiered() {
-				// The cross-tier cleanup DELETE carries If-Match so a racing
-				// replacement is never deleted; that ordering is verified on
-				// Tigris only. Say so once at startup rather than let a
-				// silently-ignored precondition surprise an operator.
-				log.Warn().Str("endpoint", cfg.Upstream.Endpoint).
-					Msg("Tiered mode on a non-Tigris endpoint: If-Match on the cross-tier cleanup DELETE is verified on Tigris only; if this backend ignores it, an overwrite racing a cleanup can lose the replacement's upstream copy")
+				// The cross-tier cleanup DELETE is safe only where If-Match is
+				// enforced (verified on Tigris), so it is disabled here by
+				// construction; say so once so the accumulating displaced
+				// copies are not a surprise.
+				log.Info().Str("endpoint", cfg.Upstream.Endpoint).
+					Msg("Tiered mode on a non-Tigris endpoint: cross-tier cleanup is disabled (If-Match on DELETE is verified on Tigris only); displaced upstream copies age out by bucket expiry")
 			}
 		}
 	}
