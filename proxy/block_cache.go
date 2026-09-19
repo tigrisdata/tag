@@ -454,7 +454,12 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 		s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, start, end, nil)
 		return out, nil
 	}
-	if errors.Is(err, errBlockStreamDegraded) && ctx.Err() == nil && start+cw.written <= end {
+	if errors.Is(err, errBlockStreamDegraded) &&
+		!errors.Is(err, cache.ErrBodyReadIdleTimeout) &&
+		ctx.Err() == nil && start+cw.written <= end {
+		// An idle cache-read cancellation is terminal after commitment: unlike a
+		// recoverable block miss, retrying it from upstream would violate the
+		// no-post-commit-fallback contract.
 		// The committed response can still be completed byte-exact from upstream: cw.written
 		// counts exactly the bytes delivered so far (buffered blocks are written whole; a
 		// direct-streamed partial block advances it precisely), so the remainder picks up at

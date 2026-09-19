@@ -112,6 +112,7 @@ TAG can be configured via YAML file or environment variables. Key settings:
 - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` - TAG's own Tigris credentials with read-only access (required). In transparent proxy mode (default), clients use their own credentials directly.
 - `TAG_CACHE_NODE_ID` - Unique node identifier for cluster mode
 - `TAG_CACHE_DISK_PATH` - Path to cache data directory
+- `cache.body_read_idle_timeout` / `TAG_CACHE_BODY_READ_IDLE_TIMEOUT` - Maximum idle gap between non-empty chunks from cache body and range streams (default: 60s)
 - `TAG_LOG_LEVEL` - Log level: debug, info, warn, error
 
 See [docs/configuration.md](docs/configuration.md) for full configuration reference.
