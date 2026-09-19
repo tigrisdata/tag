@@ -210,6 +210,119 @@ func TestCanonicalQueryStringReservedBytes(t *testing.T) {
 	}
 }
 
+func TestCanonicalSigningHeaderName(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		want   string
+	}{
+		{"lowercase host", "host", "host"},
+		{"mixed-case host", "hOsT", "host"},
+		{"lowercase content type", "content-type", "content-type"},
+		{"mixed-case content type", "cOnTeNt-TyPe", "content-type"},
+		{"lowercase x-amz", "x-amz-meta-color", "x-amz-meta-color"},
+		{"mixed-case x-amz", "X-aMz-MeTa-Color", "x-amz-meta-color"},
+		{"content encoding", "Content-Encoding", ""},
+		{"range", "Range", ""},
+		{"conditional", "If-None-Match", ""},
+		{"tigris", "Tigris-Force-Delete", ""},
+		{"authorization", "Authorization", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := canonicalSigningHeaderName(tt.header); got != tt.want {
+				t.Errorf("canonicalSigningHeaderName(%q) = %q, want %q", tt.header, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRequestSignerBuildCanonicalHeadersMixedCase(t *testing.T) {
+	signer := NewRequestSigner("https://upstream.example.com", "us-east-1")
+	req, err := http.NewRequest(http.MethodGet, "https://upstream.example.com/bucket/key", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header = http.Header{
+		"hOsT":                {" signing.example.com "},
+		"cOnTeNt-TyPe":        {" application/octet-stream "},
+		"X-aMz-MeTa-Color":    {" blue ", "green\t"},
+		"Content-Encoding":    {"gzip"},
+		"Range":               {"bytes=0-1"},
+		"Tigris-Force-Delete": {"true"},
+		"X-Tigris-Custom":     {"true"},
+	}
+
+	canonicalHeaders, signedHeaders := signer.buildCanonicalHeaders(req)
+	wantCanonicalHeaders := "content-type:application/octet-stream\n" +
+		"host:signing.example.com\n" +
+		"x-amz-meta-color:blue,green\n"
+	if canonicalHeaders != wantCanonicalHeaders {
+		t.Errorf("canonical headers = %q, want %q", canonicalHeaders, wantCanonicalHeaders)
+	}
+	const wantSignedHeaders = "content-type;host;x-amz-meta-color"
+	if signedHeaders != wantSignedHeaders {
+		t.Errorf("signed headers = %q, want %q", signedHeaders, wantSignedHeaders)
+	}
+}
+
+func TestRequestSignerBuildCanonicalHeadersCoalescesCaseVariants(t *testing.T) {
+	signer := NewRequestSigner("https://upstream.example.com", "us-east-1")
+	req, err := http.NewRequest(http.MethodGet, "https://upstream.example.com/bucket/key", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header = http.Header{
+		"Content-Type":     {"application/json"},
+		"content-type":     {"text/plain"},
+		"Host":             {"first.example.com"},
+		"host":             {"second.example.com"},
+		"X-Amz-Meta-Color": {"blue"},
+		"x-aMz-mEtA-cOlOr": {"green"},
+	}
+
+	canonicalHeaders, signedHeaders := signer.buildCanonicalHeaders(req)
+	for _, header := range []struct {
+		name   string
+		first  string
+		second string
+	}{
+		{"content-type", "application/json", "text/plain"},
+		{"host", "first.example.com", "second.example.com"},
+		{"x-amz-meta-color", "blue", "green"},
+	} {
+		if got := strings.Count(canonicalHeaders, header.name+":"); got != 1 {
+			t.Errorf("%s count = %d, want 1; canonical headers = %q", header.name, got, canonicalHeaders)
+		}
+		if !strings.Contains(canonicalHeaders, header.name+":"+header.first+"\n") &&
+			!strings.Contains(canonicalHeaders, header.name+":"+header.second+"\n") {
+			t.Errorf("canonical headers = %q, want one %s case-variant value", canonicalHeaders, header.name)
+		}
+	}
+	const wantSignedHeaders = "content-type;host;x-amz-meta-color"
+	if signedHeaders != wantSignedHeaders {
+		t.Errorf("signed headers = %q, want %q", signedHeaders, wantSignedHeaders)
+	}
+}
+
+func TestHasPrefixFold(t *testing.T) {
+	for _, tt := range []struct {
+		key    string
+		prefix string
+		want   bool
+	}{
+		{"X-AmZ-Meta-Color", "x-amz-", true},
+		{"tIgRiS-Force-Delete", "tigris-", true},
+		{"x-am", "x-amz-", false},
+		{"Content-Type", "x-amz-", false},
+	} {
+		if got := hasPrefixFold(tt.key, tt.prefix); got != tt.want {
+			t.Errorf("hasPrefixFold(%q, %q) = %v, want %v", tt.key, tt.prefix, got, tt.want)
+		}
+	}
+}
+
 func TestShouldCopyHeader(t *testing.T) {
 	tests := []struct {
 		header   string
@@ -220,11 +333,15 @@ func TestShouldCopyHeader(t *testing.T) {
 		{"Content-Length", true},
 		{"Content-Encoding", true},
 		{"Content-Disposition", true},
+		{"Content-Language", true},
 		{"Cache-Control", true},
 		{"Expires", true},
 		{"Content-MD5", true},
+		{"cOnTeNt-TyPe", true},
+		{"cOnTeNt-LaNgUaGe", true},
 		// All x-amz-* headers are allowed (signer overwrites X-Amz-Date etc.)
 		{"X-Amz-Meta-Custom", true},
+		{"x-AmZ-mEtA-CuStOm", true},
 		{"X-Amz-Meta-Another-Header", true},
 		{"X-Amz-Date", true},
 		{"X-Amz-Content-Sha256", true},
@@ -233,15 +350,22 @@ func TestShouldCopyHeader(t *testing.T) {
 		// Tigris-specific headers (tigris-* and x-tigris-*)
 		{"Tigris-Force-Delete", true},
 		{"X-Tigris-Custom", true},
+		{"tIgRiS-FoRcE-DeLeTe", true},
 		// Proxy headers are blocked to prevent client injection in signing mode
 		{"X-Tigris-Forwarded-Host", false},
+		{"x-TiGrIs-FoRwArDeD-HoSt", false},
 		{"X-Tigris-Proxy-Access-Key", false},
 		{"X-Tigris-Proxy-Timestamp", false},
 		{"X-Tigris-Proxy-Signature", false},
 		// Conditional request headers
+		{"If-Match", true},
 		{"If-None-Match", true},
 		{"If-Modified-Since", true},
+		{"If-Unmodified-Since", true},
+		{"iF-NoNe-MaTcH", true},
+		{"iF-UnMoDiFiEd-SiNcE", true},
 		// Not copied
+		{"", false},
 		{"Authorization", false},
 		{"Host", false},
 		{"Random-Header", false},
