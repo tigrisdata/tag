@@ -424,12 +424,37 @@ func (s *Service) streamFromUpstream(
 	if chunkSize <= 0 {
 		chunkSize = broadcast.DefaultChunkSize
 	}
-	buf := make([]byte, chunkSize)
+	// Lease the first read buffer from the broadcast pool. BroadcastOwned transfers
+	// a successful read to one listener and leaves this lease with us only when no
+	// listener accepted it, so a disconnected broadcast can keep reusing it.
+	// Keep the existing reusable input path for larger configured chunks: those
+	// buffers are intentionally not pooled, and leasing a fresh one per read would
+	// turn a single reusable allocation into one allocation per chunk.
+	ownedInput := chunkSize <= broadcast.DefaultChunkSize
+	var buf []byte
+	if ownedInput {
+		buf = broadcast.GetChunkBuf(chunkSize)
+	} else {
+		buf = make([]byte, chunkSize)
+	}
+	defer func() {
+		broadcast.PutChunkBuf(buf)
+	}()
 
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
-			broadcaster.Broadcast(buf[:n])
+			if ownedInput && broadcaster.BroadcastOwned(buf[:n]) {
+				// The first successful listener now owns this buffer. A fresh lease
+				// is needed before the next read so queued listeners cannot observe
+				// reuse.
+				buf = nil
+				if readErr == nil {
+					buf = broadcast.GetChunkBuf(chunkSize)
+				}
+			} else if !ownedInput {
+				broadcaster.Broadcast(buf[:n])
+			}
 		}
 
 		if readErr == io.EOF {
