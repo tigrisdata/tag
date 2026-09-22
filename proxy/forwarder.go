@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -174,6 +175,133 @@ type baseForwarder struct {
 	responseInterceptor ResponseInterceptor // Optional: called before headers are sent to client
 }
 
+const (
+	// A later flush is useful for incremental responses, but flushing every
+	// io.Copy write turns the reader's buffer boundaries into downstream writes.
+	// Keep later flushes bounded without making a fast response flush per read.
+	forwarderFlushBytes    = 512 * 1024
+	forwarderFlushInterval = 100 * time.Millisecond
+)
+
+// pacedFlushWriter flushes the first body bytes immediately and coalesces later
+// flushes by bytes or elapsed time. Its mutex serializes timer callbacks with
+// response writes because net/http ResponseWriters are not safe for concurrent
+// use by the handler and a timer.
+type pacedFlushWriter struct {
+	dst     io.Writer
+	flusher http.Flusher
+
+	mu              sync.Mutex
+	timer           *time.Timer
+	flushDeadline   time.Time
+	flushPending    bool
+	bytesSinceFlush int64
+	firstBodyWrite  bool
+	stopped         bool
+}
+
+func newPacedFlushWriter(dst io.Writer, flusher http.Flusher) *pacedFlushWriter {
+	return &pacedFlushWriter{dst: dst, flusher: flusher}
+}
+
+// findResponseFlusher follows transparent response-writer wrappers before
+// checking http.Flusher. Several handlers expose Flush while forwarding to an
+// underlying writer that does not support it; treating that forwarding method
+// as capability would add pacing work without providing a downstream flush.
+func findResponseFlusher(w http.ResponseWriter) (http.Flusher, bool) {
+	for range 8 {
+		if unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
+			next := unwrapper.Unwrap()
+			if next == nil {
+				return nil, false
+			}
+			w = next
+			continue
+		}
+		flusher, ok := w.(http.Flusher)
+		return flusher, ok
+	}
+	return nil, false
+}
+
+func (w *pacedFlushWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	n, err := w.dst.Write(p)
+	if n <= 0 || w.stopped {
+		return n, err
+	}
+
+	if !w.firstBodyWrite {
+		w.firstBodyWrite = true
+		w.flushLocked()
+		return n, err
+	}
+
+	w.bytesSinceFlush += int64(n)
+	if w.bytesSinceFlush >= forwarderFlushBytes {
+		w.flushLocked()
+	} else if !w.flushPending {
+		w.flushPending = true
+		w.flushDeadline = time.Now().Add(forwarderFlushInterval)
+		if w.timer == nil {
+			w.timer = time.AfterFunc(forwarderFlushInterval, w.delayedFlush)
+		} else {
+			w.timer.Reset(forwarderFlushInterval)
+		}
+	}
+	return n, err
+}
+
+func (w *pacedFlushWriter) delayedFlush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.stopped {
+		w.timer = nil
+		return
+	}
+	if time.Now().Before(w.flushDeadline) {
+		w.timer.Reset(time.Until(w.flushDeadline))
+		return
+	}
+	w.timer = nil
+	w.flushDeadline = time.Time{}
+	if !w.flushPending {
+		return
+	}
+	w.flushPending = false
+	w.bytesSinceFlush = 0
+	w.flusher.Flush()
+}
+
+func (w *pacedFlushWriter) flushLocked() {
+	if w.timer != nil {
+		w.flushDeadline = time.Now().Add(forwarderFlushInterval)
+	}
+	w.flushPending = false
+	w.bytesSinceFlush = 0
+	w.flusher.Flush()
+}
+
+func (w *pacedFlushWriter) stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.stopped = true
+	if w.timer != nil {
+		w.timer.Stop()
+		w.timer = nil
+	}
+	w.flushDeadline = time.Time{}
+	w.flushPending = false
+	if w.bytesSinceFlush > 0 {
+		w.bytesSinceFlush = 0
+		w.flusher.Flush()
+	}
+}
+
 // newBaseForwarder creates the shared base with HTTP client and signer.
 func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) baseForwarder {
 	if maxIdleConnsPerHost <= 0 {
@@ -238,10 +366,29 @@ func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *
 		respHeaders = resp.Header.Clone()
 	}
 
-	// Stream response back to client
+	// Stream response back to client. HTTP/1.x servers may stop accepting an
+	// inbound request body after response headers are flushed, so only enable
+	// eager downstream flushing for bodyless forwarded requests. A known-length
+	// response can keep net/http's normal transfer path without the streaming
+	// cadence. Keep net/http's content-type inference for
+	// responses that did not provide a Content-Type header.
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	n, copyErr := io.Copy(w, resp.Body)
+
+	var n int64
+	var copyErr error
+	if resp.ContentLength < 0 && inContentLength == 0 && resp.Header.Get("Content-Type") != "" {
+		if flusher, ok := findResponseFlusher(w); ok {
+			flusher.Flush()
+			flushWriter := newPacedFlushWriter(w, flusher)
+			n, copyErr = io.Copy(flushWriter, resp.Body)
+			flushWriter.stop()
+		} else {
+			n, copyErr = io.Copy(w, resp.Body)
+		}
+	} else {
+		n, copyErr = io.Copy(w, resp.Body)
+	}
 	if copyErr != nil {
 		log.Warn().Err(copyErr).Msg("Failed to copy response body to client")
 	}
