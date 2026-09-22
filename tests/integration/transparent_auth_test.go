@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/tag/auth"
+	"github.com/tigrisdata/tag/proxy"
 )
 
 // TestTransparentAuth_SigningKeyLearning_ThenCacheHit verifies the core transparent
@@ -67,6 +68,81 @@ func TestTransparentAuth_SigningKeyLearning_ThenCacheHit(t *testing.T) {
 	assert.Equal(t, content, body2)
 	env.AssertXCacheHit(t)
 	assert.Equal(t, int32(1), env.GetUpstreamRequestCount(), "Second request should be served from cache, upstream count should not increase")
+}
+
+// TestTransparentAuth_AuthzMissForwardsClientRequest verifies that a known key
+// without a current bucket grant skips local signature validation but still
+// forwards the original request to upstream and reports a cache miss.
+func TestTransparentAuth_AuthzMissForwardsClientRequest(t *testing.T) {
+	type observedRequest struct {
+		path          string
+		rawQuery      string
+		authorization string
+		xAmzDate      string
+	}
+
+	observed := make(chan observedRequest, 2)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observed <- observedRequest{
+			path:          r.URL.Path,
+			rawQuery:      r.URL.RawQuery,
+			authorization: r.Header.Get("Authorization"),
+			xAmzDate:      r.Header.Get("X-Amz-Date"),
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("upstream fallback"))
+	})
+
+	env := NewTestEnvironmentWithTransparentAuth(t, handler)
+	defer env.Close()
+
+	bucket := "tp-authz-miss-bucket"
+	key := "test-object.txt"
+	validReq, err := env.SignedRequest("GET", "/"+bucket+"/"+key+"?partNumber=1", nil)
+	require.NoError(t, err)
+
+	// Make the access key known to TAG but leave this bucket unauthorized. The
+	// exact signing key is immaterial to this fallback branch; using the request's
+	// scope keeps the fixture faithful to a learned key.
+	info, err := auth.ParseAuthInfo(validReq)
+	require.NoError(t, err)
+	env.DerivedKeyStore.Store(info.AccessKey, info.Date, info.Region, deriveSigningKeyForTest(TestSecretKey, info.Date, info.Region))
+	require.False(t, env.AuthzCache.IsAuthorized(TestAccessKey, bucket))
+
+	resp, err := http.DefaultClient.Do(validReq)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, []byte("upstream fallback"), body)
+	assert.Equal(t, proxy.XCacheMiss, string(env.GetLastXCacheStatus()))
+
+	got := <-observed
+	assert.Equal(t, "/"+bucket+"/"+key, got.path)
+	assert.Equal(t, "partNumber=1", got.rawQuery)
+	assert.Equal(t, validReq.Header.Get("Authorization"), got.authorization)
+	assert.Equal(t, validReq.Header.Get("X-Amz-Date"), got.xAmzDate)
+
+	// An invalid signature on the same known-but-unauthorized key follows the
+	// same authoritative upstream path instead of being rejected locally.
+	invalidReq := env.RequestWithInvalidSignature("GET", "/"+bucket+"/"+key)
+	wantInvalidAuth := invalidReq.Header.Get("Authorization")
+	actualInvalidReq, err := http.NewRequest(http.MethodGet, env.TAGServer.URL+"/"+bucket+"/"+key, nil)
+	require.NoError(t, err)
+	actualInvalidReq.Header = invalidReq.Header
+	resp, err = http.DefaultClient.Do(actualInvalidReq)
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, proxy.XCacheMiss, string(env.GetLastXCacheStatus()))
+
+	got = <-observed
+	assert.Equal(t, wantInvalidAuth, got.authorization)
+	assert.Equal(t, int32(2), env.GetUpstreamRequestCount())
 }
 
 // TestTransparentAuth_UnknownAccessKey_ForwardsToTigris verifies that requests
