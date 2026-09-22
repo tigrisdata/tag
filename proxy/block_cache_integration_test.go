@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -155,6 +156,22 @@ func newBlockServiceWithBudget(t *testing.T, mock *blockMockForwarder, blockSize
 	cfg.Cache.MaxPopulateMemoryBytes = budget
 	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
 	return NewService(mock, c, cfg), c
+}
+
+type stalledBlockRangeClient struct {
+	cacheclient.CacheClient
+	stallKey string
+	started  chan struct{}
+	once     sync.Once
+}
+
+func (c *stalledBlockRangeClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if key == c.stallKey {
+		c.once.Do(func() { close(c.started) })
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return c.CacheClient.GetRangeStream(ctx, key, start, end, w)
 }
 
 // Cold range miss forwards from upstream, then block-populates in the background; a
@@ -1557,6 +1574,52 @@ func TestBlockCache_CompleteEntryMidServeStaleSignalInvalidates(t *testing.T) {
 	// repeating the truncation.
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
 		t.Fatal("stale BlocksComplete entry survived a definitive mid-serve stale signal")
+	}
+}
+
+// An idle cache-read timeout after block headers are committed must not trigger the
+// upstream remainder salvage. The timeout is terminal for the already-committed cache response.
+func TestBlockCache_IdleTimeoutDoesNotSalvageCommittedResponse(t *testing.T) {
+	object := []byte("ABCDEFGHIJ")
+	mock := newBlockMock(object, `"v1"`)
+	memCache := cacheclient.NewMemoryCache()
+	stalled := &stalledBlockRangeClient{
+		CacheClient: memCache,
+		stallKey:    cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 1),
+		started:     make(chan struct{}),
+	}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	cfg.Cache.BodyReadIdleTimeout = 20 * time.Millisecond
+	c := cache.NewCacheWithClient(stalled, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("cold full GET: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	before := mock.blockGets.Load()
+	warm := httptest.NewRecorder()
+	err := svc.HandleGetObject(warm, fullGet(wowBucket, wowKey))
+	select {
+	case <-stalled.started:
+	case <-time.After(time.Second):
+		t.Fatal("stalled block read was not started")
+	}
+	if !errors.Is(err, cache.ErrBodyReadIdleTimeout) {
+		t.Fatalf("warm full GET error = %v, want cache idle timeout", err)
+	}
+	if got := mock.blockGets.Load() - before; got != 0 {
+		t.Fatalf("post-commit idle timeout triggered %d upstream remainder requests, want 0", got)
+	}
+	if warm.Code != http.StatusOK || warm.Body.String() != "ABCD" {
+		t.Fatalf("warm response = status %d body %q, want 200/ABCD", warm.Code, warm.Body.String())
 	}
 }
 
