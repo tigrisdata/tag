@@ -218,20 +218,7 @@ func (v *RequestValidator) buildCanonicalRequest(r *http.Request, signedHeaders 
 	// Canonical query string
 	canonicalQueryString := v.buildCanonicalQueryString(r.URL.Query())
 
-	// Canonical headers
-	canonicalHeaders := v.buildCanonicalHeadersFromList(r, signedHeaders)
-
-	// Signed headers string
-	signedHeadersStr := strings.Join(signedHeaders, ";")
-
-	return strings.Join([]string{
-		r.Method,
-		canonicalURI,
-		canonicalQueryString,
-		canonicalHeaders,
-		signedHeadersStr,
-		bodyHash,
-	}, "\n")
+	return buildCanonicalRequestFromParts(r, canonicalURI, canonicalQueryString, signedHeaders, bodyHash)
 }
 
 // buildCanonicalRequestPresigned builds the canonical request for presigned URL verification.
@@ -248,20 +235,33 @@ func (v *RequestValidator) buildCanonicalRequestPresigned(r *http.Request, signe
 	delete(query, "X-Amz-Signature")
 	canonicalQueryString := v.buildCanonicalQueryString(query)
 
-	// Canonical headers
-	canonicalHeaders := v.buildCanonicalHeadersFromList(r, signedHeaders)
+	return buildCanonicalRequestFromParts(r, canonicalURI, canonicalQueryString, signedHeaders, bodyHash)
+}
 
-	// Signed headers string
-	signedHeadersStr := strings.Join(signedHeaders, ";")
+func buildCanonicalRequestFromParts(r *http.Request, canonicalURI, canonicalQueryString string, signedHeaders []string, bodyHash string) string {
+	canonicalHeaderValues, canonicalHeadersSize := prepareCanonicalHeaders(r, signedHeaders)
+	canonicalRequestSize := len(r.Method) + len(canonicalURI) + len(canonicalQueryString) + canonicalHeadersSize + len(bodyHash) + 5
+	for i, name := range signedHeaders {
+		canonicalRequestSize += len(name)
+		if i > 0 {
+			canonicalRequestSize++
+		}
+	}
 
-	return strings.Join([]string{
-		r.Method,
-		canonicalURI,
-		canonicalQueryString,
-		canonicalHeaders,
-		signedHeadersStr,
-		bodyHash,
-	}, "\n")
+	var builder strings.Builder
+	builder.Grow(canonicalRequestSize)
+	builder.WriteString(r.Method)
+	builder.WriteByte('\n')
+	builder.WriteString(canonicalURI)
+	builder.WriteByte('\n')
+	builder.WriteString(canonicalQueryString)
+	builder.WriteByte('\n')
+	appendCanonicalHeadersFromList(&builder, signedHeaders, canonicalHeaderValues)
+	builder.WriteByte('\n')
+	appendSignedHeaders(&builder, signedHeaders)
+	builder.WriteByte('\n')
+	builder.WriteString(bodyHash)
+	return builder.String()
 }
 
 // buildCanonicalQueryString builds the canonical query string.
@@ -269,31 +269,51 @@ func (*RequestValidator) buildCanonicalQueryString(query url.Values) string {
 	return canonicalQueryString(query)
 }
 
-// buildCanonicalHeadersFromList builds canonical headers from a list of header names.
-func (v *RequestValidator) buildCanonicalHeadersFromList(r *http.Request, signedHeaders []string) string {
-	var builder strings.Builder
-
-	for _, name := range signedHeaders {
+// prepareCanonicalHeaders trims signed request header values in place and returns
+// their rendered values and total byte count.
+func prepareCanonicalHeaders(r *http.Request, signedHeaders []string) ([]string, int) {
+	canonicalValues := make([]string, len(signedHeaders))
+	size := 0
+	for i, name := range signedHeaders {
 		var value string
 		if name == "host" {
-			value = r.Host
-			if value == "" {
-				value = r.URL.Host
-			}
+			value = canonicalHost(r)
 		} else {
 			values := r.Header.Values(name)
-			// Trim and join values
-			for i, val := range values {
-				values[i] = strings.TrimSpace(val)
+			for i, value := range values {
+				values[i] = strings.TrimSpace(value)
 			}
 			value = strings.Join(values, ",")
 		}
 
-		builder.WriteString(name)
-		builder.WriteString(":")
-		builder.WriteString(value)
-		builder.WriteString("\n")
+		canonicalValues[i] = value
+		size += len(name) + len(value) + 2 // colon and newline
 	}
+	return canonicalValues, size
+}
 
-	return builder.String()
+// appendCanonicalHeadersFromList writes canonical headers from a list of header names.
+func appendCanonicalHeadersFromList(builder *strings.Builder, signedHeaders, canonicalValues []string) {
+	for i, name := range signedHeaders {
+		builder.WriteString(name)
+		builder.WriteByte(':')
+		builder.WriteString(canonicalValues[i])
+		builder.WriteByte('\n')
+	}
+}
+
+func canonicalHost(r *http.Request) string {
+	if r.Host != "" {
+		return r.Host
+	}
+	return r.URL.Host
+}
+
+func appendSignedHeaders(builder *strings.Builder, signedHeaders []string) {
+	for i, name := range signedHeaders {
+		if i > 0 {
+			builder.WriteByte(';')
+		}
+		builder.WriteString(name)
+	}
 }

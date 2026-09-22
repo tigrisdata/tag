@@ -9,7 +9,10 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/auth"
@@ -201,6 +204,165 @@ func newSigningPassthroughBenchmark(b testing.TB, method, path, body string, hea
 		validator:     auth.NewRequestValidator(store),
 	}
 	return NewService(forwarder, cache.NewDisabledCache(), config.NewDefault()), incomingRequest
+}
+
+type signingForwarderValidationBenchmarkCase struct {
+	name            string
+	metadataHeaders int
+	metadataBytes   int
+}
+
+var signingForwarderValidationBenchmarkCases = []signingForwarderValidationBenchmarkCase{
+	{name: "small"},
+	{name: "metadata_2KiB_one_header", metadataHeaders: 1, metadataBytes: 2048},
+	{name: "metadata_2KiB_sixteen_headers", metadataHeaders: 16, metadataBytes: 2048},
+}
+
+func newSigningForwarderValidationBenchmarkHeaders(t testing.TB, metadataHeaders, metadataBytes int) http.Header {
+	t.Helper()
+
+	if metadataHeaders == 0 && metadataBytes != 0 {
+		t.Fatalf("metadataBytes = %d with no metadata headers", metadataBytes)
+	}
+	if metadataHeaders > 0 && metadataBytes%metadataHeaders != 0 {
+		t.Fatalf("metadataBytes = %d is not divisible by metadataHeaders = %d", metadataBytes, metadataHeaders)
+	}
+
+	headers := make(http.Header, metadataHeaders+1)
+	if metadataHeaders > 0 {
+		value := strings.Repeat("m", metadataBytes/metadataHeaders)
+		for i := 0; i < metadataHeaders; i++ {
+			headers.Set(fmt.Sprintf("X-Amz-Meta-Benchmark-%02d", i), value)
+		}
+	}
+	return headers
+}
+
+func newSigningForwarderValidationBenchmarkRequest(t testing.TB, presigned bool, metadataHeaders, metadataBytes int) (*signingForwarder, *http.Request) {
+	t.Helper()
+
+	store := auth.NewCredentialStore()
+	store.AddCredential(signingForwarderBenchmarkAccessKey, signingForwarderBenchmarkSecretKey)
+	forwarder, ok := NewForwarder(store, "https://upstream.example.com", "us-east-1", 1, nil, nil).(*signingForwarder)
+	if !ok {
+		t.Fatal("NewForwarder returned a non-signing forwarder")
+	}
+	headers := newSigningForwarderValidationBenchmarkHeaders(t, metadataHeaders, metadataBytes)
+
+	if presigned {
+		req, err := http.NewRequest(http.MethodPut, "https://s3.amazonaws.com/benchmark-bucket/metadata-object", nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		req.Header = headers
+		req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+		query := req.URL.Query()
+		query.Set("X-Amz-Expires", "900")
+		req.URL.RawQuery = query.Encode()
+
+		signedURL, signedHeaders, err := v4.NewSigner().PresignHTTP(
+			context.Background(),
+			aws.Credentials{AccessKeyID: signingForwarderBenchmarkAccessKey, SecretAccessKey: signingForwarderBenchmarkSecretKey},
+			req,
+			"UNSIGNED-PAYLOAD",
+			"s3",
+			"us-east-1",
+			time.Now(),
+			func(options *v4.SignerOptions) {
+				options.DisableHeaderHoisting = true
+				options.DisableURIPathEscaping = true
+			},
+		)
+		if err != nil {
+			t.Fatalf("PresignHTTP: %v", err)
+		}
+		req, err = http.NewRequest(http.MethodPut, signedURL, nil)
+		if err != nil {
+			t.Fatalf("NewRequest signed URL: %v", err)
+		}
+		req.Header = signedHeaders
+		return forwarder, req
+	}
+
+	body := "benchmark request body"
+	bodyHashSum := sha256.Sum256([]byte(body))
+	req, err := auth.NewRequestSigner("https://s3.amazonaws.com", "us-east-1").SignRequest(
+		context.Background(),
+		http.MethodPut,
+		"/benchmark-bucket/metadata-object",
+		strings.NewReader(body),
+		hex.EncodeToString(bodyHashSum[:]),
+		signingForwarderBenchmarkAccessKey,
+		signingForwarderBenchmarkSecretKey,
+		headers,
+	)
+	if err != nil {
+		t.Fatalf("SignRequest: %v", err)
+	}
+	return forwarder, req
+}
+
+func validateSigningForwarderBenchmarkRequest(t testing.TB, forwarder *signingForwarder, req *http.Request) {
+	t.Helper()
+
+	result, accessKey, secretKey, err := forwarder.ValidateAndGetCredentials(req)
+	if err != nil {
+		t.Fatalf("ValidateAndGetCredentials: %v", err)
+	}
+	if result != AuthValidated {
+		t.Fatalf("ValidateAndGetCredentials result = %v, want %v", result, AuthValidated)
+	}
+	if accessKey != signingForwarderBenchmarkAccessKey {
+		t.Fatalf("ValidateAndGetCredentials access key = %q, want %q", accessKey, signingForwarderBenchmarkAccessKey)
+	}
+	if secretKey != signingForwarderBenchmarkSecretKey {
+		t.Fatalf("ValidateAndGetCredentials secret key = %q, want %q", secretKey, signingForwarderBenchmarkSecretKey)
+	}
+}
+
+func TestSigningForwarderValidateAndGetCredentialsBenchmarkRequests(t *testing.T) {
+	for _, presigned := range []bool{false, true} {
+		form := "signed"
+		if presigned {
+			form = "presigned"
+		}
+		for _, tc := range signingForwarderValidationBenchmarkCases {
+			t.Run(form+"/"+tc.name, func(t *testing.T) {
+				forwarder, req := newSigningForwarderValidationBenchmarkRequest(t, presigned, tc.metadataHeaders, tc.metadataBytes)
+				validateSigningForwarderBenchmarkRequest(t, forwarder, req)
+			})
+		}
+	}
+}
+
+func benchmarkSigningForwarderValidateAndGetCredentials(b *testing.B, presigned bool) {
+	for _, tc := range signingForwarderValidationBenchmarkCases {
+		b.Run(tc.name, func(b *testing.B) {
+			forwarder, req := newSigningForwarderValidationBenchmarkRequest(b, presigned, tc.metadataHeaders, tc.metadataBytes)
+			validateSigningForwarderBenchmarkRequest(b, forwarder, req)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				result, accessKey, secretKey, err := forwarder.ValidateAndGetCredentials(req)
+				if err != nil || result != AuthValidated || accessKey != signingForwarderBenchmarkAccessKey || secretKey != signingForwarderBenchmarkSecretKey {
+					b.Fatalf("ValidateAndGetCredentials = (%v, %q, %q, %v), want (%v, %q, %q, nil)", result, accessKey, secretKey, err, AuthValidated, signingForwarderBenchmarkAccessKey, signingForwarderBenchmarkSecretKey)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkSigningForwarderValidateAndGetCredentialsSignedPUT measures the
+// signing-mode credential-validation entry point for valid signed S3 PUTs.
+func BenchmarkSigningForwarderValidateAndGetCredentialsSignedPUT(b *testing.B) {
+	benchmarkSigningForwarderValidateAndGetCredentials(b, false)
+}
+
+// BenchmarkSigningForwarderValidateAndGetCredentialsPresignedPUT measures the
+// signing-mode credential-validation entry point for valid presigned S3 PUTs.
+func BenchmarkSigningForwarderValidateAndGetCredentialsPresignedPUT(b *testing.B) {
+	benchmarkSigningForwarderValidateAndGetCredentials(b, true)
 }
 
 // BenchmarkServiceHandlePassthroughSigning measures the signing-mode
