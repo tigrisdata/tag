@@ -12,6 +12,7 @@
 # Tunable via env vars (CI-friendly defaults shown):
 #   WARP_VERSION       warp version to install            (v1.5.0)
 #   WARP_HOST          TAG host:port                      (localhost:${TAG_HTTP_PORT:-8080})
+#   WARP_TLS           1 = connect with TLS (--tls)         (0)
 #   WARP_BUCKET        bucket for benchmark data          (tag-warp-benchmark)
 #   WARP_REGION        SigV4 region (must match TAG)      (auto)
 #   WARP_DURATION      duration per operation             (30s)
@@ -80,7 +81,8 @@ RANGE_OBJ_SIZE="${WARP_RANGE_OBJ_SIZE:-256MiB}"
 RANGE_SIZE="${WARP_RANGE_SIZE:-64KiB}"
 RANGE_OBJECTS="${WARP_RANGE_OBJECTS:-8}"
 
-# Flags shared by every operation. TAG is plain HTTP locally, so no --tls.
+# Flags shared by every operation. TAG is plain HTTP locally, so --tls is off
+# unless WARP_TLS=1 (benchmarking a TLS-terminated endpoint such as a gateway).
 # --lookup=path matches TAG/SDK path-style addressing; warp clears the bucket
 # before and after each run by default (no --noclear), so ops don't interfere.
 COMMON=(
@@ -93,6 +95,9 @@ COMMON=(
     --concurrent="$CONCURRENT"
     --duration="$DURATION"
 )
+if [ "${WARP_TLS:-0}" = "1" ]; then
+    COMMON+=(--tls)
+fi
 
 echo "TAG host: $HOST | bucket: $BUCKET | region: $REGION | duration: $DURATION | concurrent: $CONCURRENT"
 
