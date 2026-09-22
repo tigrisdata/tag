@@ -287,3 +287,46 @@ func TestCopyHeaders_MetadataLowercase(t *testing.T) {
 		t.Errorf("x-amz-meta-custom-key value = %q, want %q", dst["x-amz-meta-custom-key"][0], "custom-value")
 	}
 }
+
+func TestCopyHeaders_MixedCaseMetadataPrefix(t *testing.T) {
+	ordinaryValues := []string{"ordinary", "second"}
+	metadataValues := []string{"metadata", "another"}
+	src := http.Header{
+		"x-AmZ-MeTa-Custom-Key": metadataValues,
+		"X-AMZ-META-UPPER":      {"upper"},
+		"X-Amz-Meta-":           {"empty suffix"},
+		"X-Amz-Metad-Near-Miss": {"near miss"},
+		"X-Mixed-Case":          ordinaryValues,
+		"Short":                 {"short"},
+	}
+
+	dst := http.Header{}
+	copyHeaders(dst, src)
+
+	for _, key := range []string{"x-amz-meta-custom-key", "x-amz-meta-upper", "x-amz-meta-"} {
+		if _, ok := dst[key]; !ok {
+			t.Errorf("metadata key %q was not lowercased", key)
+		}
+	}
+	if _, ok := dst["x-AmZ-MeTa-Custom-Key"]; ok {
+		t.Error("mixed-case metadata key should not be retained")
+	}
+	if got := dst["x-amz-meta-custom-key"]; &got[0] != &metadataValues[0] {
+		t.Error("metadata value slice was not assigned unchanged")
+	}
+
+	for _, key := range []string{"X-Amz-Metad-Near-Miss", "X-Mixed-Case", "Short"} {
+		if _, ok := dst[key]; !ok {
+			t.Errorf("ordinary key %q was not retained", key)
+		}
+	}
+	if _, ok := dst["x-amz-metad-near-miss"]; ok {
+		t.Error("near-miss key should not be treated as metadata")
+	}
+	if got := dst["X-Mixed-Case"]; &got[0] != &ordinaryValues[0] {
+		t.Error("ordinary value slice was not assigned unchanged")
+	}
+	if got := dst.Get("X-Mixed-Case"); got != "ordinary" {
+		t.Errorf("ordinary value = %q, want ordinary", got)
+	}
+}
