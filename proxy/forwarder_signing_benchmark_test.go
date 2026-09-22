@@ -52,6 +52,32 @@ const (
 	signingForwarderBenchmarkUploadPartBody = "benchmark upload part body with escaped-key coverage"
 )
 
+var signingForwarderBenchmarkCopiedNonSigningHeaders = []struct {
+	key   string
+	value string
+}{
+	{"Content-Encoding", "gzip"},
+	{"Content-Disposition", "attachment"},
+	{"Content-Language", "en"},
+	{"Cache-Control", "no-cache"},
+	{"Expires", "Wed, 21 Oct 2015 07:28:00 GMT"},
+	{"Content-Md5", "Q2hlY2sgSW50ZWdyaXR5IQ=="},
+	{"Range", "bytes=0-1048575"},
+	{"If-Match", "\"benchmark-etag\""},
+	{"If-None-Match", "\"other-benchmark-etag\""},
+	{"Tigris-Force-Delete", "true"},
+}
+
+var signingForwarderBenchmarkCopiedHeaderCases = []struct {
+	name  string
+	count int
+}{
+	{"copied_headers_0", 0},
+	{"copied_headers_1", 1},
+	{"copied_headers_4", 4},
+	{"copied_headers_10", 10},
+}
+
 type signingForwarderBenchmarkTransport struct {
 	expectedBody     string
 	expectedBodyHash string
@@ -225,6 +251,38 @@ func BenchmarkServiceHandlePassthroughSigning(b *testing.B) {
 	}
 }
 
+func BenchmarkServiceHandlePassthroughSigningCopiedHeaders(b *testing.B) {
+	for _, tc := range signingForwarderBenchmarkCopiedHeaderCases {
+		b.Run(tc.name, func(b *testing.B) {
+			headers := http.Header{"X-Amz-Expected-Bucket-Owner": {"123456789012"}}
+			for _, header := range signingForwarderBenchmarkCopiedNonSigningHeaders[:tc.count] {
+				headers.Set(header.key, header.value)
+			}
+			service, incomingRequest := newSigningPassthroughBenchmark(
+				b,
+				http.MethodGet,
+				signingForwarderBenchmarkGetPath,
+				"",
+				headers,
+			)
+			for _, header := range signingForwarderBenchmarkCopiedNonSigningHeaders[:tc.count] {
+				if got := incomingRequest.Header.Get(header.key); got != header.value {
+					b.Fatalf("incoming header %q = %q, want %q", header.key, got, header.value)
+				}
+			}
+			req := incomingRequest.Clone(context.Background())
+			writer := signingForwarderBenchmarkResponseWriter{header: make(http.Header)}
+			b.ReportAllocs()
+
+			for b.Loop() {
+				if err := service.HandlePassthrough(&writer, req); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkServiceHandlePassthroughSigningEscapedQuery measures a signed
 // passthrough request whose canonical query has reserved keys and values.
 func BenchmarkServiceHandlePassthroughSigningEscapedQuery(b *testing.B) {
@@ -240,6 +298,33 @@ func BenchmarkServiceHandlePassthroughSigningEscapedQuery(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
+		if err := service.HandlePassthrough(&writer, req); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkServiceHandlePassthroughSigningUploadPart measures a sequential
+// body-bearing UploadPart request through the signing passthrough handler.
+func BenchmarkServiceHandlePassthroughSigningUploadPart(b *testing.B) {
+	service, incomingRequest := newSigningPassthroughBenchmark(
+		b,
+		http.MethodPut,
+		signingForwarderBenchmarkUploadPartPath,
+		signingForwarderBenchmarkUploadPartBody,
+		http.Header{
+			"Content-Type":                {"application/octet-stream"},
+			"X-Amz-Expected-Bucket-Owner": {"123456789012"},
+		},
+	)
+	req := incomingRequest.Clone(context.Background())
+	body := newSigningForwarderBenchmarkBody(signingForwarderBenchmarkUploadPartBody)
+	req.Body = body
+	writer := signingForwarderBenchmarkResponseWriter{header: make(http.Header)}
+	b.ReportAllocs()
+
+	for b.Loop() {
+		body.Reset(signingForwarderBenchmarkUploadPartBody)
 		if err := service.HandlePassthrough(&writer, req); err != nil {
 			b.Fatal(err)
 		}
