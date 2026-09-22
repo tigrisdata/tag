@@ -57,6 +57,138 @@ func TestBroadcasterBasicStreaming(t *testing.T) {
 	}
 }
 
+func TestBroadcasterBroadcastOwnedTransfersAndCopies(t *testing.T) {
+	b := NewBroadcaster(DefaultChannelBuffer)
+	first := b.Subscribe()
+	second := b.Subscribe()
+	if first == nil || second == nil {
+		t.Fatal("Subscribe failed")
+	}
+	b.SetHeaders(http.StatusOK, http.Header{})
+
+	const payload = "owned broadcast payload"
+	data := GetChunkBuf(len(payload))
+	copy(data, payload)
+	if !b.BroadcastOwned(data) {
+		t.Fatal("BroadcastOwned reported that no listener accepted the data")
+	}
+	b.Complete(nil)
+
+	firstChunk := <-first.Chunks()
+	secondChunk := <-second.Chunks()
+	if firstChunk.Err != nil || secondChunk.Err != nil {
+		t.Fatalf("unexpected terminal chunk: first=%v second=%v", firstChunk.Err, secondChunk.Err)
+	}
+	if &firstChunk.Data[0] != &data[0] {
+		t.Fatal("first listener did not receive the owned input buffer")
+	}
+	if &secondChunk.Data[0] == &data[0] {
+		t.Fatal("second listener shares the first listener's input buffer")
+	}
+	firstChunk.Data[0] = 'O'
+	if got := secondChunk.Data[0]; got != payload[0] {
+		t.Fatalf("second listener data changed with first listener: got %q, want %q", got, payload[0])
+	}
+	firstChunk.Release()
+	secondChunk.Release()
+	for chunk := range first.Chunks() {
+		chunk.Release()
+	}
+	for chunk := range second.Chunks() {
+		chunk.Release()
+	}
+}
+
+func TestBroadcasterBroadcastOwnedPreservesInputForLaterListener(t *testing.T) {
+	b := NewBroadcaster(1)
+	slow := b.Subscribe()
+	fast := b.Subscribe()
+	if slow == nil || fast == nil {
+		t.Fatal("Subscribe failed")
+	}
+	b.SetHeaders(http.StatusOK, http.Header{})
+
+	// Fill both listeners, then consume only the second one. The first listener
+	// must be disconnected without taking ownership of the next input buffer.
+	b.Broadcast([]byte("queued"))
+	queued := <-fast.Chunks()
+	queued.Release()
+
+	const payload = "later listener owns this"
+	data := GetChunkBuf(len(payload))
+	copy(data, payload)
+	if !b.BroadcastOwned(data) {
+		t.Fatal("BroadcastOwned did not transfer to the available listener")
+	}
+	b.Complete(nil)
+
+	owned := <-fast.Chunks()
+	if owned.Err != nil {
+		t.Fatalf("fast listener got terminal chunk before data: %v", owned.Err)
+	}
+	if &owned.Data[0] != &data[0] {
+		t.Fatal("available listener did not receive the caller-owned buffer")
+	}
+	if string(owned.Data) != payload {
+		t.Fatalf("fast listener data = %q, want %q", owned.Data, payload)
+	}
+	owned.Release()
+	for chunk := range fast.Chunks() {
+		chunk.Release()
+	}
+	for chunk := range slow.Chunks() {
+		chunk.Release()
+	}
+	if got := b.ListenerCount(); got != 1 {
+		t.Fatalf("active listener count = %d, want 1", got)
+	}
+}
+
+func TestBroadcasterBroadcastOwnedReturnsInputWhenUnaccepted(t *testing.T) {
+	b := NewBroadcaster(DefaultChannelBuffer)
+	const payload = "no listeners"
+	data := GetChunkBuf(len(payload))
+	copy(data, payload)
+
+	if b.BroadcastOwned(data) {
+		t.Fatal("BroadcastOwned reported ownership transfer without a listener")
+	}
+	if !b.IsStreaming() {
+		t.Fatal("BroadcastOwned did not mark the broadcast as streaming")
+	}
+	if string(data) != payload {
+		t.Fatalf("caller-owned data changed: got %q, want %q", data, payload)
+	}
+	PutChunkBuf(data)
+	b.Complete(nil)
+}
+
+func TestBroadcasterBroadcastCopiesCallerData(t *testing.T) {
+	b := NewBroadcaster(DefaultChannelBuffer)
+	listener := b.Subscribe()
+	if listener == nil {
+		t.Fatal("Subscribe failed")
+	}
+	b.SetHeaders(http.StatusOK, http.Header{})
+
+	data := []byte("copy before caller reuse")
+	b.Broadcast(data)
+	data[0] = 'X'
+	b.Complete(nil)
+
+	chunk := <-listener.Chunks()
+	if chunk.Err != nil {
+		t.Fatalf("unexpected terminal chunk: %v", chunk.Err)
+	}
+	if got := string(chunk.Data); got != "copy before caller reuse" {
+		t.Fatalf("listener data = %q, want original caller data", got)
+	}
+	chunk.Release()
+	for chunk := range listener.Chunks() {
+		chunk.Release()
+	}
+}
+
 func TestBroadcasterMultipleListeners(t *testing.T) {
 	b := NewBroadcaster(DefaultChannelBuffer)
 

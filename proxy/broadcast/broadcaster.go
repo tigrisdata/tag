@@ -215,11 +215,31 @@ func (b *Broadcaster) SetHeaders(status int, headers http.Header) {
 	}
 }
 
-// Broadcast sends a chunk to all listeners.
-// Slow consumers (buffer full) are disconnected immediately.
+// Broadcast sends a chunk to all listeners, copying the caller's data for each
+// listener. Slow consumers (buffer full) are disconnected immediately.
 func (b *Broadcaster) Broadcast(data []byte) {
+	b.broadcast(data, false)
+}
+
+// BroadcastOwned sends a chunk to all listeners and transfers ownership of data
+// to the first listener that accepts it. The data is copied for every subsequent
+// listener so each listener still owns an independent buffer.
+//
+// It returns true when a listener accepted data and therefore owns the input
+// buffer. When it returns false, no listener owns data and the caller may reuse
+// or release it. The caller must not reuse or release data after a true result.
+// Slow consumers (buffer full) are disconnected immediately.
+func (b *Broadcaster) BroadcastOwned(data []byte) bool {
+	return b.broadcast(data, true)
+}
+
+// broadcast delivers data through either the copying or ownership-taking path.
+// Keeping the copying Broadcast API separate from the ownership-taking
+// BroadcastOwned API prevents callers with reusable input slices from
+// accidentally racing with listeners.
+func (b *Broadcaster) broadcast(data []byte, owned bool) bool {
 	if len(data) == 0 {
-		return
+		return false
 	}
 
 	b.mu.Lock()
@@ -229,8 +249,11 @@ func (b *Broadcaster) Broadcast(data []byte) {
 	if !b.streaming {
 		b.streaming = true
 	}
+	if owned {
+		return b.broadcastOwnedLocked(data)
+	}
 
-	// Process listeners, removing slow ones
+	// Process listeners, removing slow ones.
 	activeListeners := b.listeners[:0] // Reuse slice
 	for _, l := range b.listeners {
 		if l.disconnected {
@@ -246,18 +269,86 @@ func (b *Broadcaster) Broadcast(data []byte) {
 			activeListeners = append(activeListeners, l)
 		default:
 			// Buffer full - disconnect slow consumer.
-			// Return pooled buffer since this chunk won't be consumed.
 			chunk.Release()
-			l.disconnected = true
-			select {
-			case l.ch <- Chunk{Err: ErrSlowConsumer}:
-			default:
-			}
-			close(l.ch)
-			log.Warn().Msg("Disconnecting slow consumer from broadcast (buffer full)")
+			disconnectSlowConsumer(l)
 		}
 	}
 	b.listeners = activeListeners
+	return false
+}
+
+// broadcastOwnedLocked selects the first listener with room as the owner,
+// sends independent copies to every other listener first, and transfers the
+// input buffer to the owner last. Preparing copies first prevents a fast owner
+// from releasing the input back to the pool while it is still needed as the
+// source for a later copy. The caller must hold b.mu.
+func (b *Broadcaster) broadcastOwnedLocked(data []byte) bool {
+	ownerIndex := -1
+	for i, l := range b.listeners {
+		if !l.disconnected && len(l.ch) < cap(l.ch) {
+			ownerIndex = i
+			break
+		}
+	}
+	activeListeners := b.listeners[:0]
+	ownerPosition := 0
+	var owner *Listener
+	if ownerIndex >= 0 {
+		owner = b.listeners[ownerIndex]
+	}
+
+	// Send independent copies while the input is still exclusively owned by the
+	// producer. The order of activeListeners remains the same as b.listeners so
+	// the fetcher's listener stays the owner candidate on subsequent chunks.
+	for i, l := range b.listeners {
+		if l.disconnected || i == ownerIndex {
+			continue
+		}
+
+		chunk := Chunk{Data: GetChunkBuf(len(data))}
+		copy(chunk.Data, data)
+		select {
+		case l.ch <- chunk:
+			if ownerIndex >= 0 && i < ownerIndex {
+				ownerPosition++
+			}
+			activeListeners = append(activeListeners, l)
+		default:
+			chunk.Release()
+			disconnectSlowConsumer(l)
+		}
+	}
+
+	if owner == nil {
+		b.listeners = activeListeners
+		return false
+	}
+
+	// The owner was observed with room before copies were sent. Since this
+	// broadcaster is the only sender and consumers can only drain, this send
+	// remains non-blocking. If it nevertheless fails, the caller retains data.
+	select {
+	case owner.ch <- Chunk{Data: data}:
+		activeListeners = append(activeListeners, nil)
+		copy(activeListeners[ownerPosition+1:], activeListeners[ownerPosition:])
+		activeListeners[ownerPosition] = owner
+		b.listeners = activeListeners
+		return true
+	default:
+		disconnectSlowConsumer(owner)
+		b.listeners = activeListeners
+		return false
+	}
+}
+
+func disconnectSlowConsumer(l *Listener) {
+	l.disconnected = true
+	select {
+	case l.ch <- Chunk{Err: ErrSlowConsumer}:
+	default:
+	}
+	close(l.ch)
+	log.Warn().Msg("Disconnecting slow consumer from broadcast (buffer full)")
 }
 
 // Complete marks the broadcast as done.
