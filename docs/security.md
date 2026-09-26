@@ -185,6 +185,8 @@ TAG validates the upstream endpoint at startup. In **every mode**, the endpoint 
 
 Any other host causes a fatal startup error in transparent mode.
 
+**Tiered mode** does not apply the allowlist. It derives its forwarding flavor from the endpoint: a Tigris domain (`*.tigris.dev`, `*.storage.dev`) forwards transparently; any other host — `localhost` included, since it makes no claim about the backend behind it — forwards by signing, with the same SSRF considerations as signing mode below. See [Tiered store mode](tiered-mode.md#authentication).
+
 **Signing mode** (`transparent_proxy: false`) does not apply the Tigris allowlist — it re-signs with standard SigV4 and can front any S3-compatible service. The upstream is a single, operator-configured value; TAG forwards only to that endpoint and never lets clients choose the upstream, so this is not an open proxy. The SSRF surface is limited to operator misconfiguration of `upstream.endpoint`, so treat that value as trusted configuration and set it explicitly. TAG logs a warning at startup when signing mode targets a non-Tigris host; third-party backends are community-supported.
 
 ## Credential Requirements

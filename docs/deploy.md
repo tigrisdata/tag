@@ -69,10 +69,14 @@ resources:
   - ../../base
 images:
   - name: tigrisdata/tag
-    newTag: v1.19.0
+    newTag: v1.22.1
 ```
 
 ## Production Considerations
+
+### Operating mode
+
+The manifests run the default **transparent** mode against Tigris. Set `TAG_MODE` to `signing` to front a non-Tigris S3-compatible endpoint, or to `tiered` to run TAG as a two-tier cache over a capacity-priced upstream bucket — see [Tiered store mode](tiered-mode.md) for its semantics, credential requirements, and the block-caching interaction. The [Configuration Reference](configuration.md) covers all three.
 
 ### High Availability
 
@@ -213,6 +217,32 @@ What to watch:
 - **Physical vs logical divergence is the real health signal**: compare `kubelet_volume_stats_used_bytes` for the cache PVC against `ocache_disk_usage_bytes` (live bytes). A gap that grows and never shrinks means dead space is accumulating faster than it is reclaimed; a gap that stays small means reclaim is keeping up. Expect the gap to spike during heavy population and while a recompaction holds both the old and new segment on disk.
 
 Because segments must pass the age gate first, reclaim begins roughly two hours after a pod restart, not immediately.
+
+### Upgrades and meta coordination
+
+Cache invalidation and populate ordering are coordinated by one of two mechanisms, selected at startup by `TAG_CACHE_LEGACY_COORDINATION` (`cache.legacy_coordination`):
+
+| Value | Mechanism | Cluster requirement |
+| --- | --- | --- |
+| `true` (default) | Legacy timestamp tombstones | None — safe with any mix of versions, including nodes upgrading straight from ≤v1.20 |
+| `false` | Fenced CAS (version-token preconditions) | Every node must run ≥v1.21 **before** the flip |
+
+**Upgrading from ≤v1.20:** roll out the new image with the default. No configuration change is needed and mixed-version clusters stay correct throughout the rollout.
+
+**Switching to CAS coordination** (optional, stronger ordering guarantees):
+
+1. Confirm every pod runs ≥v1.21 — `kubectl get pods -n tag -o jsonpath='{..image}'`.
+2. Set the flag in the StatefulSet and apply; the rolling restart performs the flip:
+
+   ```yaml
+   env:
+     - name: TAG_CACHE_LEGACY_COORDINATION
+       value: "false"
+   ```
+
+3. Let the rollout complete promptly. During the restart, nodes on different mechanisms do not see each other's ordering (a CAS delete writes no tombstone for a legacy populate to check, and vice versa). The exposure is bounded and converges by TTL, but it lasts as long as the rollout — do not pause it midway.
+
+Parsing is fail-safe: only an explicit `false` or `0` selects CAS; any other value keeps legacy. A standalone (single-node) deployment may flip at any time. **Tiered mode** always runs CAS: it selects CAS when the setting is unset and refuses to start with an explicit `true` (see [Tiered store mode](tiered-mode.md)). Reverting (`true`) carries the same mixed-window exposure, so do it with the same brisk rolling restart.
 
 ### Health Checks
 
