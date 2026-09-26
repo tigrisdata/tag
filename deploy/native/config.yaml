@@ -4,6 +4,11 @@
 # Override any setting via environment variables (see docs/configuration.md).
 # Environment variables take precedence over this file.
 
+# Operating mode: transparent (default), signing, or tiered.
+# See docs/configuration.md and docs/tiered-mode.md.
+# Default: "transparent"
+mode: transparent
+
 # Server configuration
 server:
   # HTTP port for the S3 API

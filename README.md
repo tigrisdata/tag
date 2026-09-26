@@ -6,6 +6,7 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 
 - **S3-Compatible API**: Supports all S3 API endpoints supported by Tigris
 - **Transparent Proxy Mode**: Forwards client requests as-is with proxy headers, preserving original signatures (enabled by default)
+- **Tiered Store Mode**: `mode: tiered` runs TAG as a two-tier cache — small objects live entirely in the local tier with authoritative misses, large objects in a capacity-priced upstream bucket (see [docs/tiered-mode.md](docs/tiered-mode.md))
 - **Embedded Cache**: High-performance RocksDB-based cache with automatic cluster discovery
 - **Request Coalescing**: Streaming broadcast pattern reduces duplicate upstream requests under concurrent load
 - **Range Request Caching**: Background fetch of full objects on range cache miss for optimal ML training workloads
@@ -44,7 +45,7 @@ Each release publishes the install script, run script, and a matching `config.ya
 curl -fsSL https://tag-releases.t3.storage.dev/latest/install.sh | bash
 
 # A specific release
-curl -fsSL https://tag-releases.t3.storage.dev/v1.19.0/install.sh | bash
+curl -fsSL https://tag-releases.t3.storage.dev/v1.22.1/install.sh | bash
 ```
 
 The script installs the `tag` binary to `/usr/local/bin` and a default config to `/etc/tag/config.yaml`.
@@ -123,6 +124,8 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 - **Kubernetes** — StatefulSet, HPA, and services in [`deploy/kubernetes/`](deploy/kubernetes/); high availability, scaling, and probes in [docs/deploy.md](docs/deploy.md).
 - **Docker** — single-node and cluster Compose in [`deploy/docker/`](deploy/docker/); see [docs/docker.md](docs/docker.md).
 - **TLS/HTTPS** — see [docs/tls.md](docs/tls.md).
+- **Upgrades** — meta coordination mode and rolling-upgrade guidance in [docs/deploy.md](docs/deploy.md#upgrades-and-meta-coordination).
+- **Tiered store mode** — TAG as a two-tier cache over a capacity-priced upstream; see [docs/tiered-mode.md](docs/tiered-mode.md).
 - **Parquet workloads** — caching parquet metadata ahead of the reader that needs it; see [docs/parquet-optimization.md](docs/parquet-optimization.md).
 - **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
 
@@ -176,7 +179,7 @@ See [docs/metrics.md](docs/metrics.md) for complete metrics reference.
 
 ## Security
 
-TAG supports transparent proxy mode (default) with local SigV4 validation and per-bucket authorization caching, as well as signing mode with local credential stores.
+TAG supports transparent proxy mode (default) with local SigV4 validation and per-bucket authorization caching, signing mode with local credential stores, and tiered store mode, which forwards transparently on Tigris endpoints and by signing on any other.
 
 See [docs/security.md](docs/security.md) for authentication, access control, and security architecture.
 
