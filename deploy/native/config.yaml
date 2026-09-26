@@ -6,8 +6,10 @@
 
 # Operating mode: transparent (default), signing, or tiered.
 # See docs/configuration.md and docs/tiered-mode.md.
+# Left unset so the deprecated TAG_TRANSPARENT_PROXY / upstream.transparent_proxy
+# still select the mode; setting both inconsistently is a startup-fatal error.
 # Default: "transparent"
-mode: transparent
+# mode: transparent
 
 # Server configuration
 server:

@@ -242,7 +242,7 @@ Cache invalidation and populate ordering are coordinated by one of two mechanism
 
 3. Let the rollout complete promptly. During the restart, nodes on different mechanisms do not see each other's ordering (a CAS delete writes no tombstone for a legacy populate to check, and vice versa). The exposure is bounded and converges by TTL, but it lasts as long as the rollout — do not pause it midway.
 
-Parsing is fail-safe: only an explicit `false` or `0` selects CAS; any other value keeps legacy. A standalone (single-node) deployment may flip at any time. Reverting (`true`) carries the same mixed-window exposure, so do it with the same brisk rolling restart.
+Parsing is fail-safe: only an explicit `false` or `0` selects CAS; any other value keeps legacy. A standalone (single-node) deployment may flip at any time. **Tiered mode** always runs CAS: it selects CAS when the setting is unset and refuses to start with an explicit `true` (see [Tiered store mode](tiered-mode.md)). Reverting (`true`) carries the same mixed-window exposure, so do it with the same brisk rolling restart.
 
 ### Health Checks
 
