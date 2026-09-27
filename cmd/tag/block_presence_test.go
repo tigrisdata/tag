@@ -507,63 +507,60 @@ func TestEmbeddedBlockPresenceMultiNodeAndFallback(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled presence = %v, want context.Canceled", err)
 	}
-}
 
-func TestEmbeddedBlockPresencePrunesReplacedOwnerID(t *testing.T) {
-	fixture := newEmbeddedBlockRangeBenchmarkFixture(t, 2)
-	ctx := context.Background()
-	const bucket, etag = "benchmark", `"block-range"`
-	oldKey := cache.MakeBlockKey(bucket, fixture.key, etag, fixture.cacheConfig.BlockSize, 1)
-	oldOwner, err := fixture.embeddedClient.Coordinator().GetNodeForKey(oldKey)
+	// A replacement with a fresh ID owns the same deterministic block keys, but
+	// the old connection must be removed from the batcher's owner cache.
+	oldOwnerKey := cache.MakeBlockKey(bucket, fixture.key, etag, embeddedBlockRangeBenchmarkBlockSize, 1)
+	oldOwner, err := fixture.embeddedClient.Coordinator().GetNodeForKey(oldOwnerKey)
 	if err != nil || oldOwner.ID != "range-bench-1" {
 		t.Fatalf("initial block owner = (%v,%v), want range-bench-1", oldOwner, err)
 	}
-	found, err := fixture.cacheClient.BlockPresence(ctx, []string{oldKey})
-	if err != nil || len(found) != 1 || !found[0] {
-		t.Fatalf("initial peer presence = (%v,%v), want present", found, err)
-	}
 	fixture.cacheClient.peerMu.Lock()
 	oldPeer := fixture.cacheClient.peers[oldOwner.ID]
+	stalePeer := fixture.cacheClient.peers["stale-owner"]
 	fixture.cacheClient.peerMu.Unlock()
 	if oldPeer == nil {
-		t.Fatal("initial remote presence did not cache its owner connection")
+		t.Fatal("multi-node probes did not cache the old owner's connection")
 	}
 
 	fixture.closeNodes[1]()
 	waitForEmbeddedActiveNodeIDs(t, fixture.embeddedClient, "range-bench-0")
-	startEmbeddedBlockRangeReplacementNode(t, fixture, "range-bench-replacement")
+	replacement := startEmbeddedBlockRangeReplacementNode(t, fixture, "range-bench-replacement")
 	waitForEmbeddedActiveNodeIDs(t, fixture.embeddedClient, "range-bench-0", "range-bench-replacement")
+	waitForMatchingEmbeddedEpoch(t, fixture.embeddedClient, replacement)
 
-	newOwner, err := fixture.embeddedClient.Coordinator().GetNodeForKey(oldKey)
+	newOwner, err := fixture.embeddedClient.Coordinator().GetNodeForKey(oldOwnerKey)
 	if err != nil || newOwner.ID != "range-bench-replacement" {
 		t.Fatalf("replacement block owner = (%v,%v), want range-bench-replacement", newOwner, err)
 	}
-	start := int(fixture.cacheConfig.BlockSize)
-	if err := fixture.cacheClient.Put(ctx, oldKey, fixture.body[start:], 60); err != nil {
+	blockStart := embeddedBlockRangeBenchmarkBlockSize
+	if err := fixture.cacheClient.Put(ctx, oldOwnerKey, fixture.body[blockStart:2*blockStart], 60); err != nil {
 		t.Fatalf("seed replacement block: %v", err)
 	}
-	present, err := fixture.cacheClient.BlockPresence(ctx, []string{oldKey})
-	if err != nil || len(present) != 1 || !present[0] {
-		t.Fatalf("replacement peer presence = (%v,%v), want present", present, err)
+	fixture.stats.reset()
+	assertEmbeddedRangeResponse(t, fixture.client, fixture.gateway.URL, fixture.key, fixture.body, 2, fixture.gatewaySigner, fixture.accessKey, fixture.secretKey)
+	if got := fixture.stats.presenceRequests.Load(); got != 1 {
+		t.Fatalf("replacement Range made %d presence attempts, want 1", got)
 	}
 
 	fixture.cacheClient.peerMu.Lock()
 	_, oldRetained := fixture.cacheClient.peers[oldOwner.ID]
+	_, staleRetained := fixture.cacheClient.peers["stale-owner"]
 	replacementPeer := fixture.cacheClient.peers["range-bench-replacement"]
 	peerCount := len(fixture.cacheClient.peers)
 	fixture.cacheClient.peerMu.Unlock()
-	if oldRetained || replacementPeer == nil || peerCount != 1 {
-		t.Fatalf("peer connections after replacement = (old_retained=%t, replacement=%v, count=%d), want only the new owner", oldRetained, replacementPeer, peerCount)
+	if oldRetained || staleRetained || replacementPeer == nil || peerCount != 1 {
+		t.Fatalf("peer connections after replacement = (old=%t stale=%t replacement=%v count=%d), want only new owner", oldRetained, staleRetained, replacementPeer, peerCount)
 	}
-	if got := oldPeer.conn.GetState(); got != connectivity.Shutdown {
-		t.Fatalf("retired owner connection state = %v, want shutdown", got)
+	if oldPeer.conn.GetState() != connectivity.Shutdown {
+		t.Fatalf("retired owner connection state = %v, want shutdown", oldPeer.conn.GetState())
 	}
-
-	response := fixture.doRange(t, nil)
-	fixture.verifyResponse(t, response)
+	if stalePeer != nil && stalePeer.conn.GetState() != connectivity.Shutdown {
+		t.Fatalf("stale owner connection state = %v, want shutdown", stalePeer.conn.GetState())
+	}
 }
 
-func startEmbeddedBlockRangeReplacementNode(tb testing.TB, fixture *embeddedBlockRangeBenchmarkFixture, nodeID string) {
+func startEmbeddedBlockRangeReplacementNode(tb testing.TB, fixture *embeddedBlockRangeBenchmarkFixture, nodeID string) *embedded.Client {
 	tb.Helper()
 	diskPath := tb.TempDir()
 	writeEmbeddedBlockRangeRingTokens(tb, diskPath, 1)
@@ -599,6 +596,25 @@ func startEmbeddedBlockRangeReplacementNode(tb testing.TB, fixture *embeddedBloc
 	defer cancel()
 	if err := client.WaitReady(readyCtx); err != nil {
 		tb.Fatalf("replacement embedded node did not become ready: %v", err)
+	}
+	return client
+}
+
+func waitForMatchingEmbeddedEpoch(tb testing.TB, first, second *embedded.Client) {
+	tb.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if first.Coordinator().GetEpoch() == second.Coordinator().GetEpoch() {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			tb.Fatalf("replacement ring epochs did not converge: first=%d second=%d: %v", first.Coordinator().GetEpoch(), second.Coordinator().GetEpoch(), ctx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 
