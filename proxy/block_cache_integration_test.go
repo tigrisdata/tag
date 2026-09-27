@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +19,8 @@ import (
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // blockMockForwarder serves range GETs from a backing object, for both the initial
@@ -36,6 +40,8 @@ type blockMockForwarder struct {
 	blockGetShortBody   bool         // if set, per-block 206 body is shorter than its Content-Length
 	blockGets           atomic.Int32 // count of per-block DoConditionalGetRequest calls
 	forwards            atomic.Int32 // count of client-range forwards (DoRequestWithCreds)
+	blockGetStarted     chan struct{}
+	blockGetRelease     <-chan struct{}
 }
 
 func newBlockMock(object []byte, etag string) *blockMockForwarder {
@@ -91,6 +97,15 @@ func (m *blockMockForwarder) serveRange(rangeHeader, etag string) *http.Response
 
 func (m *blockMockForwarder) DoConditionalGetRequest(_ context.Context, _, _, _, _, _ string, _ int64, rangeHeader string) (*http.Response, error) {
 	m.blockGets.Add(1)
+	if m.blockGetRelease != nil {
+		if m.blockGetStarted != nil {
+			select {
+			case m.blockGetStarted <- struct{}{}:
+			default:
+			}
+		}
+		<-m.blockGetRelease
+	}
 	if m.blockGetTransient {
 		return nil, fmt.Errorf("simulated upstream blip")
 	}
@@ -142,6 +157,64 @@ func newBlockService(t *testing.T, mock *blockMockForwarder) (*Service, *cache.C
 	svc.config.Cache.BlockSize = 4 // boundary: the 10-byte test object (>= 4) is block-mode
 	svc.config.Cache.SizeThreshold = 1 << 20
 	return svc, c
+}
+
+// blockPresenceRecordingClient is a correctness-test double for the optional batch capability.
+// Its internal exact [0,1] reads preserve BlockExistsErr's miss/error semantics; probeCalls counts
+// only calls made through the CacheClient interface under test, not this fake's implementation.
+type blockPresenceRecordingClient struct {
+	cacheclient.CacheClient
+	pageMu     sync.Mutex
+	pageSizes  []int
+	batchErr   error
+	probeCalls atomic.Int32
+}
+
+func (c *blockPresenceRecordingClient) BlockPresence(ctx context.Context, keys []string) ([]bool, error) {
+	c.pageMu.Lock()
+	c.pageSizes = append(c.pageSizes, len(keys))
+	c.pageMu.Unlock()
+	if c.batchErr != nil {
+		return nil, c.batchErr
+	}
+	found := make([]bool, len(keys))
+	for i, key := range keys {
+		writer := &blockPresenceRecordingWriter{}
+		err := c.CacheClient.GetRangeStream(ctx, key, 0, 1, writer)
+		if status.Code(err) == codes.NotFound {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		found[i] = writer.written > 0
+	}
+	return found, nil
+}
+
+type blockPresenceRecordingWriter struct {
+	written int64
+}
+
+func (w *blockPresenceRecordingWriter) Write(p []byte) (int, error) {
+	w.written += int64(len(p))
+	return len(p), nil
+}
+
+func (c *blockPresenceRecordingClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if strings.HasPrefix(key, "blk|") && start == 0 && end == 1 {
+		c.probeCalls.Add(1)
+	}
+	return c.CacheClient.GetRangeStream(ctx, key, start, end, w)
+}
+
+func newBlockServiceWithClient(mock *blockMockForwarder, client cacheclient.CacheClient) (*Service, *cache.Cache) {
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(client, &cfg.Cache)
+	return NewService(mock, c, cfg), c
 }
 
 // newBlockServiceWithBudget builds a block-mode service with a specific populate byte budget,
@@ -1097,12 +1170,13 @@ func TestBlockCache_Block403DoesNotInvalidateSharedEntry(t *testing.T) {
 // into one aligned GET per block (a request storm). serveRangeFromBlockCache bails to a single
 // upstream range GET, without touching the still-valid entry.
 func TestBlockCache_LargeRangeServeBailsInsteadOfFanningOut(t *testing.T) {
-	obj := make([]byte, 200) // block_size 4 -> 50 covering blocks, > maxRangeBlockFanout (32)
+	obj := make([]byte, 400) // block_size 4 -> 100 covering blocks, > maxRangeBlockFanout (32)
 	for i := range obj {
 		obj[i] = byte('A' + i%26)
 	}
 	mock := newBlockMock(obj, `"v1"`)
-	svc, c := newBlockService(t, mock)
+	presenceClient := &blockPresenceRecordingClient{CacheClient: cacheclient.NewMemoryCache()}
+	svc, c := newBlockServiceWithClient(mock, presenceClient)
 
 	// Establish the block-mode entry with a small read (block 0 + meta).
 	w := httptest.NewRecorder()
@@ -1113,17 +1187,25 @@ func TestBlockCache_LargeRangeServeBailsInsteadOfFanningOut(t *testing.T) {
 		t.Fatal("entry not established")
 	}
 	before := mock.blockGets.Load()
+	probesBeforeRange := presenceClient.probeCalls.Load()
 
-	// A range spanning all 50 blocks (~49 missing > cap) must bail to one upstream range GET.
+	// A range spanning 100 blocks (99 missing) must bail after two bounded pages
+	// and use one upstream range GET rather than probing the rest of the object.
 	w2 := httptest.NewRecorder()
-	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=0-199")); err != nil {
+	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=0-399")); err != nil {
 		t.Fatalf("large range: %v", err)
 	}
-	if w2.Code != http.StatusPartialContent || w2.Body.Len() != 200 {
-		t.Fatalf("large range: code=%d len=%d, want 206 with 200 bytes", w2.Code, w2.Body.Len())
+	if w2.Code != http.StatusPartialContent || w2.Body.Len() != 400 {
+		t.Fatalf("large range: code=%d len=%d, want 206 with 400 bytes", w2.Code, w2.Body.Len())
 	}
 	if after := mock.blockGets.Load(); after != before {
 		t.Errorf("large range fanned out into per-block fetches: blockGets %d -> %d", before, after)
+	}
+	if want := []int{32, 32}; !reflect.DeepEqual(presenceClient.pageSizes, want) {
+		t.Errorf("presence page sizes = %v, want %v", presenceClient.pageSizes, want)
+	}
+	if got := presenceClient.probeCalls.Load() - probesBeforeRange; got != 0 {
+		t.Errorf("batched cap check opened %d block reads after preflight, want 0", got)
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
 		t.Error("range amplify-bail wrongly invalidated the entry")
@@ -1722,7 +1804,8 @@ func TestBlockCache_PipelineBudgetDeclineDegradesToSequential(t *testing.T) {
 // is byte-exact across all block boundaries.
 func TestBlockCache_WarmMultiBlockRangeServesPipelined(t *testing.T) {
 	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`) // blocks [0..3][4..7][8..9]
-	svc, c := newBlockService(t, mock)
+	presenceClient := &blockPresenceRecordingClient{CacheClient: cacheclient.NewMemoryCache()}
+	svc, c := newBlockServiceWithClient(mock, presenceClient)
 
 	// Cold miss on bytes=0-7 populates blocks 0 and 1 (and the meta) in the background.
 	w := httptest.NewRecorder()
@@ -1733,8 +1816,9 @@ func TestBlockCache_WarmMultiBlockRangeServesPipelined(t *testing.T) {
 		t.Fatal("block-mode meta not populated")
 	}
 
-	// bytes=0-9 (10 bytes > BlockSize 4) skips the assembled-range path: probe finds block 2
-	// missing, fetches it, then the three blocks stream pipelined.
+	// bytes=0-9 (10 bytes > BlockSize 4) skips the assembled-range path: batched presence
+	// finds block 2 missing, fetches it, then the three blocks stream pipelined.
+	probesBeforeRange := presenceClient.probeCalls.Load()
 	w2 := httptest.NewRecorder()
 	if err := svc.HandleGetObject(w2, blockGet(wowBucket, wowKey, "bytes=0-9")); err != nil {
 		t.Fatalf("warm multi-block range: %v", err)
@@ -1745,8 +1829,233 @@ func TestBlockCache_WarmMultiBlockRangeServesPipelined(t *testing.T) {
 	if got := w2.Header().Get("X-Cache"); got != XCacheHit {
 		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
 	}
+	if got := w2.Header().Get("Content-Range"); got != "bytes 0-9/10" {
+		t.Errorf("Content-Range=%q, want %q", got, "bytes 0-9/10")
+	}
+	if got := w2.Header().Get("Content-Length"); got != "10" {
+		t.Errorf("Content-Length=%q, want 10", got)
+	}
+	if got := w2.Header().Get("ETag"); got != `"v1"` {
+		t.Errorf("ETag=%q, want %q", got, `"v1"`)
+	}
+	if want := []int{3}; !reflect.DeepEqual(presenceClient.pageSizes, want) {
+		t.Errorf("presence page sizes = %v, want %v", presenceClient.pageSizes, want)
+	}
+	if got := presenceClient.probeCalls.Load() - probesBeforeRange; got != 2 {
+		t.Errorf("partial warm range made %d byte-zero reads, want 2 (one missing-block recheck and the short final payload block)", got)
+	}
 	if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 2) {
 		t.Error("block 2 not cached after the probe-path fetch")
+	}
+}
+
+func TestBlockCache_BatchedPresenceFailureFallsThroughWithoutInvalidating(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	presenceClient := &blockPresenceRecordingClient{CacheClient: cacheclient.NewMemoryCache()}
+	svc, c := newBlockServiceWithClient(mock, presenceClient)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
+		t.Fatalf("cold range: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("cold range did not populate block-mode metadata")
+	}
+	beforeBlockGets := mock.blockGets.Load()
+	presenceClient.batchErr = errors.New("simulated owner read failure")
+
+	warm := httptest.NewRecorder()
+	if err := svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-9")); err != nil {
+		t.Fatalf("range after batch failure: %v", err)
+	}
+	if warm.Code != http.StatusPartialContent || warm.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("fall-through response = (status=%d, body=%q), want exact upstream 206", warm.Code, warm.Body.String())
+	}
+	if got := warm.Header().Get("X-Cache"); got != XCacheMiss {
+		t.Errorf("X-Cache=%q, want upstream miss %q", got, XCacheMiss)
+	}
+	if after := mock.blockGets.Load(); after != beforeBlockGets {
+		t.Errorf("batch probe failure fetched %d blocks, want no per-block fetch", after-beforeBlockGets)
+	}
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
+		t.Error("transient batch probe failure invalidated the still-valid entry")
+	}
+}
+
+// Warm probe-first ranges keep exact 206 bytes and headers while batching presence checks for
+// every required multi-block width.
+func TestBlockCache_BatchedRangePresenceBlockCounts(t *testing.T) {
+	for _, blockCount := range []int{2, 4, 8, 32} {
+		t.Run(fmt.Sprintf("%d_blocks", blockCount), func(t *testing.T) {
+			object := make([]byte, blockCount*4)
+			for i := range object {
+				object[i] = byte('A' + i%26)
+			}
+			mock := newBlockMock(object, `"v1"`)
+			presenceClient := &blockPresenceRecordingClient{CacheClient: cacheclient.NewMemoryCache()}
+			svc, c := newBlockServiceWithClient(mock, presenceClient)
+			rangeHeader := fmt.Sprintf("bytes=0-%d", len(object)-1)
+
+			cold := httptest.NewRecorder()
+			if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, rangeHeader)); err != nil {
+				t.Fatalf("cold range: %v", err)
+			}
+			if cold.Code != http.StatusPartialContent || cold.Body.Len() != len(object) {
+				t.Fatalf("cold range = (status=%d, bytes=%d), want (206, %d)", cold.Code, cold.Body.Len(), len(object))
+			}
+			if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+				t.Fatal("cold range did not populate block-mode metadata")
+			}
+
+			presenceClient.pageSizes = nil
+			probesBeforeRange := presenceClient.probeCalls.Load()
+			warm := httptest.NewRecorder()
+			if err := svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, rangeHeader)); err != nil {
+				t.Fatalf("warm range: %v", err)
+			}
+			if warm.Code != http.StatusPartialContent || warm.Body.String() != string(object) {
+				t.Fatalf("warm range = (status=%d, body=%q), want exact 206 body", warm.Code, warm.Body.String())
+			}
+			if got := warm.Header().Get("X-Cache"); got != XCacheHit {
+				t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
+			}
+			if got, want := warm.Header().Get("Content-Range"), fmt.Sprintf("bytes 0-%d/%d", len(object)-1, len(object)); got != want {
+				t.Errorf("Content-Range=%q, want %q", got, want)
+			}
+			if got, want := warm.Header().Get("Content-Length"), fmt.Sprint(len(object)); got != want {
+				t.Errorf("Content-Length=%q, want %q", got, want)
+			}
+			if got := warm.Header().Get("ETag"); got != `"v1"` {
+				t.Errorf("ETag=%q, want %q", got, `"v1"`)
+			}
+			if want := []int{blockCount}; !reflect.DeepEqual(presenceClient.pageSizes, want) {
+				t.Errorf("presence page sizes = %v, want %v", presenceClient.pageSizes, want)
+			}
+			if got := presenceClient.probeCalls.Load() - probesBeforeRange; got != 0 {
+				t.Errorf("batched range opened %d byte-zero block reads, want 0", got)
+			}
+		})
+	}
+}
+
+func TestBlockCache_ProbeFirstRangesCoalesceMissingBlockFetch(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGH"), `"v1"`)
+	presenceClient := &blockPresenceRecordingClient{CacheClient: cacheclient.NewMemoryCache()}
+	svc, c := newBlockServiceWithClient(mock, presenceClient)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-3")); err != nil {
+		t.Fatalf("cold range: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) ||
+		!c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 0) ||
+		c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 1) {
+		t.Fatal("expected block 0 and metadata cached, with block 1 absent")
+	}
+
+	mock.blockGetStarted = make(chan struct{}, 2)
+	release := make(chan struct{})
+	mock.blockGetRelease = release
+	var releaseOnce sync.Once
+	releaseFetch := func() { releaseOnce.Do(func() { close(release) }) }
+	before := mock.blockGets.Load()
+
+	type rangeResult struct {
+		response *httptest.ResponseRecorder
+		err      error
+	}
+	results := make(chan rangeResult, 2)
+	startedRanges, completedRanges := 0, 0
+	t.Cleanup(func() {
+		releaseFetch()
+		for completedRanges < startedRanges {
+			select {
+			case <-results:
+				completedRanges++
+			case <-time.After(5 * time.Second):
+				return
+			}
+		}
+	})
+	startRange := func() {
+		startedRanges++
+		go func() {
+			response := httptest.NewRecorder()
+			err := svc.HandleGetObject(response, blockGet(wowBucket, wowKey, "bytes=0-7"))
+			results <- rangeResult{response: response, err: err}
+		}()
+	}
+	startRange()
+	select {
+	case <-mock.blockGetStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first range did not start the missing-block fetch")
+	}
+	startRange()
+
+	blockKey := cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 1)
+	joined := false
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for !joined {
+		svc.blockFetchMu.Lock()
+		state := svc.blockFetches[blockKey]
+		svc.blockFetchMu.Unlock()
+		if state != nil {
+			state.mu.Lock()
+			joined = state.consumers >= 2
+			state.mu.Unlock()
+		}
+		if joined {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("second range did not join the in-flight block fetch")
+		case <-ticker.C:
+		}
+	}
+	if got := mock.blockGets.Load(); got != before+1 {
+		t.Fatalf("overlapping ranges started %d upstream block fetches, want 1", got-before)
+	}
+	releaseFetch()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case result := <-results:
+			completedRanges++
+			if result.err != nil {
+				t.Fatalf("warm range %d: %v", i, result.err)
+			}
+			if result.response.Code != http.StatusPartialContent || result.response.Body.String() != "ABCDEFGH" {
+				t.Fatalf("warm range %d = (%d, %q), want exact 206 ABCDEFGH", i, result.response.Code, result.response.Body.String())
+			}
+			if got := result.response.Header().Get("X-Cache"); got != XCacheHit {
+				t.Errorf("warm range %d X-Cache=%q, want %q", i, got, XCacheHit)
+			}
+			if got := result.response.Header().Get("Content-Range"); got != "bytes 0-7/8" {
+				t.Errorf("warm range %d Content-Range=%q, want %q", i, got, "bytes 0-7/8")
+			}
+			if got := result.response.Header().Get("Content-Length"); got != "8" {
+				t.Errorf("warm range %d Content-Length=%q, want 8", i, got)
+			}
+			if got := result.response.Header().Get("ETag"); got != `"v1"` {
+				t.Errorf("warm range %d ETag=%q, want %q", i, got, `"v1"`)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("overlapping range did not finish after the shared fetch")
+		}
+	}
+	if got := mock.blockGets.Load(); got != before+1 {
+		t.Errorf("overlapping ranges fetched the missing block %d times, want 1", got-before)
+	}
+	presenceClient.pageMu.Lock()
+	pageSizes := append([]int(nil), presenceClient.pageSizes...)
+	presenceClient.pageMu.Unlock()
+	if !reflect.DeepEqual(pageSizes, []int{2, 2}) {
+		t.Errorf("overlapping range presence pages = %v, want two two-block pages", pageSizes)
 	}
 }
 

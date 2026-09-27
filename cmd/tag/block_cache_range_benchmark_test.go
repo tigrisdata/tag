@@ -35,14 +35,20 @@ const (
 )
 
 type embeddedBlockRangeBenchmarkFixture struct {
-	handler       http.Handler
-	body          []byte
-	key           string
-	stats         *embeddedBlockRangeRPCStats
-	requestSigner *auth.RequestSigner
-	accessKey     string
-	secretKey     string
-	region        string
+	gateway        *httptest.Server
+	client         *http.Client
+	handler        http.Handler
+	body           []byte
+	key            string
+	cacheConfig    config.CacheConfig
+	cacheClient    *embeddedBlockCacheClient
+	embeddedClient *embedded.Client
+	stats          *embeddedBlockRangeRPCStats
+	requestSigner  *auth.RequestSigner
+	gatewaySigner  *auth.RequestSigner
+	accessKey      string
+	secretKey      string
+	region         string
 }
 
 type benchmark206Writer struct {
@@ -78,6 +84,7 @@ func (w *benchmark206Writer) Unwrap() http.ResponseWriter { return w.ResponseRec
 
 type embeddedBlockRangeRPCStats struct {
 	presenceRPCs       atomic.Int64
+	presenceRequests   atomic.Int64
 	presenceReplyBytes atomic.Int64
 	probeGetRPCs       atomic.Int64
 	probePayloadBytes  atomic.Int64
@@ -92,6 +99,13 @@ type embeddedBlockRangeRPCRecord struct {
 
 func (s *embeddedBlockRangeRPCStats) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
 	return context.WithValue(ctx, embeddedBlockRangeRPCKey{}, &embeddedBlockRangeRPCRecord{method: info.FullMethodName})
+}
+
+func (s *embeddedBlockRangeRPCStats) countBlockPresenceStream(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	if method == benchmarkBlockPresenceMethod {
+		s.presenceRequests.Add(1)
+	}
+	return streamer(ctx, desc, cc, method, opts...)
 }
 
 func (s *embeddedBlockRangeRPCStats) HandleRPC(ctx context.Context, event stats.RPCStats) {
@@ -131,6 +145,7 @@ func (*embeddedBlockRangeRPCStats) HandleConn(context.Context, stats.ConnStats) 
 
 func (s *embeddedBlockRangeRPCStats) reset() {
 	s.presenceRPCs.Store(0)
+	s.presenceRequests.Store(0)
 	s.presenceReplyBytes.Store(0)
 	s.probeGetRPCs.Store(0)
 	s.probePayloadBytes.Store(0)
@@ -145,6 +160,14 @@ func newEmbeddedBlockRangeTransparentBenchmarkFixture(tb testing.TB, blockCount 
 }
 
 func newEmbeddedBlockRangeBenchmarkFixtureWithMode(tb testing.TB, blockCount int, transparent bool, withRPCStats ...bool) *embeddedBlockRangeBenchmarkFixture {
+	return newEmbeddedBlockRangeBenchmarkFixtureWithOptions(tb, blockCount, transparent, false, withRPCStats...)
+}
+
+func newEmbeddedBlockRangeLegacyPeerFixture(tb testing.TB, blockCount int) *embeddedBlockRangeBenchmarkFixture {
+	return newEmbeddedBlockRangeBenchmarkFixtureWithOptions(tb, blockCount, false, true, true)
+}
+
+func newEmbeddedBlockRangeBenchmarkFixtureWithOptions(tb testing.TB, blockCount int, transparent, legacyPeer bool, withRPCStats ...bool) *embeddedBlockRangeBenchmarkFixture {
 	tb.Helper()
 	if blockCount < 2 || blockCount > 32 {
 		tb.Fatalf("benchmark block count %d outside 2..32", blockCount)
@@ -180,6 +203,10 @@ func newEmbeddedBlockRangeBenchmarkFixtureWithMode(tb testing.TB, blockCount int
 	for i := range gossipAddrs {
 		diskPath := tb.TempDir()
 		writeEmbeddedBlockRangeRingTokens(tb, diskPath, i)
+		var presenceServer *blockPresenceServer
+		if !legacyPeer || i == 0 {
+			presenceServer = &blockPresenceServer{}
+		}
 		embeddedCfg := &embedded.Config{
 			DiskPath:      diskPath,
 			TTL:           cfg.Cache.TTL,
@@ -195,6 +222,10 @@ func newEmbeddedBlockRangeBenchmarkFixtureWithMode(tb testing.TB, blockCount int
 		}
 		if stats != nil {
 			embeddedCfg.GRPCServerOptions = append(embeddedCfg.GRPCServerOptions, grpc.StatsHandler(stats))
+			embeddedCfg.GRPCDialOptions = append(embeddedCfg.GRPCDialOptions, grpc.WithChainStreamInterceptor(stats.countBlockPresenceStream))
+		}
+		if presenceServer != nil {
+			embeddedCfg.GRPCServerOptions = append(embeddedCfg.GRPCServerOptions, presenceServer.serverOption())
 		}
 		if i > 0 {
 			embeddedCfg.SeedNodes = []string{gossipAddrs[0]}
@@ -203,9 +234,12 @@ func newEmbeddedBlockRangeBenchmarkFixtureWithMode(tb testing.TB, blockCount int
 		if err != nil {
 			tb.Fatalf("create embedded range node %d: %v", i, err)
 		}
+		if presenceServer != nil {
+			presenceServer.client = client
+		}
 		nodes = append(nodes, client)
 		if i == 0 {
-			blockCacheClient = newEmbeddedBlockCacheClient(client)
+			blockCacheClient = newEmbeddedBlockCacheClient(client, embeddedCfg.GRPCDialOptions...)
 			tb.Cleanup(func() { _ = blockCacheClient.Close() })
 		} else {
 			tb.Cleanup(func() { _ = client.Close() })
@@ -311,8 +345,10 @@ func newEmbeddedBlockRangeBenchmarkFixtureWithMode(tb testing.TB, blockCount int
 	server := handlers.NewServer(service, "127.0.0.1", 0, false, cfg.Server.MaxInflightRequests)
 	handler := server.Router()
 	return &embeddedBlockRangeBenchmarkFixture{
-		handler: handler, body: body, key: key, stats: stats,
-		requestSigner: requestSigner, accessKey: accessKey, secretKey: secretKey, region: cfg.Upstream.Region,
+		handler: handler, body: body, key: key,
+		cacheConfig: cfg.Cache, cacheClient: blockCacheClient,
+		embeddedClient: nodes[0], stats: stats, requestSigner: requestSigner,
+		accessKey: accessKey, secretKey: secretKey, region: cfg.Upstream.Region,
 	}
 }
 
