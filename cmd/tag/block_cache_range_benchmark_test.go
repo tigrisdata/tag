@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -175,8 +178,10 @@ func newEmbeddedBlockRangeBenchmarkFixtureWithMode(tb testing.TB, blockCount int
 	cfg.Cache.SetBlockCachingEnabled(true)
 	cfg.Cache.BlockSize = embeddedBlockRangeBenchmarkBlockSize
 	for i := range gossipAddrs {
+		diskPath := tb.TempDir()
+		writeEmbeddedBlockRangeRingTokens(tb, diskPath, i)
 		embeddedCfg := &embedded.Config{
-			DiskPath:      tb.TempDir(),
+			DiskPath:      diskPath,
 			TTL:           cfg.Cache.TTL,
 			NodeID:        fmt.Sprintf("range-bench-%d", i),
 			ClusterAddr:   gossipAddrs[i],
@@ -311,16 +316,51 @@ func newEmbeddedBlockRangeBenchmarkFixtureWithMode(tb testing.TB, blockCount int
 	}
 }
 
-// embeddedBlockRangeObjectKey holds the owner mix constant across fresh randomized rings:
-// the first block is local, the second remote, and half of the full range is remote.
+// writeEmbeddedBlockRangeRingTokens gives both benchmark arms the same ownership layout.
+// OCache otherwise generates fresh tokens for every temporary DiskPath, which can change
+// metadata locality and the local/remote order of a measured range between arms.
+func writeEmbeddedBlockRangeRingTokens(tb testing.TB, diskPath string, nodeIndex int) {
+	tb.Helper()
+	const tokenCount = 512
+	if nodeIndex < 0 || nodeIndex > 1 {
+		tb.Fatalf("benchmark ring node index %d outside 0..1", nodeIndex)
+	}
+	state := uint32(0x6d2b79f5) ^ uint32(nodeIndex+1)*0x9e3779b9
+	tokens := make([]uint32, tokenCount)
+	for i := range tokens {
+		state ^= state << 13
+		state ^= state >> 17
+		state ^= state << 5
+		tokens[i] = state
+	}
+	contents, err := json.Marshal(struct {
+		Tokens []uint32 `json:"tokens"`
+	}{Tokens: tokens})
+	if err != nil {
+		tb.Fatalf("marshal benchmark ring tokens: %v", err)
+	}
+	tokensPath := filepath.Join(diskPath, "coordinator", "ring-tokens")
+	if err := os.MkdirAll(filepath.Dir(tokensPath), 0o755); err != nil {
+		tb.Fatalf("create benchmark ring-token directory: %v", err)
+	}
+	if err := os.WriteFile(tokensPath, contents, 0o600); err != nil {
+		tb.Fatalf("write benchmark ring tokens: %v", err)
+	}
+}
+
+// embeddedBlockRangeObjectKey keeps metadata local and holds the block-owner mix
+// constant across both benchmark arms: block 0 is local, block 1 is remote, and
+// half of the full range is remote.
 func embeddedBlockRangeObjectKey(tb testing.TB, client *embedded.Client, blockCount int, bucket, etag string) string {
 	tb.Helper()
 	localID := client.Coordinator().GetLocalNodeID()
 	wantRemote := blockCount / 2
+	wantPattern := expectedEmbeddedBlockRangeOwnerPattern(blockCount)
 	for candidate := 0; candidate < 65536; candidate++ {
 		key := fmt.Sprintf("block-range-%05d", candidate)
 		remote := 0
 		remoteFirst, remoteSecond := false, false
+		ownerPattern := make([]byte, blockCount)
 		for index := 0; index < blockCount; index++ {
 			blockKey := cache.MakeBlockKey(bucket, key, etag, embeddedBlockRangeBenchmarkBlockSize, int64(index))
 			node, err := client.Coordinator().GetNodeForKey(blockKey)
@@ -330,6 +370,9 @@ func embeddedBlockRangeObjectKey(tb testing.TB, client *embedded.Client, blockCo
 			isRemote := node.ID != localID
 			if isRemote {
 				remote++
+				ownerPattern[index] = '1'
+			} else {
+				ownerPattern[index] = '0'
 			}
 			if index == 0 {
 				remoteFirst = isRemote
@@ -337,12 +380,33 @@ func embeddedBlockRangeObjectKey(tb testing.TB, client *embedded.Client, blockCo
 				remoteSecond = isRemote
 			}
 		}
-		if remote == wantRemote && !remoteFirst && remoteSecond {
+		metaOwner, err := client.Coordinator().GetNodeForKey(cache.MakeMetaKey(bucket, key))
+		if err != nil {
+			tb.Fatalf("resolve benchmark metadata owner: %v", err)
+		}
+		if remote == wantRemote && !remoteFirst && remoteSecond && metaOwner.ID == localID &&
+			(wantPattern == "" || string(ownerPattern) == wantPattern) {
 			return key
 		}
 	}
-	tb.Fatalf("could not find a %d-block object with %d remote owners", blockCount, wantRemote)
+	tb.Fatalf("could not find a %d-block object with %d remote owners and pattern %q", blockCount, wantRemote, wantPattern)
 	return ""
+}
+
+// expectedEmbeddedBlockRangeOwnerPattern guards the exact measured owner order.
+func expectedEmbeddedBlockRangeOwnerPattern(blockCount int) string {
+	switch blockCount {
+	case 2:
+		return "01"
+	case 4:
+		return "0110"
+	case 8:
+		return "01111000"
+	case 32:
+		return "01000011001100011011010011100111"
+	default:
+		return ""
+	}
 }
 
 func embeddedBlockRangeFreeAddress(tb testing.TB) string {
