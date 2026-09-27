@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -43,11 +44,14 @@ type embeddedBlockRangeBenchmarkFixture struct {
 	cacheConfig    config.CacheConfig
 	cacheClient    *embeddedBlockCacheClient
 	embeddedClient *embedded.Client
+	closeNodes     []func()
+	seedGossipAddr string
 	stats          *embeddedBlockRangeRPCStats
 	requestSigner  *auth.RequestSigner
 	gatewaySigner  *auth.RequestSigner
 	accessKey      string
 	secretKey      string
+	grpcToken      string
 	region         string
 }
 
@@ -186,6 +190,7 @@ func newEmbeddedBlockRangeBenchmarkFixtureWithOptions(tb testing.TB, blockCount 
 
 	var blockCacheClient *embeddedBlockCacheClient
 	var nodes []*embedded.Client
+	closeNodes := make([]func(), len(gossipAddrs))
 	var stats *embeddedBlockRangeRPCStats
 	if len(withRPCStats) > 0 && withRPCStats[0] {
 		stats = &embeddedBlockRangeRPCStats{}
@@ -240,10 +245,15 @@ func newEmbeddedBlockRangeBenchmarkFixtureWithOptions(tb testing.TB, blockCount 
 		nodes = append(nodes, client)
 		if i == 0 {
 			blockCacheClient = newEmbeddedBlockCacheClient(client, embeddedCfg.GRPCDialOptions...)
-			tb.Cleanup(func() { _ = blockCacheClient.Close() })
+			wrapper := blockCacheClient
+			var closeOnce sync.Once
+			closeNodes[i] = func() { closeOnce.Do(func() { _ = wrapper.Close() }) }
 		} else {
-			tb.Cleanup(func() { _ = client.Close() })
+			node := client
+			var closeOnce sync.Once
+			closeNodes[i] = func() { closeOnce.Do(func() { _ = node.Close() }) }
 		}
+		tb.Cleanup(closeNodes[i])
 		if err := client.StartGRPCServer(); err != nil {
 			tb.Fatalf("start embedded range node %d: %v", i, err)
 		}
@@ -347,8 +357,9 @@ func newEmbeddedBlockRangeBenchmarkFixtureWithOptions(tb testing.TB, blockCount 
 	return &embeddedBlockRangeBenchmarkFixture{
 		handler: handler, body: body, key: key,
 		cacheConfig: cfg.Cache, cacheClient: blockCacheClient,
-		embeddedClient: nodes[0], stats: stats, requestSigner: requestSigner,
-		accessKey: accessKey, secretKey: secretKey, region: cfg.Upstream.Region,
+		embeddedClient: nodes[0], closeNodes: closeNodes, seedGossipAddr: gossipAddrs[0],
+		stats: stats, requestSigner: requestSigner,
+		accessKey: accessKey, secretKey: secretKey, grpcToken: grpcToken, region: cfg.Upstream.Region,
 	}
 }
 

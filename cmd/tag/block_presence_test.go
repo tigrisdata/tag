@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,9 +25,62 @@ import (
 	"github.com/tigrisdata/tag/proxy"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 )
+
+func TestBlockPresencePeerPruningRetainsActiveOwnerAndLeasedConnection(t *testing.T) {
+	client := newEmbeddedBlockCacheClient(nil)
+	t.Cleanup(func() { _ = client.Close() })
+
+	retiredLease, err := client.peerConnection("retired", "127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("open retired peer connection: %v", err)
+	}
+	activeLease, err := client.peerConnection("active", "127.0.0.1:2")
+	if err != nil {
+		t.Fatalf("open active peer connection: %v", err)
+	}
+	activeConn := activeLease.conn
+	client.releasePeerConnection(activeLease)
+
+	// The current ring still contains the active peer even though this page has
+	// no key for it. The retired owner has a live lease while the ring changes.
+	client.prunePeerConnections(map[string]string{
+		"active": "127.0.0.1:2",
+		"new":    "127.0.0.1:3",
+	})
+	client.peerMu.Lock()
+	activePeer := client.peers["active"]
+	_, retiredPresent := client.peers["retired"]
+	_, leaseRetained := client.retiredPeers[retiredLease]
+	client.peerMu.Unlock()
+	if activePeer != activeLease || retiredPresent || !leaseRetained {
+		t.Fatalf("pruned peers: active retained=%t retired present=%t lease retained=%t", activePeer == activeLease, retiredPresent, leaseRetained)
+	}
+	if activeConn.GetState() == connectivity.Shutdown || retiredLease.conn.GetState() == connectivity.Shutdown {
+		t.Fatal("pruning closed an active owner or a leased connection")
+	}
+
+	newLease, err := client.peerConnection("new", "127.0.0.1:3")
+	if err != nil {
+		t.Fatalf("open replacement peer connection: %v", err)
+	}
+	client.releasePeerConnection(newLease)
+	client.releasePeerConnection(retiredLease)
+	if got := retiredLease.conn.GetState(); got != connectivity.Shutdown {
+		t.Fatalf("released retired connection state = %v, want shutdown", got)
+	}
+	client.peerMu.Lock()
+	_, activeRetained := client.peers["active"]
+	_, newRetained := client.peers["new"]
+	_, retiredLeaseRetained := client.retiredPeers[retiredLease]
+	client.peerMu.Unlock()
+	if !activeRetained || !newRetained || retiredLeaseRetained {
+		t.Fatalf("final peer cache: active=%t new=%t retired lease=%t", activeRetained, newRetained, retiredLeaseRetained)
+	}
+}
 
 func TestBlockPresenceRequestFallsBackForNonUTF8Keys(t *testing.T) {
 	key := string([]byte{'b', 'l', 'k', '|', 0xff})
@@ -452,6 +506,135 @@ func TestEmbeddedBlockPresenceMultiNodeAndFallback(t *testing.T) {
 	_, err = batchCache.BlockExistsBatchErr(canceled, bucket, fixture.key, etag, embeddedBlockRangeBenchmarkBlockSize, []int64{0})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled presence = %v, want context.Canceled", err)
+	}
+}
+
+func TestEmbeddedBlockPresencePrunesReplacedOwnerID(t *testing.T) {
+	fixture := newEmbeddedBlockRangeBenchmarkFixture(t, 2)
+	ctx := context.Background()
+	const bucket, etag = "benchmark", `"block-range"`
+	oldKey := cache.MakeBlockKey(bucket, fixture.key, etag, fixture.cacheConfig.BlockSize, 1)
+	oldOwner, err := fixture.embeddedClient.Coordinator().GetNodeForKey(oldKey)
+	if err != nil || oldOwner.ID != "range-bench-1" {
+		t.Fatalf("initial block owner = (%v,%v), want range-bench-1", oldOwner, err)
+	}
+	found, err := fixture.cacheClient.BlockPresence(ctx, []string{oldKey})
+	if err != nil || len(found) != 1 || !found[0] {
+		t.Fatalf("initial peer presence = (%v,%v), want present", found, err)
+	}
+	fixture.cacheClient.peerMu.Lock()
+	oldPeer := fixture.cacheClient.peers[oldOwner.ID]
+	fixture.cacheClient.peerMu.Unlock()
+	if oldPeer == nil {
+		t.Fatal("initial remote presence did not cache its owner connection")
+	}
+
+	fixture.closeNodes[1]()
+	waitForEmbeddedActiveNodeIDs(t, fixture.embeddedClient, "range-bench-0")
+	startEmbeddedBlockRangeReplacementNode(t, fixture, "range-bench-replacement")
+	waitForEmbeddedActiveNodeIDs(t, fixture.embeddedClient, "range-bench-0", "range-bench-replacement")
+
+	newOwner, err := fixture.embeddedClient.Coordinator().GetNodeForKey(oldKey)
+	if err != nil || newOwner.ID != "range-bench-replacement" {
+		t.Fatalf("replacement block owner = (%v,%v), want range-bench-replacement", newOwner, err)
+	}
+	start := int(fixture.cacheConfig.BlockSize)
+	if err := fixture.cacheClient.Put(ctx, oldKey, fixture.body[start:], 60); err != nil {
+		t.Fatalf("seed replacement block: %v", err)
+	}
+	present, err := fixture.cacheClient.BlockPresence(ctx, []string{oldKey})
+	if err != nil || len(present) != 1 || !present[0] {
+		t.Fatalf("replacement peer presence = (%v,%v), want present", present, err)
+	}
+
+	fixture.cacheClient.peerMu.Lock()
+	_, oldRetained := fixture.cacheClient.peers[oldOwner.ID]
+	replacementPeer := fixture.cacheClient.peers["range-bench-replacement"]
+	peerCount := len(fixture.cacheClient.peers)
+	fixture.cacheClient.peerMu.Unlock()
+	if oldRetained || replacementPeer == nil || peerCount != 1 {
+		t.Fatalf("peer connections after replacement = (old_retained=%t, replacement=%v, count=%d), want only the new owner", oldRetained, replacementPeer, peerCount)
+	}
+	if got := oldPeer.conn.GetState(); got != connectivity.Shutdown {
+		t.Fatalf("retired owner connection state = %v, want shutdown", got)
+	}
+
+	response := fixture.doRange(t, nil)
+	fixture.verifyResponse(t, response)
+}
+
+func startEmbeddedBlockRangeReplacementNode(tb testing.TB, fixture *embeddedBlockRangeBenchmarkFixture, nodeID string) {
+	tb.Helper()
+	diskPath := tb.TempDir()
+	writeEmbeddedBlockRangeRingTokens(tb, diskPath, 1)
+	presenceServer := &blockPresenceServer{}
+	gossipAddr := embeddedBlockRangeFreeAddress(tb)
+	grpcAddr := embeddedBlockRangeFreeAddress(tb)
+	cfg := &embedded.Config{
+		DiskPath:      diskPath,
+		TTL:           fixture.cacheConfig.TTL,
+		NodeID:        nodeID,
+		ClusterAddr:   gossipAddr,
+		GRPCAddr:      grpcAddr,
+		AdvertiseAddr: grpcAddr,
+		SeedNodes:     []string{fixture.seedGossipAddr},
+		Registerer:    prometheus.NewRegistry(),
+	}
+	if fixture.cacheConfig.IsGRPCAuthEnabled() {
+		cfg.GRPCServerOptions = auth.GRPCServerOptions(fixture.grpcToken)
+		cfg.GRPCDialOptions = auth.GRPCDialOptions(fixture.grpcToken)
+	}
+	cfg.GRPCServerOptions = append(cfg.GRPCServerOptions, presenceServer.serverOption())
+	client, err := embedded.New(cfg)
+	if err != nil {
+		tb.Fatalf("create replacement embedded node: %v", err)
+	}
+	presenceServer.client = client
+	var closeOnce sync.Once
+	tb.Cleanup(func() { closeOnce.Do(func() { _ = client.Close() }) })
+	if err := client.StartGRPCServer(); err != nil {
+		tb.Fatalf("start replacement embedded node: %v", err)
+	}
+	readyCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := client.WaitReady(readyCtx); err != nil {
+		tb.Fatalf("replacement embedded node did not become ready: %v", err)
+	}
+}
+
+func waitForEmbeddedActiveNodeIDs(tb testing.TB, client *embedded.Client, want ...string) {
+	tb.Helper()
+	wantSet := make(map[string]struct{}, len(want))
+	for _, id := range want {
+		wantSet[id] = struct{}{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		nodes := client.Coordinator().GetRing().GetActiveNodes()
+		if len(nodes) == len(wantSet) {
+			allPresent := true
+			for _, node := range nodes {
+				if _, ok := wantSet[node.ID]; !ok {
+					allPresent = false
+					break
+				}
+			}
+			if allPresent {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			got := make([]string, 0, len(nodes))
+			for _, node := range nodes {
+				got = append(got, node.ID)
+			}
+			tb.Fatalf("active nodes = %v, want %v: %v", got, want, ctx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 
