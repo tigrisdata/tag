@@ -76,6 +76,65 @@ func isS3ErrorBody(body []byte) bool {
 	}
 }
 
+// deleteObjectsResponseStager retains only response headers and status. ForwardWithCapture
+// owns the response body in ResponseCapture; acknowledging but discarding its writes here
+// prevents a cache-enabled bulk-delete response from reaching the client before the
+// post-success invalidations complete, without retaining a second body copy.
+type deleteObjectsResponseStager struct {
+	header     http.Header
+	statusCode int
+}
+
+func newDeleteObjectsResponseStager() *deleteObjectsResponseStager {
+	return &deleteObjectsResponseStager{header: make(http.Header)}
+}
+
+func (w *deleteObjectsResponseStager) Header() http.Header {
+	return w.header
+}
+
+func (w *deleteObjectsResponseStager) deferResponseByteAccounting() {}
+
+func (w *deleteObjectsResponseStager) WriteHeader(statusCode int) {
+	if w.statusCode == 0 {
+		w.statusCode = statusCode
+	}
+}
+
+func (w *deleteObjectsResponseStager) Write(body []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	return len(body), nil
+}
+
+func (w *deleteObjectsResponseStager) commit(dst http.ResponseWriter, capture *ResponseCapture) {
+	headers := w.header
+	statusCode := w.statusCode
+	var body []byte
+	if capture != nil {
+		if len(headers) == 0 {
+			headers = capture.Headers
+		}
+		if statusCode == 0 {
+			statusCode = capture.StatusCode
+		}
+		body = capture.Body
+	}
+
+	copyHeaders(dst.Header(), headers)
+	if statusCode != 0 {
+		dst.WriteHeader(statusCode)
+	}
+	if len(body) > 0 {
+		n, err := dst.Write(body)
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to write captured bulk-delete response body")
+		}
+	}
+}
+
 // HandleDeleteObjects handles POST /{bucket}?delete for bulk object deletion.
 // Invalidates cache for requested objects BEFORE forwarding to ensure consistency.
 func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) error {
@@ -137,10 +196,20 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		}
 	}
 
+	// For parsed requests with cache keys to fence, stage response headers and
+	// status while ForwardWithCapture retains the body for result classification.
+	// Cache-disabled, malformed, and empty requests keep the direct streaming path.
+	forwardWriter := w
+	var responseStager *deleteObjectsResponseStager
+	if s.cache.IsEnabled() && len(requestedCounts) > 0 {
+		responseStager = newDeleteObjectsResponseStager()
+		forwardWriter = responseStager
+	}
+
 	// Forward request to upstream, capturing the response so we can tell which
 	// per-object deletes actually succeeded — S3 returns 200 OK with per-key
 	// <Error> elements for partial failures.
-	capture, err := s.forwarder.ForwardWithCapture(r.Context(), w, r)
+	capture, err := s.forwarder.ForwardWithCapture(r.Context(), forwardWriter, r)
 
 	// Re-invalidate AFTER upstream confirms the deletes, for the same
 	// read-after-write reason as HandleDeleteObject: a GET racing the in-flight
@@ -166,6 +235,10 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 			}
 			s.convergeInvalidation(context.Background(), bucket, key)
 		}
+	}
+
+	if responseStager != nil {
+		responseStager.commit(w, capture)
 	}
 
 	// Record metrics

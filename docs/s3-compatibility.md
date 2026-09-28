@@ -81,7 +81,7 @@ Key caching behaviors:
 - **Request coalescing** — Multiple concurrent GETs for the same object are coalesced into a single upstream fetch using a broadcast/subscriber pattern.
 - **Range requests** — If the full object is cached, range requests are served from cache. On a range cache miss, the range is served directly from Tigris while a background fetch populates the cache with the full object.
 - **Conditional requests** — `If-None-Match` and `If-Modified-Since` are evaluated against cached metadata and can return 304 without hitting Tigris.
-- **Write-through invalidation** — PUT, DELETE, CopyObject, and DeleteObjects invalidate the cache _before_ forwarding to Tigris to prevent stale reads.
+- **Write-through invalidation** — In proxy mode, PUT, DELETE, CopyObject, and DeleteObjects invalidate affected cache entries before forwarding. For cache-enabled DeleteObjects requests with a nonempty parsed key list, TAG completes an upstream 2xx only after the post-success invalidation attempts return.
 - **Tombstone protection** — A short-lived tombstone is written on DELETE to prevent in-flight background cache writes from resurrecting deleted objects.
 
 ## Addressing Style
