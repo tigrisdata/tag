@@ -135,6 +135,10 @@ func TestHandleDeleteObjects_PartialFailureKeepsFailedKeyRefill(t *testing.T) {
 	var c *cache.Cache
 	const okKey = "ok-key"
 	const failKey = "fail-key"
+	const responseBody = `<DeleteResult><Deleted><Key>ok-key</Key></Deleted><Error><Key>fail-key</Key><Code>AccessDenied</Code></Error></DeleteResult>`
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/xml")
+	headers.Set("X-Upstream-Delete-Result", "partial")
 
 	repopulateThenPartial := func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
 		b, _ := ParseBucketKey(r)
@@ -142,10 +146,13 @@ func TestHandleDeleteObjects_PartialFailureKeepsFailedKeyRefill(t *testing.T) {
 			meta := &cache.CachedObjectMeta{Bucket: b, Key: k, ETag: `"refill"`, ContentLength: 6, StatusCode: 200}
 			_ = c.PutWithMeta(context.Background(), b, k, meta, []byte("refill"), 60)
 		}
-		body := []byte(`<DeleteResult><Deleted><Key>ok-key</Key></Deleted><Error><Key>fail-key</Key><Code>AccessDenied</Code></Error></DeleteResult>`)
+		body := []byte(responseBody)
+		for key, values := range headers {
+			w.Header()[key] = append([]string(nil), values...)
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
-		return &ResponseCapture{StatusCode: http.StatusOK, Body: body, Complete: true}, nil
+		return &ResponseCapture{StatusCode: http.StatusOK, Headers: headers.Clone(), Body: body, Complete: true}, nil
 	}
 
 	var svc *Service
@@ -156,6 +163,15 @@ func TestHandleDeleteObjects_PartialFailureKeepsFailedKeyRefill(t *testing.T) {
 	w := httptest.NewRecorder()
 	if err := svc.HandleDeleteObjects(w, r); err != nil {
 		t.Fatalf("HandleDeleteObjects: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("DeleteObjects status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get("X-Upstream-Delete-Result"); got != "partial" {
+		t.Fatalf("DeleteObjects response header = %q, want partial", got)
+	}
+	if got := w.Body.String(); got != responseBody {
+		t.Fatalf("DeleteObjects response body = %q, want byte-exact upstream body %q", got, responseBody)
 	}
 
 	b, _ := ParseBucketKey(r)
@@ -238,5 +254,105 @@ func TestHandleDeleteObjects_VersionIdMismatchFailureKeepsRefill(t *testing.T) {
 				t.Errorf("failed delete (response VersionId=%q) over-invalidated the key — valid refill discarded", respVersion)
 			}
 		})
+	}
+}
+
+// If the upstream result cannot be parsed, bulk delete conservatively invalidates
+// every requested key and still returns the upstream status, headers, and bytes.
+func TestHandleDeleteObjects_UnparseableResultInvalidatesAllAndPreservesResponse(t *testing.T) {
+	var c *cache.Cache
+	const firstKey = "first-key"
+	const secondKey = "second-key"
+	const responseBody = `<Error><Code>InternalError</Code><Message>result could not be parsed</Message></Error>`
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/xml")
+	headers.Set("X-Upstream-Delete-Result", "unparseable")
+
+	repopulateThenReturnUnparseable := func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+		bucket, _ := ParseBucketKey(r)
+		for _, key := range []string{firstKey, secondKey} {
+			meta := &cache.CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"refill"`, ContentLength: 6, StatusCode: http.StatusOK}
+			if err := c.PutWithMeta(context.Background(), bucket, key, meta, []byte("refill"), 60); err != nil {
+				return nil, err
+			}
+		}
+		for key, values := range headers {
+			w.Header()[key] = append([]string(nil), values...)
+		}
+		body := []byte(responseBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+		return &ResponseCapture{StatusCode: http.StatusOK, Headers: headers.Clone(), Body: body, Complete: true}, nil
+	}
+
+	var svc *Service
+	svc, c = newTestService(&mockForwarder{captureFunc: repopulateThenReturnUnparseable}, true)
+	requestBody := `<Delete><Object><Key>first-key</Key></Object><Object><Key>second-key</Key></Object></Delete>`
+	r := httptest.NewRequest(http.MethodPost, "/bulk-bucket?delete", strings.NewReader(requestBody))
+	w := httptest.NewRecorder()
+	if err := svc.HandleDeleteObjects(w, r); err != nil {
+		t.Fatalf("HandleDeleteObjects: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("DeleteObjects status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get("X-Upstream-Delete-Result"); got != "unparseable" {
+		t.Fatalf("DeleteObjects response header = %q, want unparseable", got)
+	}
+	if got := w.Body.String(); got != responseBody {
+		t.Fatalf("DeleteObjects response body = %q, want byte-exact upstream body %q", got, responseBody)
+	}
+	bucket, _ := ParseBucketKey(r)
+	for _, key := range []string{firstKey, secondKey} {
+		if _, found, err := c.GetMeta(context.Background(), bucket, key); err != nil || found {
+			t.Errorf("unparseable DeleteResult left %q cached: found=%t err=%v", key, found, err)
+		}
+	}
+}
+
+// A forwarded HTTP failure is not a successful delete: it retains any refill
+// and preserves the upstream error response without running the success fence.
+func TestHandleDeleteObjects_UpstreamFailurePreservesResponseAndRefill(t *testing.T) {
+	var c *cache.Cache
+	const key = "failed-key"
+	const responseBody = `<Error><Code>AccessDenied</Code><Message>delete denied</Message></Error>`
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/xml")
+	headers.Set("X-Upstream-Delete-Result", "failed")
+
+	repopulateThenFail := func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+		bucket, _ := ParseBucketKey(r)
+		meta := &cache.CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"refill"`, ContentLength: 6, StatusCode: http.StatusOK}
+		if err := c.PutWithMeta(context.Background(), bucket, key, meta, []byte("refill"), 60); err != nil {
+			return nil, err
+		}
+		for header, values := range headers {
+			w.Header()[header] = append([]string(nil), values...)
+		}
+		body := []byte(responseBody)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write(body)
+		return &ResponseCapture{StatusCode: http.StatusForbidden, Headers: headers.Clone(), Body: body, Complete: true}, nil
+	}
+
+	var svc *Service
+	svc, c = newTestService(&mockForwarder{captureFunc: repopulateThenFail}, true)
+	r := httptest.NewRequest(http.MethodPost, "/bulk-bucket?delete", strings.NewReader(`<Delete><Object><Key>failed-key</Key></Object></Delete>`))
+	w := httptest.NewRecorder()
+	if err := svc.HandleDeleteObjects(w, r); err != nil {
+		t.Fatalf("HandleDeleteObjects: %v", err)
+	}
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("DeleteObjects status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if got := w.Header().Get("X-Upstream-Delete-Result"); got != "failed" {
+		t.Fatalf("DeleteObjects response header = %q, want failed", got)
+	}
+	if got := w.Body.String(); got != responseBody {
+		t.Fatalf("DeleteObjects response body = %q, want byte-exact upstream body %q", got, responseBody)
+	}
+	bucket, _ := ParseBucketKey(r)
+	if _, found, err := c.GetMeta(context.Background(), bucket, key); err != nil || !found {
+		t.Fatalf("failed delete discarded the refill: found=%t err=%v", found, err)
 	}
 }
