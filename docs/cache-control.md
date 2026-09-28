@@ -44,7 +44,9 @@ TAG automatically invalidates cached objects when they are modified through TAG:
 
 - **PutObject** — Cache entry deleted before forwarding the upload
 - **DeleteObject** — Cache entry deleted before forwarding the delete
-- **DeleteObjects** (bulk) — Cache entries deleted for all keys in the request
+- **DeleteObjects** (bulk) — In proxy mode, requested cache entries are invalidated before forwarding. For cache-enabled requests with a nonempty parsed key list, TAG collects the upstream response before publishing it and waits for the post-success per-key invalidation attempts to return before completing a 2xx response.
+
+  The post-success pass targets keys with at least one successful requested delete; keys whose requested entries all fail are not re-invalidated. An unparseable result uses the conservative all-requested-keys fallback. Cache-disabled requests, unparseable request bodies, and empty key lists keep the direct streaming path. Cache backend failures remain best-effort and may leave stale metadata.
 - **CopyObject** — Cache entry deleted for the destination key
 
 Objects modified directly on Tigris (bypassing TAG) remain in cache until they expire (default TTL: 24 hours, configurable via `TAG_CACHE_TTL`) or are revalidated via `Cache-Control: no-cache`.

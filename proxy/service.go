@@ -1007,23 +1007,23 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 // already succeeded, so a failed local invalidation is a stale-cache blip.
 // preForwardInvalidate is the proxy-mode "invalidate BEFORE forwarding"
 // consistency step, shared by the mutating handlers (DELETE, CopyObject,
-// CompleteMultipartUpload, bulk DeleteObjects). In proxy mode dropping a
-// cache entry is always safe, and doing it up front means a forward that
-// succeeds but whose post-invalidation fails cannot leave stale data served.
-// In TIERED mode it is the opposite of safe: the cache is authoritative and a
-// local-tier entry is the ONLY copy, so destroying it before upstream has
-// authorized and confirmed the operation turns a rejected request into data
-// loss (and drops a live marker on a failed upstream-tier op). Tiered relies
-// solely on the post-success invalidation these handlers already perform.
-// convergeInvalidation is the POST-SUCCESS invalidation of the mutating
-// handlers. By the time it runs the client already holds its 2xx, and in
-// tiered mode it is the ONLY invalidation (preForwardInvalidate is a no-op
-// there), so a transient failure leaves a deleted or overwritten local-tier
-// object — or a stale marker — serving authoritatively until TTL with no
-// retry signal. One immediate retry absorbs the transient class cheaply; a
-// repeat failure stays visible as tag_cache_operations_total{operation=
-// "delete",result="error"} (the dashboard's invalidation-errors panel),
-// since the acked response cannot be recalled.
+// CompleteMultipartUpload, bulk DeleteObjects). Dropping the cached entry up
+// front protects against a failed forward; a GET racing a successful mutation
+// can still refill the old upstream object, so the post-success converge remains
+// necessary. In TIERED mode the cache is authoritative and a local-tier entry is
+// the ONLY copy, so destroying it before upstream has authorized and confirmed
+// the operation turns a rejected request into data loss (and drops a live marker
+// on a failed upstream-tier op). Tiered mutation paths use their mode-specific
+// post-success state updates instead.
+// convergeInvalidation is the synchronous post-success invalidation used by
+// proxy-mode mutation handlers. Most callers stream the upstream response before
+// calling it; bulk DeleteObjects stages its captured response until this helper
+// returns. One immediate retry absorbs a transient backend failure. Returning
+// means the attempts finished, not that the backend fence succeeded; if both
+// attempts fail, stale metadata may remain until TTL and the failure stays visible
+// as tag_cache_operations_total{operation="delete",result="error"} (the dashboard's
+// invalidation-errors panel). Callers that already committed a response cannot
+// recall it; bulk DeleteObjects still waits for the helper to return before commit.
 func (s *Service) convergeInvalidation(ctx context.Context, bucket, key string) {
 	if s.invalidateObject(ctx, bucket, key) == nil {
 		return
@@ -1048,12 +1048,13 @@ func (s *Service) convergeTieredDelete(bucket, key string, priorVersion uint64, 
 		return
 	}
 	// One immediate retry absorbs the transient class (the discipline
-	// convergeInvalidation already applies): the client holds its 2xx, and
-	// a converge that never lands leaves the old metadata AUTHORITATIVE —
-	// a marker makes HEAD report the deleted object present, a surviving
-	// local-tier entry keeps serving the deleted body — until TTL. The
-	// version guard is kept on the retry; a repeat failure stays visible on
-	// the invalidation-errors metric.
+	// convergeInvalidation also applies). A direct-streaming caller may already
+	// have committed the upstream response; HandleDeleteObjects commits its
+	// captured response after this helper returns. The version guard is kept on
+	// both attempts. If the prior is unknown or both attempts return backend
+	// errors, old metadata may remain authoritative until TTL; the failure stays
+	// visible on the invalidation-errors metric. A version mismatch leaves the
+	// newer state in place.
 	_, err := s.cache.DeleteMetaIfVersion(ctx, bucket, key, priorVersion)
 	if err != nil {
 		_, err = s.cache.DeleteMetaIfVersion(ctx, bucket, key, priorVersion)
