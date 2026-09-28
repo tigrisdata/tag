@@ -22,13 +22,12 @@ import (
 )
 
 const (
-	bulkDeleteFenceBucket          = "bulk-delete-fence-bucket"
-	bulkDeleteFenceKey             = "racing-key"
-	bulkDeleteFenceOldBody         = "old-object-bytes"
-	bulkDeleteFenceHeader          = "X-Bulk-Delete-Result"
-	bulkDeleteFenceHeaderValue     = "upstream-response"
-	bulkDeleteFenceViolationMarker = "DELETE_FENCE_ASSERTION_VIOLATED"
-	bulkDeleteFenceAuthorization   = "AWS4-HMAC-SHA256 Credential=benchmark/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=deadbeef"
+	bulkDeleteFenceBucket        = "bulk-delete-fence-bucket"
+	bulkDeleteFenceKey           = "racing-key"
+	bulkDeleteFenceOldBody       = "old-object-bytes"
+	bulkDeleteFenceHeader        = "X-Bulk-Delete-Result"
+	bulkDeleteFenceHeaderValue   = "upstream-response"
+	bulkDeleteFenceAuthorization = "AWS4-HMAC-SHA256 Credential=benchmark/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=deadbeef"
 )
 
 type bulkDeleteFenceCacheClient struct {
@@ -83,8 +82,8 @@ func TestBulkDeleteResponseWaitsForPostSuccessFence(t *testing.T) {
 		t.Fatalf("could not complete the controlled delete/fence schedule: %v", err)
 	}
 	if observation.completedBeforeFence && observation.staleRefillServedBefore {
-		t.Errorf("%s: the client completed the successful DeleteObjects response while the target key's post-success tombstone was held, then GET served the old refill; status=%d, X-Cache=%q, response_bytes=%d",
-			bulkDeleteFenceViolationMarker, response.statusCode, "HIT", len(response.body))
+		t.Errorf("the client completed the successful DeleteObjects response while the target key's post-success tombstone was held, then GET served the old refill; status=%d, X-Cache=%q, response_bytes=%d",
+			response.statusCode, "HIT", len(response.body))
 		return
 	}
 	if observation.committedBeforeFence {
