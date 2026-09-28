@@ -293,8 +293,11 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 		capture.Complete = true
 	}
 
-	// Track bytes out from response body
-	metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
+	// Track bytes out from response body. A deferred writer counts the bytes
+	// accepted by the client when it later commits the captured response.
+	if _, deferred := w.(responseByteAccountingDeferred); !deferred {
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
+	}
 
 	logUpstreamResponse(fwdReq, originalReq, resp.StatusCode, upstreamStart)
 	return capture, nil
@@ -577,6 +580,13 @@ func logUpstreamResponse(fwdReq *http.Request, originalReq *http.Request, status
 		Int("status", statusCode).
 		Int64("upstream_ms", time.Since(upstreamStart).Milliseconds()).
 		Msg("Upstream response")
+}
+
+// responseByteAccountingDeferred marks a writer that buffers a captured response
+// instead of sending it to the client as the upstream body is read. The writer
+// accounts for outbound bytes when it commits the response.
+type responseByteAccountingDeferred interface {
+	deferResponseByteAccounting()
 }
 
 // ResponseCapture holds captured response data.

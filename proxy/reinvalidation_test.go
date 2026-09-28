@@ -356,3 +356,47 @@ func TestHandleDeleteObjects_UpstreamFailurePreservesResponseAndRefill(t *testin
 		t.Fatalf("failed delete discarded the refill: found=%t err=%v", found, err)
 	}
 }
+
+// An incomplete 2xx capture still forwards its exact captured prefix; its
+// unparseable result takes the conservative all-keys invalidation fallback.
+func TestHandleDeleteObjects_IncompleteCapturePreservesPrefixAndInvalidatesKey(t *testing.T) {
+	var c *cache.Cache
+	const key = "partial-key"
+	const responsePrefix = `<DeleteResult><Deleted><Key>partial-key</Key>`
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/xml")
+	headers.Set("Content-Length", "128")
+	headers.Set("X-Upstream-Delete-Result", "incomplete")
+
+	capturePartialResponse := func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+		bucket, _ := ParseBucketKey(r)
+		meta := &cache.CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"refill"`, ContentLength: 6, StatusCode: http.StatusOK}
+		if err := c.PutWithMeta(context.Background(), bucket, key, meta, []byte("refill"), 60); err != nil {
+			return nil, err
+		}
+		for header, values := range headers {
+			w.Header()[header] = append([]string(nil), values...)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(responsePrefix))
+		return &ResponseCapture{StatusCode: http.StatusOK, Headers: headers.Clone(), Body: []byte(responsePrefix), Complete: false}, nil
+	}
+
+	var svc *Service
+	svc, c = newTestService(&mockForwarder{captureFunc: capturePartialResponse}, true)
+	r := httptest.NewRequest(http.MethodPost, "/bulk-bucket?delete", strings.NewReader(`<Delete><Object><Key>partial-key</Key></Object></Delete>`))
+	w := httptest.NewRecorder()
+	if err := svc.HandleDeleteObjects(w, r); err != nil {
+		t.Fatalf("HandleDeleteObjects: %v", err)
+	}
+	if w.Code != http.StatusOK || w.Header().Get("X-Upstream-Delete-Result") != "incomplete" {
+		t.Fatalf("incomplete response status/header = %d/%q", w.Code, w.Header().Get("X-Upstream-Delete-Result"))
+	}
+	if got := w.Body.String(); got != responsePrefix {
+		t.Fatalf("incomplete response body = %q, want captured prefix %q", got, responsePrefix)
+	}
+	bucket, _ := ParseBucketKey(r)
+	if _, found, err := c.GetMeta(context.Background(), bucket, key); err != nil || found {
+		t.Fatalf("incomplete response fallback left key cached: found=%t err=%v", found, err)
+	}
+}
