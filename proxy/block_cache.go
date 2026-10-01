@@ -975,14 +975,32 @@ func (s *Service) serveCompleteFromBlocks(
 // errors ensureBlocksCached acts on to invalidate, so a fast transient failure of one block
 // must not mask a slower stale signal from another (which would leave the stale meta to retry
 // until TTL). Blocks are therefore not canceled on a sibling's error — each runs to completion
-// so its signal is observed — but the caller's ctx still aborts them (e.g. client disconnect).
+// so its signal is observed. Caller cancellation stops admitting new block states; already-admitted
+// fetches remain detached. After the group drains, a collected stale signal wins; otherwise a
+// canceled admission returns the context error.
 func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdxs []int64) error {
+	if len(blockIdxs) == 0 {
+		return nil
+	}
 	var g errgroup.Group
 	g.SetLimit(maxConcurrentBlockFetches)
 	var mu sync.Mutex
 	var stale, transient error
+	var canceledAdmission bool
 	for _, idx := range blockIdxs {
+		if ctx.Err() != nil {
+			mu.Lock()
+			canceledAdmission = true
+			mu.Unlock()
+			break
+		}
 		g.Go(func() error {
+			if ctx.Err() != nil {
+				mu.Lock()
+				canceledAdmission = true
+				mu.Unlock()
+				return nil
+			}
 			err := s.fetchOneBlock(ctx, bucket, key, accessKey, secretKey, meta, idx)
 			if err == nil {
 				return nil
@@ -1002,17 +1020,24 @@ func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey
 		})
 	}
 	_ = g.Wait()
-	if stale != nil {
+	mu.Lock()
+	staleErr, transientErr := stale, transient
+	wasAdmissionCanceled := canceledAdmission
+	mu.Unlock()
+	if staleErr != nil {
 		// A definitive stale signal means the cached meta describes a version upstream no
 		// longer serves. Invalidate HERE — every block fetch flows through this point — so no
 		// caller can forget it and leave the stale meta to fail again until TTL.
 		// invalidateStaleMeta is ETag-guarded and idempotent, so central invocation is
 		// safe for every caller.
-		log.Debug().Err(stale).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
+		log.Debug().Err(staleErr).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
 		s.invalidateStaleMeta(bucket, key, meta.ETag)
-		return stale
+		return staleErr
 	}
-	return transient
+	if wasAdmissionCanceled {
+		return ctx.Err()
+	}
+	return transientErr
 }
 
 // recordBlockServeMetrics records per-block hit/miss counts and the full/partial serve
@@ -1072,16 +1097,29 @@ func (l *blockFetchLease) release() {
 // which makes ownership exact even when a fast remote write finishes before
 // waiters wake up.
 func (s *Service) beginBlockFetch(blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) *blockFetchState {
+	return s.beginBlockFetchWithContext(nil, blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, knownMissing)
+}
+
+// beginBlockFetchWithContext applies ctx only to new-state admission. Existing
+// states are still joined for single-flight coalescing; callers observe
+// cancellation while waiting on the shared state. A canceled admission without
+// an existing state returns nil; checking under blockFetchMu closes the gap
+// between a task's earlier context check and detached fetch creation.
+func (s *Service) beginBlockFetchWithContext(ctx context.Context, blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) *blockFetchState {
 	s.blockFetchMu.Lock()
-	if s.blockFetches == nil {
-		s.blockFetches = make(map[string]*blockFetchState)
-	}
 	if state := s.blockFetches[blockKey]; state != nil {
 		state.mu.Lock()
 		state.consumers++
 		state.mu.Unlock()
 		s.blockFetchMu.Unlock()
 		return state
+	}
+	if ctx != nil && ctx.Err() != nil {
+		s.blockFetchMu.Unlock()
+		return nil
+	}
+	if s.blockFetches == nil {
+		s.blockFetches = make(map[string]*blockFetchState)
 	}
 
 	state := &blockFetchState{
@@ -1184,7 +1222,10 @@ func (s *Service) fetchOneBlockForAssembly(ctx context.Context, bucket, key, acc
 // after validation while this same state keeps the bounded writer alive.
 func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) error {
 	blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, blockIdx)
-	state := s.beginBlockFetch(blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, false)
+	state := s.beginBlockFetchWithContext(ctx, blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, false)
+	if state == nil {
+		return ctx.Err()
+	}
 
 	select {
 	case <-state.cacheDone:
