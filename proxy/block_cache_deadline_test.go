@@ -148,7 +148,7 @@ func waitForBlockFetchStart(t *testing.T, forwarder *gatedBlockFetchForwarder, c
 		select {
 		case <-forwarder.started:
 		case <-ctx.Done():
-			t.Fatalf("context expired before the first %d block GETs started", count)
+			t.Fatalf("context was canceled before the first %d block GETs started", count)
 		case <-time.After(5 * time.Second):
 			t.Fatalf("timed out waiting for block GET %d of %d", i+1, count)
 		}
@@ -165,11 +165,35 @@ func waitForBlockFetchDrain(t *testing.T, svc *Service, forwarder *gatedBlockFet
 	})
 }
 
-func summarizeLateBlockFetchEvents(events []blockFetchDeadlineEvent, deadline time.Time) (int, time.Time, time.Time) {
+type blockFetchTaskCheckContext struct {
+	context.Context
+	mu           sync.Mutex
+	checks       int
+	checkReached chan struct{}
+	resumeCheck  chan struct{}
+}
+
+func (c *blockFetchTaskCheckContext) Err() error {
+	c.mu.Lock()
+	c.checks++
+	check := c.checks
+	c.mu.Unlock()
+	if check == 2 {
+		// Capture the task-entry result before the test cancels the parent, then
+		// pause the task between that check and blockFetchMu admission.
+		err := c.Context.Err()
+		close(c.checkReached)
+		<-c.resumeCheck
+		return err
+	}
+	return c.Context.Err()
+}
+
+func summarizeLateBlockFetchEvents(events []blockFetchDeadlineEvent, cutoff time.Time) (int, time.Time, time.Time) {
 	count := 0
 	var first, last time.Time
 	for _, event := range events {
-		if !event.at.After(deadline) {
+		if !event.at.After(cutoff) {
 			continue
 		}
 		if count == 0 {
@@ -181,10 +205,10 @@ func summarizeLateBlockFetchEvents(events []blockFetchDeadlineEvent, deadline ti
 	return count, first, last
 }
 
-// TestFetchBlocksToCacheStopsPostDeadlineAdmission verifies that expiry stops a
-// populate batch from admitting queued blocks while already-admitted block fetches
-// remain detached and can complete.
-func TestFetchBlocksToCacheStopsPostDeadlineAdmission(t *testing.T) {
+// TestFetchBlocksToCacheStopsAdmissionAfterCancellation verifies that a canceled
+// parent stops a populate batch from admitting queued blocks while already-admitted
+// block fetches remain detached and can complete.
+func TestFetchBlocksToCacheStopsAdmissionAfterCancellation(t *testing.T) {
 	const (
 		blockSize  = int64(4)
 		blockCount = 32
@@ -219,8 +243,7 @@ func TestFetchBlocksToCacheStopsPostDeadlineAdmission(t *testing.T) {
 		blocks[i] = int64(i)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	deadline, _ := ctx.Deadline()
+	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	done := make(chan struct{})
 	go func() {
@@ -242,9 +265,6 @@ func TestFetchBlocksToCacheStopsPostDeadlineAdmission(t *testing.T) {
 
 	waitForBlockFetchStart(t, forwarder, maxConcurrentBlockFetches, ctx)
 	before := snapshotBlockFetchAdmission(svc, probeClient, forwarder)
-	if !before.at.Before(deadline) {
-		t.Fatalf("first wave did not reach the upstream before the deadline: deadline=%s snapshot=%s", deadline, before.at)
-	}
 	if got := len(before.states); got != maxConcurrentBlockFetches {
 		t.Fatalf("first wave created %d block states, want %d", got, maxConcurrentBlockFetches)
 	}
@@ -258,11 +278,17 @@ func TestFetchBlocksToCacheStopsPostDeadlineAdmission(t *testing.T) {
 		t.Fatalf("first wave populate permits = (slots=%d bytes=%d), want (%d slots, %d bytes)", before.slots, before.bytesUsed, maxConcurrentBlockFetches, int64(maxConcurrentBlockFetches)*blockSize)
 	}
 
-	<-ctx.Done()
+	// Start cancellation only after the first wave is synchronized at upstream.
+	// This keeps the admission check independent of scheduler speed.
+	canceledAt := time.Now()
+	if !before.at.Before(canceledAt) {
+		t.Fatalf("first wave was not observed before cancellation: snapshot=%s canceled_at=%s", before.at, canceledAt)
+	}
+	cancel()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("fetchBlocksToCache did not drain its admitted tasks after the deadline")
+		t.Fatal("fetchBlocksToCache did not drain its admitted tasks after cancellation")
 	}
 	fetchErr := <-result
 	afterStates := snapshotBlockFetchAdmission(svc, probeClient, forwarder)
@@ -283,20 +309,100 @@ func TestFetchBlocksToCacheStopsPostDeadlineAdmission(t *testing.T) {
 			newStates++
 		}
 	}
-	lateProbes, firstLateProbe, lastLateProbe := summarizeLateBlockFetchEvents(after.probes, deadline)
-	lateGets, firstLateGet, lastLateGet := summarizeLateBlockFetchEvents(after.gets, deadline)
-	if !errors.Is(fetchErr, context.DeadlineExceeded) || newStates != 0 || len(after.probes) != len(before.probes) || len(after.gets) != len(before.gets) || after.slots != before.slots || after.bytesUsed != before.bytesUsed || lateProbes != 0 || lateGets != 0 {
-		t.Errorf("post-deadline block admission: deadline=%s before@%s(states=%d probes=%d GETs=%d slots=%d bytes=%d) after@%s(states=%d probes=%d GETs=%d slots=%d bytes=%d) new_states=%d late_probes=%d[%s..%s] late_GETs=%d[%s..%s] result=%v", deadline, before.at, len(before.states), len(before.probes), len(before.gets), before.slots, before.bytesUsed, after.at, len(after.states), len(after.probes), len(after.gets), after.slots, after.bytesUsed, newStates, lateProbes, firstLateProbe, lastLateProbe, lateGets, firstLateGet, lastLateGet, fetchErr)
+	lateProbes, firstLateProbe, lastLateProbe := summarizeLateBlockFetchEvents(after.probes, canceledAt)
+	lateGets, firstLateGet, lastLateGet := summarizeLateBlockFetchEvents(after.gets, canceledAt)
+	if !errors.Is(fetchErr, context.Canceled) || newStates != 0 || len(after.probes) != len(before.probes) || len(after.gets) != len(before.gets) || after.slots != before.slots || after.bytesUsed != before.bytesUsed || lateProbes != 0 || lateGets != 0 {
+		t.Errorf("post-cancellation block admission: canceled_at=%s before@%s(states=%d probes=%d GETs=%d slots=%d bytes=%d) after@%s(states=%d probes=%d GETs=%d slots=%d bytes=%d) new_states=%d late_probes=%d[%s..%s] late_GETs=%d[%s..%s] result=%v", canceledAt, before.at, len(before.states), len(before.probes), len(before.gets), before.slots, before.bytesUsed, after.at, len(after.states), len(after.probes), len(after.gets), after.slots, after.bytesUsed, newStates, lateProbes, firstLateProbe, lastLateProbe, lateGets, firstLateGet, lastLateGet, fetchErr)
 	}
 
-	// The four states admitted before expiry are intentionally detached from the
+	// The four states admitted before cancellation are intentionally detached from the
 	// batch context; after upstream is released they still finish their cache writes.
 	release()
 	waitForBlockFetchDrain(t, svc, forwarder)
 	for i := 0; i < maxConcurrentBlockFetches; i++ {
 		if !store.BlockExists(context.Background(), meta.Bucket, meta.Key, meta.ETag, blockSize, int64(i)) {
-			t.Errorf("pre-deadline admitted block %d did not complete its detached cache write", i)
+			t.Errorf("pre-cancellation admitted block %d did not complete its detached cache write", i)
 		}
+	}
+}
+
+// TestFetchBlocksToCacheRejectsCancellationAfterTaskCheck prevents a task that
+// passed its context check before cancellation from admitting state after waiting
+// between that check and blockFetchMu.
+func TestFetchBlocksToCacheRejectsCancellationAfterTaskCheck(t *testing.T) {
+	blockSize := blockFetchTestBlockSize
+	object := []byte("data")
+	mock := newBlockMock(object, `"v1"`)
+	forwarder := &gatedBlockFetchForwarder{
+		blockMockForwarder: mock,
+		started:            make(chan blockFetchDeadlineEvent, 1),
+		release:            make(chan struct{}),
+	}
+	probeClient := &blockProbeRecordingClient{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = blockSize
+	cfg.Cache.SizeThreshold = int64(len(object))
+	cfg.Cache.MaxConcurrentWrites = 2
+	cfg.Cache.MaxPopulateMemoryBytes = 1 << 20
+	store := cache.NewCacheWithClient(probeClient, &cfg.Cache)
+	svc := NewService(forwarder, store, cfg)
+	meta := &cache.CachedObjectMeta{
+		Bucket:             "deadline-bucket",
+		Key:                "admission-race-key",
+		ETag:               `"v1"`,
+		ContentLength:      int64(len(object)),
+		BlockSize:          blockSize,
+		ContentLengthKnown: true,
+		StatusCode:         http.StatusOK,
+	}
+
+	parent, cancel := context.WithCancel(context.Background())
+	ctx := &blockFetchTaskCheckContext{
+		Context:      parent,
+		checkReached: make(chan struct{}),
+		resumeCheck:  make(chan struct{}),
+	}
+	result := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		result <- svc.fetchBlocksToCache(ctx, meta.Bucket, meta.Key, "access", "secret", meta, []int64{0})
+	}()
+	var releaseOnce, resumeOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(forwarder.release) }) }
+	resume := func() { resumeOnce.Do(func() { close(ctx.resumeCheck) }) }
+	t.Cleanup(func() {
+		cancel()
+		resume()
+		release()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("fetchBlocksToCache did not return during cleanup")
+		}
+		waitForBlockFetchDrain(t, svc, forwarder)
+	})
+
+	select {
+	case <-ctx.checkReached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("task did not reach its context check")
+	}
+	cancel()
+	resume()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetchBlocksToCache did not return after cancellation")
+	}
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Errorf("canceled task result = %v, want %v", err, context.Canceled)
+	}
+
+	snapshot := snapshotBlockFetchAdmission(svc, probeClient, forwarder)
+	if len(snapshot.states) != 0 || len(snapshot.probes) != 0 || len(snapshot.gets) != 0 || snapshot.slots != 0 || snapshot.bytesUsed != 0 {
+		t.Errorf("canceled task admitted state or populate work: states=%d probes=%d GETs=%d slots=%d bytes=%d", len(snapshot.states), len(snapshot.probes), len(snapshot.gets), snapshot.slots, snapshot.bytesUsed)
 	}
 }
 
