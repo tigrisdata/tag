@@ -710,13 +710,21 @@ func (r *handlerParquetReplay) close() {
 
 func (r *handlerParquetReplay) request(tb testing.TB, method, query, phase, rangeHeader string) *http.Response {
 	tb.Helper()
+	resp, err := r.requestWithError(method, query, phase, rangeHeader)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return resp
+}
+
+func (r *handlerParquetReplay) requestWithError(method, query, phase, rangeHeader string) (*http.Response, error) {
 	path := "/" + handlerParquetBucket + "/" + handlerParquetKey + query
 	req, err := http.NewRequest(method, r.gateway.URL+path, strings.NewReader(handlerParquetUploadXML))
 	if method == http.MethodGet || method == http.MethodDelete {
 		req, err = http.NewRequest(method, r.gateway.URL+path, nil)
 	}
 	if err != nil {
-		tb.Fatalf("new %s request: %v", method, err)
+		return nil, fmt.Errorf("new %s request: %w", method, err)
 	}
 	req.Header.Set("Authorization", handlerParquetAuthHeader)
 	if phase != "" {
@@ -730,50 +738,77 @@ func (r *handlerParquetReplay) request(tb testing.TB, method, query, phase, rang
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {
-		tb.Fatalf("%s %s: %v", method, path, err)
+		return nil, fmt.Errorf("%s %s: %w", method, path, err)
 	}
-	return resp
+	return resp, nil
 }
 
 func (r *handlerParquetReplay) completeAndPauseFooter(tb testing.TB, uploadID string) {
 	tb.Helper()
-	completed := make(chan struct {
-		status int
-		body   []byte
-		err    error
-	}, 1)
+	type completionResult struct {
+		status      int
+		body        []byte
+		requestErr  error
+		responseErr error
+	}
+	completed := make(chan completionResult, 1)
 	go func() {
-		resp := r.request(tb, http.MethodPost, "?uploadId="+uploadID, "completion", "")
+		resp, err := r.requestWithError(http.MethodPost, "?uploadId="+uploadID, "completion", "")
+		if err != nil {
+			completed <- completionResult{requestErr: err}
+			return
+		}
 		body, readErr := io.ReadAll(resp.Body)
 		closeErr := resp.Body.Close()
 		if readErr == nil {
 			readErr = closeErr
 		}
-		completed <- struct {
-			status int
-			body   []byte
-			err    error
-		}{resp.StatusCode, body, readErr}
+		completed <- completionResult{status: resp.StatusCode, body: body, responseErr: readErr}
 	}()
 
-	waitHandlerParquetSignal(tb, r.order.firstValidation, "footer credential validation")
+	var result *completionResult
+	checkResult := func(completed completionResult) {
+		result = &completed
+		if completed.requestErr != nil {
+			tb.Fatalf("complete multipart request: %v", completed.requestErr)
+		}
+		if completed.responseErr != nil {
+			tb.Fatalf("read completion response: %v", completed.responseErr)
+		}
+	}
+	waitForSignal := func(signal <-chan struct{}, name string) {
+		timer := time.NewTimer(3 * time.Second)
+		defer timer.Stop()
+		for {
+			select {
+			case <-signal:
+				return
+			case completed := <-completed:
+				checkResult(completed)
+			case <-timer.C:
+				tb.Fatalf("timed out waiting for %s", name)
+			}
+		}
+	}
+
+	waitForSignal(r.order.firstValidation, "footer credential validation")
 	r.gate.armed.Store(true)
 	r.order.releaseFirst()
-	waitHandlerParquetSignal(tb, r.gate.entered, "footer metadata decision")
-	waitHandlerParquetSignal(tb, r.order.secondValidation, "metadata HEAD credential validation")
+	waitForSignal(r.gate.entered, "footer metadata decision")
+	waitForSignal(r.order.secondValidation, "metadata HEAD credential validation")
 	r.order.releaseSecond()
 
-	select {
-	case result := <-completed:
-		if result.err != nil {
-			tb.Fatalf("read completion response: %v", result.err)
+	if result == nil {
+		select {
+		case completed := <-completed:
+			checkResult(completed)
+		case <-time.After(3 * time.Second):
+			tb.Fatal("completion waited for detached footer or HEAD work")
 		}
-		want := []byte(`<CompleteMultipartUploadResult><ETag>` + handlerParquetETag + `</ETag></CompleteMultipartUploadResult>`)
-		if result.status != http.StatusOK || !bytes.Equal(result.body, want) {
-			tb.Fatalf("CompleteMultipartUpload response = %d %q; want 200 %q", result.status, result.body, want)
-		}
-	case <-time.After(3 * time.Second):
-		tb.Fatal("completion waited for detached footer or HEAD work")
+	}
+	want := []byte(`<CompleteMultipartUploadResult><ETag>` + handlerParquetETag + `</ETag></CompleteMultipartUploadResult>`)
+	if result.status != http.StatusOK || !bytes.Equal(result.body, want) {
+		tb.Fatalf("CompleteMultipartUpload response = %d %q; want 200 %q", result.status, result.body, want)
 	}
 	if got := r.forwarder.completionForwards.Load(); got != 1 {
 		tb.Fatalf("completion forward count = %d, want one nonreplayed completion", got)
