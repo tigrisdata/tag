@@ -975,14 +975,32 @@ func (s *Service) serveCompleteFromBlocks(
 // errors ensureBlocksCached acts on to invalidate, so a fast transient failure of one block
 // must not mask a slower stale signal from another (which would leave the stale meta to retry
 // until TTL). Blocks are therefore not canceled on a sibling's error — each runs to completion
-// so its signal is observed — but the caller's ctx still aborts them (e.g. client disconnect).
+// so its signal is observed. Caller cancellation stops admitting new block states; already-admitted
+// fetches remain detached. After the group drains, a collected stale signal wins; otherwise a
+// canceled admission returns the context error.
 func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdxs []int64) error {
+	if len(blockIdxs) == 0 {
+		return nil
+	}
 	var g errgroup.Group
 	g.SetLimit(maxConcurrentBlockFetches)
 	var mu sync.Mutex
 	var stale, transient error
+	var canceledAdmission bool
 	for _, idx := range blockIdxs {
+		if ctx.Err() != nil {
+			mu.Lock()
+			canceledAdmission = true
+			mu.Unlock()
+			break
+		}
 		g.Go(func() error {
+			if ctx.Err() != nil {
+				mu.Lock()
+				canceledAdmission = true
+				mu.Unlock()
+				return nil
+			}
 			err := s.fetchOneBlock(ctx, bucket, key, accessKey, secretKey, meta, idx)
 			if err == nil {
 				return nil
@@ -1002,17 +1020,24 @@ func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey
 		})
 	}
 	_ = g.Wait()
-	if stale != nil {
+	mu.Lock()
+	staleErr, transientErr := stale, transient
+	wasAdmissionCanceled := canceledAdmission
+	mu.Unlock()
+	if staleErr != nil {
 		// A definitive stale signal means the cached meta describes a version upstream no
 		// longer serves. Invalidate HERE — every block fetch flows through this point — so no
 		// caller can forget it and leave the stale meta to fail again until TTL.
 		// invalidateStaleMeta is ETag-guarded and idempotent, so central invocation is
 		// safe for every caller.
-		log.Debug().Err(stale).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
+		log.Debug().Err(staleErr).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
 		s.invalidateStaleMeta(bucket, key, meta.ETag)
-		return stale
+		return staleErr
 	}
-	return transient
+	if wasAdmissionCanceled {
+		return ctx.Err()
+	}
+	return transientErr
 }
 
 // recordBlockServeMetrics records per-block hit/miss counts and the full/partial serve
