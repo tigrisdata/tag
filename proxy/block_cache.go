@@ -1097,16 +1097,29 @@ func (l *blockFetchLease) release() {
 // which makes ownership exact even when a fast remote write finishes before
 // waiters wake up.
 func (s *Service) beginBlockFetch(blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) *blockFetchState {
+	return s.beginBlockFetchWithContext(nil, blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, knownMissing)
+}
+
+// beginBlockFetchWithContext applies ctx only to new-state admission. Existing
+// states are still joined for single-flight coalescing; callers observe
+// cancellation while waiting on the shared state. A canceled admission without
+// an existing state returns nil; checking under blockFetchMu closes the gap
+// between a task's earlier context check and detached fetch creation.
+func (s *Service) beginBlockFetchWithContext(ctx context.Context, blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) *blockFetchState {
 	s.blockFetchMu.Lock()
-	if s.blockFetches == nil {
-		s.blockFetches = make(map[string]*blockFetchState)
-	}
 	if state := s.blockFetches[blockKey]; state != nil {
 		state.mu.Lock()
 		state.consumers++
 		state.mu.Unlock()
 		s.blockFetchMu.Unlock()
 		return state
+	}
+	if ctx != nil && ctx.Err() != nil {
+		s.blockFetchMu.Unlock()
+		return nil
+	}
+	if s.blockFetches == nil {
+		s.blockFetches = make(map[string]*blockFetchState)
 	}
 
 	state := &blockFetchState{
@@ -1209,7 +1222,10 @@ func (s *Service) fetchOneBlockForAssembly(ctx context.Context, bucket, key, acc
 // after validation while this same state keeps the bounded writer alive.
 func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) error {
 	blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, blockIdx)
-	state := s.beginBlockFetch(blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, false)
+	state := s.beginBlockFetchWithContext(ctx, blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, false)
+	if state == nil {
+		return ctx.Err()
+	}
 
 	select {
 	case <-state.cacheDone:
