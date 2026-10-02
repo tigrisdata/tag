@@ -1141,7 +1141,7 @@ func TestBlockCache_ServeInteriorBlockRangeThroughHandler(t *testing.T) {
 		ContentLength: total, StatusCode: 200, BlockSize: blockSize,
 		LastModified: time.Now().Unix(),
 	}
-	wrote, err := env.Cache.PutMetaIfVersion(ctx, bucket, key, meta, 300, cache.VersionAny)
+	wrote, err := env.Cache.PutMetaIfVersion(ctx, bucket, key, meta, 300, cache.AnyMetaVersionToken())
 	require.NoError(t, err)
 	require.True(t, wrote, "block-mode meta write skipped")
 

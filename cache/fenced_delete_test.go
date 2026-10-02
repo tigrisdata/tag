@@ -15,7 +15,7 @@ func TestGetMetaWithVersion_AbsentCarriesToken(t *testing.T) {
 	if err != nil || found {
 		t.Fatalf("absent read: found=%v err=%v", found, err)
 	}
-	if tok == 0 {
+	if tok.version == 0 {
 		t.Fatal("absent read returned token 0: the absence token was squashed")
 	}
 }
