@@ -101,7 +101,9 @@ Applies to keys ending in `.parquet` (case-insensitive). The suffix is a hint, n
 ### Related settings
 
 - **`cache.block_size`** — the single most important tuning knob. Size it to your reader's granularity; an oversized block over-fetches on every miss. It also sets what counts as "metadata too large to fit", as above.
-- **`cache.meta_on_write`** — complementary, not an alternative. It caches an object's *metadata entry* on write so the first read does not spend a round trip discovering the object exists. Measured across a reader's opening sequence, it removes the discovery round trips while footer caching removes the block fetches; enabling both takes a cold first open to zero upstream requests.
+- **`cache.meta_on_write`** — complementary, not an alternative. It caches an object's *metadata entry* on write so the first read does not spend a round trip discovering the object exists. It removes the discovery round trips while footer caching removes the block fetches.
+
+On a successful multipart completion with both options enabled, the metadata HEAD and footer warm run independently after the write response. The footer warm validates the suffix-range ETag against the completed write and fills missing footer blocks even if the metadata HEAD publishes first. If the ETag-matched metadata HEAD has published an entry but the suffix response cannot be trusted, TAG keeps the metadata-only entry; later range reads fetch missing blocks normally. A first open that arrives before the footer warm finishes can still fetch missing blocks from upstream.
 
 ---
 
