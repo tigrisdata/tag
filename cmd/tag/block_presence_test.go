@@ -39,32 +39,6 @@ func (missingBlockPresenceOwnerCoordinator) GetNodeForKey(string) (*ring.NodeInf
 	return nil, nil
 }
 
-type blockPresenceEpochCoordinator uint64
-
-func (c blockPresenceEpochCoordinator) GetEpoch() uint64     { return uint64(c) }
-func (blockPresenceEpochCoordinator) GetLocalNodeID() string { return "local" }
-func (blockPresenceEpochCoordinator) GetNodeForKey(string) (*ring.NodeInfo, error) {
-	return nil, nil
-}
-
-type blockPresenceEpochSequence struct {
-	epochs []uint64
-	calls  int
-}
-
-func (c *blockPresenceEpochSequence) GetEpoch() uint64 {
-	if c.calls < len(c.epochs) {
-		epoch := c.epochs[c.calls]
-		c.calls++
-		return epoch
-	}
-	return c.epochs[len(c.epochs)-1]
-}
-func (*blockPresenceEpochSequence) GetLocalNodeID() string { return "local" }
-func (*blockPresenceEpochSequence) GetNodeForKey(string) (*ring.NodeInfo, error) {
-	return nil, nil
-}
-
 func TestCheckBlockPresenceOwnerRetriesWhenNodeIsMissing(t *testing.T) {
 	err := checkBlockPresenceOwner(missingBlockPresenceOwnerCoordinator{}, "block-key", "owner")
 	if !errors.Is(err, cache.ErrBlockPresenceTopologyChanged) {
@@ -72,193 +46,89 @@ func TestCheckBlockPresenceOwnerRetriesWhenNodeIsMissing(t *testing.T) {
 	}
 }
 
-func TestBlockPresencePeerPruningRetainsActiveOwnerAndLeasedConnection(t *testing.T) {
-	client := newEmbeddedBlockCacheClient(nil)
+func TestRemoteBlockPresenceClosesEachAddressConnection(t *testing.T) {
+	requestSeen := []chan struct{}{make(chan struct{}, 1), make(chan struct{}, 1)}
+	listeners := make([]net.Listener, len(requestSeen))
+	servers := make([]*grpc.Server, len(requestSeen))
+	for i := range requestSeen {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners[i] = listener
+		index := i
+		servers[i] = grpc.NewServer(grpc.UnknownServiceHandler(func(_ any, stream grpc.ServerStream) error {
+			var request structpb.Struct
+			if err := stream.RecvMsg(&request); err != nil {
+				return err
+			}
+			requestSeen[index] <- struct{}{}
+			response, err := encodeBlockPresenceResponse([]bool{true}, 0)
+			if err != nil {
+				return err
+			}
+			return stream.SendMsg(response)
+		}))
+		go func(i int) { _ = servers[i].Serve(listeners[i]) }(i)
+		t.Cleanup(func() {
+			servers[index].Stop()
+			_ = listeners[index].Close()
+		})
+	}
+
+	var connMu sync.Mutex
+	var connections []*grpc.ClientConn
+	streamInterceptor := func(ctx context.Context, desc *grpc.StreamDesc, conn *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		connMu.Lock()
+		connections = append(connections, conn)
+		connMu.Unlock()
+		return streamer(ctx, desc, conn, method, opts...)
+	}
+	client := newEmbeddedBlockCacheClient(nil, grpc.WithStreamInterceptor(streamInterceptor))
 	t.Cleanup(func() { _ = client.Close() })
 
-	retiredLease, err := client.peerConnection("retired", "127.0.0.1:1")
-	if err != nil {
-		t.Fatalf("open retired peer connection: %v", err)
+	for i, listener := range listeners {
+		found, err := client.remoteBlockPresence(context.Background(), "same-owner", listener.Addr().String(), 0, []string{"blk|b|k|e|4|0"})
+		if err != nil || len(found) != 1 || !found[0] {
+			t.Fatalf("presence exchange %d = (%v,%v), want one present result", i, found, err)
+		}
+		select {
+		case <-requestSeen[i]:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("address %d did not receive a presence request", i)
+		}
+		connMu.Lock()
+		if len(connections) != i+1 {
+			connMu.Unlock()
+			t.Fatalf("presence exchanges opened %d ClientConns, want %d", len(connections), i+1)
+		}
+		conn := connections[i]
+		connMu.Unlock()
+		if got := conn.GetState(); got != connectivity.Shutdown {
+			t.Fatalf("presence exchange %d retained its ClientConn in state %v", i, got)
+		}
 	}
-	activeLease, err := client.peerConnection("active", "127.0.0.1:2")
-	if err != nil {
-		t.Fatalf("open active peer connection: %v", err)
-	}
-	activeConn := activeLease.conn
-	client.releasePeerConnection(activeLease)
-
-	// The current ring still contains the active peer even though this page has
-	// no key for it. The retired owner has a live lease while the ring changes.
-	coord := blockPresenceEpochCoordinator(1)
-	client.prunePeerConnections(map[string]string{
-		"active": "127.0.0.1:2",
-		"new":    "127.0.0.1:3",
-	}, coord, 1)
-	if !client.hasCachedPeerConnections() {
-		t.Fatal("active peer connection is missing from the cache")
-	}
-	client.peerMu.Lock()
-	activePeer := client.peers["active"]
-	_, retiredPresent := client.peers["retired"]
-	_, leaseRetained := client.retiredPeers[retiredLease]
-	client.peerMu.Unlock()
-	if activePeer != activeLease || retiredPresent || !leaseRetained {
-		t.Fatalf("pruned peers: active retained=%t retired present=%t lease retained=%t", activePeer == activeLease, retiredPresent, leaseRetained)
-	}
-	if activeConn.GetState() == connectivity.Shutdown || retiredLease.conn.GetState() == connectivity.Shutdown {
-		t.Fatal("pruning closed an active owner or a leased connection")
-	}
-
-	newLease, err := client.peerConnection("new", "127.0.0.1:3")
-	if err != nil {
-		t.Fatalf("open replacement peer connection: %v", err)
-	}
-	client.releasePeerConnection(newLease)
-	client.releasePeerConnection(retiredLease)
-	if got := retiredLease.conn.GetState(); got != connectivity.Shutdown {
-		t.Fatalf("released retired connection state = %v, want shutdown", got)
-	}
-	client.peerMu.Lock()
-	_, activeRetained := client.peers["active"]
-	_, newRetained := client.peers["new"]
-	_, retiredLeaseRetained := client.retiredPeers[retiredLease]
-	client.peerMu.Unlock()
-	if !activeRetained || !newRetained || retiredLeaseRetained {
-		t.Fatalf("final peer cache: active=%t new=%t retired lease=%t", activeRetained, newRetained, retiredLeaseRetained)
+	if connections[0] == connections[1] {
+		t.Fatal("address change reused the previous owner's ClientConn")
 	}
 }
 
-func TestBlockPresencePeerPruningDiscardsStaleEpochSnapshot(t *testing.T) {
-	client := newEmbeddedBlockCacheClient(nil)
-	t.Cleanup(func() { _ = client.Close() })
-
-	oldPeer, err := client.peerConnection("old-owner", "127.0.0.1:1")
-	if err != nil {
-		t.Fatalf("open old owner connection: %v", err)
-	}
-	client.releasePeerConnection(oldPeer)
-	currentPeer, err := client.peerConnection("current-owner", "127.0.0.1:2")
-	if err != nil {
-		t.Fatalf("open current owner connection: %v", err)
-	}
-	client.releasePeerConnection(currentPeer)
-
-	// An older Range took this snapshot before the topology changed, but its
-	// cleanup reaches the peer cache only after the current epoch is visible.
-	// Epochs are opaque hashes, so the current value can be numerically smaller.
-	coord := blockPresenceEpochCoordinator(1)
-	client.prunePeerConnections(map[string]string{"old-owner": "127.0.0.1:1"}, coord, 2)
-	client.peerMu.Lock()
-	_, oldRetained := client.peers["old-owner"]
-	_, currentRetained := client.peers["current-owner"]
-	client.peerMu.Unlock()
-	if !oldRetained || !currentRetained {
-		t.Fatalf("stale epoch pruned peers: old=%t current=%t, want both retained", oldRetained, currentRetained)
-	}
-
-	client.prunePeerConnections(map[string]string{"current-owner": "127.0.0.1:2"}, coord, 1)
-	if got := oldPeer.conn.GetState(); got != connectivity.Shutdown {
-		t.Fatalf("retired old owner connection state = %v, want shutdown", got)
-	}
-	if currentPeer.conn.GetState() == connectivity.Shutdown {
-		t.Fatal("current owner connection was closed")
-	}
-
-	// A delayed completion from the earlier request must not sweep the cache a
-	// second time after the current snapshot has been reconciled.
-	client.prunePeerConnections(map[string]string{"old-owner": "127.0.0.1:1"}, coord, 2)
-	client.peerMu.Lock()
-	_, currentRetained = client.peers["current-owner"]
-	client.peerMu.Unlock()
-	if !currentRetained {
-		t.Fatal("stale snapshot changed the current peer cache")
-	}
-}
-
-func TestBlockPresencePeerPruningDiscardsUnstableSnapshot(t *testing.T) {
-	client := newEmbeddedBlockCacheClient(nil)
-	t.Cleanup(func() { _ = client.Close() })
-
-	stalePeer, err := client.peerConnection("stale-owner", "127.0.0.1:1")
-	if err != nil {
-		t.Fatalf("open stale owner connection: %v", err)
-	}
-	client.releasePeerConnection(stalePeer)
-	currentPeer, err := client.peerConnection("current-owner", "127.0.0.1:2")
-	if err != nil {
-		t.Fatalf("open current owner connection: %v", err)
-	}
-	client.releasePeerConnection(currentPeer)
-
-	// A ring update during the peer scan invalidates the owner snapshot. The
-	// prune must not close connections or mark the new epoch as reconciled.
-	changingCoord := &blockPresenceEpochSequence{epochs: []uint64{17, 8}}
-	client.prunePeerConnections(map[string]string{"current-owner": "127.0.0.1:2"}, changingCoord, 17)
-	client.peerMu.Lock()
-	_, staleRetained := client.peers["stale-owner"]
-	_, currentRetained := client.peers["current-owner"]
-	client.peerMu.Unlock()
-	if !staleRetained || !currentRetained || !client.hasCachedPeerConnections() {
-		t.Fatal("unstable owner snapshot pruned cached peers")
-	}
-
-	client.prunePeerConnections(map[string]string{"current-owner": "127.0.0.1:2"}, blockPresenceEpochCoordinator(8), 8)
-	if got := stalePeer.conn.GetState(); got != connectivity.Shutdown {
-		t.Fatalf("stale owner connection after stable retry = %v, want shutdown", got)
-	}
-}
-
-func TestBlockPresencePeerConnectionReplacesChangedAddress(t *testing.T) {
-	client := newEmbeddedBlockCacheClient(nil)
-	t.Cleanup(func() { _ = client.Close() })
-
-	coord := blockPresenceEpochCoordinator(1)
-	oldPeer, err := client.peerConnection("owner", "127.0.0.1:1")
-	if err != nil {
-		t.Fatalf("open original owner connection: %v", err)
-	}
-	client.releasePeerConnection(oldPeer)
-	client.prunePeerConnections(map[string]string{"owner": "127.0.0.1:1"}, coord, 1)
-	newPeer, err := client.peerConnection("owner", "127.0.0.1:2")
-	if err != nil {
-		t.Fatalf("open updated owner connection: %v", err)
-	}
-	defer client.releasePeerConnection(newPeer)
-
-	if oldPeer == newPeer {
-		t.Fatal("address change reused the previous peer connection")
-	}
-	if got := oldPeer.conn.GetState(); got != connectivity.Shutdown {
-		t.Fatalf("old address connection state = %v, want shutdown", got)
-	}
-	if newPeer.conn.GetState() == connectivity.Shutdown {
-		t.Fatal("new address connection is already closed")
-	}
-}
-
-func TestBlockPresenceAddressChangeDefersClosingLeasedPeer(t *testing.T) {
-	requestReceived := make(chan struct{})
-	releaseResponse := make(chan struct{})
-	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { close(releaseResponse) }) }
-	defer release()
-
+func TestEmbeddedBlockCacheClientCloseCancelsActivePresence(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	requestReceived := make(chan struct{})
+	serverCanceled := make(chan struct{})
 	server := grpc.NewServer(grpc.UnknownServiceHandler(func(_ any, stream grpc.ServerStream) error {
 		var request structpb.Struct
 		if err := stream.RecvMsg(&request); err != nil {
 			return err
 		}
 		close(requestReceived)
-		<-releaseResponse
-		response, err := encodeBlockPresenceResponse([]bool{true}, 0)
-		if err != nil {
-			return err
-		}
-		return stream.SendMsg(response)
+		<-stream.Context().Done()
+		close(serverCanceled)
+		return status.FromContextError(stream.Context().Err()).Err()
 	}))
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() {
@@ -268,58 +138,39 @@ func TestBlockPresenceAddressChangeDefersClosingLeasedPeer(t *testing.T) {
 
 	client := newEmbeddedBlockCacheClient(nil)
 	t.Cleanup(func() { _ = client.Close() })
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	result := make(chan error, 1)
+	requestErr := make(chan error, 1)
 	go func() {
-		_, err := client.remoteBlockPresence(ctx, "owner", listener.Addr().String(), 0, []string{"blk|bucket|object|etag|4|0"})
-		result <- err
+		_, err := client.remoteBlockPresence(context.Background(), "owner", listener.Addr().String(), 0, []string{"blk|b|k|e|4|0"})
+		requestErr <- err
 	}()
 	select {
 	case <-requestReceived:
-	case <-ctx.Done():
-		t.Fatalf("presence request did not reach peer: %v", ctx.Err())
+	case <-time.After(2 * time.Second):
+		t.Fatal("presence request did not reach the owner")
 	}
 
-	client.peerMu.Lock()
-	peer := client.peers["owner"]
-	active := 0
-	if peer != nil {
-		active = peer.active
-	}
-	client.peerMu.Unlock()
-	if peer == nil || active != 1 {
-		t.Fatalf("in-flight peer lease = (%v,%d), want one active lease", peer, active)
-	}
-
-	// The address changes while the peer RPC is active. Pruning must detach the
-	// old connection but leave it open until remoteBlockPresence releases its lease.
-	client.prunePeerConnections(map[string]string{"owner": "127.0.0.1:2"}, blockPresenceEpochCoordinator(1), 1)
-	client.peerMu.Lock()
-	_, cached := client.peers["owner"]
-	_, retired := client.retiredPeers[peer]
-	client.peerMu.Unlock()
-	if cached || !retired || peer.conn.GetState() == connectivity.Shutdown {
-		t.Fatalf("leased peer after prune = (cached=%t, retired=%t, state=%v), want detached and open", cached, retired, peer.conn.GetState())
-	}
-
-	release()
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- client.Close() }()
 	select {
-	case err := <-result:
-		if err != nil {
-			t.Fatalf("presence exchange: %v", err)
+	case <-serverCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client Close did not cancel the active presence RPC")
+	}
+	select {
+	case err := <-requestErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("presence error after client Close = %v, want context.Canceled", err)
 		}
-	case <-ctx.Done():
-		t.Fatalf("presence exchange did not finish after release: %v", ctx.Err())
+	case <-time.After(2 * time.Second):
+		t.Fatal("presence RPC did not return after client Close")
 	}
-	if got := peer.conn.GetState(); got != connectivity.Shutdown {
-		t.Fatalf("released retired peer state = %v, want shutdown", got)
-	}
-	client.peerMu.Lock()
-	_, retired = client.retiredPeers[peer]
-	client.peerMu.Unlock()
-	if retired {
-		t.Fatal("released peer lease remained in retired peer set")
+	select {
+	case err := <-closeErr:
+		if err != nil {
+			t.Fatalf("client Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client Close did not join the active presence RPC")
 	}
 }
 
@@ -749,28 +600,21 @@ func TestEmbeddedBlockPresenceMultiNodeAndFallback(t *testing.T) {
 		t.Fatalf("canceled presence = %v, want context.Canceled", err)
 	}
 
-	// A replacement with a fresh ID owns the same deterministic block keys, but
-	// the old connection must be removed from the batcher's owner cache.
+	// A replacement with a fresh ID owns the same deterministic block keys. The
+	// next Range must route its grouped presence exchange to the replacement node.
 	oldOwnerKey := cache.MakeBlockKey(bucket, fixture.key, etag, embeddedBlockRangeBenchmarkBlockSize, 1)
-	oldOwner, err := fixture.embeddedClient.Coordinator().GetNodeForKey(oldOwnerKey)
+	oldOwner, err := coord.GetNodeForKey(oldOwnerKey)
 	if err != nil || oldOwner.ID != "range-bench-1" {
 		t.Fatalf("initial block owner = (%v,%v), want range-bench-1", oldOwner, err)
-	}
-	fixture.cacheClient.peerMu.Lock()
-	oldPeer := fixture.cacheClient.peers[oldOwner.ID]
-	stalePeer := fixture.cacheClient.peers["stale-owner"]
-	fixture.cacheClient.peerMu.Unlock()
-	if oldPeer == nil {
-		t.Fatal("multi-node probes did not cache the old owner's connection")
 	}
 
 	fixture.closeNodes[1]()
 	waitForEmbeddedActiveNodeIDs(t, fixture.embeddedClient, "range-bench-0")
-	replacement, closeReplacement := startEmbeddedBlockRangeReplacementNode(t, fixture, "range-bench-replacement")
+	replacement := startEmbeddedBlockRangeReplacementNode(t, fixture, "range-bench-replacement")
 	waitForEmbeddedActiveNodeIDs(t, fixture.embeddedClient, "range-bench-0", "range-bench-replacement")
 	waitForMatchingEmbeddedEpoch(t, fixture.embeddedClient, replacement)
 
-	newOwner, err := fixture.embeddedClient.Coordinator().GetNodeForKey(oldOwnerKey)
+	newOwner, err := coord.GetNodeForKey(oldOwnerKey)
 	if err != nil || newOwner.ID != "range-bench-replacement" {
 		t.Fatalf("replacement block owner = (%v,%v), want range-bench-replacement", newOwner, err)
 	}
@@ -783,70 +627,9 @@ func TestEmbeddedBlockPresenceMultiNodeAndFallback(t *testing.T) {
 	if got := fixture.stats.presenceRequests.Load(); got != 1 {
 		t.Fatalf("replacement Range made %d presence attempts, want 1", got)
 	}
-
-	fixture.cacheClient.peerMu.Lock()
-	_, oldRetained := fixture.cacheClient.peers[oldOwner.ID]
-	_, staleRetained := fixture.cacheClient.peers["stale-owner"]
-	replacementPeer := fixture.cacheClient.peers["range-bench-replacement"]
-	peerCount := len(fixture.cacheClient.peers)
-	fixture.cacheClient.peerMu.Unlock()
-	if oldRetained || staleRetained || replacementPeer == nil || peerCount != 1 {
-		t.Fatalf("peer connections after replacement = (old=%t stale=%t replacement=%v count=%d), want only new owner", oldRetained, staleRetained, replacementPeer, peerCount)
-	}
-	if oldPeer.conn.GetState() != connectivity.Shutdown {
-		t.Fatalf("retired owner connection state = %v, want shutdown", oldPeer.conn.GetState())
-	}
-	if stalePeer != nil && stalePeer.conn.GetState() != connectivity.Shutdown {
-		t.Fatalf("stale owner connection state = %v, want shutdown", stalePeer.conn.GetState())
-	}
-
-	// Rejoin the same active node ID with the same token count but a new address.
-	// OCache's epoch is based on membership/state/token count, so the final epoch
-	// is unchanged even though the peer connection above points at the old address.
-	addressOnlyEpoch := coord.GetEpoch()
-	oldAddress := newOwner.ListenAddress
-	closeReplacement()
-	waitForEmbeddedActiveNodeIDs(t, fixture.embeddedClient, "range-bench-0")
-	replacement, closeReplacement = startEmbeddedBlockRangeReplacementNode(t, fixture, "range-bench-replacement")
-	defer closeReplacement()
-	waitForEmbeddedActiveNodeIDs(t, fixture.embeddedClient, "range-bench-0", "range-bench-replacement")
-	waitForMatchingEmbeddedEpoch(t, fixture.embeddedClient, replacement)
-	if got := coord.GetEpoch(); got != addressOnlyEpoch {
-		t.Fatalf("ring epoch after same-ID address change = %d, want unchanged %d", got, addressOnlyEpoch)
-	}
-	updatedOwner, err := coord.GetNodeForKey(oldOwnerKey)
-	if err != nil || updatedOwner.ID != "range-bench-replacement" || updatedOwner.ListenAddress == oldAddress {
-		t.Fatalf("same-ID owner address = (%v,%v), want %q changed", updatedOwner, err, oldAddress)
-	}
-	for _, index := range []int64{2, 3} {
-		key := cache.MakeBlockKey(bucket, fixture.key, etag, embeddedBlockRangeBenchmarkBlockSize, index)
-		owner, err := coord.GetNodeForKey(key)
-		if err != nil || owner.ID != coord.GetLocalNodeID() {
-			t.Fatalf("block %d owner = (%v,%v), want local node %q", index, owner, err, coord.GetLocalNodeID())
-		}
-	}
-
-	// This >1-block Range covers only local blocks, so the replacement peer is
-	// absent from the page. Reconciliation must still retire its old connection.
-	fixture.stats.reset()
-	const rangeStart = int64(2 * embeddedBlockRangeBenchmarkBlockSize)
-	const rangeEnd = int64(3*embeddedBlockRangeBenchmarkBlockSize + 127)
-	assertEmbeddedRangeBytes(t, fixture.client, fixture.gateway.URL, fixture.key, fixture.body, rangeStart, rangeEnd, fixture.gatewaySigner, fixture.accessKey, fixture.secretKey)
-	if got := fixture.stats.presenceRequests.Load(); got != 0 {
-		t.Fatalf("local-only Range made %d remote presence exchanges, want 0", got)
-	}
-	fixture.cacheClient.peerMu.Lock()
-	_, staleAddressRetained := fixture.cacheClient.peers["range-bench-replacement"]
-	fixture.cacheClient.peerMu.Unlock()
-	if staleAddressRetained {
-		t.Fatal("address-only ring change retained the unused old peer connection")
-	}
-	if got := replacementPeer.conn.GetState(); got != connectivity.Shutdown {
-		t.Fatalf("unused old-address connection state = %v, want shutdown", got)
-	}
 }
 
-func startEmbeddedBlockRangeReplacementNode(tb testing.TB, fixture *embeddedBlockRangeBenchmarkFixture, nodeID string) (*embedded.Client, func()) {
+func startEmbeddedBlockRangeReplacementNode(tb testing.TB, fixture *embeddedBlockRangeBenchmarkFixture, nodeID string) *embedded.Client {
 	tb.Helper()
 	diskPath := tb.TempDir()
 	writeEmbeddedBlockRangeRingTokens(tb, diskPath, 1)
@@ -874,8 +657,7 @@ func startEmbeddedBlockRangeReplacementNode(tb testing.TB, fixture *embeddedBloc
 	}
 	presenceServer.client = client
 	var closeOnce sync.Once
-	closeClient := func() { closeOnce.Do(func() { _ = client.Close() }) }
-	tb.Cleanup(closeClient)
+	tb.Cleanup(func() { closeOnce.Do(func() { _ = client.Close() }) })
 	if err := client.StartGRPCServer(); err != nil {
 		tb.Fatalf("start replacement embedded node: %v", err)
 	}
@@ -884,51 +666,7 @@ func startEmbeddedBlockRangeReplacementNode(tb testing.TB, fixture *embeddedBloc
 	if err := client.WaitReady(readyCtx); err != nil {
 		tb.Fatalf("replacement embedded node did not become ready: %v", err)
 	}
-	return client, closeClient
-}
-
-func assertEmbeddedRangeBytes(tb testing.TB, client *http.Client, gatewayURL, key string, object []byte, start, end int64, signer *auth.RequestSigner, accessKey, secretKey string) {
-	tb.Helper()
-	req, err := http.NewRequest(http.MethodGet, gatewayURL+"/benchmark/"+key, nil)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-	if signer == nil {
-		req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/s3/aws4_request, Signature=deadbeef")
-	} else {
-		signed, err := signer.SignRequest(req.Context(), req.Method, req.URL.RequestURI(), req.Body, "", accessKey, secretKey, req.Header)
-		if err != nil {
-			tb.Fatalf("sign byte-range request: %v", err)
-		}
-		signed.RemoteAddr = req.RemoteAddr
-		req = signed
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		tb.Fatalf("byte-range request: %v", err)
-	}
-	body, readErr := io.ReadAll(resp.Body)
-	closeErr := resp.Body.Close()
-	if readErr != nil {
-		tb.Fatalf("read byte-range response: %v", readErr)
-	}
-	if closeErr != nil {
-		tb.Fatalf("close byte-range response: %v", closeErr)
-	}
-	wantBody := object[start : end+1]
-	if resp.StatusCode != http.StatusPartialContent || resp.Header.Get(proxy.XCacheHeader) != proxy.XCacheHit || !bytes.Equal(body, wantBody) {
-		tb.Fatalf("byte-range response = (status=%d, cache=%q, bytes=%d, exact=%t), want exact cache 206", resp.StatusCode, resp.Header.Get(proxy.XCacheHeader), len(body), bytes.Equal(body, wantBody))
-	}
-	if got, want := resp.Header.Get("Content-Range"), fmt.Sprintf("bytes %d-%d/%d", start, end, len(object)); got != want {
-		tb.Errorf("Content-Range=%q, want %q", got, want)
-	}
-	if got, want := resp.Header.Get("Content-Length"), fmt.Sprint(end-start+1); got != want {
-		tb.Errorf("Content-Length=%q, want %q", got, want)
-	}
-	if got := resp.Header.Get("ETag"); got != `"block-range"` {
-		tb.Errorf("ETag=%q, want %q", got, `"block-range"`)
-	}
+	return client
 }
 
 func waitForMatchingEmbeddedEpoch(tb testing.TB, first, second *embedded.Client) {
@@ -1083,7 +821,45 @@ func TestEmbeddedBlockPresenceUsesClusterGRPCAuth(t *testing.T) {
 func assertEmbeddedRangeResponse(tb testing.TB, client *http.Client, gatewayURL, key string, object []byte, blockCount int, signer *auth.RequestSigner, accessKey, secretKey string) {
 	tb.Helper()
 	rangeLen := blockCount * embeddedBlockRangeBenchmarkBlockSize
-	assertEmbeddedRangeBytes(tb, client, gatewayURL, key, object, 0, int64(rangeLen-1), signer, accessKey, secretKey)
+	req, err := http.NewRequest(http.MethodGet, gatewayURL+"/benchmark/"+key, nil)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", rangeLen-1))
+	if signer == nil {
+		req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/s3/aws4_request, Signature=deadbeef")
+	} else {
+		signed, err := signer.SignRequest(req.Context(), req.Method, req.URL.RequestURI(), req.Body, "", accessKey, secretKey, req.Header)
+		if err != nil {
+			tb.Fatalf("sign range request: %v", err)
+		}
+		signed.RemoteAddr = req.RemoteAddr
+		req = signed
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		tb.Fatalf("range request: %v", err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	closeErr := resp.Body.Close()
+	if readErr != nil {
+		tb.Fatalf("read range response: %v", readErr)
+	}
+	if closeErr != nil {
+		tb.Fatalf("close range response: %v", closeErr)
+	}
+	if resp.StatusCode != http.StatusPartialContent || resp.Header.Get(proxy.XCacheHeader) != proxy.XCacheHit || !bytes.Equal(body, object[:rangeLen]) {
+		tb.Fatalf("range response = (status=%d, cache=%q, bytes=%d, exact=%t), want exact cache 206", resp.StatusCode, resp.Header.Get(proxy.XCacheHeader), len(body), bytes.Equal(body, object[:rangeLen]))
+	}
+	if got, want := resp.Header.Get("Content-Range"), fmt.Sprintf("bytes 0-%d/%d", rangeLen-1, len(object)); got != want {
+		tb.Errorf("Content-Range=%q, want %q", got, want)
+	}
+	if got, want := resp.Header.Get("Content-Length"), fmt.Sprint(rangeLen); got != want {
+		tb.Errorf("Content-Length=%q, want %q", got, want)
+	}
+	if got := resp.Header.Get("ETag"); got != `"block-range"` {
+		tb.Errorf("ETag=%q, want %q", got, `"block-range"`)
+	}
 }
 
 func TestBlockPresencePeerCancellationIsFatalUnlessSiblingCanceledGroup(t *testing.T) {

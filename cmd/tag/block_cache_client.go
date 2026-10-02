@@ -23,23 +23,14 @@ import (
 type embeddedBlockCacheClient struct {
 	*embedded.Client
 
-	dialOptions  []grpc.DialOption
-	peerMu       sync.Mutex
-	peers        map[string]*blockPresencePeer
-	retiredPeers map[*blockPresencePeer]struct{} // detached entries kept only while leased
-	closed       bool
-	closeOnce    sync.Once
-	closeErr     error
-}
-
-// Peer lifecycle fields are protected by embeddedBlockCacheClient.peerMu. active
-// counts RPC leases; retired peers are closed after their last lease is released.
-type blockPresencePeer struct {
-	address string
-	conn    *grpc.ClientConn
-	active  int // outstanding RPC leases, protected by peerMu
-	retired bool
-	closed  bool
+	dialOptions    []grpc.DialOption
+	lifecycleMu    sync.Mutex
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	activeCalls    sync.WaitGroup
+	closed         bool
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 type blockPresenceOwnerGroup struct {
@@ -52,11 +43,12 @@ type blockPresenceOwnerGroup struct {
 
 func newEmbeddedBlockCacheClient(client *embedded.Client, dialOptions ...grpc.DialOption) *embeddedBlockCacheClient {
 	options := append(cacheclient.DefaultDialOptions(), dialOptions...)
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	return &embeddedBlockCacheClient{
-		Client:       client,
-		dialOptions:  options,
-		peers:        make(map[string]*blockPresencePeer),
-		retiredPeers: make(map[*blockPresencePeer]struct{}),
+		Client:         client,
+		dialOptions:    options,
+		shutdownCtx:    shutdownCtx,
+		shutdownCancel: shutdownCancel,
 	}
 }
 
@@ -85,18 +77,6 @@ func (c *embeddedBlockCacheClient) BlockPresence(ctx context.Context, keys []str
 	if coord != nil {
 		epoch = coord.GetEpoch()
 		localID = coord.GetLocalNodeID()
-		if ringManager := coord.GetRing(); ringManager != nil && c.hasCachedPeerConnections() {
-			nodes := ringManager.GetActiveNodes()
-			activeOwners := make(map[string]string, len(nodes))
-			for _, node := range nodes {
-				if node != nil && node.ID != "" {
-					activeOwners[node.ID] = node.ListenAddress
-				}
-			}
-			if len(activeOwners) > 0 {
-				c.prunePeerConnections(activeOwners, coord, epoch)
-			}
-		}
 	}
 	groups := make(map[string]*blockPresenceOwnerGroup)
 	owners := make([]string, len(keys))
@@ -221,34 +201,42 @@ func (c *embeddedBlockCacheClient) remoteBlockPresence(ctx context.Context, owne
 		}
 		return nil, err
 	}
-	peer, err := c.peerConnection(owner, address)
+	rpcCtx, finishCall, err := c.beginPresenceCall(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer c.releasePeerConnection(peer)
-	stream, err := peer.conn.NewStream(ctx, &grpc.StreamDesc{
+	defer finishCall()
+	// Keep this ClientConn scoped to one owner exchange. OCache's topology epoch
+	// omits addresses, so retaining owner channels would require a full-ring scan
+	// on the Range path to retire an unused owner's old address.
+	conn, err := grpc.NewClient(address, c.dialOptions...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+	stream, err := conn.NewStream(rpcCtx, &grpc.StreamDesc{
 		StreamName:    "Check",
 		ClientStreams: true,
 		ServerStreams: true,
 	}, blockPresenceMethod)
 	if err != nil {
-		return nil, blockPresenceRPCError(ctx, err)
+		return nil, blockPresenceRPCError(rpcCtx, err)
 	}
 	if err := stream.SendMsg(request); err != nil {
 		// A server-side Unimplemented/FailedPrecondition can arrive before SendMsg
 		// finishes. grpc-go reports io.EOF here and exposes the status on RecvMsg.
 		if !errors.Is(err, io.EOF) {
-			return nil, blockPresenceRPCError(ctx, err)
+			return nil, blockPresenceRPCError(rpcCtx, err)
 		}
-		return receiveBlockPresenceResponse(ctx, stream, epoch, len(keys))
+		return receiveBlockPresenceResponse(rpcCtx, stream, epoch, len(keys))
 	}
 	if err := stream.CloseSend(); err != nil {
 		if !errors.Is(err, io.EOF) {
-			return nil, blockPresenceRPCError(ctx, err)
+			return nil, blockPresenceRPCError(rpcCtx, err)
 		}
-		return receiveBlockPresenceResponse(ctx, stream, epoch, len(keys))
+		return receiveBlockPresenceResponse(rpcCtx, stream, epoch, len(keys))
 	}
-	return receiveBlockPresenceResponse(ctx, stream, epoch, len(keys))
+	return receiveBlockPresenceResponse(rpcCtx, stream, epoch, len(keys))
 }
 
 func receiveBlockPresenceResponse(ctx context.Context, stream grpc.ClientStream, epoch uint64, keyCount int) ([]bool, error) {
@@ -285,153 +273,38 @@ func blockPresenceRPCError(ctx context.Context, err error) error {
 	}
 }
 
-func (c *embeddedBlockCacheClient) peerConnection(owner, address string) (*blockPresencePeer, error) {
-	c.peerMu.Lock()
+// beginPresenceCall keeps wrapper shutdown authoritative while a one-owner
+// exchange owns its temporary ClientConn. Add happens under lifecycleMu so Close
+// cannot begin waiting before the final call has registered.
+func (c *embeddedBlockCacheClient) beginPresenceCall(parent context.Context) (context.Context, func(), error) {
+	c.lifecycleMu.Lock()
 	if c.closed {
-		c.peerMu.Unlock()
-		return nil, errors.New("embedded cache client is closed")
+		c.lifecycleMu.Unlock()
+		return nil, nil, errors.New("embedded cache client is closed")
 	}
-	var closeConnections []*grpc.ClientConn
-	if peer, ok := c.peers[owner]; ok {
-		if peer.address == address && !peer.retired {
-			peer.active++
-			c.peerMu.Unlock()
-			return peer, nil
-		}
-		delete(c.peers, owner)
-		c.retirePeerLocked(peer, &closeConnections)
-	}
-	conn, err := grpc.NewClient(address, c.dialOptions...)
-	if err != nil {
-		c.peerMu.Unlock()
-		closeBlockPresenceConnections(closeConnections)
-		return nil, err
-	}
-	peer := &blockPresencePeer{address: address, conn: conn, active: 1}
-	c.peers[owner] = peer
-	c.peerMu.Unlock()
-	closeBlockPresenceConnections(closeConnections)
-	return peer, nil
+	c.activeCalls.Add(1)
+	rpcCtx, cancel := context.WithCancel(parent)
+	stopShutdown := context.AfterFunc(c.shutdownCtx, cancel)
+	c.lifecycleMu.Unlock()
+	return rpcCtx, func() {
+		stopShutdown()
+		cancel()
+		c.activeCalls.Done()
+	}, nil
 }
 
-func (c *embeddedBlockCacheClient) hasCachedPeerConnections() bool {
-	c.peerMu.Lock()
-	defer c.peerMu.Unlock()
-	return !c.closed && len(c.peers) > 0
-}
-
-// prunePeerConnections evicts cached connections for owners no longer active or
-// whose address changed in the full ring snapshot. Page membership is deliberately
-// not used: an active peer absent from one Range page still belongs in the cache.
-// Address-only changes do not affect the ring epoch, so inspect the snapshot on
-// each page while peers are cached. Epoch checks discard snapshots made stale by
-// membership/state changes; per-key routing and the caller's post-page checks
-// remain authoritative for the exchange. This sweep only manages connections.
-func (c *embeddedBlockCacheClient) prunePeerConnections(activeOwners map[string]string, coord blockPresenceCoordinator, epoch uint64) {
-	if len(activeOwners) == 0 {
-		return
-	}
-	var closeConnections []*grpc.ClientConn
-	c.peerMu.Lock()
-	if c.closed || coord.GetEpoch() != epoch {
-		c.peerMu.Unlock()
-		return
-	}
-	type cachedPeer struct {
-		owner string
-		peer  *blockPresencePeer
-	}
-	var stalePeers []cachedPeer
-	for owner, peer := range c.peers {
-		address, active := activeOwners[owner]
-		if active && address == peer.address {
-			continue
-		}
-		stalePeers = append(stalePeers, cachedPeer{owner: owner, peer: peer})
-	}
-	if coord.GetEpoch() != epoch {
-		c.peerMu.Unlock()
-		return
-	}
-	for _, stale := range stalePeers {
-		delete(c.peers, stale.owner)
-		c.retirePeerLocked(stale.peer, &closeConnections)
-	}
-	c.peerMu.Unlock()
-	closeBlockPresenceConnections(closeConnections)
-}
-
-// retirePeerLocked defers closing a detached connection until no RPC lease uses it.
-func (c *embeddedBlockCacheClient) retirePeerLocked(peer *blockPresencePeer, closeConnections *[]*grpc.ClientConn) {
-	peer.retired = true
-	if peer.active == 0 {
-		if !peer.closed {
-			peer.closed = true
-			*closeConnections = append(*closeConnections, peer.conn)
-		}
-		return
-	}
-	c.retiredPeers[peer] = struct{}{}
-}
-
-func (c *embeddedBlockCacheClient) releasePeerConnection(peer *blockPresencePeer) {
-	var closeConnection *grpc.ClientConn
-	c.peerMu.Lock()
-	peer.active--
-	if peer.active == 0 && peer.retired && !peer.closed {
-		peer.closed = true
-		delete(c.retiredPeers, peer)
-		closeConnection = peer.conn
-	}
-	c.peerMu.Unlock()
-	if closeConnection != nil {
-		_ = closeConnection.Close()
-	}
-}
-
-func closeBlockPresenceConnections(connections []*grpc.ClientConn) {
-	for _, connection := range connections {
-		_ = connection.Close()
-	}
-}
-
-// Close releases the optional peer connections before stopping the embedded
-// cache. The embedded cache close remains the caller-visible behavior.
+// Close cancels and joins active presence exchanges before closing the embedded
+// cache. Each exchange closes its own ClientConn when it returns.
 func (c *embeddedBlockCacheClient) Close() error {
 	c.closeOnce.Do(func() {
-		c.peerMu.Lock()
+		c.lifecycleMu.Lock()
 		c.closed = true
-		peers := make(map[*blockPresencePeer]struct{}, len(c.peers)+len(c.retiredPeers))
-		for _, peer := range c.peers {
-			peers[peer] = struct{}{}
-		}
-		for peer := range c.retiredPeers {
-			peers[peer] = struct{}{}
-		}
-		c.peers = nil
-		c.retiredPeers = nil
-		var connections []*grpc.ClientConn
-		for peer := range peers {
-			peer.retired = true
-			if !peer.closed {
-				peer.closed = true
-				connections = append(connections, peer.conn)
-			}
-		}
-		c.peerMu.Unlock()
-
-		var closeErrors []error
-		for _, connection := range connections {
-			if err := connection.Close(); err != nil {
-				closeErrors = append(closeErrors, err)
-			}
-		}
+		c.lifecycleMu.Unlock()
+		c.shutdownCancel()
+		c.activeCalls.Wait()
 		if c.Client != nil {
-			if err := c.Client.Close(); err != nil {
-				closeErrors = append(closeErrors, err)
-			}
+			c.closeErr = c.Client.Close()
 		}
-		c.closeErr = errors.Join(closeErrors...)
 	})
 	return c.closeErr
 }
