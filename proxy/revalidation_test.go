@@ -59,6 +59,11 @@ func (m *mockForwarder) ValidateAndGetCredentials(r *http.Request) (AuthResult, 
 	return AuthValidated, "access", "secret", nil
 }
 
+func (m *mockForwarder) authenticatedCompletionAccessKey(r *http.Request) (string, bool) {
+	result, accessKey, _, err := m.ValidateAndGetCredentials(r)
+	return accessKey, err == nil && result == AuthValidated && accessKey != ""
+}
+
 func (m *mockForwarder) DoRequestWithCreds(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error) {
 	if m.doRequestFunc != nil {
 		return m.doRequestFunc(ctx, r, accessKey, secretKey)

@@ -89,7 +89,9 @@ func TestHandleCompleteMultipartUpload_200ErrorBodyKeepsRacingRefill(t *testing.
 	}
 
 	// A failed completion must not be cached as a successful idempotent replay.
-	if _, found, _ := c.GetCompletion(context.Background(), mpBucket, mpKey, mpUpload); found {
+	if _, found, _ := c.GetCompletion(context.Background(), mpBucket, mpKey, mpUpload, func() (string, bool) {
+		return "access", true
+	}); found {
 		t.Error("200-with-error-body completion was cached as a successful completion — an idempotent replay would return the error as success")
 	}
 }

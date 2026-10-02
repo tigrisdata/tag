@@ -133,7 +133,28 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 	}
 	prepareForwardedRequest(fwdReq, contentLength, chunked)
 
-	return f.executeAndCapture(w, fwdReq, contentLength, nil)
+	capture, err := f.executeAndCapture(w, fwdReq, contentLength, nil)
+	if capture != nil && err == nil {
+		capture.authenticatedAccessKey = accessKey
+	}
+	return capture, err
+}
+
+// authenticatedCompletionAccessKey returns the client identity only when its
+// signature and credentials validate locally.
+func (f *signingForwarder) authenticatedCompletionAccessKey(r *http.Request) (string, bool) {
+	validationRequest, ok := completionRequestForLocalValidation(r)
+	if !ok {
+		return "", false
+	}
+	accessKey, err := f.validator.ValidateRequest(validationRequest)
+	if err != nil {
+		return "", false
+	}
+	if _, err := f.credStore.GetSecretKey(accessKey); err != nil {
+		return "", false
+	}
+	return accessKey, accessKey != ""
 }
 
 // ValidateAndGetCredentials validates the request signature and returns credentials.

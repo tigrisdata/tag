@@ -3,6 +3,8 @@ package cache
 import (
 	"context"
 	"net/http"
+	"net/url"
+	"strings"
 
 	json "github.com/goccy/go-json"
 	"github.com/rs/zerolog/log"
@@ -24,13 +26,31 @@ type CompletionEntry struct {
 	Body       []byte            `json:"body"`
 }
 
+// completionCacheRecord keeps caller identity in the cache's internal record;
+// it is never returned to callers.
+type completionCacheRecord struct {
+	AccessKey  string            `json:"access_key,omitempty"`
+	StatusCode int               `json:"status_code"`
+	Headers    map[string]string `json:"headers"`
+	Body       []byte            `json:"body"`
+}
+
 // MakeCompletionKey creates a cache key for a completion response.
 func MakeCompletionKey(bucket, key, uploadId string) string {
+	if strings.ContainsAny(bucket, "|") || strings.ContainsAny(key, "|") || strings.ContainsAny(uploadId, "|") {
+		// Keep the legacy form for ordinary tuples. For components containing its
+		// delimiter, escape every component and use a separator that QueryEscape
+		// also escapes. The encoded form contains no '|', so it cannot alias a
+		// legacy key, which always contains two delimiters.
+		return completionKeyPrefix + url.QueryEscape(bucket) + ":" + url.QueryEscape(key) + ":" + url.QueryEscape(uploadId)
+	}
 	return completionKeyPrefix + bucket + "|" + key + "|" + uploadId
 }
 
-// GetCompletion retrieves a cached completion response.
-func (c *Cache) GetCompletion(ctx context.Context, bucket, key, uploadId string) (*CompletionEntry, bool, error) {
+// GetCompletion retrieves a cached completion response only for a caller that
+// matches the identity stored with the successful completion. The callback is
+// evaluated only when a bound cache entry exists.
+func (c *Cache) GetCompletion(ctx context.Context, bucket, key, uploadId string, callerAccessKey func() (string, bool)) (*CompletionEntry, bool, error) {
 	if !c.IsEnabled() {
 		return nil, false, nil
 	}
@@ -47,19 +67,28 @@ func (c *Cache) GetCompletion(ctx context.Context, bucket, key, uploadId string)
 		return nil, false, nil
 	}
 
-	var entry CompletionEntry
+	var entry completionCacheRecord
 	if err := json.Unmarshal(data, &entry); err != nil {
 		log.Debug().Err(err).Str("key", cacheKey).Msg("Completion cache decode error")
 		return nil, false, nil // Treat decode errors as cache miss
 	}
+	if entry.AccessKey == "" || callerAccessKey == nil {
+		return nil, false, nil
+	}
+	accessKey, authenticated := callerAccessKey()
+	if !authenticated || accessKey == "" || entry.AccessKey != accessKey {
+		return nil, false, nil
+	}
 
 	log.Debug().Str("bucket", bucket).Str("uploadId", uploadId).Msg("Completion cache hit")
-	return &entry, true, nil
+	return &CompletionEntry{StatusCode: entry.StatusCode, Headers: entry.Headers, Body: entry.Body}, true, nil
 }
 
-// PutCompletion stores a completion response in cache.
-func (c *Cache) PutCompletion(ctx context.Context, bucket, key, uploadId string, statusCode int, headers http.Header, body []byte) error {
-	if !c.IsEnabled() {
+// PutCompletion stores a completion response in cache, bound to the access key
+// that successfully completed the upload. Responses without an identified
+// principal are not replayable.
+func (c *Cache) PutCompletion(ctx context.Context, bucket, key, uploadId, accessKey string, statusCode int, headers http.Header, body []byte) error {
+	if !c.IsEnabled() || accessKey == "" {
 		return nil
 	}
 
@@ -71,7 +100,8 @@ func (c *Cache) PutCompletion(ctx context.Context, bucket, key, uploadId string,
 		}
 	}
 
-	entry := CompletionEntry{
+	entry := completionCacheRecord{
+		AccessKey:  accessKey,
 		StatusCode: statusCode,
 		Headers:    headerMap,
 		Body:       body,
