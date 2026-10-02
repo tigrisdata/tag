@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -86,6 +87,123 @@ func TestAWSChunkedReader_SmallReads(t *testing.T) {
 	if string(result) != "0123456789" {
 		t.Errorf("got %q, want %q", string(result), "0123456789")
 	}
+}
+
+type oneByteChunkInput struct {
+	data         []byte
+	offset       int
+	payloadStart int
+	payloadRead  int
+}
+
+func (r *oneByteChunkInput) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.offset == len(r.data) {
+		return 0, io.EOF
+	}
+	p[0] = r.data[r.offset]
+	if r.offset >= r.payloadStart {
+		r.payloadRead++
+	}
+	r.offset++
+	return 1, nil
+}
+
+func TestAWSChunkedReaderRejectsOversizedHeaderBeforePayload(t *testing.T) {
+	input := &oneByteChunkInput{
+		data:         []byte("8\r\nabc"),
+		payloadStart: len("8\r\n"),
+	}
+	reader := newAWSChunkedReader(input)
+	reader.decodedRemaining = 3
+
+	buf := make([]byte, 8)
+	n, err := reader.Read(buf)
+	if n != 0 {
+		t.Fatalf("Read yielded %d bytes from an oversized frame, want 0", n)
+	}
+	if !errors.Is(err, errAWSChunkExceedsDecodedLength) {
+		t.Fatalf("Read error = %v, want decoded-extent error", err)
+	}
+	if input.payloadRead != 0 {
+		t.Fatalf("reader consumed %d offending payload bytes before rejecting the header", input.payloadRead)
+	}
+}
+
+func TestAWSChunkedReaderDecodedExtentAcrossPartialReads(t *testing.T) {
+	t.Run("valid multi-frame total", func(t *testing.T) {
+		reader := newAWSChunkedReader(strings.NewReader("2\r\nab\r\n3\r\ncde\r\n0\r\n\r\n"))
+		reader.decodedRemaining = 5
+
+		var got strings.Builder
+		buf := make([]byte, 1)
+		for {
+			n, err := reader.Read(buf)
+			got.Write(buf[:n])
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Read failed: %v", err)
+			}
+			if n == 0 {
+				t.Fatal("Read made no progress")
+			}
+		}
+		if got.String() != "abcde" {
+			t.Fatalf("decoded body = %q, want %q", got.String(), "abcde")
+		}
+	})
+
+	t.Run("later frame exceeds remaining total", func(t *testing.T) {
+		reader := newAWSChunkedReader(strings.NewReader("2\r\nab\r\n3\r\nFAIL"))
+		reader.decodedRemaining = 4
+
+		var got strings.Builder
+		buf := make([]byte, 1)
+		for {
+			n, err := reader.Read(buf)
+			got.Write(buf[:n])
+			if errors.Is(err, errAWSChunkExceedsDecodedLength) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Read error = %v, want decoded-extent error", err)
+			}
+			if n == 0 {
+				t.Fatal("Read made no progress")
+			}
+		}
+		if got.String() != "ab" {
+			t.Fatalf("decoded body = %q, want only prior valid frame %q", got.String(), "ab")
+		}
+	})
+
+	t.Run("frame after exact total", func(t *testing.T) {
+		reader := newAWSChunkedReader(strings.NewReader("4\r\nkeep\r\n1\r\nX\r\n0\r\n\r\n"))
+		reader.decodedRemaining = 4
+
+		var got strings.Builder
+		buf := make([]byte, 1)
+		for {
+			n, err := reader.Read(buf)
+			got.Write(buf[:n])
+			if errors.Is(err, errAWSChunkExceedsDecodedLength) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Read error = %v, want decoded-extent error", err)
+			}
+			if n == 0 {
+				t.Fatal("Read made no progress")
+			}
+		}
+		if got.String() != "keep" {
+			t.Fatalf("decoded body = %q, want only the prior frame %q", got.String(), "keep")
+		}
+	})
 }
 
 func TestAWSChunkedReader_LongSignature(t *testing.T) {
@@ -239,7 +357,9 @@ func TestPrepareForwardedRequest_Chunked(t *testing.T) {
 	req.Header.Set("Content-Encoding", "aws-chunked")
 	req.ContentLength = 2000 // wire size
 
-	prepareForwardedRequest(req, 1024, true)
+	if err := prepareForwardedRequest(req, 1024, true); err != nil {
+		t.Fatalf("prepareForwardedRequest: %v", err)
+	}
 
 	if req.ContentLength != 1024 {
 		t.Errorf("ContentLength = %d, want 1024", req.ContentLength)
@@ -257,7 +377,9 @@ func TestPrepareForwardedRequest_ChunkedZeroByte(t *testing.T) {
 	req.Header.Set("X-Amz-Decoded-Content-Length", "0")
 	req.ContentLength = 100 // wire size with chunk framing
 
-	prepareForwardedRequest(req, 0, true)
+	if err := prepareForwardedRequest(req, 0, true); err != nil {
+		t.Fatalf("prepareForwardedRequest: %v", err)
+	}
 
 	if req.ContentLength != 0 {
 		t.Errorf("ContentLength = %d, want 0", req.ContentLength)
@@ -273,11 +395,31 @@ func TestPrepareForwardedRequest_ChunkedZeroByte(t *testing.T) {
 	}
 }
 
+func TestPrepareForwardedRequest_ZeroExtentOverrun(t *testing.T) {
+	input := &oneByteChunkInput{
+		data:         []byte("1\r\nz\r\n"),
+		payloadStart: len("1\r\n"),
+	}
+	reader := newAWSChunkedReader(input)
+	reader.decodedRemaining = 0
+	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", io.NopCloser(reader))
+
+	err := prepareForwardedRequest(req, 0, true)
+	if !errors.Is(err, errAWSChunkExceedsDecodedLength) {
+		t.Fatalf("prepareForwardedRequest error = %v, want decoded-extent error", err)
+	}
+	if input.payloadRead != 0 {
+		t.Fatalf("prepareForwardedRequest consumed %d overrun payload bytes", input.payloadRead)
+	}
+}
+
 func TestPrepareForwardedRequest_NonChunked(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
 	req.ContentLength = 0
 
-	prepareForwardedRequest(req, 512, false)
+	if err := prepareForwardedRequest(req, 512, false); err != nil {
+		t.Fatalf("prepareForwardedRequest: %v", err)
+	}
 
 	if req.ContentLength != 512 {
 		t.Errorf("ContentLength = %d, want 512", req.ContentLength)
@@ -288,7 +430,9 @@ func TestPrepareForwardedRequest_NonChunkedNoBody(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://localhost/bucket/key", nil)
 	req.ContentLength = 0
 
-	prepareForwardedRequest(req, 0, false)
+	if err := prepareForwardedRequest(req, 0, false); err != nil {
+		t.Fatalf("prepareForwardedRequest: %v", err)
+	}
 
 	// Should not change ContentLength for non-chunked with 0/negative length
 	if req.ContentLength != 0 {
@@ -376,7 +520,9 @@ func TestPrepareForwardedRequest_PreservesNonAWSContentEncoding(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
 	req.Header.Set("Content-Encoding", "gzip")
 
-	prepareForwardedRequest(req, 1024, true)
+	if err := prepareForwardedRequest(req, 1024, true); err != nil {
+		t.Fatalf("prepareForwardedRequest: %v", err)
+	}
 
 	if req.Header.Get("Content-Encoding") != "gzip" {
 		t.Errorf("Content-Encoding = %q, want %q", req.Header.Get("Content-Encoding"), "gzip")
@@ -390,7 +536,9 @@ func TestPrepareForwardedRequest_CombinedContentEncoding(t *testing.T) {
 	req.Header.Set("Content-Encoding", "aws-chunked,gzip")
 	req.ContentLength = 2000
 
-	prepareForwardedRequest(req, 1024, true)
+	if err := prepareForwardedRequest(req, 1024, true); err != nil {
+		t.Fatalf("prepareForwardedRequest: %v", err)
+	}
 
 	if got := req.Header.Get("Content-Encoding"); got != "gzip" {
 		t.Errorf("Content-Encoding = %q, want %q", got, "gzip")
@@ -402,7 +550,9 @@ func TestPrepareForwardedRequest_CombinedContentEncodingWithSpaces(t *testing.T)
 	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
 	req.Header.Set("Content-Encoding", "aws-chunked , gzip")
 
-	prepareForwardedRequest(req, 1024, true)
+	if err := prepareForwardedRequest(req, 1024, true); err != nil {
+		t.Fatalf("prepareForwardedRequest: %v", err)
+	}
 
 	if got := req.Header.Get("Content-Encoding"); got != "gzip" {
 		t.Errorf("Content-Encoding = %q, want %q", got, "gzip")

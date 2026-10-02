@@ -201,6 +201,68 @@ func TestHandlePutObject_WriteThroughTee_ETagMismatchFallsBackToWarm(t *testing.
 	}
 }
 
+// A transport may stop reading the tee before the full request body is copied. If the
+// authoritative HEAD advertises a different length, the short tee must fall back to the
+// upstream body instead of caching the bytes the transport happened to read.
+func TestHandlePutObject_WriteThroughTee_IncompleteBufferFallsBackToWarm(t *testing.T) {
+	var puts, warmGets atomic.Int32
+	const (
+		requestBody = "complete-request-body"
+		teePrefix   = "accepted-prefix"
+		warmBody    = "authoritative-origin-body"
+	)
+	mock := &teeMockForwarder{
+		mockForwarder: &mockForwarder{
+			conditionalResp:  headResp(`"tee-etag"`, "text/plain", int64(len(requestBody))),
+			doFullObjectFunc: warmObjectResponder(&warmGets, warmBody),
+		},
+		teeFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request, tee io.Writer) (int, http.Header, string, string, error) {
+			if _, err := io.WriteString(tee, teePrefix); err != nil {
+				return 0, nil, "", "", err
+			}
+			puts.Add(1)
+			headers := http.Header{"ETag": []string{`"tee-etag"`}}
+			w.WriteHeader(http.StatusOK)
+			return http.StatusOK, headers, "access", "secret", nil
+		},
+	}
+	service, c := newTestService(mock, true)
+	service.config.Cache.WarmOnWrite = true
+	service.config.Cache.SizeThreshold = 1 << 20
+	service.config.Cache.BlockSize = 1 << 20
+
+	w := httptest.NewRecorder()
+	if err := service.HandlePutObject(w, authedPut(wowBucket, wowKey, requestBody)); err != nil {
+		t.Fatalf("HandlePutObject: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("client status = %d, want 200", w.Code)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("authoritative body was not cached after the short tee fell back")
+	}
+	if got := warmGets.Load(); got != 1 {
+		t.Fatalf("read-back warms = %d, want 1 after HEAD/tee length mismatch", got)
+	}
+	if got := puts.Load(); got != 1 {
+		t.Fatalf("upstream PUTs = %d, want 1", got)
+	}
+	meta, found, err := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if err != nil || !found {
+		t.Fatalf("cached metadata found=%t err=%v", found, err)
+	}
+	if meta.ETag != `"warm-etag"` {
+		t.Fatalf("cached ETag = %q, want the authoritative warm body's ETag", meta.ETag)
+	}
+	var cachedBody bytes.Buffer
+	if err := c.GetBodyStream(context.Background(), wowBucket, wowKey, meta.ETag, &cachedBody); err != nil {
+		t.Fatalf("read cached body: %v", err)
+	}
+	if cachedBody.String() != warmBody {
+		t.Fatalf("cached body = %q, want authoritative body %q", cachedBody.String(), warmBody)
+	}
+}
+
 // If the HEAD itself fails, the tee can't source authoritative metadata, so it falls back to
 // a read-back warm rather than caching with guessed headers.
 func TestHandlePutObject_WriteThroughTee_HeadFailureFallsBackToWarm(t *testing.T) {

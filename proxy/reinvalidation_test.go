@@ -2,11 +2,17 @@ package proxy
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 )
 
@@ -37,6 +43,167 @@ func TestHandlePutObject_ReinvalidatesAfterForward(t *testing.T) {
 	b, k := ParseBucketKey(r)
 	if _, found, _ := c.GetMeta(context.Background(), b, k); found {
 		t.Error("stale entry still cached after PUT — post-forward re-invalidation missing")
+	}
+}
+
+type earlySuccessRoundTripper struct {
+	prefixAccepted chan<- []byte
+	allowResponse  <-chan struct{}
+}
+
+func (transport earlySuccessRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	var prefix [1]byte
+	n, err := io.ReadFull(req.Body, prefix[:])
+	if err != nil {
+		return nil, err
+	}
+	transport.prefixAccepted <- append([]byte(nil), prefix[:n]...)
+	<-transport.allowResponse
+	if trace := httptrace.ContextClientTrace(req.Context()); trace != nil && trace.WroteRequest != nil {
+		trace.WroteRequest(httptrace.WroteRequestInfo{})
+	}
+	return &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Length": []string{"6"}},
+		Body:          io.NopCloser(strings.NewReader("stored")),
+		ContentLength: 6,
+		Request:       req,
+	}, nil
+}
+
+type releaseBodyOnDeadlineWriter struct {
+	*httptest.ResponseRecorder
+	releaseBody  chan struct{}
+	releaseOnce  *sync.Once
+	deadlineSet  chan struct{}
+	deadlineOnce sync.Once
+}
+
+func (w *releaseBodyOnDeadlineWriter) SetReadDeadline(time.Time) error {
+	w.releaseOnce.Do(func() { close(w.releaseBody) })
+	w.deadlineOnce.Do(func() { close(w.deadlineSet) })
+	return nil
+}
+
+func TestHandlePutObject_ReinvalidatesAfterUpstreamSuccessAndValidationError(t *testing.T) {
+	const (
+		accessKey = "AKIAIOSDNN7EXAMPLE"
+		secretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+		region    = "us-east-1"
+		bucket    = "bucket"
+		key       = "chunked-object"
+	)
+	const wireBody = "8\r\nABCDEFGH\r\n5\r\nFAIL!\r\n0\r\n\r\n"
+
+	bodyBlocked := make(chan struct{})
+	releaseBody := make(chan struct{})
+	var releaseBodyOnce sync.Once
+	defer releaseBodyOnce.Do(func() { close(releaseBody) })
+	allowResponse := make(chan struct{})
+	var allowResponseOnce sync.Once
+	defer allowResponseOnce.Do(func() { close(allowResponse) })
+	prefixAccepted := make(chan []byte, 1)
+
+	service, c := newTestService(&mockForwarder{}, true)
+	credentials := auth.NewCredentialStore()
+	credentials.AddCredential(accessKey, secretKey)
+	base := newBaseForwarder("http://upstream.example.com", region, 1)
+	base.httpClient = &http.Client{
+		Transport: earlySuccessRoundTripper{
+			prefixAccepted: prefixAccepted,
+			allowResponse:  allowResponse,
+		},
+		Timeout: 5 * time.Second,
+	}
+	service.forwarder = &signingForwarder{
+		baseForwarder: base,
+		credStore:     credentials,
+		validator:     auth.NewRequestValidator(credentials),
+	}
+	service.config.Cache.WarmOnWrite = false
+
+	chunkHeader := "8\r\n"
+	requestBody := &chunkExtentBodyGate{
+		reader:    strings.NewReader(wireBody),
+		stopAfter: int64(len(chunkHeader) + 1),
+		blocked:   bodyBlocked,
+		release:   releaseBody,
+	}
+	headers := make(http.Header)
+	headers.Set("Content-Encoding", "aws-chunked")
+	headers.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	headers.Set("X-Amz-Decoded-Content-Length", "12")
+	r, err := auth.NewRequestSigner("http://client.example.com", region).SignRequest(
+		context.Background(),
+		http.MethodPut,
+		"/"+bucket+"/"+key,
+		requestBody,
+		"STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+		accessKey,
+		secretKey,
+		headers,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.ContentLength = int64(len(wireBody))
+
+	writer := &releaseBodyOnDeadlineWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+		releaseBody:      releaseBody,
+		releaseOnce:      &releaseBodyOnce,
+		deadlineSet:      make(chan struct{}),
+	}
+	forwardDone := make(chan error, 1)
+	go func() { forwardDone <- service.HandlePutObject(writer, r) }()
+	select {
+	case prefix := <-prefixAccepted:
+		if string(prefix) != "A" {
+			t.Fatalf("upstream prefix = %q, want the first valid-frame byte", prefix)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("upstream did not accept a prefix of the valid frame")
+	}
+
+	// A GET that began before the PUT completed can repopulate stale bytes after
+	// the pre-forward invalidation. Model that commit before the upstream 2xx.
+	staleMeta := &cache.CachedObjectMeta{
+		Bucket:        bucket,
+		Key:           key,
+		ETag:          `"stale"`,
+		ContentLength: 5,
+		StatusCode:    http.StatusOK,
+	}
+	if err := c.PutWithMeta(context.Background(), bucket, key, staleMeta, []byte("stale"), 60); err != nil {
+		t.Fatalf("seed racing stale refill: %v", err)
+	}
+	allowResponseOnce.Do(func() { close(allowResponse) })
+
+	select {
+	case err := <-forwardDone:
+		if !errors.Is(err, errAWSChunkExceedsDecodedLength) {
+			t.Fatalf("HandlePutObject error = %v, want the overlong-frame error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PUT did not finish after the overlong frame was validated")
+	}
+	select {
+	case <-bodyBlocked:
+	default:
+		t.Fatal("post-response validation did not reach the unread client body")
+	}
+	select {
+	case <-writer.deadlineSet:
+	default:
+		t.Fatal("post-response validation did not set a read deadline")
+	}
+	if writer.Body.Len() != 0 {
+		t.Fatalf("upstream success body reached the client despite validation failure: %q", writer.Body.String())
+	}
+	if _, found, err := c.GetMeta(context.Background(), bucket, key); err != nil {
+		t.Fatalf("read cache metadata: %v", err)
+	} else if found {
+		t.Fatal("racing stale refill survived the upstream-success validation error")
 	}
 }
 

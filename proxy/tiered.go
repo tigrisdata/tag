@@ -208,20 +208,21 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// that makes this object exist in TAG's authoritative view.
 	//
 	// No pre-forward invalidation, unlike HandlePutObject: for a local-tier
-	// prior the cache holds the ONLY copy, and a failed forward must leave it
-	// intact — S3 semantics say a rejected PUT changes nothing. Reads racing
-	// the in-flight PUT serve the prior version, which is the atomic-replace
-	// behavior clients expect. The one read-triggered populate in this mode —
-	// the re-tier — cannot be ordered against this path's writes here (it
-	// performs none pre-forward); it defends itself with a claim plus its own
-	// pre-fetch decision token instead (see maybeRetierOnRead).
-	// No post-success invalidation either: the marker overwrites the prior
-	// metadata directly (a displaced local body ages out by TTL, the engine's
-	// own overwrite semantics), which lets the marker commit under the
-	// PRE-FORWARD decision token — see putUpstreamMarker for why that closes
-	// the concurrent-DELETE resurrection race.
+	// prior the cache holds the ONLY copy, and an upstream rejection or unknown
+	// outcome must leave it intact. Reads racing the in-flight PUT serve the prior
+	// version, which is the atomic-replace behavior clients expect. The one
+	// read-triggered populate in this mode — the re-tier — cannot be ordered
+	// against this path's writes here (it performs none pre-forward); it defends
+	// itself with a claim plus its own pre-fetch decision token instead (see
+	// maybeRetierOnRead).
+	// Ordinary successful forwards need no separate invalidation: the new marker
+	// replaces prior metadata under the PRE-FORWARD decision token, closing the
+	// concurrent-DELETE resurrection race (see putUpstreamMarker). When a known
+	// upstream 2xx cannot be relayed because later body validation fails, no
+	// marker can be built from the incomplete request; the guarded sweep below
+	// removes only the displaced prior.
 	// Capture the displaced prior before forwarding — tolerated, never blocking:
-	// it only arms the identity guard of the failure sweep in putUpstreamMarker.
+	// it arms the marker and validation-error sweeps.
 	// A failed lookup leaves the prior unknown, and the sweep then refuses to
 	// delete anything rather than guess.
 	// Only a PLAIN object PUT writes the object and therefore owns the marker.
@@ -243,6 +244,12 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	rec := &statusRecorder{ResponseWriter: w}
 	err = s.forwarder.Forward(ctx, rec, r)
 
+	// A body-validation error can hide an upstream 2xx from the client after
+	// the origin has changed the object. Remove only the displaced pre-forward
+	// version; a newer tiered write must keep its authoritative local state.
+	if err != nil && rec.upstreamSucceeded() && markerOwning && s.cache.IsEnabled() {
+		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorVersion, priorKnown)
+	}
 	if err == nil && rec.wroteSuccess() && markerOwning && s.cache.IsEnabled() {
 		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, prior, priorVersion, priorKnown)
 	}
@@ -448,8 +455,9 @@ func (s *Service) headObjectMeta(ctx context.Context, bucket, key, accessKey, se
 }
 
 // invalidateDisplacedTieredMeta converges a key on an authoritative miss
-// after a marker could not be established, without either destroying a newer
-// racing write or deleting blind: cache.DeleteIfETag removes the entry only
+// after a marker could not be established, including a known upstream success
+// whose body validation failed, without destroying a newer racing write or
+// deleting blind: cache.DeleteMetaIfVersion removes the entry only
 // while it still IS the displaced prior — the compare and the delete are one
 // CAS, so the compare-then-delete window the pre-CAS helper documented is
 // gone. Anything else present is a newer write and keeps the key; this PUT's
