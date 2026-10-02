@@ -968,22 +968,41 @@ func (s *Service) serveCompleteFromBlocks(
 	return true, nil
 }
 
-// fetchBlocksToCache fetches the given missing blocks from upstream and writes them to cache,
-// concurrently (bounded) and coalesced per block across requests. On any error the caller must
-// not serve from cache (some blocks may be absent). It reports a definitive stale-entry signal
-// (ETag mismatch / upstream gone) in preference to a transient one: those two are the only
-// errors ensureBlocksCached acts on to invalidate, so a fast transient failure of one block
-// must not mask a slower stale signal from another (which would leave the stale meta to retry
-// until TTL). Blocks are therefore not canceled on a sibling's error — each runs to completion
-// so its signal is observed — but the caller's ctx still aborts them (e.g. client disconnect).
+// fetchBlocksToCache fetches the given blocks from upstream and writes them to cache,
+// concurrently (bounded) and coalesced per block across requests. New leaders recheck presence;
+// callers without a recent error-aware absence scan must use this path.
 func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdxs []int64) error {
+	return s.fetchBlocksToCacheWithKnownMissing(ctx, bucket, key, accessKey, secretKey, meta, blockIdxs, false)
+}
+
+// fetchKnownMissingBlocksToCache is only for indices ensureBlocksCached just classified absent
+// with BlockExistsErr. A new leader skips the dependent presence recheck; a same-ETag fill that
+// races after the scan may cause one redundant aligned GET and idempotent cache put. Coalescing
+// still prevents duplicate work while a fetch or its cache write is active. After a non-stale
+// populate failure, each live probe-first caller can use one bounded recovery probe to reuse a
+// racing same-ETag fill.
+func (s *Service) fetchKnownMissingBlocksToCache(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdxs []int64) error {
+	return s.fetchBlocksToCacheWithKnownMissing(ctx, bucket, key, accessKey, secretKey, meta, blockIdxs, true)
+}
+
+// fetchBlocksToCacheWithKnownMissing preserves error priority and coalescing for both fetch paths.
+// On any error the caller must not serve from cache (some blocks may be absent), unless the
+// probe-first caller's failure recovery positively finds its ETag-scoped block. It reports a
+// definitive stale-entry signal (ETag mismatch / upstream gone) in preference to a transient one:
+// those two are the only errors ensureBlocksCached acts on to invalidate, so a fast transient
+// failure of one block must not mask a slower stale signal from another (which would leave the
+// stale meta to retry until TTL). Blocks are therefore not canceled on a sibling's error — each
+// runs to completion so its signal is observed — but the caller's ctx still aborts them (e.g.
+// client disconnect).
+func (s *Service) fetchBlocksToCacheWithKnownMissing(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdxs []int64, knownMissing bool) error {
 	var g errgroup.Group
 	g.SetLimit(maxConcurrentBlockFetches)
 	var mu sync.Mutex
 	var stale, transient error
 	for _, idx := range blockIdxs {
+		idx := idx
 		g.Go(func() error {
-			err := s.fetchOneBlock(ctx, bucket, key, accessKey, secretKey, meta, idx)
+			err := s.fetchOneBlockWithKnownMissing(ctx, bucket, key, accessKey, secretKey, meta, idx, knownMissing)
 			if err == nil {
 				return nil
 			}
@@ -1066,11 +1085,11 @@ func (l *blockFetchLease) release() {
 }
 
 // beginBlockFetch joins or starts a detached block fetch. knownMissing is set
-// only by an assembled serve whose initial range read returned ErrNotFound, so
-// a new leader can avoid asking the same remote owner to prove that miss again.
-// Every caller reserves one consumer before the fetch can publish its buffer,
-// which makes ownership exact even when a fast remote write finishes before
-// waiters wake up.
+// only after the caller's own block read or error-aware presence probe classified
+// this ETag-scoped block absent; that leader can skip the dependent presence recheck.
+// A racing same-ETag fill may therefore get an idempotent put. Every caller reserves
+// one consumer before the fetch can publish its buffer, which makes ownership exact
+// even when a fast remote write finishes before waiters wake up.
 func (s *Service) beginBlockFetch(blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) *blockFetchState {
 	s.blockFetchMu.Lock()
 	if s.blockFetches == nil {
@@ -1083,7 +1102,6 @@ func (s *Service) beginBlockFetch(blockKey, bucket, key, accessKey, secretKey st
 		s.blockFetchMu.Unlock()
 		return state
 	}
-
 	state := &blockFetchState{
 		serveDone: make(chan struct{}),
 		cacheDone: make(chan struct{}),
@@ -1107,8 +1125,7 @@ func (state *blockFetchState) completeServe(bufp *[]byte, data []byte, err error
 
 // finishBlockFetch removes the state only after its cache write no longer reads
 // data. Existing consumers can still hold leases; the last one returns the
-// buffer to the pool. A later caller therefore either joins an in-flight write
-// or probes a write that has already completed.
+// buffer to the pool.
 func (s *Service) finishBlockFetch(blockKey string, state *blockFetchState, cacheErr error) {
 	s.blockFetchMu.Lock()
 	if s.blockFetches[blockKey] == state {
@@ -1178,13 +1195,19 @@ func (s *Service) fetchOneBlockForAssembly(ctx context.Context, bucket, key, acc
 	}
 }
 
-// fetchOneBlock waits for both validation and durability, preserving the
-// established behavior for probe-first and background populate callers. A
-// remote assembled serve can use fetchOneBlockForAssembly instead and return
-// after validation while this same state keeps the bounded writer alive.
+// fetchOneBlock waits for both validation and durability, retaining the generic
+// leader's presence recheck for direct and background callers.
 func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) error {
+	return s.fetchOneBlockWithKnownMissing(ctx, bucket, key, accessKey, secretKey, meta, blockIdx, false)
+}
+
+// fetchOneBlockWithKnownMissing keeps the generic cache-write completion boundary while allowing
+// a just-confirmed miss from ensureBlocksCached to skip the new leader's dependent presence probe.
+// A racing same-ETag fill may cause an idempotent write; non-stale failures still let each live
+// probe-first caller recover a late fill with its request context.
+func (s *Service) fetchOneBlockWithKnownMissing(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) error {
 	blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, blockIdx)
-	state := s.beginBlockFetch(blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, false)
+	state := s.beginBlockFetch(blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, knownMissing)
 
 	select {
 	case <-state.cacheDone:
@@ -1192,6 +1215,9 @@ func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, sec
 		err := state.cacheErr
 		state.mu.Unlock()
 		s.releaseBlockFetchConsumer(state)
+		if knownMissing {
+			return s.recoverKnownMissingBlockFailure(ctx, err, bucket, key, meta, blockIdx)
+		}
 		return err
 	case <-ctx.Done():
 		s.releaseBlockFetchConsumer(state)
@@ -1248,6 +1274,25 @@ func (s *Service) fetchBlocksForAssembly(ctx context.Context, bucket, key, acces
 	return leases, nil
 }
 
+// recoverKnownMissingBlockFailure keeps a probe-first caller from discarding a same-ETag block
+// that another writer filled after the scan. Its recovery read is bounded by that caller's
+// request context and a short timeout; stale-version signals and failed probes keep the original error.
+func (s *Service) recoverKnownMissingBlockFailure(ctx context.Context, err error, bucket, key string, meta *cache.CachedObjectMeta, blockIdx int64) error {
+	if err == nil || errors.Is(err, errBlockETagMismatch) || errors.Is(err, errBlockUpstreamGone) {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, probeCancel := context.WithTimeout(ctx, blockFailureRecoveryTimeout)
+	defer probeCancel()
+	present, probeErr := s.cache.BlockExistsErr(probeCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx)
+	if probeErr == nil && present {
+		return nil
+	}
+	return err
+}
+
 // runBlockFetch fetches and validates one aligned block under a detached,
 // timeout-bounded context. It transfers the acquired populate slot and staged
 // buffer to a remote writer only after io.ReadFull has completed. Local owners
@@ -1261,12 +1306,10 @@ func (s *Service) runBlockFetch(state *blockFetchState, blockKey, bucket, key, a
 		s.finishBlockFetch(blockKey, state, err)
 	}
 
-	// A generic coalesced fetch may have been preceded by an unrelated writer,
-	// so it retains the presence recheck. The assembled path reaches here only
-	// after its own range read returned ErrNotFound; repeating that remote probe
-	// adds a serial RPC without making the staged bytes safer. A writer that
-	// races after that observed miss can at most receive an idempotent put of the
-	// same ETag-versioned block.
+	// Generic callers may have been preceded by an unrelated writer, so they retain
+	// the presence recheck. Probe-first and assembled callers have already established
+	// an ETag-scoped miss and skip it; a local same-ETag fill that races after the scan
+	// may receive one redundant aligned GET and idempotent put per new leader.
 	if !knownMissing && s.cache.BlockExists(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx) {
 		state.completeServe(nil, nil, nil)
 		cancel()
@@ -1444,7 +1487,7 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 		recordBlockServeMetrics(total, 0)
 		return nil
 	}
-	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, missing); err != nil {
+	if err := s.fetchKnownMissingBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, missing); err != nil {
 		// A definitive stale signal has already invalidated the entry inside
 		// fetchBlocksToCache, so the caller's fall-through re-establishes the current state.
 		// Transient failures (budget shed, 5xx, upstream blip) leave the still-valid meta in
