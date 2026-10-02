@@ -23,10 +23,10 @@ In signing mode, TAG terminates the client signature and re-issues the upstream 
 
 1. The client signs its request with its own SigV4 credentials.
 2. TAG looks up the secret for the client's access key in its **local credential store** and cryptographically validates the incoming request signature.
-3. For `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, TAG verifies each chained chunk signature and the terminal signature, then stages the decoded payload in a temporary file before forwarding.
+3. For header-authenticated requests with `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, TAG verifies each chained chunk signature and the terminal signature, then stages the decoded payload in a temporary file before forwarding.
 4. TAG re-signs the (possibly transformed) request for the upstream endpoint using standard AWS SigV4 with **the same access key and secret**, then streams it upstream.
 
-TAG re-signs rather than forwarding the original signature because it may transform the request — for example decoding AWS chunked transfer encoding to `UNSIGNED-PAYLOAD` — which would otherwise invalidate the client's signature. Signed streaming uploads require temporary storage proportional to the payload and are not dispatched upstream until the full chain has been verified. The upstream sees the **same identity** as the client; this is not identity translation.
+TAG re-signs rather than forwarding the original signature because it may transform the request — for example decoding AWS chunked transfer encoding to `UNSIGNED-PAYLOAD` — which would otherwise invalidate the client's signature. These header-authenticated streaming uploads require temporary storage proportional to the payload and are not dispatched upstream until the full chain has been verified. Presigned URL validation continues to use `UNSIGNED-PAYLOAD` and does not establish this chunk-signature guarantee. The upstream sees the **same identity** as the client; this is not identity translation.
 
 Because TAG must know the secret for every access key it serves, those credentials must be present in its local credential store. In production the store is populated only from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (a single pair), so **clients must authenticate with those same credentials**, and TAG re-signs upstream with them. If the store is empty, TAG rejects all requests.
 
