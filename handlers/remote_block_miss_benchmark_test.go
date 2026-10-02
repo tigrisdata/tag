@@ -31,7 +31,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const remoteBlockMissBenchmarkSize = 1 << 20
+const (
+	remoteBlockMissBenchmarkBlockSize = 1 << 20
+	remoteBlockProbeBenchmarkDelay    = 2 * time.Millisecond
+)
 
 const goUserCPUMetric = "/cpu/classes/user:cpu-seconds"
 
@@ -68,18 +71,20 @@ type remoteBlockMissBenchmarkServer struct {
 
 	mu sync.RWMutex
 
-	blocks map[string][]byte
+	blocks     map[string][]byte
+	probeDelay time.Duration
 
 	putStarted chan struct{}
 	putDone    chan struct{}
 	putGate    <-chan struct{}
 
-	rpcs atomic.Int64
-	gets atomic.Int64
+	rpcs         atomic.Int64
+	gets         atomic.Int64
+	presenceGets atomic.Int64
 }
 
-func newRemoteBlockMissBenchmarkServer() *remoteBlockMissBenchmarkServer {
-	s := &remoteBlockMissBenchmarkServer{blocks: make(map[string][]byte)}
+func newRemoteBlockMissBenchmarkServer(probeDelay time.Duration) *remoteBlockMissBenchmarkServer {
+	s := &remoteBlockMissBenchmarkServer{blocks: make(map[string][]byte), probeDelay: probeDelay}
 	s.beginMiss()
 	return s
 }
@@ -95,6 +100,7 @@ func (s *remoteBlockMissBenchmarkServer) beginMiss() {
 	s.mu.Unlock()
 	s.rpcs.Store(0)
 	s.gets.Store(0)
+	s.presenceGets.Store(0)
 }
 
 // blockPuts holds a remote write before it reaches storage. It lets the trace
@@ -185,6 +191,18 @@ func (s *remoteBlockMissBenchmarkServer) PutObject(ctx context.Context, req *pb.
 func (s *remoteBlockMissBenchmarkServer) Get(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
 	s.rpcs.Add(1)
 	s.gets.Add(1)
+	if req.Start == 0 && req.End == 1 {
+		s.presenceGets.Add(1)
+		if s.probeDelay > 0 {
+			timer := time.NewTimer(s.probeDelay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-stream.Context().Done():
+				return stream.Context().Err()
+			}
+		}
+	}
 	s.mu.RLock()
 	data, ok := s.blocks[req.Key]
 	s.mu.RUnlock()
@@ -441,6 +459,9 @@ func (c *remoteBlockOwnerClient) Put(ctx context.Context, key string, data []byt
 }
 
 func (c *remoteBlockOwnerClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if c.trace == nil {
+		return c.CacheClient.GetRangeStream(ctx, key, start, end, w)
+	}
 	started := time.Now()
 	err := c.CacheClient.GetRangeStream(ctx, key, start, end, w)
 	c.trace.recordCacheRead(started)
@@ -452,9 +473,14 @@ func (c *remoteBlockOwnerClient) PutBlockBytes(ctx context.Context, key string, 
 }
 
 func (c *remoteBlockOwnerClient) putRemoteBlock(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
-	started := time.Now()
+	var started time.Time
+	if c.trace != nil {
+		started = time.Now()
+	}
 	resp, err := c.rpc.PutObject(ctx, &pb.PutRequest{Key: key, Data: data, TtlSeconds: ttlSeconds})
-	c.trace.record("remote-cache-put", started, false)
+	if c.trace != nil {
+		c.trace.record("remote-cache-put", started, false)
+	}
 	c.signalPutReturned()
 	if err != nil {
 		return err
@@ -533,7 +559,10 @@ func (*benchmarkRangeForwarder) DoAnonymousFullObjectRequest(context.Context, st
 }
 
 func (f *benchmarkRangeForwarder) DoConditionalGetRequest(ctx context.Context, bucket, key, _, _, _ string, _ int64, rangeHeader string) (*http.Response, error) {
-	started := time.Now()
+	var started time.Time
+	if f.trace != nil {
+		started = time.Now()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.upstreamURL+"/"+url.PathEscape(bucket)+"/"+url.PathEscape(key), nil)
 	if err != nil {
 		return nil, err
@@ -543,9 +572,11 @@ func (f *benchmarkRangeForwarder) DoConditionalGetRequest(ctx context.Context, b
 	if err != nil {
 		return nil, err
 	}
-	resp.Body = &timedReadCloser{ReadCloser: resp.Body, remaining: resp.ContentLength, onClose: func() {
-		f.trace.record("upstream-fetch", started, false)
-	}}
+	if f.trace != nil {
+		resp.Body = &timedReadCloser{ReadCloser: resp.Body, remaining: resp.ContentLength, onClose: func() {
+			f.trace.record("upstream-fetch", started, false)
+		}}
+	}
 	return resp, nil
 }
 
@@ -566,10 +597,20 @@ type remoteBlockMissBenchmarkFixture struct {
 }
 
 func newRemoteBlockMissBenchmarkFixture(tb testing.TB) *remoteBlockMissBenchmarkFixture {
-	tb.Helper()
+	return newRemoteBlockRangeBenchmarkFixture(tb, 1, 0, true)
+}
 
-	trace := &remoteMissStageTrace{}
-	owner := newRemoteBlockMissBenchmarkServer()
+func newRemoteBlockRangeBenchmarkFixture(tb testing.TB, blockCount int, probeDelay time.Duration, recordTrace bool) *remoteBlockMissBenchmarkFixture {
+	tb.Helper()
+	if blockCount <= 0 {
+		tb.Fatal("block count must be positive")
+	}
+
+	var trace *remoteMissStageTrace
+	if recordTrace {
+		trace = &remoteMissStageTrace{}
+	}
+	owner := newRemoteBlockMissBenchmarkServer(probeDelay)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		tb.Fatal(err)
@@ -596,7 +637,7 @@ func newRemoteBlockMissBenchmarkFixture(tb testing.TB) *remoteBlockMissBenchmark
 	}
 	tb.Cleanup(func() { _ = conn.Close() })
 
-	body := make([]byte, remoteBlockMissBenchmarkSize)
+	body := make([]byte, remoteBlockMissBenchmarkBlockSize*blockCount)
 	for i := range body {
 		body[i] = byte(i)
 	}
@@ -619,7 +660,7 @@ func newRemoteBlockMissBenchmarkFixture(tb testing.TB) *remoteBlockMissBenchmark
 
 	cfg := config.NewDefault()
 	cfg.Cache.SetBlockCachingEnabled(true)
-	cfg.Cache.BlockSize = int64(len(body))
+	cfg.Cache.BlockSize = int64(remoteBlockMissBenchmarkBlockSize)
 	cfg.Cache.SizeThreshold = int64(len(body))
 	remoteClient := newRemoteBlockOwnerClient(readClient, cacheclient.NewMemoryCache(), pb.NewCacheServiceClient(conn), trace)
 	cacheStore := cache.NewCacheWithClient(remoteClient, &cfg.Cache)
@@ -637,7 +678,7 @@ func newRemoteBlockMissBenchmarkFixture(tb testing.TB) *remoteBlockMissBenchmark
 		trace:        trace,
 		body:         body,
 		etag:         etag,
-		blockLen:     int64(len(body)),
+		blockLen:     int64(remoteBlockMissBenchmarkBlockSize),
 	}
 }
 
@@ -674,7 +715,7 @@ func (f *remoteBlockMissBenchmarkFixture) seedMeta(tb testing.TB, bucket, key st
 		Bucket:        bucket,
 		Key:           key,
 		ETag:          f.etag,
-		ContentLength: f.blockLen,
+		ContentLength: int64(len(f.body)),
 		StatusCode:    http.StatusOK,
 		BlockSize:     f.blockLen,
 	}
@@ -689,15 +730,19 @@ func (f *remoteBlockMissBenchmarkFixture) getRange(ctx context.Context, bucket, 
 	if err != nil {
 		return 0, "", nil, err
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", f.blockLen-1))
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", len(f.body)-1))
 	resp, err := f.client.Do(req)
 	if err != nil {
 		return 0, "", nil, err
 	}
-	f.trace.mark("response-headers")
+	if f.trace != nil {
+		f.trace.mark("response-headers")
+	}
 	body, readErr := io.ReadAll(resp.Body)
 	closeErr := resp.Body.Close()
-	f.trace.mark("response-complete")
+	if f.trace != nil {
+		f.trace.mark("response-complete")
+	}
 	if readErr != nil {
 		return resp.StatusCode, resp.Header.Get("X-Cache"), body, readErr
 	}
@@ -723,9 +768,10 @@ func (f *remoteBlockMissBenchmarkFixture) warm(tb testing.TB) {
 		key    = "warmup"
 	)
 	meta := f.seedMeta(tb, bucket, key)
-	blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, 0)
 	f.beginMiss()
-	f.trace.reset()
+	if f.trace != nil {
+		f.trace.reset()
+	}
 	statusCode, cacheStatus, got, err := f.getRange(context.Background(), bucket, key)
 	if err != nil {
 		tb.Fatalf("warm handler GET = %v", err)
@@ -733,7 +779,10 @@ func (f *remoteBlockMissBenchmarkFixture) warm(tb testing.TB) {
 	f.requireResponse(tb, statusCode, cacheStatus, got)
 	f.owner.waitForPut(tb)
 	f.remoteClient.waitForPutReturn(tb)
-	f.owner.deleteBlock(blockKey)
+	for blockIdx := int64(0); blockIdx*meta.BlockSize < meta.ContentLength; blockIdx++ {
+		blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, blockIdx)
+		f.owner.deleteBlock(blockKey)
+	}
 }
 
 // TestRemoteBlockMissTraceStages emits the ordinary handler-path waterfall for
@@ -805,7 +854,7 @@ func BenchmarkHandleGetObjectRemoteBlockMiss(b *testing.B) {
 	userCPU := newGoUserCPUCounter(b)
 	var totalRPCs, totalGets, totalRereads, totalUserCPUNS int64
 	var totalStageSum time.Duration
-	b.SetBytes(fixture.blockLen)
+	b.SetBytes(int64(len(fixture.body)))
 	b.ResetTimer()
 	for iteration := 0; b.Loop(); iteration++ {
 		b.StopTimer()
@@ -863,4 +912,64 @@ func BenchmarkHandleGetObjectRemoteBlockMiss(b *testing.B) {
 	b.ReportMetric(float64(totalRereads)/float64(b.N), "post_fetch_cache_rereads/op")
 	b.ReportMetric(float64(totalGets)/float64(b.N), "remote_block_cache_get_rpcs/op")
 	b.ReportMetric(float64(totalRPCs)/float64(b.N), "remote_cache_rpcs/op")
+}
+
+// BenchmarkHandleGetObjectProbeFirstRemotePartialRange measures the ordinary
+// multi-block Range path with one warm 1 MiB block and one missing block on
+// a distinct gRPC cache owner. The owner adds 2 ms to each byte-zero presence
+// probe so the removed cache round trip is visible; the metric remains the
+// full client-visible 206 operation through handlers.Server.
+func BenchmarkHandleGetObjectProbeFirstRemotePartialRange(b *testing.B) {
+	oldLogger := log.Logger
+	log.Logger = log.Logger.Level(zerolog.WarnLevel)
+	b.Cleanup(func() { log.Logger = oldLogger })
+
+	const (
+		bucket       = "benchmark"
+		blockCount   = 2
+		missingBlock = 1
+	)
+	fixture := newRemoteBlockRangeBenchmarkFixture(b, blockCount, remoteBlockProbeBenchmarkDelay, false)
+	fixture.warm(b)
+	b.ResetTimer()
+
+	for iteration := 0; b.Loop(); iteration++ {
+		b.StopTimer()
+		key := fmt.Sprintf("partial-range-%d", iteration)
+		meta := fixture.seedMeta(b, bucket, key)
+		for blockIdx := int64(0); blockIdx < int64(blockCount); blockIdx++ {
+			if blockIdx == missingBlock {
+				continue
+			}
+			start := blockIdx * meta.BlockSize
+			blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, blockIdx)
+			fixture.owner.store(blockKey, fixture.body[start:start+meta.BlockSize])
+		}
+		fixture.beginMiss()
+
+		b.StartTimer()
+		statusCode, cacheStatus, got, err := fixture.getRange(context.Background(), bucket, key)
+		b.StopTimer()
+		if err != nil {
+			b.Fatal(err)
+		}
+		fixture.requireResponse(b, statusCode, cacheStatus, got)
+
+		missingKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, missingBlock)
+		missingStart := int64(missingBlock) * meta.BlockSize
+		if !fixture.owner.hasBlock(missingKey, fixture.body[missingStart:missingStart+meta.BlockSize]) {
+			b.Fatal("remote owner did not retain the fetched block")
+		}
+		// The baseline has one extra presence RPC for the newly led miss; the
+		// Candidate has only the blockCount probes made by the outer range scan.
+		probes := fixture.owner.presenceGets.Load()
+		if probes != blockCount && probes != blockCount+1 {
+			b.Fatalf("byte-zero block probes = %d, want %d or %d", probes, blockCount, blockCount+1)
+		}
+		// Keep the mock owner bounded across iterations; cleanup is not request work.
+		fixture.owner.deleteBlock(cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, 0))
+		fixture.owner.deleteBlock(missingKey)
+		b.StartTimer()
+	}
+	b.StopTimer()
 }
