@@ -255,7 +255,7 @@ func checkBlockPresenceOwner(coord blockPresenceCoordinator, key, owner string) 
 	if err != nil {
 		return fmt.Errorf("resolve block owner for %q: %w", key, err)
 	}
-	if node.ID != owner {
+	if node == nil || node.ID != owner {
 		return cache.ErrBlockPresenceTopologyChanged
 	}
 	return nil

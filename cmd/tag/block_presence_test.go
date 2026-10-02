@@ -17,6 +17,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	cacheclient "github.com/tigrisdata/ocache/client"
+	"github.com/tigrisdata/ocache/coordinator/ring"
 	"github.com/tigrisdata/ocache/embedded"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
@@ -29,6 +30,21 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 )
+
+type missingBlockPresenceOwnerCoordinator struct{}
+
+func (missingBlockPresenceOwnerCoordinator) GetEpoch() uint64       { return 1 }
+func (missingBlockPresenceOwnerCoordinator) GetLocalNodeID() string { return "local" }
+func (missingBlockPresenceOwnerCoordinator) GetNodeForKey(string) (*ring.NodeInfo, error) {
+	return nil, nil
+}
+
+func TestCheckBlockPresenceOwnerRetriesWhenNodeIsMissing(t *testing.T) {
+	err := checkBlockPresenceOwner(missingBlockPresenceOwnerCoordinator{}, "block-key", "owner")
+	if !errors.Is(err, cache.ErrBlockPresenceTopologyChanged) {
+		t.Fatalf("missing owner error = %v, want topology change", err)
+	}
+}
 
 func TestBlockPresencePeerPruningRetainsActiveOwnerAndLeasedConnection(t *testing.T) {
 	client := newEmbeddedBlockCacheClient(nil)
