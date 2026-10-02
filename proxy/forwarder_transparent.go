@@ -43,9 +43,10 @@ func (f *transparentForwarder) initInterceptor() {
 // interceptResponse is called by base forwarder methods after receiving the
 // upstream response but before headers are sent to the client. It extracts
 // signing keys from successful responses and revokes authZ on 403s.
-func (f *transparentForwarder) interceptResponse(resp *http.Response, originalReq *http.Request) {
-	f.learnSigningKeys(resp, originalReq)
+func (f *transparentForwarder) interceptResponse(resp *http.Response, originalReq *http.Request) (string, bool) {
+	accessKey, authenticated := f.learnSigningKeys(resp, originalReq)
 	f.handleAuthzRevocation(resp, originalReq)
+	return accessKey, authenticated
 }
 
 // shallowHeaderCopy gives the forwarded request its own header map while
@@ -202,6 +203,48 @@ func (f *transparentForwarder) ValidateAndGetCredentials(r *http.Request) (AuthR
 	return result, f.proxySigner.AccessKey(), f.proxySigner.SecretKey(), nil
 }
 
+// authenticatedCompletionAccessKey returns the caller identity after local
+// signature and bucket-authorization checks pass. Without local auth configured,
+// transparent requests cannot be bound to a validated principal for replay.
+func (f *transparentForwarder) authenticatedCompletionAccessKey(r *http.Request) (string, bool) {
+	if f.validator == nil || f.derivedKeyStore == nil || f.authzCache == nil {
+		return "", false
+	}
+	validationRequest, ok := completionRequestForLocalValidation(r)
+	if !ok {
+		return "", false
+	}
+	result, err := f.validateLocally(validationRequest)
+	if err != nil || result != AuthValidated {
+		return "", false
+	}
+	authInfo, err := auth.ParseAuthInfo(r)
+	if err != nil || authInfo.AccessKey == "" {
+		return "", false
+	}
+	return authInfo.AccessKey, true
+}
+
+// authenticatedCompletionAccessKeyAtRequestStart captures transparent-mode
+// identity before an upstream round trip can age out the request signature.
+func (f *transparentForwarder) authenticatedCompletionAccessKeyAtRequestStart(r *http.Request) (string, bool) {
+	return f.authenticatedCompletionAccessKey(r)
+}
+
+// completionAccessKeyStillAuthorized rechecks the grant at the replay decision
+// point after a potentially remote completion-cache read has finished.
+func (f *transparentForwarder) completionAccessKeyStillAuthorized(accessKey string, r *http.Request) bool {
+	if accessKey == "" || f.authzCache == nil {
+		return false
+	}
+	authInfo, err := auth.ParseAuthInfo(r)
+	if err != nil || authInfo.AccessKey != accessKey {
+		return false
+	}
+	bucket, _ := ParseBucketKey(r)
+	return f.authzCache.IsAuthorized(accessKey, bucket)
+}
+
 // validateLocally performs local SigV4 validation of the client's request.
 func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, error) {
 	// If local auth is not configured, always treat as validated (legacy behavior)
@@ -286,13 +329,14 @@ func (f *transparentForwarder) DoRequestWithCreds(ctx context.Context, r *http.R
 
 // learnSigningKeys extracts and caches derived signing keys from the Tigris response.
 // The signing keys header is always stripped before the response reaches the client.
-func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Request) {
+// It returns the caller identity only when a successful response supplied a usable key.
+func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Request) (string, bool) {
 	// Always strip the internal header, even when local auth is disabled.
 	headerVal := resp.Header.Get(signingKeysHeader)
 	resp.Header.Del(signingKeysHeader)
 
 	if f.keyUnwrapper == nil {
-		return
+		return "", false
 	}
 
 	// Header may be absent on 2xx if feature is disabled on Tigris side, or non-proxy request
@@ -300,22 +344,23 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 		if headerVal == "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			log.Debug().Int("status", resp.StatusCode).Msg("Signing keys header absent from successful response")
 		}
-		return
+		return "", false
 	}
 
 	authInfo, err := auth.ParseAuthInfo(r)
 	if err != nil {
 		log.Debug().Err(err).Msg("Failed to parse auth info for signing key learning")
-		return
+		return "", false
 	}
 
 	entries, err := f.keyUnwrapper.Unwrap(headerVal, authInfo.AccessKey)
 	if err != nil {
 		log.Warn().Err(err).Str("access_key", authInfo.AccessKey).Msg("Failed to unwrap signing keys")
-		return
+		return "", false
 	}
 
 	newKeys := 0
+	usableKey := false
 	for _, entry := range entries {
 		keyBytes, err := hex.DecodeString(entry.SigningKey)
 		if err != nil {
@@ -326,6 +371,7 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 			newKeys++
 		}
 		f.derivedKeyStore.Store(authInfo.AccessKey, entry.Date, entry.Region, keyBytes)
+		usableKey = true
 	}
 
 	bucket, _ := ParseBucketKey(r)
@@ -342,6 +388,7 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 	metrics.ProxySigningKeysReceived.Inc()
 	metrics.DerivedKeyStoreSize.Set(float64(f.derivedKeyStore.Count()))
 	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
+	return authInfo.AccessKey, usableKey && f.authzCache.IsAuthorized(authInfo.AccessKey, bucket)
 }
 
 // handleAuthzRevocation revokes authorization when Tigris returns 403.

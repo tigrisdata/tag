@@ -80,6 +80,44 @@ type RequestForwarder interface {
 	DoConditionalHeadRequest(ctx context.Context, bucket, key, accessKey, secretKey, etag string, lastModified int64) (*http.Response, error)
 }
 
+// completionAccessKeyValidator identifies a caller only after the forwarder's
+// local authentication and, where available, bucket-authorization checks pass.
+type completionAccessKeyValidator interface {
+	authenticatedCompletionAccessKey(r *http.Request) (accessKey string, ok bool)
+}
+
+// completionAccessKeyAtRequestStart snapshots the caller identity before forwarding
+// and can recheck its bucket authorization after a cache read.
+type completionAccessKeyAtRequestStart interface {
+	authenticatedCompletionAccessKeyAtRequestStart(r *http.Request) (accessKey string, ok bool)
+	completionAccessKeyStillAuthorized(accessKey string, r *http.Request) bool
+}
+
+// completionRequestForLocalValidation supplies the unsigned payload marker that
+// presigned SigV4 validation expects without changing the request sent upstream.
+func completionRequestForLocalValidation(r *http.Request) (*http.Request, bool) {
+	if r.Header.Get("X-Amz-Content-Sha256") != "" {
+		return r, true
+	}
+	if !auth.IsPresignedRequest(r) {
+		return r, false
+	}
+	authInfo, err := auth.ParseAuthInfo(r)
+	if err != nil || !authInfo.IsPresigned {
+		return r, false
+	}
+	for _, header := range authInfo.SignedHeaders {
+		if strings.EqualFold(header, "x-amz-content-sha256") {
+			return r, false
+		}
+	}
+
+	validationRequest := r.Clone(r.Context())
+	validationRequest.Header = r.Header.Clone()
+	validationRequest.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	return validationRequest, true
+}
+
 // AuthErrorCode represents the type of authentication error.
 type AuthErrorCode int
 
@@ -162,9 +200,9 @@ var (
 
 // ResponseInterceptor is called after receiving the upstream response but before
 // headers are sent to the client. Used by transparentForwarder to extract signing
-// keys and strip internal headers from the response.
-// The originalReq parameter is the original client request (needed for parsing auth info).
-type ResponseInterceptor func(resp *http.Response, originalReq *http.Request)
+// keys, strip internal headers, and report a client identity authenticated by the
+// response. The originalReq is needed to parse the client's auth info.
+type ResponseInterceptor func(resp *http.Response, originalReq *http.Request) (accessKey string, authenticated bool)
 
 // baseForwarder contains shared HTTP execution logic used by both
 // signingForwarder and transparentForwarder.
@@ -228,7 +266,7 @@ func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *
 
 	// Run response interceptor before sending headers to client
 	if b.responseInterceptor != nil {
-		b.responseInterceptor(resp, originalReq)
+		_, _ = b.responseInterceptor(resp, originalReq)
 	}
 
 	var respHeaders http.Header
@@ -269,14 +307,19 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 	defer resp.Body.Close()
 
 	// Run response interceptor before sending headers to client
+	var authenticatedAccessKey string
+	var authenticated bool
 	if b.responseInterceptor != nil {
-		b.responseInterceptor(resp, originalReq)
+		authenticatedAccessKey, authenticated = b.responseInterceptor(resp, originalReq)
 	}
 
 	// Capture response
 	capture := &ResponseCapture{
 		StatusCode: resp.StatusCode,
 		Headers:    resp.Header.Clone(),
+	}
+	if authenticated {
+		capture.authenticatedAccessKey = authenticatedAccessKey
 	}
 
 	// Copy headers to response writer
@@ -319,7 +362,7 @@ func (b *baseForwarder) executeRequest(fwdReq *http.Request, inContentLength int
 
 	// Run response interceptor (e.g., signing key learning, header stripping)
 	if b.responseInterceptor != nil {
-		b.responseInterceptor(resp, originalReq)
+		_, _ = b.responseInterceptor(resp, originalReq)
 	}
 
 	return resp, nil
@@ -585,6 +628,8 @@ type ResponseCapture struct {
 	Headers    http.Header
 	Body       []byte
 	Complete   bool // True if body was fully captured without errors
+
+	authenticatedAccessKey string // Set after local validation or trusted upstream key learning.
 }
 
 // ContentLength returns the content length from headers or body length.

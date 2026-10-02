@@ -1179,8 +1179,8 @@ func (s *Service) HandlePassthrough(w http.ResponseWriter, r *http.Request) erro
 }
 
 // HandleCompleteMultipartUpload handles CompleteMultipartUpload with idempotency caching.
-// This caches successful completion responses in ocache to support idempotent calls,
-// matching tigris-os behavior where a second CompleteMultipartUpload call returns success.
+// Fully captured successful responses are cached for five seconds and replayed only
+// for the same locally validated access key and bucket.
 func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request) error {
 	bucket, key := ParseBucketKey(r)
 	uploadId := r.URL.Query().Get("uploadId")
@@ -1188,13 +1188,35 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Str("uploadId", uploadId).Msg("HandleCompleteMultipartUpload")
 
+	// Preserve transparent-mode identity before forwarding: a long completion can
+	// outlive the SigV4 age window before its response is captured.
+	var (
+		requestAccessKey      string
+		requestAuthValidated  bool
+		requestAuthWasChecked bool
+	)
+	if s.cache.IsEnabled() {
+		requestAccessKey, requestAuthValidated, requestAuthWasChecked = s.completionAccessKeyAtRequestStart(r)
+	}
+
 	// Check ocache first for idempotent completion (works across TAG pods).
 	// A replay returns the already-completed response without touching upstream and
 	// without changing the object, so it needs no read-cache invalidation — the first
 	// completion (below) already invalidated it.
 	if s.cache.IsEnabled() {
-		entry, found, err := s.cache.GetCompletion(ctx, bucket, key, uploadId)
-		if err == nil && found {
+		callerAccessKey := func() (string, bool) {
+			if requestAuthWasChecked {
+				// Keep the request-start signature result, but recheck the grant after
+				// GetCompletion's potentially remote read; that is the replay decision point.
+				if !requestAuthValidated || !s.completionAccessKeyStillAuthorized(requestAccessKey, r) {
+					return requestAccessKey, false
+				}
+				return requestAccessKey, true
+			}
+			return s.completionAccessKey(r)
+		}
+		entry, found, err := s.cache.GetCompletion(ctx, bucket, key, uploadId, callerAccessKey)
+		if err == nil && found && entry != nil {
 			log.Debug().Str("uploadId", uploadId).Msg("CompleteMultipartUpload cache hit - returning cached response")
 			for k, v := range entry.Headers {
 				w.Header().Set(k, v)
@@ -1271,17 +1293,47 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	// Cache successful completions in ocache for idempotent replays. Only cache a
-	// genuine success (not a 200-with-<Error> body) that was fully captured, so we
-	// never replay a corrupted or error response as a successful completion.
-	if completed && capture.Complete {
-		if cacheErr := s.cache.PutCompletion(ctx, bucket, key, uploadId, capture.StatusCode, capture.Headers, capture.Body); cacheErr != nil {
-			log.Debug().Err(cacheErr).Msg("Failed to cache completion response")
-			// Don't fail the request if caching fails
+	// Cache successful completions only when the validated caller identity is
+	// available. The response is replayable only for that principal and bucket.
+	if completed && capture.Complete && s.cache.IsEnabled() {
+		accessKey := capture.authenticatedAccessKey
+		if accessKey == "" {
+			accessKey = requestAccessKey
+		}
+		if accessKey == "" {
+			accessKey, _ = s.completionAccessKey(r)
+		}
+		if accessKey != "" {
+			if cacheErr := s.cache.PutCompletion(ctx, bucket, key, uploadId, accessKey, capture.StatusCode, capture.Headers, capture.Body); cacheErr != nil {
+				log.Debug().Err(cacheErr).Msg("Failed to cache completion response")
+				// Don't fail the request if caching fails
+			}
 		}
 	}
 
 	return nil
+}
+
+func (s *Service) completionAccessKey(r *http.Request) (string, bool) {
+	validator, ok := s.forwarder.(completionAccessKeyValidator)
+	if !ok {
+		return "", false
+	}
+	return validator.authenticatedCompletionAccessKey(r)
+}
+
+func (s *Service) completionAccessKeyAtRequestStart(r *http.Request) (string, bool, bool) {
+	validator, ok := s.forwarder.(completionAccessKeyAtRequestStart)
+	if !ok {
+		return "", false, false
+	}
+	accessKey, authenticated := validator.authenticatedCompletionAccessKeyAtRequestStart(r)
+	return accessKey, authenticated, true
+}
+
+func (s *Service) completionAccessKeyStillAuthorized(accessKey string, r *http.Request) bool {
+	validator, ok := s.forwarder.(completionAccessKeyAtRequestStart)
+	return ok && validator.completionAccessKeyStillAuthorized(accessKey, r)
 }
 
 // ParseBucketKey extracts bucket and key from request path.
