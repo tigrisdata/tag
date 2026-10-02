@@ -23,15 +23,13 @@ import (
 type embeddedBlockCacheClient struct {
 	*embedded.Client
 
-	dialOptions        []grpc.DialOption
-	peerMu             sync.Mutex
-	peers              map[string]*blockPresencePeer
-	retiredPeers       map[*blockPresencePeer]struct{} // detached entries kept only while leased
-	closed             bool
-	closeOnce          sync.Once
-	closeErr           error
-	reconciledEpoch    uint64
-	reconciledEpochSet bool
+	dialOptions  []grpc.DialOption
+	peerMu       sync.Mutex
+	peers        map[string]*blockPresencePeer
+	retiredPeers map[*blockPresencePeer]struct{} // detached entries kept only while leased
+	closed       bool
+	closeOnce    sync.Once
+	closeErr     error
 }
 
 // Peer lifecycle fields are protected by embeddedBlockCacheClient.peerMu. active
@@ -87,9 +85,10 @@ func (c *embeddedBlockCacheClient) BlockPresence(ctx context.Context, keys []str
 	if coord != nil {
 		epoch = coord.GetEpoch()
 		localID = coord.GetLocalNodeID()
-		if ringManager := coord.GetRing(); ringManager != nil && c.peerCacheNeedsReconcile(epoch) {
-			activeOwners := make(map[string]string)
-			for _, node := range ringManager.GetActiveNodes() {
+		if ringManager := coord.GetRing(); ringManager != nil && c.hasCachedPeerConnections() {
+			nodes := ringManager.GetActiveNodes()
+			activeOwners := make(map[string]string, len(nodes))
+			for _, node := range nodes {
 				if node != nil && node.ID != "" {
 					activeOwners[node.ID] = node.ListenAddress
 				}
@@ -315,27 +314,26 @@ func (c *embeddedBlockCacheClient) peerConnection(owner, address string) (*block
 	return peer, nil
 }
 
-func (c *embeddedBlockCacheClient) peerCacheNeedsReconcile(epoch uint64) bool {
+func (c *embeddedBlockCacheClient) hasCachedPeerConnections() bool {
 	c.peerMu.Lock()
 	defer c.peerMu.Unlock()
-	return !c.closed && (!c.reconciledEpochSet || c.reconciledEpoch != epoch)
+	return !c.closed && len(c.peers) > 0
 }
 
-// prunePeerConnections evicts cached connections for owners no longer active in
-// the full ring snapshot. Page membership is deliberately not used: an active
-// peer absent from one Range page still belongs in the cache. The epoch is an
-// opaque topology fingerprint, so reconciliation is equality-gated and the full
-// owner/peer scan stays off the steady-state Range path. A stale snapshot is
-// discarded if the coordinator has already observed another epoch; this sweep
-// is only connection cleanup, while per-key routing remains authoritative. An
-// address change for an owner used by this page is handled by peerConnection.
+// prunePeerConnections evicts cached connections for owners no longer active or
+// whose address changed in the full ring snapshot. Page membership is deliberately
+// not used: an active peer absent from one Range page still belongs in the cache.
+// Address-only changes do not affect the ring epoch, so inspect the snapshot on
+// each page while peers are cached. Epoch checks discard snapshots made stale by
+// membership/state changes; per-key routing and the caller's post-page checks
+// remain authoritative for the exchange. This sweep only manages connections.
 func (c *embeddedBlockCacheClient) prunePeerConnections(activeOwners map[string]string, coord blockPresenceCoordinator, epoch uint64) {
 	if len(activeOwners) == 0 {
 		return
 	}
 	var closeConnections []*grpc.ClientConn
 	c.peerMu.Lock()
-	if c.closed || (c.reconciledEpochSet && c.reconciledEpoch == epoch) || coord.GetEpoch() != epoch {
+	if c.closed || coord.GetEpoch() != epoch {
 		c.peerMu.Unlock()
 		return
 	}
@@ -359,8 +357,6 @@ func (c *embeddedBlockCacheClient) prunePeerConnections(activeOwners map[string]
 		delete(c.peers, stale.owner)
 		c.retirePeerLocked(stale.peer, &closeConnections)
 	}
-	c.reconciledEpoch = epoch
-	c.reconciledEpochSet = true
 	c.peerMu.Unlock()
 	closeBlockPresenceConnections(closeConnections)
 }
