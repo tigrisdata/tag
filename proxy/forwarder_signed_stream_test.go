@@ -84,9 +84,9 @@ func TestSigningForwarderSignedStreamIntegrity(t *testing.T) {
 	credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
 	forwarder := NewForwarder(credentials, upstream.URL, "us-east-1", 1, nil, nil)
 	// Keep the integrity assertion independent of the host's available temp space.
-	forwarder.(*signingForwarder).stageBudgetOverride = newSignedStreamStageBudget(func(string) (signedStreamStageSpace, error) {
+	useSignedStreamStageBudget(t, newSignedStreamStageBudget(func(string) (signedStreamStageSpace, error) {
 		return signedStreamStageSpace{availableBytes: 1 << 30, blockSize: 1}, nil
-	})
+	}))
 	chunks := [][]byte{[]byte("first chunk "), []byte("second chunk")}
 	decodedLength := len(chunks[0]) + len(chunks[1])
 	seed := newSignedStreamSeed(t, upstream.URL, StreamingPayloadHash, decodedLength, true)

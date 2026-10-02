@@ -573,15 +573,6 @@ func sha256HexBytes(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// stageBudget returns the process-wide reservation pool unless a test supplies
-// an isolated pool for deterministic capacity and ownership checks.
-func (f *signingForwarder) stageBudget() *signedStreamStageBudget {
-	if f.stageBudgetOverride != nil {
-		return f.stageBudgetOverride
-	}
-	return defaultSignedStreamStageBudget
-}
-
 // decodeIncomingBody authenticates the only signed HMAC marker repaired by this
 // path. Other supported streaming markers keep the existing decoder behavior.
 func (f *signingForwarder) decodeIncomingBody(ctx context.Context, w http.ResponseWriter, r *http.Request, accessKey string) (io.ReadCloser, string, int64, bool, *stagedSignedChunkedBody, error) {
@@ -639,7 +630,7 @@ func (f *signingForwarder) decodeIncomingBody(ctx context.Context, w http.Respon
 		date+"/"+info.Region+"/s3/aws4_request",
 		info.Signature,
 		decodedLength,
-		f.stageBudget(),
+		defaultSignedStreamStageBudget,
 	)
 	if err != nil {
 		if errors.Is(err, auth.ErrSignatureMismatch) {

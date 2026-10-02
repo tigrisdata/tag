@@ -17,6 +17,13 @@ import (
 	"github.com/tigrisdata/tag/auth"
 )
 
+func useSignedStreamStageBudget(t *testing.T, budget *signedStreamStageBudget) {
+	t.Helper()
+	previous := defaultSignedStreamStageBudget
+	defaultSignedStreamStageBudget = budget
+	t.Cleanup(func() { defaultSignedStreamStageBudget = previous })
+}
+
 func TestStatusRecorderUnwrapsReadDeadline(t *testing.T) {
 	writer := &readDeadlineResponseWriter{ResponseWriter: httptest.NewRecorder()}
 	wrapped := &statusRecorder{ResponseWriter: writer}
@@ -68,7 +75,7 @@ func TestSigningForwarderWaitsForCancellationCallbackBeforeReturning(t *testing.
 	credentials := auth.NewCredentialStore()
 	credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
 	forwarder := NewForwarder(credentials, "http://stage.test", "us-east-1", 1, nil, nil).(*signingForwarder)
-	forwarder.stageBudgetOverride = budget
+	useSignedStreamStageBudget(t, budget)
 	body := &blockingSignedStreamBody{readStarted: make(chan struct{}), closed: make(chan struct{})}
 	writer := &blockingReadDeadlineWriter{
 		ResponseWriter: httptest.NewRecorder(),
@@ -357,9 +364,9 @@ func TestSigningForwarderRejectsSignedStreamLengthMismatch(t *testing.T) {
 	credentials := auth.NewCredentialStore()
 	credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
 	forwarder := NewForwarder(credentials, upstream.URL, "us-east-1", 1, nil, nil).(*signingForwarder)
-	forwarder.stageBudgetOverride = newSignedStreamStageBudget(func(string) (signedStreamStageSpace, error) {
+	useSignedStreamStageBudget(t, newSignedStreamStageBudget(func(string) (signedStreamStageSpace, error) {
 		return signedStreamStageSpace{availableBytes: 1 << 30, blockSize: 1}, nil
-	})
+	}))
 
 	methods := []struct {
 		name string
@@ -443,9 +450,9 @@ func TestSigningForwarderForwardsUnknownLengthSignedStream(t *testing.T) {
 	credentials := auth.NewCredentialStore()
 	credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
 	forwarder := NewForwarder(credentials, upstream.URL, "us-east-1", 1, nil, nil).(*signingForwarder)
-	forwarder.stageBudgetOverride = newSignedStreamStageBudget(func(string) (signedStreamStageSpace, error) {
+	useSignedStreamStageBudget(t, newSignedStreamStageBudget(func(string) (signedStreamStageSpace, error) {
 		return signedStreamStageSpace{availableBytes: 1 << 20, blockSize: 1}, nil
-	})
+	}))
 	payload := []byte("unknown decoded length")
 	seed := newSignedStreamSeed(t, upstream.URL, StreamingPayloadHash, -1, true)
 	stream := makeSignedStreamWire(t, seed, payload)
@@ -494,9 +501,9 @@ func TestSigningForwarderPreservesLargeChunkSegmentation(t *testing.T) {
 	credentials := auth.NewCredentialStore()
 	credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
 	forwarder := NewForwarder(credentials, upstream.URL, "us-east-1", 1, nil, nil)
-	forwarder.(*signingForwarder).stageBudgetOverride = newSignedStreamStageBudget(func(string) (signedStreamStageSpace, error) {
+	useSignedStreamStageBudget(t, newSignedStreamStageBudget(func(string) (signedStreamStageSpace, error) {
 		return signedStreamStageSpace{availableBytes: 1 << 20, blockSize: 1}, nil
-	})
+	}))
 	payload := bytes.Repeat([]byte("x"), 256<<10)
 	seed := newSignedStreamSeed(t, upstream.URL, StreamingPayloadHash, len(payload), true)
 	t.Run("one large chunk", func(t *testing.T) {
@@ -581,7 +588,7 @@ func TestSigningForwarderReservesKnownLengthBeforeReading(t *testing.T) {
 	credentials := auth.NewCredentialStore()
 	credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
 	forwarder := NewForwarder(credentials, upstream.URL, "us-east-1", 1, nil, nil).(*signingForwarder)
-	forwarder.stageBudgetOverride = budget
+	useSignedStreamStageBudget(t, budget)
 
 	payload := []byte("12345")
 	seed := newSignedStreamSeed(t, upstream.URL, StreamingPayloadHash, len(payload), true)
@@ -618,7 +625,7 @@ func TestSigningForwarderReservesUnknownChunkBeforeCopy(t *testing.T) {
 	credentials := auth.NewCredentialStore()
 	credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
 	forwarder := NewForwarder(credentials, upstream.URL, "us-east-1", 1, nil, nil).(*signingForwarder)
-	forwarder.stageBudgetOverride = budget
+	useSignedStreamStageBudget(t, budget)
 
 	payload := []byte("12345")
 	seed := newSignedStreamSeed(t, upstream.URL, StreamingPayloadHash, -1, true)
@@ -699,7 +706,7 @@ func TestSigningForwarderAccountsForPartialChunkWritesDuringConcurrentAdmission(
 	credentials := auth.NewCredentialStore()
 	credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
 	forwarder := NewForwarder(credentials, upstream.URL, "us-east-1", 1, nil, nil).(*signingForwarder)
-	forwarder.stageBudgetOverride = budget
+	useSignedStreamStageBudget(t, budget)
 
 	firstPayload := bytes.Repeat([]byte("a"), 40)
 	firstSeed := newSignedStreamSeed(t, upstream.URL, StreamingPayloadHash, len(firstPayload), true)
@@ -805,7 +812,7 @@ func TestSigningForwarderStagingReservationLivesUntilTransportClose(t *testing.T
 	credentials := auth.NewCredentialStore()
 	credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
 	forwarder := NewForwarder(credentials, "http://stage.test", "us-east-1", 1, nil, nil).(*signingForwarder)
-	forwarder.stageBudgetOverride = budget
+	useSignedStreamStageBudget(t, budget)
 	transport := &holdingSignedBodyTransport{}
 	forwarder.httpClient.Transport = transport
 

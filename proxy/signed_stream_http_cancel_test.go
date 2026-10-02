@@ -93,7 +93,7 @@ func TestSigningForwarderHMACFailureInterruptsRealHTTP1BodyClose(t *testing.T) {
 	credentials := auth.NewCredentialStore()
 	credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
 	forwarder := NewForwarder(credentials, upstream.URL, "us-east-1", 1, nil, nil).(*signingForwarder)
-	forwarder.stageBudgetOverride = budget
+	useSignedStreamStageBudget(t, budget)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -263,7 +263,7 @@ func TestSigningForwarderCancellationInterruptsRealHTTP1Body(t *testing.T) {
 			credentials := auth.NewCredentialStore()
 			credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
 			forwarder := NewForwarder(credentials, upstream.URL, "us-east-1", 1, nil, nil).(*signingForwarder)
-			forwarder.stageBudgetOverride = budget
+			useSignedStreamStageBudget(t, budget)
 
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
