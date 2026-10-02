@@ -52,6 +52,9 @@ const (
 	// cacheWriteTimeout is the base timeout for cache writes.
 	cacheWriteTimeout = 60 * time.Second
 
+	// blockFailureRecoveryTimeout bounds a best-effort cache presence read after a probe-first populate failure.
+	blockFailureRecoveryTimeout = 2 * time.Second
+
 	// backgroundFetchTimeout is the timeout for background fetches.
 	backgroundFetchTimeout = 5 * time.Minute
 
