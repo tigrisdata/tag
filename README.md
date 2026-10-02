@@ -178,6 +178,8 @@ See [docs/metrics.md](docs/metrics.md) for complete metrics reference.
 
 TAG supports transparent proxy mode (default) with local SigV4 validation and per-bucket authorization caching, as well as signing mode with local credential stores.
 
+For requests routed upstream through the signing forwarder, header-authenticated `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` uploads are verified before their decoded bodies are forwarded from temporary storage; concurrent stages account for at most half of the temporary-filesystem space available when the first stage is admitted. This guarantee does not cover tiered-mode PUTs stored directly in the local cache. Presigned URL validation retains its existing `UNSIGNED-PAYLOAD` behavior.
+
 See [docs/security.md](docs/security.md) for authentication, access control, and security architecture.
 
 ## Contributing

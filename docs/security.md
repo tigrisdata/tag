@@ -19,13 +19,14 @@ Tigris independently validates both the client's SigV4 signature and TAG's proxy
 
 ### Signing Mode
 
-In signing mode, TAG terminates the client signature and re-issues the upstream one itself:
+For requests routed upstream in signing mode, TAG terminates the client signature and re-issues the upstream one itself:
 
 1. The client signs its request with its own SigV4 credentials.
-2. TAG looks up the secret for the client's access key in its **local credential store** and cryptographically validates the incoming signature.
-3. TAG re-signs the (possibly transformed) request for the upstream endpoint using standard AWS SigV4 with **the same access key and secret**, then streams it upstream.
+2. TAG looks up the secret for the client's access key in its **local credential store** and cryptographically validates the incoming request signature.
+3. On this upstream-forwarding path, for header-authenticated requests with `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, TAG reserves temporary storage, verifies each chained chunk signature and the terminal signature, checks a declared decoded length against the staged bytes, and stages the payload before forwarding.
+4. TAG re-signs the (possibly transformed) request for the upstream endpoint using standard AWS SigV4 with **the same access key and secret**, then streams it upstream.
 
-TAG re-signs rather than forwarding the original signature because it may transform the request — for example decoding AWS chunked transfer encoding to `UNSIGNED-PAYLOAD` — which would otherwise invalidate the client's signature. The upstream sees the **same identity** as the client; this is not identity translation.
+TAG re-signs rather than forwarding the original signature because it may transform the request — for example decoding AWS chunked transfer encoding to `UNSIGNED-PAYLOAD` — which would otherwise invalidate the client's signature. These upstream-forwarded header-authenticated streaming uploads require temporary storage proportional to the payload and are not dispatched upstream until the full chain has been verified. Concurrent signed-stream stages reserve at most half of the temporary-filesystem space available when the first stage is admitted; other filesystem users are outside this process-local accounting. Tiered-mode PUTs stored directly in the local cache bypass this upstream-forwarding path and are not covered by this chunk-signature guarantee. Presigned URL validation continues to use `UNSIGNED-PAYLOAD` and does not establish this guarantee. The upstream sees the **same identity** as the client; this is not identity translation.
 
 Because TAG must know the secret for every access key it serves, those credentials must be present in its local credential store. In production the store is populated only from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (a single pair), so **clients must authenticate with those same credentials**, and TAG re-signs upstream with them. If the store is empty, TAG rejects all requests.
 
