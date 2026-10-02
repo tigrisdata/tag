@@ -766,6 +766,154 @@ func TestSigningForwarderAccountsForPartialChunkWritesDuringConcurrentAdmission(
 	assertStageDirectoryEmpty(t, tempDir)
 }
 
+func TestSignedStreamStageWriteDoesNotHoldSharedBudgetLock(t *testing.T) {
+	dir := t.TempDir()
+	budget := newSignedStreamStageBudget(func(string) (signedStreamStageSpace, error) {
+		return signedStreamStageSpace{availableBytes: 100, blockSize: 1}, nil
+	})
+	first := &signedStreamStageReservation{budget: budget, dir: dir}
+	if err := first.reservePayload(40); err != nil {
+		t.Fatalf("reserve first upload staging: %v", err)
+	}
+
+	writer := &blockedSignedStreamStageWriter{started: make(chan struct{}), unblocked: make(chan struct{})}
+	firstDone := make(chan error, 1)
+	go func() {
+		payload := []byte("first payload")
+		n, err := first.write(writer, payload)
+		if err == nil && n != len(payload) {
+			err = errors.New("first staged write was short")
+		}
+		firstDone <- err
+	}()
+	select {
+	case <-writer.started:
+	case <-time.After(5 * time.Second):
+		writer.unblock()
+		t.Fatal("first upload did not enter its blocked filesystem write")
+	}
+
+	overBudget := &signedStreamStageReservation{budget: budget, dir: dir}
+	if err := overBudget.reservePayload(11); !errors.Is(err, errSignedStreamStagingCapacity) {
+		t.Fatalf("reserve beyond the shared in-flight staging cap = %v, want capacity error", err)
+	}
+
+	second := &signedStreamStageReservation{budget: budget, dir: dir}
+	secondDone := make(chan error, 1)
+	go func() {
+		if err := second.reservePayload(10); err != nil {
+			secondDone <- err
+			return
+		}
+		payload := []byte("second")
+		n, err := second.write(io.Discard, payload)
+		if err == nil && n != len(payload) {
+			err = errors.New("second staged write was short")
+		}
+		second.release(true)
+		secondDone <- err
+	}()
+
+	blocked := false
+	var secondErr error
+	select {
+	case secondErr = <-secondDone:
+	case <-time.After(5 * time.Second):
+		blocked = true
+	}
+	writer.unblock()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("finish first staged write: %v", err)
+	}
+	if blocked {
+		secondErr = <-secondDone
+		if secondErr != nil {
+			t.Fatalf("complete second reservation after unblocking first write: %v", secondErr)
+		}
+		t.Fatal("second upload waited for the first upload's filesystem write")
+	}
+	if secondErr != nil {
+		t.Fatalf("reserve, write, and release second upload during first write: %v", secondErr)
+	}
+
+	first.release(true)
+	budget.mu.Lock()
+	reserved, unallocated := budget.reserved, budget.unallocated
+	budget.mu.Unlock()
+	if reserved != 0 || unallocated != 0 {
+		t.Fatalf("staging budget after both uploads: reserved=%d unallocated=%d, want 0", reserved, unallocated)
+	}
+}
+
+func TestSignedStreamStageWriteAccountsForPartialFailures(t *testing.T) {
+	writeErr := io.ErrShortWrite
+	for _, tc := range []struct {
+		name            string
+		written         int
+		writeErr        error
+		wantAllocated   int64
+		wantUnallocated int64
+	}{
+		{name: "partial write", written: 5, writeErr: writeErr, wantAllocated: 8, wantUnallocated: 8},
+		{name: "no bytes written", written: 0, writeErr: writeErr, wantAllocated: 0, wantUnallocated: 16},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			budget := newSignedStreamStageBudget(func(string) (signedStreamStageSpace, error) {
+				return signedStreamStageSpace{availableBytes: 128, blockSize: 4}, nil
+			})
+			reservation := &signedStreamStageReservation{budget: budget, dir: t.TempDir()}
+			if err := reservation.reservePayload(16); err != nil {
+				t.Fatalf("reserve staged body: %v", err)
+			}
+
+			payload := bytes.Repeat([]byte("x"), 8)
+			writer := stagedWriteResult{written: tc.written, err: tc.writeErr}
+			n, err := reservation.write(writer, payload)
+			if n != tc.written || !errors.Is(err, tc.writeErr) {
+				t.Fatalf("staged write = (%d, %v), want (%d, %v)", n, err, tc.written, tc.writeErr)
+			}
+
+			budget.mu.Lock()
+			reserved, unallocated := budget.reserved, budget.unallocated
+			budget.mu.Unlock()
+			if reserved != 16 || unallocated != tc.wantUnallocated || reservation.allocated != tc.wantAllocated {
+				t.Fatalf("partial-write accounting: reserved=%d unallocated=%d allocated=%d", reserved, unallocated, reservation.allocated)
+			}
+			reservation.release(true)
+			budget.mu.Lock()
+			reserved, unallocated = budget.reserved, budget.unallocated
+			budget.mu.Unlock()
+			if reserved != 0 || unallocated != 0 {
+				t.Fatalf("budget after cleanup: reserved=%d unallocated=%d, want 0", reserved, unallocated)
+			}
+		})
+	}
+}
+
+type stagedWriteResult struct {
+	written int
+	err     error
+}
+
+func (w stagedWriteResult) Write([]byte) (int, error) { return w.written, w.err }
+
+type blockedSignedStreamStageWriter struct {
+	started   chan struct{}
+	unblocked chan struct{}
+	startOnce sync.Once
+	stopOnce  sync.Once
+}
+
+func (w *blockedSignedStreamStageWriter) Write(p []byte) (int, error) {
+	w.startOnce.Do(func() { close(w.started) })
+	<-w.unblocked
+	return len(p), nil
+}
+
+func (w *blockedSignedStreamStageWriter) unblock() {
+	w.stopOnce.Do(func() { close(w.unblocked) })
+}
+
 type blockedSignedStreamBody struct {
 	header  []byte
 	partial []byte

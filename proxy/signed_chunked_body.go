@@ -137,6 +137,7 @@ func (b *signedStreamStageBudget) release(reserved, unallocated int64) {
 // signedStreamStageReservation tracks the rounded disk space reserved for one
 // staged body and the portion already allocated by writes to its file.
 type signedStreamStageReservation struct {
+	mu            sync.Mutex
 	budget        *signedStreamStageBudget
 	dir           string
 	blockSize     int64
@@ -153,6 +154,8 @@ func (r *signedStreamStageReservation) reservePayload(total int64) error {
 		return nil
 	}
 
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.budget.mu.Lock()
 	defer r.budget.mu.Unlock()
 	space, err := r.budget.spaceReader(r.dir)
@@ -180,6 +183,8 @@ func (r *signedStreamStageReservation) reservePayload(total int64) error {
 }
 
 func (r *signedStreamStageReservation) checkAvailable() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.reservedBytes == 0 {
 		return nil
 	}
@@ -192,15 +197,15 @@ func (r *signedStreamStageReservation) checkAvailable() error {
 	return r.budget.checkLocked(r.dir, space)
 }
 
-// write accounts allocated bytes while holding the admission lock across the
-// filesystem write, so another reservation cannot double-count that allocation.
-func (r *signedStreamStageReservation) write(file *os.File, p []byte) (int, error) {
-	r.budget.mu.Lock()
-	defer r.budget.mu.Unlock()
-
+// write serializes I/O and accounting for one staged file, but holds the shared
+// budget lock only while checking and updating reservations.
+func (r *signedStreamStageReservation) write(file io.Writer, p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	writeLength := int64(len(p))
 	if writeLength > math.MaxInt64-r.written {
 		return 0, errors.New("signed-stream written length overflows int64")
@@ -212,27 +217,64 @@ func (r *signedStreamStageReservation) write(file *os.File, p []byte) (int, erro
 	if maxAllocated > r.reservedBytes {
 		return 0, fmt.Errorf("signed-stream write would use %d bytes beyond %d-byte reservation", maxAllocated, r.reservedBytes)
 	}
-	if maxAllocated-r.allocated > r.budget.unallocated {
+
+	reservationDelta := maxAllocated - r.allocated
+	r.budget.mu.Lock()
+	if reservationDelta > r.budget.unallocated {
+		r.budget.mu.Unlock()
 		return 0, fmt.Errorf("signed-stream write would exceed unallocated staging reservations")
 	}
+	// Treat the maximum allocation as occupied before releasing the shared lock.
+	// A partial write restores the unused portion after its actual size is known.
+	r.budget.unallocated -= reservationDelta
+	r.budget.mu.Unlock()
 
 	n, writeErr := file.Write(p)
+	if n < 0 || n > len(p) {
+		allocated := maxAllocated
+		r.written += writeLength
+		r.allocated = allocated
+		return n, fmt.Errorf("signed-stream writer returned invalid count %d for %d-byte input", n, len(p))
+	}
 	if n <= 0 {
+		r.budget.mu.Lock()
+		r.budget.unallocated += reservationDelta
+		r.budget.mu.Unlock()
 		return n, writeErr
 	}
 	written := int64(n)
-	allocated, err := roundSignedStreamStageBytes(r.written+written, r.blockSize)
-	if err != nil {
-		return n, err
+	allocated, accountingErr := roundSignedStreamStageBytes(r.written+written, r.blockSize)
+	if accountingErr != nil {
+		// Charge the conservative maximum if accounting unexpectedly overflows
+		// after bytes were written, so cleanup cannot release their disk budget.
+		allocated = maxAllocated
 	}
 	allocatedDelta := allocated - r.allocated
-	r.budget.unallocated -= allocatedDelta
+	if allocatedDelta < 0 || allocatedDelta > reservationDelta {
+		allocated = maxAllocated
+		allocatedDelta = reservationDelta
+		accountingErr = errors.New("signed-stream write exceeded its reserved staging budget")
+	}
+
+	r.budget.mu.Lock()
+	r.budget.unallocated += reservationDelta - allocatedDelta
 	r.written += written
 	r.allocated = allocated
+	r.budget.mu.Unlock()
+
+	if accountingErr != nil {
+		return n, accountingErr
+	}
 	return n, writeErr
 }
 
 func (r *signedStreamStageReservation) release(fileRemoved bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.releaseLocked(fileRemoved)
+}
+
+func (r *signedStreamStageReservation) releaseLocked(fileRemoved bool) {
 	unallocated := r.reservedBytes - r.allocated
 	releasable := unallocated
 	if fileRemoved {
@@ -279,13 +321,15 @@ func (b *stagedSignedChunkedBody) Write(p []byte) (int, error) {
 
 func (b *stagedSignedChunkedBody) Close() error {
 	b.closeOnce.Do(func() {
+		b.reservation.mu.Lock()
+		defer b.reservation.mu.Unlock()
 		closeErr := b.File.Close()
 		removeErr := os.Remove(b.path)
 		removed := removeErr == nil || errors.Is(removeErr, os.ErrNotExist)
 		if errors.Is(removeErr, os.ErrNotExist) {
 			removeErr = nil
 		}
-		b.reservation.release(removed)
+		b.reservation.releaseLocked(removed)
 		b.closeErr = errors.Join(closeErr, removeErr)
 	})
 	return b.closeErr
