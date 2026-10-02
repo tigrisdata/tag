@@ -63,7 +63,9 @@ TAG supports AWS chunked transfer encoding (streaming SigV4), used by tools like
 
 In **transparent proxy mode** (default), chunked uploads are forwarded as-is since the original signatures remain valid (the Host header is not changed).
 
-In **signing mode**, when a client sends a PUT with `X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, the body is wrapped in an AWS-proprietary chunked format where each chunk includes a signature chained from the request-level seed signature. Because TAG re-signs requests with the upstream Tigris hostname (changing the `Host` header), these per-chunk signatures become invalid. TAG handles this by decoding the chunked body on-the-fly — stripping the chunk framing and signatures — and forwarding the raw payload as `UNSIGNED-PAYLOAD`. The decoded content length is read from the `X-Amz-Decoded-Content-Length` header. This is a streaming operation with no buffering of the full object.
+In **signing mode**, a PUT with `X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD` carries chunk signatures chained from the request-level signature. TAG validates every chunk and the terminal signature before forwarding any payload.
+
+Because the upstream request has a different `Host` header, TAG re-signs the decoded bytes as `UNSIGNED-PAYLOAD`. It stages those bytes in a temporary file first. Memory use is bounded, but temporary storage proportional to the upload is required and upstream dispatch waits until verification completes. TAG removes the staging file after forwarding or on failure. The decoded content length is read from `X-Amz-Decoded-Content-Length`.
 
 ## Caching Behavior
 

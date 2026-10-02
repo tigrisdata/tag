@@ -45,7 +45,8 @@ func NewRequestValidator(keyProvider KeyProvider) *RequestValidator {
 
 // ValidateRequest validates the AWS SigV4 signature of an incoming request.
 // This requires the X-Amz-Content-Sha256 header to be present (all AWS SDKs set this).
-// This enables zero-copy streaming of the request body.
+// It validates the request header without reading r.Body; callers choose the body handling
+// appropriate to the payload marker.
 // Returns the access key if validation succeeds, or an error if it fails.
 func (v *RequestValidator) ValidateRequest(r *http.Request) (string, error) {
 	// Require X-Amz-Content-Sha256 header - all AWS SDKs set this
