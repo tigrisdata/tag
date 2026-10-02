@@ -39,6 +39,32 @@ func (missingBlockPresenceOwnerCoordinator) GetNodeForKey(string) (*ring.NodeInf
 	return nil, nil
 }
 
+type blockPresenceEpochCoordinator uint64
+
+func (c blockPresenceEpochCoordinator) GetEpoch() uint64     { return uint64(c) }
+func (blockPresenceEpochCoordinator) GetLocalNodeID() string { return "local" }
+func (blockPresenceEpochCoordinator) GetNodeForKey(string) (*ring.NodeInfo, error) {
+	return nil, nil
+}
+
+type blockPresenceEpochSequence struct {
+	epochs []uint64
+	calls  int
+}
+
+func (c *blockPresenceEpochSequence) GetEpoch() uint64 {
+	if c.calls < len(c.epochs) {
+		epoch := c.epochs[c.calls]
+		c.calls++
+		return epoch
+	}
+	return c.epochs[len(c.epochs)-1]
+}
+func (*blockPresenceEpochSequence) GetLocalNodeID() string { return "local" }
+func (*blockPresenceEpochSequence) GetNodeForKey(string) (*ring.NodeInfo, error) {
+	return nil, nil
+}
+
 func TestCheckBlockPresenceOwnerRetriesWhenNodeIsMissing(t *testing.T) {
 	err := checkBlockPresenceOwner(missingBlockPresenceOwnerCoordinator{}, "block-key", "owner")
 	if !errors.Is(err, cache.ErrBlockPresenceTopologyChanged) {
@@ -63,10 +89,14 @@ func TestBlockPresencePeerPruningRetainsActiveOwnerAndLeasedConnection(t *testin
 
 	// The current ring still contains the active peer even though this page has
 	// no key for it. The retired owner has a live lease while the ring changes.
+	coord := blockPresenceEpochCoordinator(1)
 	client.prunePeerConnections(map[string]string{
 		"active": "127.0.0.1:2",
 		"new":    "127.0.0.1:3",
-	})
+	}, coord, 1)
+	if client.peerCacheNeedsReconcile(1) || !client.peerCacheNeedsReconcile(2) {
+		t.Fatal("peer cache reconciliation should be complete only for the observed epoch")
+	}
 	client.peerMu.Lock()
 	activePeer := client.peers["active"]
 	_, retiredPresent := client.peers["retired"]
@@ -95,6 +125,117 @@ func TestBlockPresencePeerPruningRetainsActiveOwnerAndLeasedConnection(t *testin
 	client.peerMu.Unlock()
 	if !activeRetained || !newRetained || retiredLeaseRetained {
 		t.Fatalf("final peer cache: active=%t new=%t retired lease=%t", activeRetained, newRetained, retiredLeaseRetained)
+	}
+}
+
+func TestBlockPresencePeerPruningDiscardsStaleEpochSnapshot(t *testing.T) {
+	client := newEmbeddedBlockCacheClient(nil)
+	t.Cleanup(func() { _ = client.Close() })
+
+	oldPeer, err := client.peerConnection("old-owner", "127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("open old owner connection: %v", err)
+	}
+	client.releasePeerConnection(oldPeer)
+	currentPeer, err := client.peerConnection("current-owner", "127.0.0.1:2")
+	if err != nil {
+		t.Fatalf("open current owner connection: %v", err)
+	}
+	client.releasePeerConnection(currentPeer)
+
+	// An older Range took this snapshot before the topology changed, but its
+	// cleanup reaches the peer cache only after the current epoch is visible.
+	// Epochs are opaque hashes, so the current value can be numerically smaller.
+	coord := blockPresenceEpochCoordinator(1)
+	client.prunePeerConnections(map[string]string{"old-owner": "127.0.0.1:1"}, coord, 2)
+	client.peerMu.Lock()
+	_, oldRetained := client.peers["old-owner"]
+	_, currentRetained := client.peers["current-owner"]
+	client.peerMu.Unlock()
+	if !oldRetained || !currentRetained {
+		t.Fatalf("stale epoch pruned peers: old=%t current=%t, want both retained", oldRetained, currentRetained)
+	}
+
+	client.prunePeerConnections(map[string]string{"current-owner": "127.0.0.1:2"}, coord, 1)
+	if got := oldPeer.conn.GetState(); got != connectivity.Shutdown {
+		t.Fatalf("retired old owner connection state = %v, want shutdown", got)
+	}
+	if currentPeer.conn.GetState() == connectivity.Shutdown {
+		t.Fatal("current owner connection was closed")
+	}
+
+	// A delayed completion from the earlier request must not sweep the cache a
+	// second time after the current snapshot has been reconciled.
+	client.prunePeerConnections(map[string]string{"old-owner": "127.0.0.1:1"}, coord, 2)
+	client.peerMu.Lock()
+	_, currentRetained = client.peers["current-owner"]
+	client.peerMu.Unlock()
+	if !currentRetained || client.peerCacheNeedsReconcile(1) {
+		t.Fatal("stale snapshot changed a cache reconciled for the current epoch")
+	}
+}
+
+func TestBlockPresencePeerPruningDiscardsUnstableSnapshot(t *testing.T) {
+	client := newEmbeddedBlockCacheClient(nil)
+	t.Cleanup(func() { _ = client.Close() })
+
+	stalePeer, err := client.peerConnection("stale-owner", "127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("open stale owner connection: %v", err)
+	}
+	client.releasePeerConnection(stalePeer)
+	currentPeer, err := client.peerConnection("current-owner", "127.0.0.1:2")
+	if err != nil {
+		t.Fatalf("open current owner connection: %v", err)
+	}
+	client.releasePeerConnection(currentPeer)
+
+	// A ring update during the peer scan invalidates the owner snapshot. The
+	// prune must not close connections or mark the new epoch as reconciled.
+	changingCoord := &blockPresenceEpochSequence{epochs: []uint64{17, 8}}
+	client.prunePeerConnections(map[string]string{"current-owner": "127.0.0.1:2"}, changingCoord, 17)
+	client.peerMu.Lock()
+	_, staleRetained := client.peers["stale-owner"]
+	_, currentRetained := client.peers["current-owner"]
+	client.peerMu.Unlock()
+	if !staleRetained || !currentRetained || !client.peerCacheNeedsReconcile(8) {
+		t.Fatal("unstable owner snapshot pruned peers or marked the new epoch reconciled")
+	}
+
+	client.prunePeerConnections(map[string]string{"current-owner": "127.0.0.1:2"}, blockPresenceEpochCoordinator(8), 8)
+	if got := stalePeer.conn.GetState(); got != connectivity.Shutdown {
+		t.Fatalf("stale owner connection after stable retry = %v, want shutdown", got)
+	}
+}
+
+func TestBlockPresencePeerConnectionReplacesChangedAddress(t *testing.T) {
+	client := newEmbeddedBlockCacheClient(nil)
+	t.Cleanup(func() { _ = client.Close() })
+
+	coord := blockPresenceEpochCoordinator(1)
+	oldPeer, err := client.peerConnection("owner", "127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("open original owner connection: %v", err)
+	}
+	client.releasePeerConnection(oldPeer)
+	client.prunePeerConnections(map[string]string{"owner": "127.0.0.1:1"}, coord, 1)
+	if client.peerCacheNeedsReconcile(1) {
+		t.Fatal("stable owner view was not reconciled")
+	}
+	newPeer, err := client.peerConnection("owner", "127.0.0.1:2")
+	if err != nil {
+		t.Fatalf("open updated owner connection: %v", err)
+	}
+	defer client.releasePeerConnection(newPeer)
+
+	if oldPeer == newPeer {
+		t.Fatal("address change reused the previous peer connection")
+	}
+	if got := oldPeer.conn.GetState(); got != connectivity.Shutdown {
+		t.Fatalf("old address connection state = %v, want shutdown", got)
+	}
+	if newPeer.conn.GetState() == connectivity.Shutdown {
+		t.Fatal("new address connection is already closed")
 	}
 }
 
