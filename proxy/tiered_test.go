@@ -70,6 +70,92 @@ func tieredMock() (*mockForwarder, *atomic.Int64, *atomic.Int64) {
 	return m, forwards, deletes
 }
 
+func TestTieredUpstreamPutCommitsMarkerAfterResponseCopyError(t *testing.T) {
+	copyErr := errors.New("response body delivery failed")
+	mock := &mockForwarder{
+		forwardFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
+			w.Header().Set("ETag", `"new-upstream-version"`)
+			w.WriteHeader(http.StatusOK)
+			return copyErr
+		},
+	}
+	service, c := newTieredTestService(mock, 4)
+	request := httptest.NewRequest(http.MethodPut, "/b/large-object", strings.NewReader("large object body"))
+	writer := httptest.NewRecorder()
+
+	if err := service.HandlePutObject(writer, request); !errors.Is(err, copyErr) {
+		t.Fatalf("HandlePutObject error = %v, want %v", err, copyErr)
+	}
+	if writer.Code != http.StatusOK {
+		t.Fatalf("upstream status = %d, want %d", writer.Code, http.StatusOK)
+	}
+	meta, found, err := c.GetMeta(context.Background(), "b", "large-object")
+	if err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	}
+	if !found || meta == nil || !meta.BodyUpstream || meta.ETag != `"new-upstream-version"` {
+		t.Fatalf("upstream mutation marker missing after body delivery error: %+v", meta)
+	}
+}
+
+func TestTieredDeleteConvergesAfterResponseCopyError(t *testing.T) {
+	copyErr := errors.New("response body delivery failed")
+	mock := &mockForwarder{
+		forwardFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
+			w.WriteHeader(http.StatusNoContent)
+			return copyErr
+		},
+	}
+	service, c := newTieredTestService(mock, 1024)
+	marker := &cache.CachedObjectMeta{Bucket: "b", Key: "object", ETag: `"upstream-version"`, BodyUpstream: true, ContentLength: 5000, StatusCode: http.StatusOK}
+	if err := c.PutWithMeta(context.Background(), "b", "object", marker, []byte("body"), 60); err != nil {
+		t.Fatalf("seed upstream marker: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodDelete, "/b/object", nil)
+	writer := httptest.NewRecorder()
+
+	if err := service.HandleDeleteObject(writer, request); !errors.Is(err, copyErr) {
+		t.Fatalf("HandleDeleteObject error = %v, want %v", err, copyErr)
+	}
+	if writer.Code != http.StatusNoContent {
+		t.Fatalf("upstream status = %d, want %d", writer.Code, http.StatusNoContent)
+	}
+	if meta, found, err := c.GetMeta(context.Background(), "b", "object"); err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	} else if found {
+		t.Fatalf("deleted upstream marker survived response copy failure: %+v", meta)
+	}
+}
+
+func TestTieredRejectedDeleteWithResponseCopyErrorKeepsMarker(t *testing.T) {
+	copyErr := errors.New("response body delivery failed")
+	mock := &mockForwarder{
+		forwardFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
+			w.WriteHeader(http.StatusForbidden)
+			return copyErr
+		},
+	}
+	service, c := newTieredTestService(mock, 1024)
+	marker := &cache.CachedObjectMeta{Bucket: "b", Key: "object", ETag: `"upstream-version"`, BodyUpstream: true, ContentLength: 5000, StatusCode: http.StatusOK}
+	if err := c.PutWithMeta(context.Background(), "b", "object", marker, []byte("body"), 60); err != nil {
+		t.Fatalf("seed upstream marker: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodDelete, "/b/object", nil)
+	writer := httptest.NewRecorder()
+
+	if err := service.HandleDeleteObject(writer, request); !errors.Is(err, copyErr) {
+		t.Fatalf("HandleDeleteObject error = %v, want %v", err, copyErr)
+	}
+	if writer.Code != http.StatusForbidden {
+		t.Fatalf("upstream status = %d, want %d", writer.Code, http.StatusForbidden)
+	}
+	if current, found, err := c.GetMeta(context.Background(), "b", "object"); err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	} else if !found || current == nil || current.ETag != marker.ETag {
+		t.Fatalf("upstream-rejected DELETE changed the marker: %+v", current)
+	}
+}
+
 func tieredDo(t *testing.T, svc *Service, method, path, body string, hdr map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	var req *http.Request

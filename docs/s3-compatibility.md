@@ -57,6 +57,14 @@ All bucket operations support both `/{bucket}` and `/{bucket}/` path forms for c
 | AbortMultipartUpload    | DELETE | `/{bucket}/{key}?uploadId=`             |                                            |
 | ListParts               | GET    | `/{bucket}/{key}?uploadId=`             |                                            |
 
+## Response Delivery
+
+The direct-streaming path forwards the upstream status and headers before streaming the body. If copying a response body fails after headers are sent, TAG aborts the downstream response instead of completing its framing around the received prefix. Clients may see a transport error or body-read error. TAG does not append S3 error XML after commitment.
+
+For directly streamed PUT and DELETE operations, an upstream 2xx still triggers cache invalidation or a tiered marker when caching is enabled, even if response delivery fails. A delivery error alone does not establish that the mutation failed.
+
+This describes the direct-streaming path. Operations that capture an upstream body for XML processing use a separate response path.
+
 ## AWS Chunked Transfer Encoding
 
 TAG supports AWS chunked transfer encoding (streaming SigV4), used by tools like [warp](https://github.com/minio/warp) and many AWS SDKs for large uploads.

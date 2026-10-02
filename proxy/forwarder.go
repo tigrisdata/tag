@@ -195,8 +195,10 @@ func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) ba
 }
 
 // executeAndStream executes the request and streams the response to the client.
-// originalReq is the original client request, passed to the response interceptor
-// for parsing auth info. It can be nil if no interceptor is set.
+// It returns a body-copy error even though the upstream status has already been
+// committed; the HTTP handler must abort that incomplete response. originalReq is
+// the original client request, passed to the response interceptor for parsing auth
+// info. It can be nil if no interceptor is set.
 func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) error {
 	_, _, err := b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, false)
 	return err
@@ -205,13 +207,15 @@ func (b *baseForwarder) executeAndStream(w http.ResponseWriter, fwdReq *http.Req
 // executeAndStreamReturningMeta is executeAndStream that also returns the upstream
 // status code and a clone of the upstream response headers. Used by the write-through
 // tee path, which needs the response ETag to build cache metadata for the just-written
-// object without a read-back GET. On a transport error it returns (0, nil, err).
+// object without a read-back GET. On a transport error it returns (0, nil, err); a
+// body-copy error returns the received status and headers with the error.
 func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (int, http.Header, error) {
 	return b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, true)
 }
 
 // executeAndStreamWithMeta streams an upstream response and optionally retains an
-// owned copy of its headers for a caller that needs metadata after streaming.
+// owned copy of its headers for a caller that needs metadata after streaming. It
+// returns any body-copy error even though the upstream status is already committed.
 func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request, captureMeta bool) (int, http.Header, error) {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
@@ -248,7 +252,7 @@ func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 
 	logUpstreamResponse(fwdReq, originalReq, resp.StatusCode, upstreamStart)
-	return resp.StatusCode, respHeaders, nil
+	return resp.StatusCode, respHeaders, copyErr
 }
 
 // executeAndCapture executes the request, streams to client, and captures the response.

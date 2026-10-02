@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -37,6 +38,89 @@ func TestHandlePutObject_ReinvalidatesAfterForward(t *testing.T) {
 	b, k := ParseBucketKey(r)
 	if _, found, _ := c.GetMeta(context.Background(), b, k); found {
 		t.Error("stale entry still cached after PUT — post-forward re-invalidation missing")
+	}
+}
+
+// A confirmed upstream PUT must re-invalidate a racing refill even when its
+// response body fails to reach the client: delivery failure does not undo the write.
+func TestHandlePutObject_ReinvalidatesAfterResponseCopyError(t *testing.T) {
+	copyErr := errors.New("response body delivery failed")
+	var c *cache.Cache
+	forward := func(_ context.Context, w http.ResponseWriter, r *http.Request) error {
+		b, k := ParseBucketKey(r)
+		stale := &cache.CachedObjectMeta{Bucket: b, Key: k, ETag: `"stale"`, ContentLength: 5, StatusCode: http.StatusOK}
+		if err := c.PutWithMeta(context.Background(), b, k, stale, []byte("stale"), 60); err != nil {
+			t.Errorf("seed racing refill: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		return copyErr
+	}
+	svc, c := newTestService(&mockForwarder{forwardFunc: forward}, true)
+
+	r := httptest.NewRequest(http.MethodPut, "/test-bucket/test-key", strings.NewReader("new body"))
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, r); !errors.Is(err, copyErr) {
+		t.Fatalf("HandlePutObject error = %v, want %v", err, copyErr)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("upstream status = %d, want %d", w.Code, http.StatusOK)
+	}
+	b, k := ParseBucketKey(r)
+	if _, found, _ := c.GetMeta(context.Background(), b, k); found {
+		t.Error("stale entry survived a 2xx mutation whose response body failed to reach the client")
+	}
+}
+
+func TestHandlePutObject_Non2xxResponseCopyErrorKeepsRacingRefill(t *testing.T) {
+	copyErr := errors.New("response body delivery failed")
+	var c *cache.Cache
+	forward := func(_ context.Context, w http.ResponseWriter, r *http.Request) error {
+		b, k := ParseBucketKey(r)
+		refill := &cache.CachedObjectMeta{Bucket: b, Key: k, ETag: `"refill"`, ContentLength: 6, StatusCode: http.StatusOK}
+		if err := c.PutWithMeta(context.Background(), b, k, refill, []byte("refill"), 60); err != nil {
+			t.Errorf("seed racing refill: %v", err)
+		}
+		w.WriteHeader(http.StatusForbidden)
+		return copyErr
+	}
+	svc, c := newTestService(&mockForwarder{forwardFunc: forward}, true)
+
+	r := httptest.NewRequest(http.MethodPut, "/test-bucket/test-key", strings.NewReader("new body"))
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, r); !errors.Is(err, copyErr) {
+		t.Fatalf("HandlePutObject error = %v, want %v", err, copyErr)
+	}
+	b, k := ParseBucketKey(r)
+	if _, found, _ := c.GetMeta(context.Background(), b, k); !found {
+		t.Error("valid racing refill was discarded after the upstream rejected the PUT")
+	}
+}
+
+func TestHandleDeleteObject_ReinvalidatesAfterResponseCopyError(t *testing.T) {
+	copyErr := errors.New("response body delivery failed")
+	var c *cache.Cache
+	forward := func(_ context.Context, w http.ResponseWriter, r *http.Request) error {
+		b, k := ParseBucketKey(r)
+		stale := &cache.CachedObjectMeta{Bucket: b, Key: k, ETag: `"stale"`, ContentLength: 5, StatusCode: http.StatusOK}
+		if err := c.PutWithMeta(context.Background(), b, k, stale, []byte("stale"), 60); err != nil {
+			t.Errorf("seed racing refill: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return copyErr
+	}
+	svc, c := newTestService(&mockForwarder{forwardFunc: forward}, true)
+
+	r := httptest.NewRequest(http.MethodDelete, "/test-bucket/test-key", nil)
+	w := httptest.NewRecorder()
+	if err := svc.HandleDeleteObject(w, r); !errors.Is(err, copyErr) {
+		t.Fatalf("HandleDeleteObject error = %v, want %v", err, copyErr)
+	}
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("upstream status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+	b, k := ParseBucketKey(r)
+	if _, found, _ := c.GetMeta(context.Background(), b, k); found {
+		t.Error("stale entry survived a 2xx DELETE whose response body failed to reach the client")
 	}
 }
 

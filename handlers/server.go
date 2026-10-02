@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"regexp"
@@ -304,17 +306,60 @@ func (rt *responseTracker) Flush() {
 	}
 }
 
+func (rt *responseTracker) Unwrap() http.ResponseWriter {
+	return rt.ResponseWriter
+}
+
+// abortHTTP10Response resets the TCP connection because HTTP/1.0 uses connection
+// close as the normal end of an unknown-length body. A reset makes a truncated
+// response distinguishable from a complete one after its headers are committed.
+// For TLS, close the underlying TCP connection directly so no close-notify turns
+// the truncated body into a successful TLS EOF.
+func abortHTTP10Response(w http.ResponseWriter) error {
+	conn, _, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		return fmt.Errorf("hijack HTTP/1.0 response: %w", err)
+	}
+
+	transportConn := conn
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		transportConn = tlsConn.NetConn()
+	}
+	tcpConn, ok := transportConn.(*net.TCPConn)
+	if !ok {
+		_ = conn.Close()
+		return fmt.Errorf("HTTP/1.0 response connection %T is not TCP", transportConn)
+	}
+	if err := tcpConn.SetLinger(0); err != nil {
+		_ = tcpConn.Close()
+		return fmt.Errorf("enable abortive HTTP/1.0 response close: %w", err)
+	}
+	if err := tcpConn.Close(); err != nil {
+		return fmt.Errorf("reset HTTP/1.0 response connection: %w", err)
+	}
+	return nil
+}
+
 // handleWithError calls a handler function and handles any returned error.
 // If headers have already been committed (e.g., the handler started streaming
-// a response before encountering an error), the error is logged but no error
-// response is written to avoid corrupting the HTTP stream.
+// a response before encountering an error), the response is aborted so the
+// server does not complete framing for a partial body or append error XML.
 func handleWithError(w http.ResponseWriter, r *http.Request, handler func(http.ResponseWriter, *http.Request) error) {
 	rt := &responseTracker{ResponseWriter: w}
 	err := handler(rt, r)
 	if err != nil {
 		if rt.committed {
 			log.Warn().Err(err).Str("path", r.URL.Path).
-				Msg("Error after response headers committed, cannot send error response")
+				Msg("Error after response headers committed, aborting response")
+			if r.ProtoMajor == 1 && r.ProtoMinor == 0 {
+				if abortErr := abortHTTP10Response(rt); abortErr == nil {
+					return
+				} else {
+					log.Warn().Err(abortErr).Str("path", r.URL.Path).
+						Msg("Failed to reset HTTP/1.0 response connection")
+				}
+			}
+			panic(http.ErrAbortHandler)
 		} else {
 			handleError(rt, r, err)
 		}
