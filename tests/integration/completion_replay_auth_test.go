@@ -6,15 +6,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/proxy"
@@ -47,6 +50,52 @@ type completionReplayResponse struct {
 	body        string
 }
 
+type completionReplayAttempt struct {
+	response completionReplayResponse
+	err      error
+}
+
+type completionReplayUpstreamFixture struct {
+	handler         http.HandlerFunc
+	completionCalls atomic.Int32
+	slowCalls       atomic.Int32
+	revocationCalls atomic.Int32
+	mainCalls       atomic.Int32
+	aliasCalls      atomic.Int32
+	slowEntered     chan struct{}
+	slowRelease     chan struct{}
+	releaseOnce     sync.Once
+}
+
+func (u *completionReplayUpstreamFixture) releaseSlow() {
+	u.releaseOnce.Do(func() { close(u.slowRelease) })
+}
+
+type completionReplayReadGate struct {
+	cacheclient.CacheClient
+	key         string
+	armed       atomic.Bool
+	entered     chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+func (g *completionReplayReadGate) releaseRead() {
+	g.releaseOnce.Do(func() { close(g.release) })
+}
+
+func (g *completionReplayReadGate) Get(ctx context.Context, key string) ([]byte, error) {
+	if key == g.key && g.armed.CompareAndSwap(true, false) {
+		close(g.entered)
+		select {
+		case <-g.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return g.CacheClient.Get(ctx, key)
+}
+
 func TestCompleteMultipartUploadReplayAuthorization(t *testing.T) {
 	t.Run("transparent", func(t *testing.T) {
 		testCompleteMultipartUploadReplayAuthorization(t, true)
@@ -55,7 +104,10 @@ func TestCompleteMultipartUploadReplayAuthorization(t *testing.T) {
 		testCompleteMultipartUploadReplayAuthorization(t, false)
 	})
 	t.Run("transparent-cold-auth", func(t *testing.T) {
-		testColdCompletionReplayAfterSignatureWindow(t)
+		testColdCompletionReplay(t)
+	})
+	t.Run("transparent-revocation-during-cache-read", func(t *testing.T) {
+		testCompletionReplayGrantRevocationDuringRead(t)
 	})
 }
 
@@ -63,8 +115,10 @@ func testCompleteMultipartUploadReplayAuthorization(t *testing.T, transparent bo
 	t.Helper()
 	bucket := completionReplayBucket(t)
 	otherBucket := bucket + "-other"
-	upstream, completionCalls, slowCalls := newCompletionReplayUpstream(t, bucket, transparent)
-	env := newCompletionReplayEnvironment(t, transparent, upstream)
+	upstream := newCompletionReplayUpstream(t, bucket, transparent)
+	defer upstream.releaseSlow()
+	completionCalls := &upstream.completionCalls
+	env := newCompletionReplayEnvironment(t, transparent, upstream.handler)
 	defer env.Close()
 
 	if transparent {
@@ -178,9 +232,122 @@ func testCompleteMultipartUploadReplayAuthorization(t *testing.T, transparent bo
 
 	if transparent {
 		env.AuthzCache.Grant(completionReplayAccessA, bucket)
+		testCompletionReplayAfterSignatureWindow(t, env, bucket, upstream, validator)
 	}
-	testCompletionReplayAfterSignatureWindow(t, env, bucket, completionCalls, slowCalls, validator)
 
+}
+
+func testColdCompletionReplay(t *testing.T) {
+	t.Helper()
+	bucket := completionReplayBucket(t)
+	upstream := newCompletionReplayUpstream(t, bucket, true)
+	defer upstream.releaseSlow()
+	env := NewTestEnvironmentWithTransparentAuth(t, upstream.handler)
+	defer env.Close()
+	if env.DerivedKeyStore.HasKey(completionReplayAccessA) || env.AuthzCache.IsAuthorized(completionReplayAccessA, bucket) {
+		t.Fatal("test did not begin with cold transparent authentication state")
+	}
+
+	client := env.TAGServer.Client()
+	first := sendCompletionReplayRequest(t, client, env.TAGServer.URL, bucket, completionReplayKey, completionReplayUploadID, completionReplayAccessA, completionReplaySecretA, false, false)
+	if first.status != http.StatusOK || first.etag != `"completed-etag"` || first.body != string(completionReplaySuccessBody) {
+		t.Fatalf("cold-auth completion = %#v; want upstream success", first)
+	}
+	if got := upstream.completionCalls.Load(); got != 1 {
+		t.Fatalf("cold-auth completion made %d upstream calls; want one", got)
+	}
+	if !env.DerivedKeyStore.HasKey(completionReplayAccessA) || !env.AuthzCache.IsAuthorized(completionReplayAccessA, bucket) {
+		t.Fatal("successful upstream response did not teach local signing and bucket authorization state")
+	}
+
+	before := upstream.completionCalls.Load()
+	retry := sendCompletionReplayRequest(t, client, env.TAGServer.URL, bucket, completionReplayKey, completionReplayUploadID, completionReplayAccessA, completionReplaySecretA, false, false)
+	if retry.status != first.status || retry.contentType != first.contentType || retry.etag != first.etag || retry.body != first.body {
+		t.Errorf("cold-auth same-principal retry = %#v; want captured response %#v", retry, first)
+	}
+	assertCompletionReplayCallCount(t, "cold-auth same-principal replay", upstream.completionCalls.Load(), before)
+}
+
+func testCompletionReplayGrantRevocationDuringRead(t *testing.T) {
+	t.Helper()
+	bucket := completionReplayBucket(t)
+	upstream := newCompletionReplayUpstream(t, bucket, true)
+	defer upstream.releaseSlow()
+
+	gate := &completionReplayReadGate{
+		CacheClient: sharedEmbeddedCache,
+		key:         cache.MakeCompletionKey(bucket, completionReplayKey, completionReplayUploadID),
+		entered:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	env := newTestEnvironmentWithTransparentAuthCacheClient(t, upstream.handler, gate)
+	defer env.Close()
+	defer gate.releaseRead()
+	seedTransparentPrincipal(t, env, completionReplayAccessA, completionReplaySecretA, bucket)
+
+	client := env.TAGServer.Client()
+	first := sendCompletionReplayRequest(t, client, env.TAGServer.URL, bucket, completionReplayKey, completionReplayUploadID, completionReplayAccessA, completionReplaySecretA, false, false)
+	if first.status != http.StatusOK || first.etag != `"completed-etag"` || first.body != string(completionReplaySuccessBody) {
+		t.Fatalf("initial completion = %#v; want a cached successful response", first)
+	}
+	if got := upstream.completionCalls.Load(); got != 1 {
+		t.Fatalf("initial completion made %d upstream calls; want 1", got)
+	}
+	data, err := env.EmbeddedCache.Get(context.Background(), gate.key)
+	if err != nil || data == nil {
+		t.Fatalf("completion cache entry is not live before the gated read: bytes=%d err=%v", len(data), err)
+	}
+	var stored struct {
+		AccessKey  string `json:"access_key"`
+		StatusCode int    `json:"status_code"`
+	}
+	if err := json.Unmarshal(data, &stored); err != nil || stored.AccessKey != completionReplayAccessA || stored.StatusCode != first.status {
+		t.Fatalf("completion cache binding = access_key %q, status %d, err %v; want the successful caller and response", stored.AccessKey, stored.StatusCode, err)
+	}
+
+	gate.armed.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	replayRequest := signCompletionReplayRequestAt(t, env.TAGServer.URL, bucket, completionReplayKey, completionReplayUploadID, completionReplayAccessA, completionReplaySecretA, time.Now().UTC())
+	replayRequest = replayRequest.WithContext(ctx)
+	result := make(chan completionReplayAttempt, 1)
+	callsBefore := upstream.completionCalls.Load()
+	go func() {
+		response, err := doCompletionReplayRequest(client, replayRequest)
+		result <- completionReplayAttempt{response: response, err: err}
+	}()
+
+	select {
+	case <-gate.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replay did not reach the completion-cache read gate")
+	}
+	if !env.AuthzCache.IsAuthorized(completionReplayAccessA, bucket) {
+		t.Fatal("bucket grant was absent before the concurrent upstream denial")
+	}
+
+	revocationRequest, err := env.Signer.SignRequest(context.Background(), http.MethodGet, "/"+bucket+"/revoke", nil, "", completionReplayAccessA, completionReplaySecretA, http.Header{})
+	if err != nil {
+		t.Fatalf("sign concurrent revocation request: %v", err)
+	}
+	revocation, err := doCompletionReplayRequest(client, revocationRequest)
+	if err != nil {
+		t.Fatalf("send concurrent revocation request: %v", err)
+	}
+	if revocation.status != http.StatusForbidden || upstream.revocationCalls.Load() != 1 {
+		t.Fatalf("concurrent upstream denial = status %d, calls %d; want one 403", revocation.status, upstream.revocationCalls.Load())
+	}
+	if env.AuthzCache.IsAuthorized(completionReplayAccessA, bucket) {
+		t.Fatal("upstream 403 did not revoke the caller's bucket grant")
+	}
+
+	gate.releaseRead()
+	attempt := <-result
+	if attempt.err != nil {
+		t.Fatalf("replay after revocation: %v", attempt.err)
+	}
+	assertCompletionReplayDenied(t, "replay after a grant was revoked during cache read", attempt.response, first)
+	assertCompletionReplayForwarded(t, "replay after a grant was revoked during cache read", attempt.response, upstream.completionCalls.Load(), callsBefore, http.StatusForbidden)
 }
 
 func seedUnboundCompletionEntry(t *testing.T, env *TestEnvironment, bucket, key, uploadID string, response completionReplayResponse) {
@@ -215,18 +382,18 @@ func newCompletionReplayEnvironment(t *testing.T, transparent bool, upstream htt
 	return NewTestEnvironmentWithCacheHandler(upstream)
 }
 
-func newCompletionReplayUpstream(t *testing.T, bucket string, transparent bool) (http.HandlerFunc, *atomic.Int32, *atomic.Int32) {
+func newCompletionReplayUpstream(t *testing.T, bucket string, transparent bool) *completionReplayUpstreamFixture {
 	t.Helper()
 	var responseKeys string
 	if transparent {
 		responseKeys = completionReplaySigningKeysHeader(t, completionReplayAccessA, completionReplaySecretA)
 	}
-	var completionCalls atomic.Int32
-	var mainCalls atomic.Int32
-	var aliasCalls atomic.Int32
-	var slowCalls atomic.Int32
-	writeSuccess := func(w http.ResponseWriter) {
-		if responseKeys != "" {
+	upstream := &completionReplayUpstreamFixture{
+		slowEntered: make(chan struct{}),
+		slowRelease: make(chan struct{}),
+	}
+	writeSuccess := func(w http.ResponseWriter, includeSigningKeys bool) {
+		if includeSigningKeys && responseKeys != "" {
 			w.Header().Set("X-Tigris-Proxy-Signing-Keys", responseKeys)
 		}
 		w.Header().Set("ETag", `"completed-etag"`)
@@ -243,26 +410,31 @@ func newCompletionReplayUpstream(t *testing.T, bucket string, transparent bool) 
 		}
 	}
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/"+bucket+"/revoke" {
+			upstream.revocationCalls.Add(1)
+			writeError(w, http.StatusForbidden)
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Query().Get("uploadId") == "" {
 			http.NotFound(w, r)
 			return
 		}
-		completionCalls.Add(1)
+		upstream.completionCalls.Add(1)
 		requestBucket, key := proxy.ParseBucketKey(r)
 		uploadID := r.URL.Query().Get("uploadId")
 		info, authErr := auth.ParseAuthInfo(r)
 		if requestBucket == bucket && key == completionReplayKey && uploadID == completionReplayUploadID && authErr == nil && info.AccessKey == completionReplayAccessA {
-			if mainCalls.Add(1) == 1 {
-				writeSuccess(w)
+			if upstream.mainCalls.Add(1) == 1 {
+				writeSuccess(w, true)
 				return
 			}
 			writeError(w, http.StatusForbidden)
 			return
 		}
 		if requestBucket == bucket && key == completionReplayKey && uploadID == completionReplayAliasID && authErr == nil && info.AccessKey == completionReplayAccessA {
-			if aliasCalls.Add(1) == 1 {
-				writeSuccess(w)
+			if upstream.aliasCalls.Add(1) == 1 {
+				writeSuccess(w, true)
 				return
 			}
 			writeError(w, http.StatusForbidden)
@@ -273,9 +445,10 @@ func newCompletionReplayUpstream(t *testing.T, bucket string, transparent bool) 
 			return
 		}
 		if requestBucket == bucket && key == completionReplayKey && uploadID == completionReplaySlowUploadID && authErr == nil && info.AccessKey == completionReplayAccessA {
-			if slowCalls.Add(1) == 1 {
-				time.Sleep(8 * time.Second)
-				writeSuccess(w)
+			if upstream.slowCalls.Add(1) == 1 {
+				close(upstream.slowEntered)
+				<-upstream.slowRelease
+				writeSuccess(w, false)
 				return
 			}
 			writeError(w, http.StatusNotFound)
@@ -287,7 +460,7 @@ func newCompletionReplayUpstream(t *testing.T, bucket string, transparent bool) 
 		}
 		writeError(w, http.StatusForbidden)
 	})
-	return handler, &completionCalls, &slowCalls
+	return upstream
 }
 
 func completionReplaySigningKeysHeader(t *testing.T, accessKey, secretKey string) string {
@@ -403,16 +576,24 @@ func sendPresignedCompletionReplayRequest(t *testing.T, client *http.Client, end
 
 func executeCompletionReplayRequest(t *testing.T, client *http.Client, req *http.Request) completionReplayResponse {
 	t.Helper()
-	resp, err := client.Do(req)
+	response, err := doCompletionReplayRequest(client, req)
 	if err != nil {
 		t.Fatalf("send completion request: %v", err)
+	}
+	return response
+}
+
+func doCompletionReplayRequest(client *http.Client, req *http.Request) (completionReplayResponse, error) {
+	resp, err := client.Do(req)
+	if err != nil {
+		return completionReplayResponse{}, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("read completion response: %v", err)
+		return completionReplayResponse{}, err
 	}
-	return completionReplayResponse{status: resp.StatusCode, contentType: resp.Header.Get("Content-Type"), etag: resp.Header.Get("ETag"), body: string(body)}
+	return completionReplayResponse{status: resp.StatusCode, contentType: resp.Header.Get("Content-Type"), etag: resp.Header.Get("ETag"), body: string(body)}, nil
 }
 
 func presignCompletionReplayRequest(t *testing.T, endpoint, bucket, key, uploadID, accessKey, secretKey string, signedAt time.Time, validator *auth.RequestValidator) *http.Request {
@@ -504,76 +685,74 @@ func signCompletionReplayRequestAt(t *testing.T, endpoint, bucket, key, uploadID
 	return request
 }
 
-func testCompletionReplayAfterSignatureWindow(t *testing.T, env *TestEnvironment, bucket string, completionCalls, slowCalls *atomic.Int32, validator *auth.RequestValidator) {
+func testCompletionReplayAfterSignatureWindow(t *testing.T, env *TestEnvironment, bucket string, upstream *completionReplayUpstreamFixture, validator *auth.RequestValidator) {
 	t.Helper()
-	signedAt := time.Now().UTC().Add(-14*time.Minute - 55*time.Second).Truncate(time.Second)
+	signedAt := time.Now().UTC().Add(-14*time.Minute - 50*time.Second).Truncate(time.Second)
 	request := signCompletionReplayRequestAt(t, env.TAGServer.URL, bucket, completionReplayKey, completionReplaySlowUploadID, completionReplayAccessA, completionReplaySecretA, signedAt)
-	if accessKey, err := validator.ValidateRequest(request); err != nil || accessKey != completionReplayAccessA {
-		t.Fatalf("near-expiry signature invalid at dispatch: accessKey=%q err=%v", accessKey, err)
+	validationRequest := request.Clone(context.Background())
+	validationRequest.Header = request.Header.Clone()
+	validationRequest.Body = nil
+	if accessKey, err := validator.ValidateRequest(validationRequest); err != nil || accessKey != completionReplayAccessA {
+		t.Fatalf("near-expiry signature invalid before dispatch: accessKey=%q err=%v", accessKey, err)
 	}
 
-	callsBefore := completionCalls.Load()
-	firstResponse := executeCompletionReplayRequest(t, env.TAGServer.Client(), request)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	request = request.WithContext(ctx)
+	result := make(chan completionReplayAttempt, 1)
+	callsBefore := upstream.completionCalls.Load()
+	go func() {
+		response, err := doCompletionReplayRequest(env.TAGServer.Client(), request)
+		result <- completionReplayAttempt{response: response, err: err}
+	}()
+
+	select {
+	case <-upstream.slowEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("near-expiry completion did not reach upstream")
+	}
+	if accessKey, err := validator.ValidateRequest(validationRequest); err != nil || accessKey != completionReplayAccessA {
+		upstream.releaseSlow()
+		t.Fatalf("near-expiry signature was no longer valid when upstream received it: accessKey=%q err=%v", accessKey, err)
+	}
+
+	// Do not release the controlled upstream response until the request-start
+	// signature crosses the validator's 15-minute age limit. The 10-second
+	// dispatch margin avoids the near-cutoff timing race while keeping the test short.
+	untilExpired := time.Until(signedAt.Add(15*time.Minute + time.Millisecond))
+	if untilExpired > 0 {
+		timer := time.NewTimer(untilExpired)
+		<-timer.C
+	}
+	if _, err := validator.ValidateRequest(validationRequest); !errors.Is(err, auth.ErrExpiredRequest) {
+		upstream.releaseSlow()
+		t.Fatalf("original completion signature error after the wait = %v; want %v", err, auth.ErrExpiredRequest)
+	}
+	upstream.releaseSlow()
+
+	attempt := <-result
+	if attempt.err != nil {
+		t.Fatalf("complete slow multipart upload: %v", attempt.err)
+	}
+	firstResponse := attempt.response
 	if firstResponse.status != http.StatusOK || firstResponse.etag != `"completed-etag"` || firstResponse.body != string(completionReplaySuccessBody) {
-		t.Fatalf("near-expiry completion = %#v; want upstream success", firstResponse)
+		t.Fatalf("slow completion = %#v; want upstream success without response signing-key metadata", firstResponse)
 	}
-	if got := completionCalls.Load(); got != callsBefore+1 {
-		t.Fatalf("near-expiry completion made %d upstream calls; want one", got-callsBefore)
+	if got := upstream.completionCalls.Load(); got != callsBefore+1 {
+		t.Fatalf("slow completion made %d upstream calls; want one", got-callsBefore)
 	}
-	if got := slowCalls.Load(); got != 1 {
-		t.Fatalf("near-expiry upload reached upstream %d times; want one", got)
+	if got := upstream.slowCalls.Load(); got != 1 {
+		t.Fatalf("slow upload reached upstream %d times; want one", got)
 	}
 
 	retry := sendCompletionReplayRequest(t, env.TAGServer.Client(), env.TAGServer.URL, bucket, completionReplayKey, completionReplaySlowUploadID, completionReplayAccessA, completionReplaySecretA, false, false)
 	if retry.status != firstResponse.status || retry.contentType != firstResponse.contentType || retry.etag != firstResponse.etag || retry.body != firstResponse.body {
 		t.Errorf("same-principal retry after the original signature expired = %#v; want the captured response %#v", retry, firstResponse)
 	}
-	if got := completionCalls.Load(); got != callsBefore+1 {
+	if got := upstream.completionCalls.Load(); got != callsBefore+1 {
 		t.Errorf("same-principal retry after signature expiry made %d upstream calls; want saved response", got-callsBefore-1)
 	}
-	if got := slowCalls.Load(); got != 1 {
+	if got := upstream.slowCalls.Load(); got != 1 {
 		t.Errorf("near-expiry upload was forwarded %d times; want one", got)
-	}
-}
-
-func testColdCompletionReplayAfterSignatureWindow(t *testing.T) {
-	t.Helper()
-	bucket := completionReplayBucket(t)
-	upstream, completionCalls, slowCalls := newCompletionReplayUpstream(t, bucket, true)
-	env := NewTestEnvironmentWithTransparentAuth(t, upstream)
-	defer env.Close()
-	if env.DerivedKeyStore.HasKey(completionReplayAccessA) || env.AuthzCache.IsAuthorized(completionReplayAccessA, bucket) {
-		t.Fatal("test did not begin with cold transparent authentication state")
-	}
-
-	signedAt := time.Now().UTC().Add(-14*time.Minute - 55*time.Second).Truncate(time.Second)
-	firstRequest := signCompletionReplayRequestAt(t, env.TAGServer.URL, bucket, completionReplayKey, completionReplaySlowUploadID, completionReplayAccessA, completionReplaySecretA, signedAt)
-	credentials := auth.NewCredentialStore()
-	credentials.AddCredential(completionReplayAccessA, completionReplaySecretA)
-	if accessKey, err := auth.NewRequestValidator(credentials).ValidateRequest(firstRequest); err != nil || accessKey != completionReplayAccessA {
-		t.Fatalf("near-expiry request is not valid at dispatch: accessKey=%q err=%v", accessKey, err)
-	}
-
-	firstResponse := executeCompletionReplayRequest(t, env.TAGServer.Client(), firstRequest)
-	if firstResponse.status != http.StatusOK || firstResponse.body != string(completionReplaySuccessBody) {
-		t.Fatalf("cold-auth completion = %#v; want upstream success", firstResponse)
-	}
-	if got := completionCalls.Load(); got != 1 || slowCalls.Load() != 1 {
-		t.Fatalf("cold-auth completion made %d completion calls and %d delayed calls; want one each", got, slowCalls.Load())
-	}
-	if !env.DerivedKeyStore.HasKey(completionReplayAccessA) || !env.AuthzCache.IsAuthorized(completionReplayAccessA, bucket) {
-		t.Fatal("successful upstream response did not teach local signing and bucket authorization state")
-	}
-	if _, err := auth.NewRequestValidator(env.DerivedKeyStore).ValidateRequest(firstRequest); err == nil {
-		t.Fatal("original completion signature did not expire during upstream work")
-	}
-
-	before := completionCalls.Load()
-	retry := sendCompletionReplayRequest(t, env.TAGServer.Client(), env.TAGServer.URL, bucket, completionReplayKey, completionReplaySlowUploadID, completionReplayAccessA, completionReplaySecretA, false, false)
-	if retry.status != firstResponse.status || retry.contentType != firstResponse.contentType || retry.etag != firstResponse.etag || retry.body != firstResponse.body {
-		t.Errorf("cold-auth same-principal retry = %#v; want captured response %#v", retry, firstResponse)
-	}
-	if got := completionCalls.Load(); got != before {
-		t.Errorf("cold-auth retry made %d upstream calls; want saved response", got-before)
 	}
 }

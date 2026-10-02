@@ -28,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
+	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/ocache/embedded"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
@@ -996,6 +997,11 @@ func newSigningKeysUpstreamHandler(t *testing.T, backend *s3mem.Backend) http.Ha
 // and local auth enabled. Uses shared embedded cache for cache-hit testing.
 func NewTestEnvironmentWithTransparentAuth(t *testing.T, upstreamHandler http.HandlerFunc) *TestEnvironment {
 	t.Helper()
+	return newTestEnvironmentWithTransparentAuthCacheClient(t, upstreamHandler, sharedEmbeddedCache)
+}
+
+func newTestEnvironmentWithTransparentAuthCacheClient(t *testing.T, upstreamHandler http.HandlerFunc, cacheClient cacheclient.CacheClient) *TestEnvironment {
+	t.Helper()
 
 	if sharedEmbeddedCache == nil {
 		panic("Shared embedded cache not initialized - TestMain must run first")
@@ -1050,7 +1056,7 @@ func NewTestEnvironmentWithTransparentAuth(t *testing.T, upstreamHandler http.Ha
 		},
 	}
 
-	testCache := cache.NewCacheWithClient(sharedEmbeddedCache, &cfg.Cache)
+	testCache := cache.NewCacheWithClient(cacheClient, &cfg.Cache)
 
 	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, proxySigner, localAuth)
 	service := proxy.NewService(forwarder, testCache, cfg)
