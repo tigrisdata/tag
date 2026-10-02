@@ -129,7 +129,7 @@ func TestETagVersionedBody_EmptyETagNotCachedViaStream(t *testing.T) {
 
 	body := bytes.NewReader([]byte("body-bytes"))
 	meta := &CachedObjectMeta{Bucket: bucket, Key: key, ETag: "", ContentLength: 10, StatusCode: 200}
-	if _, err := c.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, body, 60, VersionAny); err != nil {
+	if _, err := c.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, body, 60, AnyMetaVersionToken()); err != nil {
 		t.Fatalf("PutWithMetaStreamIfVersion: %v", err)
 	}
 	if _, found, _ := c.GetMeta(ctx, bucket, key); found {

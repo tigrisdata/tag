@@ -385,7 +385,7 @@ func TestPutMetaIfVersion(t *testing.T) {
 	meta := &CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"v1"`, ContentLength: 100, StatusCode: 200, BlockSize: 4}
 
 	// No tombstone → meta is written.
-	wrote, err := c.PutMetaIfVersion(ctx, bucket, key, meta, 60, VersionAny)
+	wrote, err := c.PutMetaIfVersion(ctx, bucket, key, meta, 60, AnyMetaVersionToken())
 	if err != nil || !wrote {
 		t.Fatalf("PutMetaIfVersion = (%v, %v), want (true, nil)", wrote, err)
 	}

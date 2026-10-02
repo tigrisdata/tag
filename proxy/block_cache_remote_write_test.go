@@ -161,7 +161,7 @@ func newGatedAssembledRangeService(t *testing.T, local bool) (*Service, *cache.C
 		StatusCode:    http.StatusOK,
 		BlockSize:     4,
 	}
-	if wrote, err := store.PutMetaIfVersion(context.Background(), bucket, key, meta, 60, cache.VersionAny); err != nil || !wrote {
+	if wrote, err := store.PutMetaIfVersion(context.Background(), bucket, key, meta, 60, cache.AnyMetaVersionToken()); err != nil || !wrote {
 		t.Fatalf("seed block meta = (wrote=%t, err=%v)", wrote, err)
 	}
 	return svc, store, client, mock, meta, trace
@@ -361,6 +361,10 @@ func TestServeAssembledRange_RemoteWriteRespectsTombstoneVisibility(t *testing.T
 	if result.err != nil || !result.served {
 		t.Fatalf("serveAssembledRange = (served=%t, err=%v)", result.served, result.err)
 	}
+	_, preDeleteToken, found, err := store.GetMetaWithVersion(context.Background(), meta.Bucket, meta.Key)
+	if err != nil || !found {
+		t.Fatalf("pre-delete metadata snapshot=(found=%t, err=%v), want live snapshot", found, err)
+	}
 	if err := store.Delete(context.Background(), meta.Bucket, meta.Key); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -370,12 +374,10 @@ func TestServeAssembledRange_RemoteWriteRespectsTombstoneVisibility(t *testing.T
 	if _, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key); err != nil || found {
 		t.Fatalf("metadata after fenced detached write = (found=%t, err=%v), want absent", found, err)
 	}
-	// The invalidation left a fence: a writer holding pre-delete state cannot
-	// recreate the entry (the ordering the tombstone timestamp used to assert).
-	preDeleteToken := meta // any stale identity; commit with expected=0-era token must lose
-	_ = preDeleteToken
+	// The invalidation left a fence: a writer holding the pre-delete token
+	// cannot recreate the entry.
 	staleMeta := *meta
-	if wrote, err := store.PutMetaIfVersion(context.Background(), meta.Bucket, meta.Key, &staleMeta, 60, 1); err != nil {
+	if wrote, err := store.PutMetaIfVersion(context.Background(), meta.Bucket, meta.Key, &staleMeta, 60, preDeleteToken); err != nil {
 		t.Fatalf("PutMetaIfVersion: %v", err)
 	} else if wrote {
 		t.Fatal("stale pre-delete write recreated the entry over the fence")

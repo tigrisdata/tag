@@ -153,7 +153,7 @@ func TestSetupCacheListener_PublishesWhenHeadersReadyAtRequestCancellation(t *te
 		broadcaster,
 		false,
 		svc.populateWeight(int64(len(body))),
-		cache.VersionAny,
+		cache.AnyMetaVersionToken(),
 	)
 	if cacheErrCh == nil {
 		t.Fatal("setupCacheListener did not create a cache listener")

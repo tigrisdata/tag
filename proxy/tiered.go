@@ -234,7 +234,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	markerOwning := originlessPlainObject(r)
 
 	var prior *cache.CachedObjectMeta
-	var priorVersion uint64
+	var priorVersion cache.MetaVersionToken
 	priorKnown := false
 	if markerOwning {
 		prior, priorVersion, priorKnown = s.captureMarkerPrior(ctx, bucket, key)
@@ -279,9 +279,9 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 // failed lookup leaves the prior unknown — the marker is then not written and
 // the sweep refuses to delete anything rather than guess (see
 // commitUpstreamMarker). Tolerated, never blocking.
-func (s *Service) captureMarkerPrior(ctx context.Context, bucket, key string) (prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
+func (s *Service) captureMarkerPrior(ctx context.Context, bucket, key string) (prior *cache.CachedObjectMeta, priorVersion cache.MetaVersionToken, priorKnown bool) {
 	if !s.cache.IsEnabled() {
-		return nil, 0, false
+		return nil, cache.MetaVersionToken{}, false
 	}
 	if m, version, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key); cacheErr == nil {
 		priorKnown = true
@@ -293,7 +293,7 @@ func (s *Service) captureMarkerPrior(ctx context.Context, bucket, key string) (p
 	return prior, priorVersion, priorKnown
 }
 
-func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
+func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, prior *cache.CachedObjectMeta, priorVersion cache.MetaVersionToken, priorKnown bool) {
 	if etag == "" {
 		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorVersion, priorKnown)
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Upstream PUT response had no ETag - no tier marker; object reads as a miss until re-put")
@@ -337,7 +337,7 @@ func (s *Service) putUpstreamMarker(r *http.Request, etag, bucket, key string, p
 // and an unordered marker could resurrect over a DELETE that ran during the
 // forward — so no marker is written: the object reads as a miss until re-put,
 // on a path that already requires the metadata store to be failing.
-func (s *Service) commitUpstreamMarker(bucket, key string, meta *cache.CachedObjectMeta, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
+func (s *Service) commitUpstreamMarker(bucket, key string, meta *cache.CachedObjectMeta, prior *cache.CachedObjectMeta, priorVersion cache.MetaVersionToken, priorKnown bool) {
 	ttl := int(s.config.Cache.TTL.Seconds())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -372,7 +372,7 @@ func (s *Service) commitUpstreamMarker(bucket, key string, meta *cache.CachedObj
 // the fallback — GETs forward regardless, HEAD just omits the length, and
 // the re-tier skips unknown-length markers. Commit and sweep are the
 // large-PUT path's, under the same pre-forward token.
-func (s *Service) stampUpstreamMarkerAfterCompletion(bucket, key, etag, accessKey, secretKey string, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
+func (s *Service) stampUpstreamMarkerAfterCompletion(bucket, key, etag, accessKey, secretKey string, prior *cache.CachedObjectMeta, priorVersion cache.MetaVersionToken, priorKnown bool) {
 	if etag == "" {
 		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorVersion, priorKnown)
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Multipart completion carried no ETag - no tier marker; object reads as a miss until re-put")
@@ -460,7 +460,7 @@ func (s *Service) headObjectMeta(ctx context.Context, bucket, key, accessKey, se
 // that path requires the metadata store to be failing already, and an
 // unguarded delete there would trade a bounded staleness window for the
 // unbounded loss of a racing local write that has no upstream copy.
-func (s *Service) invalidateDisplacedTieredMeta(bucket, key string, prior *cache.CachedObjectMeta, priorVersion uint64, priorKnown bool) {
+func (s *Service) invalidateDisplacedTieredMeta(bucket, key string, prior *cache.CachedObjectMeta, priorVersion cache.MetaVersionToken, priorKnown bool) {
 	if !priorKnown {
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Tier marker failed with unknown prior; possibly-stale metadata serves until TTL")
 		return

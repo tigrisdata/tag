@@ -792,7 +792,7 @@ func (s *Service) serveFullObjectFromBlockCache(
 	// carrying the serve ETag — an absent or different-ETag entry means the serve-path copy is
 	// already displaced, and its token could order the commit against the wrong history. A
 	// failed or disqualified read just skips the promotion.
-	var promoToken uint64
+	var promoToken cache.MetaVersionToken
 	promoTokenOK := false
 	if !meta.BlocksComplete {
 		if cur, tok, found, terr := s.cache.GetMetaWithVersion(ctx, bucket, key); terr == nil && found && cur != nil && cur.ETag == meta.ETag {
@@ -1481,7 +1481,7 @@ func (s *Service) buildBlockMeta(bucket, key string, respHeader http.Header, tot
 // truncated bytes under a committed length (and poison a later range-path populate that trusts
 // existing blocks). fetchOneBlock validates block length the same way; this keeps the two block
 // writers consistent. A body longer than Content-Length is likewise rejected before the meta.
-func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, expected uint64) (wrote bool, err error) {
+func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, expected cache.MetaVersionToken) (wrote bool, err error) {
 	// On any early return, drain the rest of r. setupCacheListener feeds this from an io.Pipe; if
 	// we stop reading with bytes still queued (a mid-object PutBlockStream error, or an oversize
 	// body), the pipe writer goroutine blocks forever on Write, leaking it and never releasing the
@@ -1542,9 +1542,10 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
 
-		// Decision-time token BEFORE fetching, so an invalidation that lands
-		// mid-populate bumps the fence past it and the meta commit loses
-		// (mirrors the whole-object paths). No token, no ordered commit: skip.
+		// Decision-time token BEFORE fetching. CAS rejects a raced metadata
+		// commit; legacy tags the row with the sidecar generation so current
+		// readers ignore it if invalidation lands mid-populate. No token, no
+		// ordered commit: skip.
 		// An entry present at decision time does NOT skip: the blocks are
 		// ETag-keyed and useful to it, and finalizeBlockModeMeta's own
 		// re-check backs off the meta write in its favor.
@@ -1567,9 +1568,10 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 // attribution there) share this logic instead of re-deriving its race handling.
 //
 // expected must be the caller's decision-time token, read BEFORE the blocks were
-// fetched (or the HEAD made): an invalidation landing mid-populate bumps the
-// fence past it and the meta commit loses.
-func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, blockCount int, expected uint64) {
+// fetched (or the HEAD made): CAS refuses a replaced metadata row; in legacy
+// mode current readers reject metadata tagged with a sidecar generation that an
+// invalidation advanced during the populate.
+func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, blockCount int, expected cache.MetaVersionToken) {
 	// Re-check that no entry was established concurrently before stamping block-mode meta.
 	// The schedule-time !found gate can go stale during the block fetch: a racing
 	// full-GET miss may have whole-cached the object. Overwriting that with block-mode meta
@@ -1580,9 +1582,9 @@ func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string,
 		return
 	}
 	ttl := int(s.config.Cache.TTL.Seconds())
-	// Committed under the decision-time absence token: a racer (a warm, another
-	// establish) or a fenced delete that landed since bumps the version and the
-	// lost precondition leaves the newer state in place.
+	// Committed under the decision-time token: CAS rejects a raced metadata
+	// version, while legacy tags the row with its sidecar generation so current
+	// readers ignore it if an invalidation advanced during the populate.
 	wrote, err := s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, expected)
 	if err != nil || !wrote {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (precondition lost or error)")

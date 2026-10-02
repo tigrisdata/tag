@@ -662,8 +662,8 @@ func (s *Service) releaseCacheSlot(weight int64) {
 // written while forwarding an upstream response. Forward() returns nil even when
 // upstream responds 4xx/5xx (the response streamed successfully), so mutating
 // handlers use this to gate post-forward cache re-invalidation on an actual 2xx —
-// otherwise a rejected PUT/DELETE/COPY would still fence the destination and
-// discard a valid racing refill, causing later reads to miss unnecessarily.
+// otherwise a rejected PUT/DELETE/COPY would still advance the destination's
+// fence/generation and discard a valid racing refill, causing later reads to miss.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -723,9 +723,8 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 
 	// Re-invalidate AFTER upstream confirms the write. A GET that raced the
 	// in-flight PUT may have fetched the pre-PUT object and begun re-caching it;
-	// this second invalidation bumps the fence past that write's decision-time
-	// token, so its version-preconditioned commit loses —
-	// restoring read-after-write semantics.
+	// this second invalidation advances the CAS fence or legacy sidecar generation,
+	// so current TAG readers reject that old refill.
 	// Gated on a 2xx: a rejected PUT leaves the object unchanged, so re-invalidating
 	// would only discard a valid racing refill and cause an unnecessary later miss.
 	// Routed through invalidateObject (like the pre-forward call) so a failure of this
@@ -802,11 +801,13 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// this DELETE displaced, and anything newer keeps the key.
 	var (
 		delPrior      *cache.CachedObjectMeta
-		delPriorVer   uint64
+		delPriorVer   cache.MetaVersionToken
 		delPriorKnown bool
 	)
 	if s.config.IsTiered() {
-		delPrior, delPriorVer, delPriorKnown = s.captureMarkerPrior(r.Context(), bucket, key)
+		var token cache.MetaVersionToken
+		delPrior, token, delPriorKnown = s.captureMarkerPrior(r.Context(), bucket, key)
+		delPriorVer = token
 		_ = delPrior
 	}
 
@@ -817,7 +818,7 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// Re-invalidate AFTER upstream confirms the delete, for the same
 	// read-after-write reason as HandlePutObject: a GET racing the in-flight
 	// DELETE may have re-cached the not-yet-deleted object; this second
-	// fence bump blocks that stale repopulation.
+	// invalidation moves the legacy reader generation or the CAS metadata fence.
 	// Gated on a 2xx: a rejected DELETE leaves the object present, so re-invalidating
 	// would only discard a valid racing refill and cause an unnecessary later miss.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
@@ -939,7 +940,7 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// (cancels/excludes re-tiers) and capture the pre-forward token; the
 	// converge removes only the state this copy displaced.
 	var (
-		cpPriorVer   uint64
+		cpPriorVer   cache.MetaVersionToken
 		cpPriorKnown bool
 	)
 	if s.config.IsTiered() {
@@ -956,8 +957,8 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 
 	// Re-invalidate the destination AFTER upstream confirms the copy, for the same
 	// read-after-write reason as HandlePutObject: a GET racing the in-flight copy
-	// may have re-cached the pre-copy destination object; this second fence bump
-	// blocks that stale repopulation.
+	// may have re-cached the pre-copy destination object; the second invalidation
+	// advances its CAS fence or legacy reader generation.
 	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
 	// unchanged, so re-invalidating would only discard a valid racing refill.
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
@@ -996,11 +997,11 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 	return !isS3ErrorBody(capture.Body)
 }
 
-// invalidateObject removes an object's cached metadata (a fenced CAS delete) and
-// records the true outcome of the attempt. A failed backend invalidation is recorded
-// as an error rather than success: a false-green delete metric would hide the very
-// read-after-write hazard the invalidation exists to prevent, since the stale entry
-// is still in place. It is a no-op when the cache is disabled.
+// invalidateObject removes an object's cached metadata through the selected
+// coordinator and records the true outcome of the attempt. A failed backend
+// invalidation is recorded as an error rather than success: a false-green metric
+// would hide the read-after-write hazard the invalidation exists to prevent, since
+// the stale entry is still in place. It is a no-op when the cache is disabled.
 // The error return matters only to origin-less callers, where the cache is the
 // only store and an acked-but-failed delete keeps serving until TTL. Proxy-mode
 // callers ignore it: there the origin is authoritative and the upstream DELETE
@@ -1040,7 +1041,7 @@ func (s *Service) convergeInvalidation(ctx context.Context, bucket, key string) 
 // (its read failed) nothing is removed: the possibly-stale marker serves
 // until TTL — an availability inconsistency, chosen over unguarded deletion
 // in the mode where the cache is the store.
-func (s *Service) convergeTieredDelete(bucket, key string, priorVersion uint64, priorKnown bool) {
+func (s *Service) convergeTieredDelete(bucket, key string, priorVersion cache.MetaVersionToken, priorKnown bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if !priorKnown {
@@ -1115,11 +1116,9 @@ func (s *Service) invalidateObject(ctx context.Context, bucket, key string) erro
 // this key is already in flight — a concurrent read-path warm, or the warm from a
 // rapid prior write to the same key — this warm coalesces into that one and is
 // dropped. When it coalesces into a fetch that predates this write, that fetch's own
-// populate is fence-blocked (its decision-time token predates this write's
-// invalidation), so it writes nothing either: the key is simply left absent, not
-// left stale. The next read then misses and inline-populates the current object.
-// This can never serve a stale object — the same fence that blocks the racing
-// populate is the read-after-write guard.
+// populate is rejected by CAS or tagged with a legacy generation that current
+// readers no longer accept, so the next read misses and can populate the current
+// object. Older TAG readers do not consult the legacy sidecar.
 func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	if !s.config.Cache.WarmOnWrite || !s.cache.IsEnabled() {
 		return
@@ -1137,9 +1136,9 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	// probe). See the doc comment: never infer public-read from a public write.
 	if hasNoAuthCredentials(r) {
 		// Token at trigger time: the absence token if this write's invalidation
-		// succeeded, the surviving stale row's live version if it failed — the
-		// warm then repairs exactly that state and loses to anything newer,
-		// including a fenced delete landing mid-fetch.
+		// succeeded, the surviving stale row's token if it failed. CAS rejects a
+		// newer row; current legacy readers reject a warm whose sidecar generation
+		// predates a later invalidation.
 		warmTok, ok := s.warmToken(bucket, key)
 		if !ok {
 			return
@@ -1162,13 +1161,13 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 }
 
 // warmToken reads a warm trigger's decision-time token. ok=false means the
-// token could not be read and the warm must be SKIPPED: expected=0 is the
-// legacy unordered put-if-absent and would publish over a fence.
-func (s *Service) warmToken(bucket, key string) (uint64, bool) {
+// token could not be read and the warm must be skipped; it must not fall back
+// to an unordered metadata write.
+func (s *Service) warmToken(bucket, key string) (cache.MetaVersionToken, bool) {
 	_, tok, _, err := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Warm skipped - decision-time token unavailable")
-		return 0, false
+		return cache.MetaVersionToken{}, false
 	}
 	return tok, true
 }
@@ -1223,7 +1222,7 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 	// real Content-Length.
 	var (
 		mpPrior      *cache.CachedObjectMeta
-		mpPriorVer   uint64
+		mpPriorVer   cache.MetaVersionToken
 		mpPriorKnown bool
 		mpAK, mpSK   string
 	)
@@ -1244,8 +1243,8 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 	// Re-invalidate AFTER upstream confirms the completion, for the same
 	// read-after-write reason as HandlePutObject: a GET racing the in-flight
-	// completion may have re-cached the pre-overwrite object; this second fence bump
-	// blocks that stale repopulation. Gated on a confirmed-successful completion
+	// completion may have re-cached the pre-overwrite object; the second
+	// invalidation advances its CAS fence or legacy reader generation. Gated on a confirmed-successful completion
 	// (2xx and not a 200-with-<Error> body) so a failed completion, which leaves the
 	// object unchanged, doesn't discard a valid racing refill.
 	completed := s3WriteSucceeded(capture)

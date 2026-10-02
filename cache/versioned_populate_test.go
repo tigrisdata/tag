@@ -22,12 +22,12 @@ func TestPutMetaIfVersion_PutIfAbsentRefusesExisting(t *testing.T) {
 	ctx := context.Background()
 
 	existing := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"racer"`, StatusCode: 200}
-	if wrote, err := c.PutMetaIfVersion(ctx, "b", "k", existing, 60, 0); err != nil || !wrote {
+	if wrote, err := c.PutMetaIfVersion(ctx, "b", "k", existing, 60, MetaVersionToken{version: 0}); err != nil || !wrote {
 		t.Fatalf("seed via put-if-absent = (%v, %v), want (true, nil)", wrote, err)
 	}
 
 	late := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"late"`, StatusCode: 200}
-	wrote, err := c.PutMetaIfVersion(ctx, "b", "k", late, 60, 0)
+	wrote, err := c.PutMetaIfVersion(ctx, "b", "k", late, 60, MetaVersionToken{version: 0})
 	if err != nil {
 		t.Fatalf("PutMetaIfVersion: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestPutMetaIfVersion_StaleVersionRefused(t *testing.T) {
 	ctx := context.Background()
 
 	v1 := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"v1"`, StatusCode: 200}
-	if wrote, err := c.PutMetaIfVersion(ctx, "b", "k", v1, 60, 0); err != nil || !wrote {
+	if wrote, err := c.PutMetaIfVersion(ctx, "b", "k", v1, 60, MetaVersionToken{version: 0}); err != nil || !wrote {
 		t.Fatalf("seed: (%v, %v)", wrote, err)
 	}
 	_, version, found, err := c.GetMetaWithVersion(ctx, "b", "k")
@@ -56,7 +56,7 @@ func TestPutMetaIfVersion_StaleVersionRefused(t *testing.T) {
 
 	// The entry moves on (an unconditional refresh)...
 	v2 := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"v2"`, StatusCode: 200}
-	if wrote, err := c.PutMetaIfVersion(ctx, "b", "k", v2, 60, VersionAny); err != nil || !wrote {
+	if wrote, err := c.PutMetaIfVersion(ctx, "b", "k", v2, 60, AnyMetaVersionToken()); err != nil || !wrote {
 		t.Fatalf("refresh: (%v, %v)", wrote, err)
 	}
 
@@ -83,13 +83,13 @@ func TestVersionAny_BumpsVersion(t *testing.T) {
 	ctx := context.Background()
 
 	v1 := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"v1"`, StatusCode: 200}
-	if wrote, err := c.PutMetaIfVersion(ctx, "b", "k", v1, 60, VersionAny); err != nil || !wrote {
+	if wrote, err := c.PutMetaIfVersion(ctx, "b", "k", v1, 60, AnyMetaVersionToken()); err != nil || !wrote {
 		t.Fatalf("first: (%v, %v)", wrote, err)
 	}
 	_, ver1, _, _ := mem.GetWithVersion(ctx, MakeMetaKey("b", "k"))
 
 	v2 := &CachedObjectMeta{Bucket: "b", Key: "k", ETag: `"v2"`, StatusCode: 200}
-	if wrote, err := c.PutMetaIfVersion(ctx, "b", "k", v2, 60, VersionAny); err != nil || !wrote {
+	if wrote, err := c.PutMetaIfVersion(ctx, "b", "k", v2, 60, AnyMetaVersionToken()); err != nil || !wrote {
 		t.Fatalf("second: (%v, %v)", wrote, err)
 	}
 	_, ver2, _, _ := mem.GetWithVersion(ctx, MakeMetaKey("b", "k"))

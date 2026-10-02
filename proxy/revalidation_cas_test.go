@@ -186,12 +186,12 @@ func TestBackgroundFetchRepairNotCoalescedBehindWarm(t *testing.T) {
 	bucket, key := "b", "k"
 
 	// 1. Absent-gated warm starts and blocks in its upstream fetch.
-	svc.triggerBackgroundCacheFetch(bucket, key, "access", "secret", false, priorityReadMiss, 0)
+	svc.triggerBackgroundCacheFetch(bucket, key, "access", "secret", false, priorityReadMiss, cache.MetaVersionToken{})
 	waitFor(t, func() bool { return calls.Load() == 1 })
 
 	// 2. A write repair triggers while the warm is in flight. It must run,
 	//    not coalesce: with the old bucket/key-only dedup it was dropped here.
-	svc.triggerBackgroundCacheFetch(bucket, key, "access", "secret", false, priorityWarmWrite, cache.VersionAny)
+	svc.triggerBackgroundCacheFetch(bucket, key, "access", "secret", false, priorityWarmWrite, cache.AnyMetaVersionToken())
 	waitFor(t, func() bool {
 		meta, found, _ := c.GetMeta(ctx, bucket, key)
 		return found && meta != nil && meta.ETag == `"new"`
@@ -201,7 +201,7 @@ func TestBackgroundFetchRepairNotCoalescedBehindWarm(t *testing.T) {
 	//    and must lose to it.
 	close(gate)
 	waitFor(t, func() bool {
-		if _, busy := svc.activeBackgroundFetches.Load(backgroundFetchKey(bucket, key, 0)); busy {
+		if _, busy := svc.activeBackgroundFetches.Load(backgroundFetchKey(bucket, key, cache.MetaVersionToken{})); busy {
 			return false
 		}
 		return true
@@ -295,9 +295,8 @@ func (f *failingGetVersionClient) GetWithVersion(ctx context.Context, key string
 	return f.CacheClient.GetWithVersion(ctx, key)
 }
 
-// A revalidation-200 whose precondition token cannot be read must stream to
-// the client WITHOUT caching: a commit would carry the legacy unordered
-// expected=0 and could publish over a fence.
+// A revalidation-200 whose decision token cannot be read must stream to the
+// client WITHOUT caching: no mode may fall back to an unordered metadata write.
 func TestRevalidation200_TokenFailureSkipsCaching(t *testing.T) {
 	newBody := "fresh content"
 	mock := &mockForwarder{
@@ -346,6 +345,46 @@ func TestRevalidation200_TokenFailureSkipsCaching(t *testing.T) {
 	// the unordered expected=0.
 	if meta, found, _ := c.GetMeta(ctx, bucket, key); found {
 		t.Fatalf("entry cached despite token-read failure: %+v", meta)
+	}
+}
+
+// If the confirmation HEAD fails, the successful revalidation response still
+// reaches the client, but its body is not installed under an unverified token.
+func TestRevalidation200_HeadConfirmationFailureSkipsCaching(t *testing.T) {
+	freshBody := "fresh content"
+	mock := &mockForwarder{
+		conditionalResp: &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(freshBody)),
+			Header: http.Header{
+				"Content-Type":   []string{"text/plain"},
+				"Content-Length": []string{"13"},
+				"Etag":           []string{`"new"`},
+			},
+		},
+		conditionalHeadErr: errors.New("origin HEAD unavailable"),
+	}
+	svc, c := newTestService(mock, true)
+	ctx := context.Background()
+	const bucket, key = "b", "k"
+	stale := &cache.CachedObjectMeta{
+		Bucket: bucket, Key: key, ETag: `"old"`,
+		ContentType: "text/plain", ContentLength: 5, StatusCode: http.StatusOK,
+	}
+	if err := c.PutWithMeta(ctx, bucket, key, stale, []byte("stale"), 0); err != nil {
+		t.Fatalf("seed stale entry: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/b/k", nil)
+	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", stale, time.Now()); err != nil {
+		t.Fatalf("revalidateAndServe: %v", err)
+	}
+	if w.Code != http.StatusOK || w.Body.String() != freshBody {
+		t.Fatalf("client response=(%d,%q), want the fresh upstream body", w.Code, w.Body.String())
+	}
+	if meta, found, err := c.GetMeta(ctx, bucket, key); err != nil || found {
+		t.Fatalf("unconfirmed revalidation cached metadata=(%+v, found=%t, err=%v)", meta, found, err)
 	}
 }
 
