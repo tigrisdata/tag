@@ -16,8 +16,9 @@ import (
 // DoFullObjectRequest is inherited from baseForwarder (always uses SigV4 signing).
 type signingForwarder struct {
 	baseForwarder
-	credStore *auth.CredentialStore
-	validator *auth.RequestValidator
+	credStore           *auth.CredentialStore
+	validator           *auth.RequestValidator
+	stageBudgetOverride *signedStreamStageBudget
 }
 
 // Forward forwards a request to Tigris and writes the response to the client.

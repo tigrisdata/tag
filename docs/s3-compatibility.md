@@ -65,7 +65,9 @@ In **transparent proxy mode** (default), chunked uploads are forwarded as-is sin
 
 In **signing mode**, a header-authenticated PUT with `X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD` carries chunk signatures chained from the request-level signature. TAG validates every chunk and the terminal signature before forwarding any payload.
 
-Because the upstream request has a different `Host` header, TAG re-signs the decoded bytes as `UNSIGNED-PAYLOAD`. It stages those bytes in a temporary file first. Memory use is bounded, but temporary storage proportional to the upload is required and upstream dispatch waits until verification completes. TAG removes the staging file after forwarding or on failure. The decoded content length is read from `X-Amz-Decoded-Content-Length`.
+Because the upstream request has a different `Host` header, TAG re-signs the decoded bytes as `UNSIGNED-PAYLOAD`. It stages those bytes in a temporary file first. Memory use is bounded, but temporary storage proportional to the upload is required and upstream dispatch waits until verification completes.
+
+Before copying data, TAG reserves the declared decoded length. If no nonnegative decoded length is available, it reserves each next chunk. The process-wide pool admits reservations up to half of the temporary-filesystem space available when the first stage is admitted. The other half is left unclaimed by signed-stream staging. This accounting is process-local; other users can still consume available space. Insufficient capacity rejects the request before the unreserved chunk is written. Reservations remain held until the staged file is removed. A nonnegative `X-Amz-Decoded-Content-Length` must match the staged body.
 
 Presigned URL validation continues to use `UNSIGNED-PAYLOAD`; it does not establish the chunk-signature guarantee described above.
 
