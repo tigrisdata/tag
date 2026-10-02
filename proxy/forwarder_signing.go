@@ -39,7 +39,7 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 		return mapAuthError(err)
 	}
 
-	body, bodyHash, contentLength, chunked, staged, err := f.decodeIncomingBody(ctx, r, accessKey)
+	body, bodyHash, contentLength, chunked, staged, err := f.decodeIncomingBody(ctx, w, r, accessKey)
 	if err != nil {
 		return err
 	}
@@ -86,7 +86,7 @@ func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.Respons
 		return 0, nil, "", "", mapAuthError(err)
 	}
 
-	body, bodyHash, contentLength, chunked, staged, err := f.decodeIncomingBody(ctx, r, accessKey)
+	body, bodyHash, contentLength, chunked, staged, err := f.decodeIncomingBody(ctx, w, r, accessKey)
 	if err != nil {
 		return 0, nil, "", "", err
 	}
@@ -131,7 +131,7 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 		return nil, mapAuthError(err)
 	}
 
-	body, bodyHash, contentLength, chunked, staged, err := f.decodeIncomingBody(ctx, r, accessKey)
+	body, bodyHash, contentLength, chunked, staged, err := f.decodeIncomingBody(ctx, w, r, accessKey)
 	if err != nil {
 		return nil, err
 	}

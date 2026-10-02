@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/auth"
@@ -322,21 +323,48 @@ func handoffStagedSignedChunkedBody(body **stagedSignedChunkedBody, request *htt
 	*body = nil
 }
 
-// closeReadCloserWhenCanceled interrupts an ingress body read when its request
-// context is canceled. Calling it from both the cancellation callback and normal
-// cleanup is safe; each body is closed once.
-func closeReadCloserWhenCanceled(ctx context.Context, body io.ReadCloser) func() {
+// cleanupSignedStreamIngress closes the consumed body and interrupts any incomplete
+// read before returning control to net/http. A read deadline wakes its HTTP/1 body
+// reader without calling Close while that reader holds its lock.
+func cleanupSignedStreamIngress(ctx context.Context, w http.ResponseWriter, r *http.Request, body io.ReadCloser) func(bool) {
 	if body == nil {
-		return func() {}
+		return func(bool) {}
 	}
-	var once sync.Once
+	var (
+		closeOnce     sync.Once
+		interruptOnce sync.Once
+	)
 	closeBody := func() {
-		once.Do(func() { _ = body.Close() })
+		closeOnce.Do(func() { _ = body.Close() })
 	}
-	stop := context.AfterFunc(ctx, closeBody)
-	return func() {
-		stop()
+	interruptRead := func() {
+		interruptOnce.Do(func() {
+			if w != nil && r != nil && r.ProtoMajor == 1 {
+				w.Header().Set("Connection", "close")
+			}
+			if w != nil {
+				if err := http.NewResponseController(w).SetReadDeadline(time.Now()); err == nil {
+					return
+				}
+			}
+			closeBody()
+		})
+	}
+	callbackDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(callbackDone)
+		interruptRead()
+	})
+	return func(bodyComplete bool) {
+		if !bodyComplete {
+			interruptRead()
+		}
+		// Keep cancellation armed while Close runs: HTTP/1 Close can itself drain
+		// the remainder of an incomplete body and block on the same request read.
 		closeBody()
+		if !stop() {
+			<-callbackDone
+		}
 	}
 }
 
@@ -388,6 +416,11 @@ func stageSignedAWSChunkedBody(ctx context.Context, source io.Reader, signingKey
 			}
 			if err := readSignedChunkTerminator(reader); err != nil {
 				return nil, cleanupFailedSignedStage(staged, fmt.Errorf("read signed AWS terminal chunk terminator: %w", signedStreamReadError(ctx, err)))
+			}
+			if _, err := reader.ReadByte(); err == nil {
+				return nil, cleanupFailedSignedStage(staged, errors.New("signed AWS stream has data after its terminal chunk"))
+			} else if !errors.Is(err, io.EOF) {
+				return nil, cleanupFailedSignedStage(staged, fmt.Errorf("finish signed AWS stream: %w", signedStreamReadError(ctx, err)))
 			}
 			if err := ctx.Err(); err != nil {
 				return nil, cleanupFailedSignedStage(staged, fmt.Errorf("finish signed AWS stream: %w", err))
@@ -551,7 +584,7 @@ func (f *signingForwarder) stageBudget() *signedStreamStageBudget {
 
 // decodeIncomingBody authenticates the only signed HMAC marker repaired by this
 // path. Other supported streaming markers keep the existing decoder behavior.
-func (f *signingForwarder) decodeIncomingBody(ctx context.Context, r *http.Request, accessKey string) (io.ReadCloser, string, int64, bool, *stagedSignedChunkedBody, error) {
+func (f *signingForwarder) decodeIncomingBody(ctx context.Context, w http.ResponseWriter, r *http.Request, accessKey string) (io.ReadCloser, string, int64, bool, *stagedSignedChunkedBody, error) {
 	if r.Header.Get("X-Amz-Content-Sha256") != StreamingPayloadHash {
 		body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 		return body, bodyHash, contentLength, chunked, nil, nil
@@ -568,9 +601,11 @@ func (f *signingForwarder) decodeIncomingBody(ctx context.Context, r *http.Reque
 		return body, bodyHash, contentLength, chunked, nil, nil
 	}
 
-	// Staging consumes the request body before forwarding. Close it on completion
-	// and interrupt any blocked read if the request is canceled.
-	defer closeReadCloserWhenCanceled(ctx, r.Body)()
+	// Staging consumes the request body before forwarding. Abort incomplete ingress
+	// reads on cancellation or validation failure, then close the body exactly once.
+	bodyComplete := false
+	cleanupBody := cleanupSignedStreamIngress(ctx, w, r, r.Body)
+	defer func() { cleanupBody(bodyComplete) }()
 
 	dateText := r.Header.Get("X-Amz-Date")
 	if dateText == "" {
@@ -613,5 +648,6 @@ func (f *signingForwarder) decodeIncomingBody(ctx context.Context, r *http.Reque
 		return nil, "", 0, false, nil, fmt.Errorf("validate signed AWS streaming payload: %w", err)
 	}
 
+	bodyComplete = true
 	return staged, "UNSIGNED-PAYLOAD", decodedLength, true, staged, nil
 }

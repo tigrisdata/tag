@@ -17,6 +17,118 @@ import (
 	"github.com/tigrisdata/tag/auth"
 )
 
+func TestStatusRecorderUnwrapsReadDeadline(t *testing.T) {
+	writer := &readDeadlineResponseWriter{ResponseWriter: httptest.NewRecorder()}
+	wrapped := &statusRecorder{ResponseWriter: writer}
+	deadline := time.Now()
+	if err := http.NewResponseController(wrapped).SetReadDeadline(deadline); err != nil {
+		t.Fatalf("set read deadline through statusRecorder: %v", err)
+	}
+	if !writer.deadline.Equal(deadline) {
+		t.Fatalf("underlying read deadline = %v, want %v", writer.deadline, deadline)
+	}
+}
+
+type readDeadlineResponseWriter struct {
+	http.ResponseWriter
+	deadline time.Time
+}
+
+func (w *readDeadlineResponseWriter) SetReadDeadline(deadline time.Time) error {
+	w.deadline = deadline
+	return nil
+}
+
+type blockingReadDeadlineWriter struct {
+	http.ResponseWriter
+	body    io.Closer
+	started chan struct{}
+	release chan struct{}
+	start   sync.Once
+	unblock sync.Once
+}
+
+func (w *blockingReadDeadlineWriter) SetReadDeadline(time.Time) error {
+	w.start.Do(func() { close(w.started) })
+	_ = w.body.Close()
+	<-w.release
+	return nil
+}
+
+func (w *blockingReadDeadlineWriter) releaseDeadline() {
+	w.unblock.Do(func() { close(w.release) })
+}
+
+func TestSigningForwarderWaitsForCancellationCallbackBeforeReturning(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+	budget := newSignedStreamStageBudget(func(string) (signedStreamStageSpace, error) {
+		return signedStreamStageSpace{availableBytes: 1 << 20, blockSize: 1}, nil
+	})
+	credentials := auth.NewCredentialStore()
+	credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
+	forwarder := NewForwarder(credentials, "http://stage.test", "us-east-1", 1, nil, nil).(*signingForwarder)
+	forwarder.stageBudgetOverride = budget
+	body := &blockingSignedStreamBody{readStarted: make(chan struct{}), closed: make(chan struct{})}
+	writer := &blockingReadDeadlineWriter{
+		ResponseWriter: httptest.NewRecorder(),
+		body:           body,
+		started:        make(chan struct{}),
+		release:        make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer func() {
+		cancel()
+		_ = body.Close()
+		writer.releaseDeadline()
+	}()
+	payload := []byte("staging before canceled read")
+	seed := newSignedStreamSeed(t, "http://stage.test", StreamingPayloadHash, len(payload), true)
+	stream := makeSignedStreamWire(t, seed, payload)
+	request := seed.request(t, stream.wire).WithContext(ctx)
+	request.Body = body
+	done := make(chan error, 1)
+	go func() { done <- forwarder.Forward(ctx, writer, request) }()
+	select {
+	case <-body.readStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("forwarder did not begin the ingress body read")
+	}
+	budget.mu.Lock()
+	reservedBeforeCancel := budget.reserved
+	budget.mu.Unlock()
+	if reservedBeforeCancel == 0 {
+		t.Fatal("staging reservation was not held before the body read")
+	}
+	cancel()
+	select {
+	case <-writer.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancellation did not invoke the read-deadline callback")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("forwarding returned before the cancellation callback completed: %v", err)
+	default:
+	}
+	writer.releaseDeadline()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled forwarding error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("forwarding did not return after the cancellation callback completed")
+	}
+	budget.mu.Lock()
+	reservedAfterCancel := budget.reserved
+	budget.mu.Unlock()
+	if reservedAfterCancel != 0 {
+		t.Fatalf("canceled forwarding retained %d reserved bytes", reservedAfterCancel)
+	}
+	assertStageDirectoryEmpty(t, tempDir)
+}
+
 func TestSigningForwarderStagingCleanup(t *testing.T) {
 	var dispatched atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
