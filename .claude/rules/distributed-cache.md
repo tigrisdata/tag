@@ -49,8 +49,10 @@ Meta invalidation/populate ordering is a strategy selected once at construction
   captured token fail closed. If a cache owner lacks the sidecar CAS RPC,
   current TAG fails closed and bypasses that cache entry. Older TAG readers
   ignore the sidecar and can still serve a late plain metadata Put during a
-  mixed-version rollout; do not claim the
-  current-reader guarantee for those readers.
+  mixed-version rollout. The v1.20 reader reads only the plain metadata key, and
+  its tombstone check precedes a separate plain Put; a writer that passed the
+  check can publish after a later delete. This old check-to-Put limitation is
+  outside the sidecar-aware current-reader guarantee.
 - **CAS**: `legacy_coordination: false` — the fenced CAS pattern above on the
   metadata key. Requires every node in the cluster to be CAS-capable (≥v1.21)
   BEFORE the flip; flip via config + a brisk rolling restart (mixed-mechanism
