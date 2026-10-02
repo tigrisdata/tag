@@ -851,12 +851,13 @@ func setupSharedCache() error {
 		return fmt.Errorf("failed to get free port for gRPC: %w", err)
 	}
 
-	// Initialize embedded cache
+	// Initialize the single-node test cache with a loopback memberlist address;
+	// tests do not need remote peers or host-private IP discovery.
 	embeddedCache, err := embedded.New(&embedded.Config{
 		DiskPath:    tempDir,
 		TTL:         config.DefaultCacheTTL,
 		NodeID:      "test-node",
-		ClusterAddr: fmt.Sprintf(":%d", clusterPort),
+		ClusterAddr: fmt.Sprintf("127.0.0.1:%d", clusterPort),
 		GRPCAddr:    fmt.Sprintf(":%d", grpcPort),
 	})
 	if err != nil {
