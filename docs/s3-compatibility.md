@@ -1,6 +1,6 @@
 # S3 API Compatibility
 
-TAG implements all the commonly used bucket and object APIs from the Amazon S3 REST API, acting as a caching proxy between S3 clients and Tigris object storage. By default, TAG operates in transparent proxy mode where client requests are forwarded as-is with proxy headers. In signing mode, requests are validated, re-signed, and forwarded to the Tigris upstream endpoint.
+TAG implements all the commonly used bucket and object APIs from the Amazon S3 REST API, acting as a caching proxy between S3 clients and Tigris object storage. By default, TAG operates in transparent proxy mode where client requests are forwarded as-is with proxy headers. Requests that signing mode routes upstream are validated, re-signed, and forwarded to the configured endpoint.
 
 ## Supported Operations
 
@@ -63,13 +63,13 @@ TAG supports AWS chunked transfer encoding (streaming SigV4), used by tools like
 
 In **transparent proxy mode** (default), chunked uploads are forwarded as-is since the original signatures remain valid (the Host header is not changed).
 
-In **signing mode**, a header-authenticated PUT with `X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD` carries chunk signatures chained from the request-level signature. TAG validates every chunk and the terminal signature before forwarding any payload.
+On the **signing-mode upstream-forwarding path**, a header-authenticated PUT with `X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD` carries chunk signatures chained from the request-level signature. TAG validates every chunk and the terminal signature before forwarding any payload. Tiered-mode PUTs stored directly in the local cache bypass this forwarding path and are not covered by this guarantee.
 
 Because the upstream request has a different `Host` header, TAG re-signs the decoded bytes as `UNSIGNED-PAYLOAD`. It stages those bytes in a temporary file first. Memory use is bounded, but temporary storage proportional to the upload is required and upstream dispatch waits until verification completes.
 
 Before copying data, TAG reserves the declared decoded length. If no nonnegative decoded length is available, it reserves each next chunk. The process-wide pool admits reservations up to half of the temporary-filesystem space available when the first stage is admitted. The other half is left unclaimed by signed-stream staging. This accounting is process-local; other users can still consume available space. Insufficient capacity rejects the request before the unreserved chunk is written. Reservations remain held until the staged file is removed. If staging aborts before the request body is fully consumed, TAG closes the HTTP/1 connection instead of reusing it. A nonnegative `X-Amz-Decoded-Content-Length` must match the staged body.
 
-Presigned URL validation continues to use `UNSIGNED-PAYLOAD`; it does not establish the chunk-signature guarantee described above.
+Presigned URL validation continues to use `UNSIGNED-PAYLOAD`; it does not establish the forwarded-path chunk-signature guarantee described above.
 
 ## Caching Behavior
 
