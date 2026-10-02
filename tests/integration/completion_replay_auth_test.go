@@ -96,7 +96,7 @@ func testCompleteMultipartUploadReplayAuthorization(t *testing.T, transparent bo
 	before = completionCalls.Load()
 	samePrincipal := sendCompletionReplayRequest(t, client, env.TAGServer.URL, bucket, completionReplayKey, completionReplayUploadID, completionReplayAccessA, completionReplaySecretA, false, false)
 	if samePrincipal != first {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: validated same-principal replay = %#v; want saved response %#v", samePrincipal, first)
+		t.Errorf("validated same-principal replay = %#v; want saved response %#v", samePrincipal, first)
 	}
 	assertCompletionReplayCallCount(t, "same-principal replay", completionCalls.Load(), before)
 
@@ -127,7 +127,7 @@ func testCompleteMultipartUploadReplayAuthorization(t *testing.T, transparent bo
 	before = completionCalls.Load()
 	presigned := sendPresignedCompletionReplayRequest(t, client, env.TAGServer.URL, bucket, completionReplayKey, completionReplayUploadID, completionReplayAccessA, completionReplaySecretA, time.Now().UTC().Truncate(time.Second), validator)
 	if presigned != first {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: valid same-principal presigned retry = %#v; want saved response %#v", presigned, first)
+		t.Errorf("valid same-principal presigned retry = %#v; want saved response %#v", presigned, first)
 	}
 	assertCompletionReplayCallCount(t, "presigned replay", completionCalls.Load(), before)
 
@@ -149,7 +149,7 @@ func testCompleteMultipartUploadReplayAuthorization(t *testing.T, transparent bo
 	miss := sendCompletionReplayRequest(t, client, env.TAGServer.URL, bucket, completionReplayKey, completionReplayMissUploadID, completionReplayAccessA, completionReplaySecretA, false, false)
 	assertCompletionReplayDenied(t, "cache miss", miss, first)
 	if miss.status != http.StatusNotFound {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: cache miss status = %d; want upstream 404", miss.status)
+		t.Errorf("cache miss status = %d; want upstream 404", miss.status)
 	}
 	assertCompletionReplayForwarded(t, "cache miss", miss, completionCalls.Load(), before, http.StatusNotFound)
 
@@ -326,31 +326,31 @@ func seedTransparentPrincipal(t *testing.T, env *TestEnvironment, accessKey, sec
 func assertCompletionReplayDenied(t *testing.T, name string, got, cached completionReplayResponse) {
 	t.Helper()
 	if got.status >= http.StatusOK && got.status < http.StatusMultipleChoices || got.etag == cached.etag || got.body == cached.body {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: %s received status=%d ETag=%q body=%q from a cached completion", name, got.status, got.etag, got.body)
+		t.Errorf("%s received status=%d ETag=%q body=%q from a cached completion", name, got.status, got.etag, got.body)
 	}
 }
 
 func assertCompletionReplayForwarded(t *testing.T, name string, response completionReplayResponse, got, before int32, wantStatus int) {
 	t.Helper()
 	if got != before+1 {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: %s made %d upstream calls; want 1 authorization request", name, got-before)
+		t.Errorf("%s made %d upstream calls; want 1 authorization request", name, got-before)
 	}
 	if response.status != wantStatus {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: forwarded %s response status = %d; want upstream status %d", name, response.status, wantStatus)
+		t.Errorf("forwarded %s response status = %d; want upstream status %d", name, response.status, wantStatus)
 	}
 }
 
 func assertCompletionReplayNotForwarded(t *testing.T, name string, got, before int32) {
 	t.Helper()
 	if got != before {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: %s made %d upstream calls; want local rejection", name, got-before)
+		t.Errorf("%s made %d upstream calls; want local rejection", name, got-before)
 	}
 }
 
 func assertCompletionReplayCallCount(t *testing.T, name string, got, before int32) {
 	t.Helper()
 	if got != before {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: %s made %d upstream calls; want cached response", name, got-before)
+		t.Errorf("%s made %d upstream calls; want cached response", name, got-before)
 	}
 }
 
@@ -526,13 +526,13 @@ func testCompletionReplayAfterSignatureWindow(t *testing.T, env *TestEnvironment
 
 	retry := sendCompletionReplayRequest(t, env.TAGServer.Client(), env.TAGServer.URL, bucket, completionReplayKey, completionReplaySlowUploadID, completionReplayAccessA, completionReplaySecretA, false, false)
 	if retry.status != firstResponse.status || retry.contentType != firstResponse.contentType || retry.etag != firstResponse.etag || retry.body != firstResponse.body {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: same-principal retry after the original signature expired = %#v; want the captured response %#v", retry, firstResponse)
+		t.Errorf("same-principal retry after the original signature expired = %#v; want the captured response %#v", retry, firstResponse)
 	}
 	if got := completionCalls.Load(); got != callsBefore+1 {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: same-principal retry after signature expiry made %d upstream calls; want saved response", got-callsBefore-1)
+		t.Errorf("same-principal retry after signature expiry made %d upstream calls; want saved response", got-callsBefore-1)
 	}
 	if got := slowCalls.Load(); got != 1 {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: near-expiry upload was forwarded %d times; want one", got)
+		t.Errorf("near-expiry upload was forwarded %d times; want one", got)
 	}
 }
 
@@ -571,9 +571,9 @@ func testColdCompletionReplayAfterSignatureWindow(t *testing.T) {
 	before := completionCalls.Load()
 	retry := sendCompletionReplayRequest(t, env.TAGServer.Client(), env.TAGServer.URL, bucket, completionReplayKey, completionReplaySlowUploadID, completionReplayAccessA, completionReplaySecretA, false, false)
 	if retry.status != firstResponse.status || retry.contentType != firstResponse.contentType || retry.etag != firstResponse.etag || retry.body != firstResponse.body {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: cold-auth same-principal retry = %#v; want captured response %#v", retry, firstResponse)
+		t.Errorf("cold-auth same-principal retry = %#v; want captured response %#v", retry, firstResponse)
 	}
 	if got := completionCalls.Load(); got != before {
-		t.Errorf("COMPLETION_REPLAY_PROPERTY_VIOLATION: cold-auth retry made %d upstream calls; want saved response", got-before)
+		t.Errorf("cold-auth retry made %d upstream calls; want saved response", got-before)
 	}
 }
