@@ -173,6 +173,104 @@ func TestSigningForwarderSignedStreamIntegrity(t *testing.T) {
 	assertCompatibilityStreamForwarded(t, methods[0].call, unsignedSeed, unsignedWire, "UNSIGNED-PAYLOAD", payload, &dispatched, &mu, &seen)
 }
 
+func TestSigningForwarderDecodedStreamOutgoingSignature(t *testing.T) {
+	credentials := auth.NewCredentialStore()
+	credentials.AddCredential(signedStreamTestAccessKey, signedStreamTestSecretKey)
+	upstreamValidator := auth.NewRequestValidator(credentials)
+	var (
+		dispatched atomic.Int32
+		mu         sync.Mutex
+		seen       []signedStreamObservation
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dispatched.Add(1)
+		if _, err := upstreamValidator.ValidateRequest(r); err != nil {
+			http.Error(w, fmt.Sprintf("outbound SigV4 validation failed: %v", err), http.StatusForbidden)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		seen = append(seen, signedStreamObservation{
+			body:          body,
+			contentHash:   r.Header.Get("X-Amz-Content-Sha256"),
+			contentLength: r.ContentLength,
+			contentCoding: r.Header.Get("Content-Encoding"),
+			decodedLength: r.Header.Get("X-Amz-Decoded-Content-Length"),
+		})
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	forwarder := NewForwarder(credentials, upstream.URL, "us-east-1", 1, nil, nil)
+	useSignedStreamStageBudget(t, newSignedStreamStageBudget(func(string) (signedStreamStageSpace, error) {
+		return signedStreamStageSpace{availableBytes: 1 << 20, blockSize: 1}, nil
+	}))
+	payload := []byte("payload signed for the decoded upstream request")
+	seed := newSignedStreamSeed(t, upstream.URL, StreamingPayloadHash, len(payload), true)
+	stream := makeSignedStreamWire(t, seed, payload)
+	methods := []struct {
+		name string
+		call func(*http.Request) (int, error)
+	}{
+		{
+			name: "Forward",
+			call: func(r *http.Request) (int, error) {
+				w := httptest.NewRecorder()
+				err := forwarder.Forward(r.Context(), w, r)
+				return w.Code, err
+			},
+		},
+		{
+			name: "ForwardWithCapture",
+			call: func(r *http.Request) (int, error) {
+				capture, err := forwarder.ForwardWithCapture(r.Context(), httptest.NewRecorder(), r)
+				if capture == nil {
+					return 0, err
+				}
+				return capture.StatusCode, err
+			},
+		},
+		{
+			name: "ForwardTeeingBody",
+			call: func(r *http.Request) (int, error) {
+				tee, ok := forwarder.(interface {
+					ForwardTeeingBody(context.Context, http.ResponseWriter, *http.Request, io.Writer) (int, http.Header, string, string, error)
+				})
+				if !ok {
+					return 0, fmt.Errorf("signing forwarder does not implement ForwardTeeingBody")
+				}
+				status, _, _, _, err := tee.ForwardTeeingBody(r.Context(), httptest.NewRecorder(), r, io.Discard)
+				return status, err
+			},
+		},
+	}
+	for _, method := range methods {
+		t.Run(method.name, func(t *testing.T) {
+			before := dispatched.Load()
+			seenBefore := observationCount(&mu, &seen)
+			status, err := method.call(seed.request(t, stream.wire))
+			if err != nil {
+				t.Fatalf("forward decoded signed stream: %v", err)
+			}
+			if status != http.StatusOK || dispatched.Load() != before+1 {
+				t.Fatalf("forwarded status=%d dispatches=%d; want one SigV4-accepted request", status, dispatched.Load()-before)
+			}
+			got, ok := observationAt(&mu, &seen, seenBefore)
+			if !ok {
+				t.Fatalf("upstream dispatch %d produced no accepted request observation", seenBefore)
+			}
+			if !bytes.Equal(got.body, payload) || got.contentHash != "UNSIGNED-PAYLOAD" || got.contentLength != int64(len(payload)) || got.contentCoding != "" || got.decodedLength != "" {
+				t.Fatalf("upstream accepted a different decoded request: %+v want bytes=%q", got, payload)
+			}
+		})
+	}
+}
+
 func newSignedStreamSeed(t *testing.T, endpoint, bodyHash string, decodedLength int, chunked bool) signedStreamSeed {
 	t.Helper()
 

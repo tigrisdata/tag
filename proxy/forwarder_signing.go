@@ -51,7 +51,7 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 	}
 
 	// Create signed request. Verified AWS streams use the staged decoded body.
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, r.Header)
+	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, headersForForwardedSigning(r.Header, chunked))
 	if err != nil {
 		return err
 	}
@@ -101,7 +101,7 @@ func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.Respons
 	if staged != nil {
 		teedBody = &stagedTeeReadCloser{Reader: teedBody, Closer: staged}
 	}
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, teedBody, bodyHash, accessKey, secretKey, r.Header)
+	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, teedBody, bodyHash, accessKey, secretKey, headersForForwardedSigning(r.Header, chunked))
 	if err != nil {
 		return 0, nil, "", "", err
 	}
@@ -143,7 +143,7 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 	}
 
 	// Create signed request. Verified AWS streams use the staged decoded body.
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, r.Header)
+	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, headersForForwardedSigning(r.Header, chunked))
 	if err != nil {
 		return nil, err
 	}
