@@ -71,10 +71,12 @@ the plain metadata key, and its writer checks the timestamp tombstone before a
 separate plain metadata Put. A writer that passed that check can publish after
 a later delete, so an older reader can still serve a late plain Put during a
 mixed-version rollout. This check-to-Put limit exists in the v1.20 protocol;
-a newer TAG binary cannot change an older reader. The stale-refill guarantee
-here applies to sidecar-aware current TAG readers, not to unmodified v1.20
-readers. CAS mode fences metadata tokens atomically and should be enabled only
-after every TAG peer in the cluster supports it.
+a newer TAG binary cannot change an older reader. The legacy setting preserves
+wire compatibility for rollouts, not fleet-wide stale-read freedom while
+unmodified v1.20 readers remain. The stale-refill guarantee here applies to
+TAG readers running this source revision, not to unmodified v1.20 readers.
+CAS mode fences metadata tokens atomically and should be enabled only after
+every TAG peer in the cluster supports it.
 
 Objects modified directly on Tigris (bypassing TAG) remain in cache until they expire (default TTL: 24 hours, configurable via `TAG_CACHE_TTL`) or are revalidated via `Cache-Control: no-cache`.
 

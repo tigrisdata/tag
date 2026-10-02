@@ -189,10 +189,11 @@ cache:
   block_caching_enabled: true
 
   # Meta invalidation/populate coordination. true (default) retains the v1.20 tombstone and
-  # plain metadata protocol for rollouts. Current TAG readers also require a CAS generation
-  # sidecar; older readers ignore it, and current readers bypass cache entries when an owner
-  # lacks sidecar CAS support. false selects fenced-CAS metadata ordering, which requires every
-  # node in the cluster to be CAS-capable BEFORE flipping, then a brisk rolling restart.
+  # plain metadata protocol for wire-compatible rollouts, not fleet-wide freshness for v1.20
+  # readers. Current TAG readers also require a CAS generation sidecar; older readers ignore it,
+  # and current readers bypass cache entries when an owner lacks sidecar CAS support. false
+  # selects fenced-CAS metadata ordering, which requires every node in the cluster to be
+  # CAS-capable BEFORE flipping, then a brisk rolling restart.
   # Standalone deployments may flip immediately. Override with TAG_CACHE_LEGACY_COORDINATION
   # (fail-safe: only an explicit "false"/"0" selects CAS).
   legacy_coordination: true
@@ -405,7 +406,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `ttl`                   | duration | `24h`            | Default TTL for cached objects                                                      |
 | `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
 | `block_caching_enabled` | bool     | `true`           | Enable block-aligned caching for large objects (RFC 0001)                           |
-| `legacy_coordination`   | bool     | `true`           | Meta coordination: `true` = v1.20 tombstones/plain metadata plus a CAS generation sidecar for current readers (old readers ignore it; current readers bypass cache owners without sidecar CAS support); `false` = fenced CAS on metadata (all nodes must be CAS-capable before flipping) |
+| `legacy_coordination`   | bool     | `true`           | Meta coordination: `true` = v1.20 tombstones/plain metadata for wire-compatible rollouts plus a CAS generation sidecar for current readers (v1.20 readers may serve late plain Puts; current readers bypass owners without sidecar CAS); `false` = fenced CAS on metadata (all nodes must be CAS-capable before flipping) |
 | `block_size`            | int64    | `1048576`        | Block granularity **and** the read-side whole-vs-block boundary (must stay below ocache's 64 MB compaction threshold) |
 | `parquet_optimization`  | bool     | `false`          | Prefetch a parquet object's metadata blocks on a tail read (only when the metadata spans more than the tail block) |
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |

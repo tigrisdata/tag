@@ -41,7 +41,8 @@ Meta invalidation/populate ordering is a strategy selected once at construction
 (`cache/coordinator.go`), never per-call if/else:
 
 - **Legacy (default)**: `cache.legacy_coordination: true` keeps the v1.20
-  metadata key and eight-byte tombstone protocol for rolling compatibility.
+  metadata key and eight-byte tombstone protocol for wire-compatible rollouts;
+  it is not a fleet-wide freshness guarantee while v1.20 readers remain.
   Current TAG also CAS-updates a separate `meta-gen|...` sidecar and records
   its generation in new metadata; current reads require a match, so old rows
   without a generation are misses until repopulated. A decision read creates a
