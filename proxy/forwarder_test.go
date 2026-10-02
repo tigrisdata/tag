@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,57 @@ type forwarderTestTransport func(*http.Request) (*http.Response, error)
 
 func (f forwarderTestTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+type failedResponseBody struct {
+	reader *strings.Reader
+	err    error
+	closed bool
+}
+
+func (b *failedResponseBody) Read(p []byte) (int, error) {
+	if b.reader.Len() > 0 {
+		return b.reader.Read(p)
+	}
+	return 0, b.err
+}
+
+func (b *failedResponseBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+func TestExecuteAndStreamReturningMetaReturnsBodyReadError(t *testing.T) {
+	readErr := errors.New("upstream response body failed")
+	body := &failedResponseBody{reader: strings.NewReader("prefix"), err: readErr}
+	headers := make(http.Header)
+	headers.Set("ETag", `"upstream-etag"`)
+	forwarder := newBaseForwarder("https://upstream.example.com", "us-east-1", 1)
+	forwarder.httpClient = &http.Client{Transport: forwarderTestTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: headers, Body: body}, nil
+	})}
+	request, err := http.NewRequest(http.MethodGet, "https://upstream.example.com/bucket", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := httptest.NewRecorder()
+
+	status, gotHeaders, err := forwarder.executeAndStreamReturningMeta(writer, request, 0, nil)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("executeAndStreamReturningMeta error = %v, want %v", err, readErr)
+	}
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want %d", status, http.StatusOK)
+	}
+	if gotHeaders.Get("ETag") != `"upstream-etag"` {
+		t.Errorf("captured ETag = %q, want upstream ETag", gotHeaders.Get("ETag"))
+	}
+	if writer.Body.String() != "prefix" {
+		t.Errorf("client body = %q, want received prefix", writer.Body.String())
+	}
+	if !body.closed {
+		t.Error("upstream response body was not closed")
+	}
 }
 
 func TestExecuteAndStreamReturningMetaOwnsHeaders(t *testing.T) {
