@@ -189,11 +189,12 @@ cache:
   block_caching_enabled: true
 
   # Meta invalidation/populate coordination. true (default) = legacy tombstone mechanism,
-  # compatible with any cluster mix — including nodes upgrading directly from <=v1.20. false =
-  # fenced-CAS coordination (stronger ordering; requires every node in the cluster to be
-  # CAS-capable BEFORE flipping, then a brisk rolling restart). Standalone deployments may flip
-  # immediately. Override with TAG_CACHE_LEGACY_COORDINATION (fail-safe: only an explicit
-  # "false"/"0" selects CAS).
+  # compatible with any cluster mix — including nodes upgrading directly from <=v1.20. A missing
+  # tombstone permits a warm; a failed read or malformed marker refuses an ordered metadata write
+  # instead of assuming no invalidation. false = fenced-CAS coordination (stronger ordering;
+  # requires every node in the cluster to be CAS-capable BEFORE flipping, then a brisk rolling
+  # restart). Standalone deployments may flip immediately. Override with
+  # TAG_CACHE_LEGACY_COORDINATION (fail-safe: only an explicit "false"/"0" selects CAS).
   legacy_coordination: true
 
   # Block granularity AND the whole-vs-block boundary for every populate path: an object
@@ -404,7 +405,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `ttl`                   | duration | `24h`            | Default TTL for cached objects                                                      |
 | `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
 | `block_caching_enabled` | bool     | `true`           | Enable block-aligned caching for large objects (RFC 0001)                           |
-| `legacy_coordination`   | bool     | `true`           | Meta coordination mechanism: `true` = legacy tombstones (safe for any cluster mix, incl. direct ≤v1.20 upgrades); `false` = fenced CAS (all nodes must be CAS-capable before flipping) |
+| `legacy_coordination`   | bool     | `true`           | Meta coordination mechanism: `true` = legacy tombstones (safe for any cluster mix, incl. direct ≤v1.20 upgrades; unreadable or malformed markers refuse ordered metadata writes); `false` = fenced CAS (all nodes must be CAS-capable before flipping) |
 | `block_size`            | int64    | `1048576`        | Block granularity **and** the read-side whole-vs-block boundary (must stay below ocache's 64 MB compaction threshold) |
 | `parquet_optimization`  | bool     | `false`          | Prefetch a parquet object's metadata blocks on a tail read (only when the metadata spans more than the tail block) |
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |
