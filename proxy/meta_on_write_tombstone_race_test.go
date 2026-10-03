@@ -252,12 +252,15 @@ func TestCompleteMultipart_TombstoneReadFailureDoesNotResurrectOldMetadata(t *te
 
 func waitForBackgroundMetaWarm(t *testing.T, svc *Service, key string) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
+	timeout := time.After(3 * time.Second)
+	for {
 		if _, active := svc.activeBackgroundFetches.Load(key); !active {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		select {
+		case <-timeout:
+			t.Fatal("first meta-on-write worker did not finish after its tombstone read")
+		case <-time.After(time.Millisecond):
+		}
 	}
-	t.Fatal("first meta-on-write worker did not finish after its tombstone read")
 }
