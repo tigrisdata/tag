@@ -89,6 +89,12 @@ TAG supports **path-style** S3 access only. Virtual-hosted style requests are no
 
 When configuring S3 clients, ensure path-style addressing is enabled. See [docs/usage.md](docs/usage.md) for SDK-specific configuration.
 
+On signing-mode PutObject requests, TAG checks each AWS data-frame header against the remaining `X-Amz-Decoded-Content-Length` before yielding its bytes.
+
+If an upstream response arrives before the request-body writer reaches later frames, TAG waits for that writer to stop and checks any remaining parseable frames before relaying success. The validation read uses the existing upstream request timeout. A timed-out check returns an error, not a successful upload.
+
+If TAG has received an upstream 2xx before a later frame exceeds the declared length, it withholds that response and does not warm from the partial body. The ordinary proxy cache path invalidates the key again when caching is enabled. Tiered mode removes only the pre-forward metadata version, preserving a newer local write. Earlier valid frames may already have reached upstream. See [AWS Chunked Transfer Encoding](docs/s3-compatibility.md#aws-chunked-transfer-encoding) for details.
+
 ### Response Headers
 
 | Header    | Description                                          |

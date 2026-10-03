@@ -26,6 +26,11 @@ TAG stores a metadata marker locally. HEAD answers from the marker; GET
 forwards for the body — the mode's only body traffic. DELETE forwards and
 drops the marker.
 
+For a signing-forwarded AWS-chunked object PUT with positive decoded length, TAG
+requires a readable pre-forward metadata snapshot. If that lookup fails, TAG
+returns an error before forwarding so a later frame-validation error can remove
+only the displaced version without deleting a newer local write.
+
 **Cross-tier overwrites clean up the displaced version.** A small write over an
 upstream-tier object deletes the upstream copy asynchronously (best-effort —
 a failure leaves an orphan for the upstream bucket's own expiry to collect).

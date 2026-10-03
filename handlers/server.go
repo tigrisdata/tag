@@ -288,6 +288,8 @@ type responseTracker struct {
 	committed bool
 }
 
+func (rt *responseTracker) Unwrap() http.ResponseWriter { return rt.ResponseWriter }
+
 func (rt *responseTracker) WriteHeader(code int) {
 	rt.committed = true
 	rt.ResponseWriter.WriteHeader(code)

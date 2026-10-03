@@ -162,23 +162,28 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	}
 
 	declaredSize, sized := originlessPutSize(r)
+	var (
+		prior        *cache.CachedObjectMeta
+		priorVersion uint64
+		priorKnown   bool
+	)
 
 	// Local-tier eligibility, before any metadata lookup: a validated caller
 	// (the engine serves from cache with no upstream auth check), a plain
-	// object PUT, and a declared size within the threshold. Everything else
-	// forwards and never needs the prior version — a metadata failure must not
-	// block a PUT that goes upstream anyway (including the unknown-key writes
-	// that bootstrap credential learning).
+	// object PUT, and a declared size within the threshold. Other writes normally
+	// forward without a prior snapshot; signing-forwarded AWS streams are the
+	// exception because late body validation may need version-guarded cleanup.
 	if result == AuthValidated && originlessPlainObject(r) && sized && declaredSize <= s.config.Cache.SizeThreshold {
 		// The prior version's tier decides what an overwrite must clean up and
 		// where a conditional write is evaluated, so a failed lookup cannot be
 		// read as "no prior". Fail retryably instead.
-		priorMeta, priorVersion, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+		priorMeta, version, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 		if cacheErr != nil {
 			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return cacheErr
 		}
-		var prior *cache.CachedObjectMeta
+		priorVersion = version
+		priorKnown = true
 		if found {
 			prior = priorMeta
 		}
@@ -192,7 +197,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 			// Thread the SAME snapshot into the engine: the tier decision
 			// above and the engine's precondition/token now share one read,
 			// so a marker committing in between cannot make them disagree.
-			err := s.handleOriginlessPut(rec, r, &putPrior{meta: priorMeta, version: priorVersion, found: found})
+			err := s.handleOriginlessPut(rec, r, &putPrior{meta: priorMeta, version: version, found: found})
 			if err == nil && rec.wroteSuccess() && prior != nil && prior.BodyUpstream {
 				// Small write displaced an upstream-tier version: remove the
 				// upstream copy so it doesn't linger as an orphan. Bound to the
@@ -208,22 +213,24 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// that makes this object exist in TAG's authoritative view.
 	//
 	// No pre-forward invalidation, unlike HandlePutObject: for a local-tier
-	// prior the cache holds the ONLY copy, and a failed forward must leave it
-	// intact — S3 semantics say a rejected PUT changes nothing. Reads racing
-	// the in-flight PUT serve the prior version, which is the atomic-replace
-	// behavior clients expect. The one read-triggered populate in this mode —
-	// the re-tier — cannot be ordered against this path's writes here (it
-	// performs none pre-forward); it defends itself with a claim plus its own
-	// pre-fetch decision token instead (see maybeRetierOnRead).
-	// No post-success invalidation either: the marker overwrites the prior
-	// metadata directly (a displaced local body ages out by TTL, the engine's
-	// own overwrite semantics), which lets the marker commit under the
-	// PRE-FORWARD decision token — see putUpstreamMarker for why that closes
-	// the concurrent-DELETE resurrection race.
-	// Capture the displaced prior before forwarding — tolerated, never blocking:
-	// it only arms the identity guard of the failure sweep in putUpstreamMarker.
-	// A failed lookup leaves the prior unknown, and the sweep then refuses to
-	// delete anything rather than guess.
+	// prior the cache holds the ONLY copy, and an upstream rejection or unknown
+	// outcome must leave it intact. Reads racing the in-flight PUT serve the prior
+	// version, which is the atomic-replace behavior clients expect. The one
+	// read-triggered populate in this mode — the re-tier — cannot be ordered
+	// against this path's writes here (it performs none pre-forward); it defends
+	// itself with a claim plus its own pre-fetch decision token instead (see
+	// maybeRetierOnRead).
+	// Ordinary successful forwards need no separate invalidation: the new marker
+	// replaces prior metadata under the PRE-FORWARD decision token, closing the
+	// concurrent-DELETE resurrection race (see putUpstreamMarker). When a known
+	// upstream 2xx cannot be relayed because later body validation fails, no
+	// marker can be built from the incomplete request; the guarded sweep below
+	// removes only the displaced prior.
+	// Capture the displaced prior before forwarding. Signed AWS-chunked PUTs
+	// require this snapshot because a later frame-validation error can follow an
+	// upstream 2xx; other marker writes retain best-effort capture. A failed
+	// required lookup stops before dispatch rather than guessing which version
+	// a later cleanup may remove.
 	// Only a PLAIN object PUT writes the object and therefore owns the marker.
 	// A sub-resource PUT with no dedicated route (?retention, ?legal-hold, …)
 	// reaches this path too, but it does not create a new object version: it
@@ -232,17 +239,34 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// a 2xx response without an ETag would sweep the object's live metadata
 	// into an authoritative miss.
 	markerOwning := originlessPlainObject(r)
-
-	var prior *cache.CachedObjectMeta
-	var priorVersion uint64
-	priorKnown := false
-	if markerOwning {
-		prior, priorVersion, priorKnown = s.captureMarkerPrior(ctx, bucket, key)
+	needsValidationSnapshot := markerOwning && s.cache.IsEnabled() && !s.config.ForwardsTransparently() &&
+		IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) && sized && declaredSize > 0
+	if markerOwning && !priorKnown {
+		if needsValidationSnapshot {
+			meta, version, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+			if cacheErr != nil {
+				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+				return cacheErr
+			}
+			priorVersion = version
+			priorKnown = true
+			if found {
+				prior = meta
+			}
+		} else {
+			prior, priorVersion, priorKnown = s.captureMarkerPrior(ctx, bucket, key)
+		}
 	}
 
 	rec := &statusRecorder{ResponseWriter: w}
 	err = s.forwarder.Forward(ctx, rec, r)
 
+	// A body-validation error can hide an upstream 2xx from the client after
+	// the origin has changed the object. Remove only the displaced pre-forward
+	// version; a newer tiered write must keep its authoritative local state.
+	if err != nil && rec.upstreamSucceeded() && markerOwning && s.cache.IsEnabled() {
+		s.invalidateDisplacedTieredMeta(bucket, key, prior, priorVersion, priorKnown)
+	}
 	if err == nil && rec.wroteSuccess() && markerOwning && s.cache.IsEnabled() {
 		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, prior, priorVersion, priorKnown)
 	}
@@ -448,8 +472,9 @@ func (s *Service) headObjectMeta(ctx context.Context, bucket, key, accessKey, se
 }
 
 // invalidateDisplacedTieredMeta converges a key on an authoritative miss
-// after a marker could not be established, without either destroying a newer
-// racing write or deleting blind: cache.DeleteIfETag removes the entry only
+// after a marker could not be established, including a known upstream success
+// whose body validation failed, without destroying a newer racing write or
+// deleting blind: cache.DeleteMetaIfVersion removes the entry only
 // while it still IS the displaced prior — the compare and the delete are one
 // CAS, so the compare-then-delete window the pre-CAS helper documented is
 // gone. Anything else present is a newer write and keeps the key; this PUT's

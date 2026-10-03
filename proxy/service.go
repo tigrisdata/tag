@@ -658,16 +658,19 @@ func (s *Service) releaseCacheSlot(weight int64) {
 	}
 }
 
-// statusRecorder wraps http.ResponseWriter to capture the response status code
-// written while forwarding an upstream response. Forward() returns nil even when
-// upstream responds 4xx/5xx (the response streamed successfully), so mutating
-// handlers use this to gate post-forward cache re-invalidation on an actual 2xx —
-// otherwise a rejected PUT/DELETE/COPY would still fence the destination and
-// discard a valid racing refill, causing later reads to miss unnecessarily.
+// statusRecorder wraps http.ResponseWriter to capture the client response status
+// and the upstream status observed before a chunked-body validation error. Mutating
+// handlers use the client status for ordinary post-forward work and the upstream
+// status only to invalidate after an upstream success that could not be relayed.
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
+	status         int
+	upstreamStatus int
 }
+
+func (rec *statusRecorder) Unwrap() http.ResponseWriter { return rec.ResponseWriter }
+
+func (rec *statusRecorder) recordUpstreamStatus(status int) { rec.upstreamStatus = status }
 
 func (rec *statusRecorder) WriteHeader(code int) {
 	rec.status = code
@@ -689,9 +692,13 @@ func (rec *statusRecorder) Flush() {
 	}
 }
 
-// wroteSuccess reports whether upstream returned a 2xx status.
+// wroteSuccess reports whether a 2xx status was written to the client.
 func (rec *statusRecorder) wroteSuccess() bool {
 	return rec.status >= 200 && rec.status < 300
+}
+
+func (rec *statusRecorder) upstreamSucceeded() bool {
+	return rec.upstreamStatus >= 200 && rec.upstreamStatus < 300
 }
 
 // HandlePutObject handles PUT requests for objects.
@@ -721,16 +728,19 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	rec := &statusRecorder{ResponseWriter: w}
 	teed, requestRejectsCache, err := s.forwardPutMaybeTee(r.Context(), rec, r, bucket, key)
 
-	// Re-invalidate AFTER upstream confirms the write. A GET that raced the
-	// in-flight PUT may have fetched the pre-PUT object and begun re-caching it;
-	// this second invalidation bumps the fence past that write's decision-time
-	// token, so its version-preconditioned commit loses —
-	// restoring read-after-write semantics.
-	// Gated on a 2xx: a rejected PUT leaves the object unchanged, so re-invalidating
-	// would only discard a valid racing refill and cause an unnecessary later miss.
-	// Routed through invalidateObject (like the pre-forward call) so a failure of this
-	// read-after-write-critical invalidation is recorded and logged, not discarded.
+	// Re-invalidate after an upstream success. A GET that raced the in-flight PUT
+	// may have fetched the pre-PUT object and begun re-caching it; this second
+	// invalidation bumps the fence past that write's decision-time token. A chunked
+	// body validation error can prevent the upstream 2xx from reaching the client
+	// after the origin accepted a prefix, so use that recorded upstream status only
+	// to invalidate; never warm from the incomplete request.
+	if err != nil && rec.upstreamSucceeded() && s.cache.IsEnabled() {
+		s.convergeInvalidation(context.Background(), bucket, key)
+	}
+	// Ordinary successful writes retain the existing cache population behavior.
 	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
+		// Routed through invalidateObject (like the pre-forward call) so a failure of this
+		// read-after-write-critical invalidation is recorded and logged, not discarded.
 		s.convergeInvalidation(context.Background(), bucket, key)
 		teeHandled := requestRejectsCache
 		if teed != nil {

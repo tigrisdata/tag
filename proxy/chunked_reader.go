@@ -58,10 +58,30 @@ func IsStreamingPayload(bodyHash string) bool {
 // Chunk signatures and trailing checksums are not validated (the
 // request-level signature was already verified by the auth validator).
 type awsChunkedReader struct {
-	reader    *bufio.Reader
-	remaining int
-	done      bool
+	reader           *bufio.Reader
+	remaining        int
+	decodedRemaining int64 // declared decoded bytes not yet assigned to a data chunk; -1 is unknown
+	done             bool
 }
+
+type awsChunkedReadCloser struct {
+	reader *awsChunkedReader
+}
+
+func (body *awsChunkedReadCloser) Read(p []byte) (int, error) {
+	return body.reader.Read(p)
+}
+
+// Close keeps the no-op ownership semantics of the previous io.NopCloser wrapper.
+func (*awsChunkedReadCloser) Close() error { return nil }
+
+// validateRemainingDecodedExtent lets the forwarder inspect unread frames after
+// the transport writer stops without passing validation-only bytes through a tee.
+func (body *awsChunkedReadCloser) validateRemainingDecodedExtent() error {
+	return body.reader.validateRemainingDecodedExtent()
+}
+
+var errAWSChunkExceedsDecodedLength = errors.New("AWS chunk exceeds remaining decoded content length")
 
 // awsChunkedReaderBufSize is the decoder's internal bufio buffer. Named so
 // budget accounting (origin-less PUT admission) can reserve exactly what the
@@ -70,7 +90,8 @@ const awsChunkedReaderBufSize = 64 * 1024
 
 func newAWSChunkedReader(r io.Reader) *awsChunkedReader {
 	return &awsChunkedReader{
-		reader: bufio.NewReaderSize(r, awsChunkedReaderBufSize),
+		reader:           bufio.NewReaderSize(r, awsChunkedReaderBufSize),
+		decodedRemaining: -1,
 	}
 }
 
@@ -150,7 +171,43 @@ func (r *awsChunkedReader) readChunkHeader() error {
 		return nil
 	}
 
+	if r.decodedRemaining >= 0 {
+		if size > r.decodedRemaining {
+			return fmt.Errorf("%w: chunk size %d, remaining decoded content length %d", errAWSChunkExceedsDecodedLength, size, r.decodedRemaining)
+		}
+		r.decodedRemaining -= size
+	}
+
 	r.remaining = int(size)
+	return nil
+}
+
+// validateRemainingDecodedExtent advances through unread AWS framing using the
+// reader's existing buffer and returns any framing or read error to the tracker.
+// The tracker preserves legacy handling of non-timeout framing errors while
+// rejecting extent violations and bounded-read timeouts.
+func (r *awsChunkedReader) validateRemainingDecodedExtent() error {
+	for !r.done {
+		if r.remaining == 0 {
+			if err := r.readChunkHeader(); err != nil {
+				return err
+			}
+			if r.done {
+				return nil
+			}
+		}
+
+		n, err := r.reader.Discard(r.remaining)
+		r.remaining -= n
+		if err != nil {
+			return err
+		}
+		if r.remaining == 0 {
+			if err := r.readTrailingCRLF(); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -209,7 +266,10 @@ func decodeChunkedIfNeeded(r *http.Request) (body io.ReadCloser, bodyHash string
 	}
 
 	decoded := newAWSChunkedReader(r.Body)
-	return io.NopCloser(decoded), "UNSIGNED-PAYLOAD", contentLength, true
+	if contentLength >= 0 {
+		decoded.decodedRemaining = contentLength
+	}
+	return &awsChunkedReadCloser{reader: decoded}, "UNSIGNED-PAYLOAD", contentLength, true
 }
 
 // stripAWSChunkedToken removes the aws-chunked token from a Content-Encoding
