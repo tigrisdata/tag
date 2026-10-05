@@ -15,30 +15,35 @@ import (
 )
 
 const (
-	authzScopeBucket       = "scope-write-bucket"
-	authzScopeObject       = "private-object"
-	authzScopeBody         = "private reader-only object body"
-	authzScopeWriter       = "WRITEONLYKEY"
-	authzScopeWriterSecret = "writer-secret"
-	authzScopeReader       = "READERKEY"
-	authzScopeReaderSecret = "reader-secret"
-	authzScopeHeadReader   = "HEADONLYKEY"
-	authzScopeHeadSecret   = "head-reader-secret"
+	authzScopeBucket            = "scope-write-bucket"
+	authzScopeObject            = "private-object"
+	authzScopeBody              = "private reader-only object body"
+	authzScopeWriter            = "WRITEONLYKEY"
+	authzScopeWriterSecret      = "writer-secret"
+	authzScopeReader            = "READERKEY"
+	authzScopeReaderSecret      = "reader-secret"
+	authzScopeHeadReader        = "HEADONLYKEY"
+	authzScopeHeadSecret        = "head-reader-secret"
+	authzScopeOtherReader       = "OTHERREADERKEY"
+	authzScopeOtherReaderSecret = "other-reader-secret"
 )
 
 // This origin enforces permissions independently of TAG's AuthzCache.
 type authzScopeOrigin struct {
-	bucket    string
-	validator *auth.RequestValidator
+	bucket      string
+	otherBucket string
+	validator   *auth.RequestValidator
 
 	mu        sync.RWMutex
 	envelopes map[string]string
 
-	writerReads  atomic.Int64
-	readerReads  atomic.Int64
-	headReads    atomic.Int64
-	writerTags   atomic.Int64
-	readerDenied atomic.Bool
+	writerReads            atomic.Int64
+	readerReads            atomic.Int64
+	readerOtherBucketReads atomic.Int64
+	headReads              atomic.Int64
+	writerTags             atomic.Int64
+	otherReaderReads       atomic.Int64
+	readerDenied           atomic.Bool
 }
 
 func newAuthzScopeTestEnvironment(t *testing.T, bucket string) (*TestEnvironment, *authzScopeOrigin, *auth.CredentialStore) {
@@ -47,10 +52,12 @@ func newAuthzScopeTestEnvironment(t *testing.T, bucket string) (*TestEnvironment
 	credentials.AddCredential(authzScopeWriter, authzScopeWriterSecret)
 	credentials.AddCredential(authzScopeReader, authzScopeReaderSecret)
 	credentials.AddCredential(authzScopeHeadReader, authzScopeHeadSecret)
+	credentials.AddCredential(authzScopeOtherReader, authzScopeOtherReaderSecret)
 	origin := &authzScopeOrigin{
-		bucket:    bucket,
-		validator: auth.NewRequestValidator(credentials),
-		envelopes: make(map[string]string),
+		bucket:      bucket,
+		otherBucket: bucket + "-other",
+		validator:   auth.NewRequestValidator(credentials),
+		envelopes:   make(map[string]string),
 	}
 	env := NewTestEnvironmentWithTransparentAuth(t, origin.serveHTTP)
 	return env, origin, credentials
@@ -80,6 +87,7 @@ func (o *authzScopeOrigin) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	objectPath := "/" + o.bucket + "/" + authzScopeObject
+	otherObjectPath := "/" + o.otherBucket + "/" + authzScopeObject
 	switch {
 	case accessKey == authzScopeWriter && r.Method == http.MethodPost && r.URL.Path == objectPath && r.URL.Query().Has("uploads"):
 		envelope := o.signingKeys(authzScopeWriter)
@@ -125,6 +133,17 @@ func (o *authzScopeOrigin) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		authzScopeWriteObject(w, false, envelope)
+	case r.URL.Path == otherObjectPath && r.URL.RawQuery == "" && r.Method == http.MethodGet && accessKey == authzScopeOtherReader:
+		o.otherReaderReads.Add(1)
+		envelope := o.signingKeys(authzScopeOtherReader)
+		if envelope == "" {
+			authzScopeDeny(w)
+			return
+		}
+		authzScopeWriteObject(w, true, envelope)
+	case r.URL.Path == otherObjectPath && r.URL.RawQuery == "" && r.Method == http.MethodGet && accessKey == authzScopeReader:
+		o.readerOtherBucketReads.Add(1)
+		authzScopeDeny(w)
 	default:
 		authzScopeDeny(w)
 	}
@@ -306,5 +325,62 @@ func TestTransparentAuth_ReadGrantRevokedAfter403(t *testing.T) {
 	}
 	if env.AuthzCache.IsAuthorized(authzScopeReader, bucket) {
 		t.Fatal("upstream 403 did not revoke the read grant")
+	}
+}
+
+func TestTransparentAuth_AuthzGrantRemainsBucketScoped(t *testing.T) {
+	const bucketA = "scope-authz-bucket-a"
+	bucketB := bucketA + "-other"
+	env, origin, credentials := newAuthzScopeTestEnvironment(t, bucketA)
+	defer env.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+	pathA := "/" + bucketA + "/" + authzScopeObject
+	pathB := "/" + bucketB + "/" + authzScopeObject
+
+	// The same access key is allowed to read bucket A but not bucket B.
+	readerARequest := authzScopeRequest(t, env.TAGServer.URL, http.MethodGet, pathA, authzScopeReader, authzScopeReaderSecret)
+	readerBRequest := authzScopeRequest(t, env.TAGServer.URL, http.MethodGet, pathB, authzScopeReader, authzScopeReaderSecret)
+	readerEnvelope, _ := authzScopeKeysForRequest(t, credentials, authzScopeReader, readerBRequest)
+	origin.setSigningKeys(authzScopeReader, readerEnvelope)
+	status, headers, body := authzScopeRead(t, client, readerARequest)
+	if status != http.StatusOK || body != authzScopeBody || headers.Get("X-Tigris-Proxy-Signing-Keys") != "" {
+		t.Fatalf("authorized bucket-A GetObject: status=%d body=%q leaked_header=%q", status, body, headers.Get("X-Tigris-Proxy-Signing-Keys"))
+	}
+	if !env.WaitForCached(bucketA, authzScopeObject, 2*time.Second) {
+		t.Fatal("reader A did not populate bucket A")
+	}
+	if !env.AuthzCache.IsAuthorized(authzScopeReader, bucketA) || env.AuthzCache.IsAuthorized(authzScopeReader, bucketB) {
+		t.Fatalf("bucket A grant leaked to bucket B: A=%v B=%v", env.AuthzCache.IsAuthorized(authzScopeReader, bucketA), env.AuthzCache.IsAuthorized(authzScopeReader, bucketB))
+	}
+
+	// Another identity populates a private cache entry in bucket B. Reader A's
+	// bucket-A grant must not make this private object readable from cache.
+	otherReaderRequest := authzScopeRequest(t, env.TAGServer.URL, http.MethodGet, pathB, authzScopeOtherReader, authzScopeOtherReaderSecret)
+	otherReaderEnvelope, _ := authzScopeKeysForRequest(t, credentials, authzScopeOtherReader, otherReaderRequest)
+	origin.setSigningKeys(authzScopeOtherReader, otherReaderEnvelope)
+	status, headers, body = authzScopeRead(t, client, otherReaderRequest)
+	if status != http.StatusOK || body != authzScopeBody || headers.Get("X-Tigris-Proxy-Signing-Keys") != "" {
+		t.Fatalf("authorized bucket-B cache fill: status=%d body=%q leaked_header=%q", status, body, headers.Get("X-Tigris-Proxy-Signing-Keys"))
+	}
+	if !env.WaitForCached(bucketB, authzScopeObject, 2*time.Second) || !env.AuthzCache.IsAuthorized(authzScopeOtherReader, bucketB) {
+		t.Fatal("other reader did not authorize and populate bucket B")
+	}
+	meta, found, err := env.Cache.GetMeta(context.Background(), bucketB, authzScopeObject)
+	if err != nil || !found || meta == nil || meta.IsPublicRead() {
+		t.Fatalf("bucket-B cache entry must remain private: found=%v meta=%v error=%v", found, meta, err)
+	}
+	otherReaderOriginGets := origin.otherReaderReads.Load()
+	status, headers, body = authzScopeRead(t, client, otherReaderRequest.Clone(context.Background()))
+	if status != http.StatusOK || headers.Get("X-Cache") != "HIT" || body != authzScopeBody || origin.otherReaderReads.Load() != otherReaderOriginGets {
+		t.Fatalf("authorized other-reader bucket-B cache hit: status=%d cache=%q body=%q origin GET delta=%d", status, headers.Get("X-Cache"), body, origin.otherReaderReads.Load()-otherReaderOriginGets)
+	}
+
+	readerOriginGets := origin.readerOtherBucketReads.Load()
+	status, headers, body = authzScopeRead(t, client, readerBRequest)
+	if status != http.StatusForbidden || strings.Contains(body, authzScopeBody) || origin.readerOtherBucketReads.Load() != readerOriginGets+1 {
+		t.Fatalf("reader A must reach origin and be denied in bucket B: status=%d cache=%q private_body=%v origin GET delta=%d", status, headers.Get("X-Cache"), strings.Contains(body, authzScopeBody), origin.readerOtherBucketReads.Load()-readerOriginGets)
+	}
+	if !env.AuthzCache.IsAuthorized(authzScopeReader, bucketA) || env.AuthzCache.IsAuthorized(authzScopeReader, bucketB) {
+		t.Fatalf("bucket-B denial changed bucket grants: A=%v B=%v", env.AuthzCache.IsAuthorized(authzScopeReader, bucketA), env.AuthzCache.IsAuthorized(authzScopeReader, bucketB))
 	}
 }
