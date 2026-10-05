@@ -52,9 +52,9 @@ func (f *transparentForwarder) interceptResponse(resp *http.Response, originalRe
 
 type readAuthorizationGrantContextKey struct{}
 
-// withReadAuthorizationGrant marks requests entering the dedicated GetObject
-// or HeadObject service path. Shared response interception cannot infer an S3
-// operation from the HTTP method alone because other operations use passthrough.
+// withReadAuthorizationGrant marks requests entering the GetObject or HeadObject
+// service path. The response interceptor checks the query before granting,
+// because fallback routes can send other S3 operations through these handlers.
 func withReadAuthorizationGrant(r *http.Request, method string) *http.Request {
 	if r.Method != method {
 		return r
@@ -64,6 +64,42 @@ func withReadAuthorizationGrant(r *http.Request, method string) *http.Request {
 		return r
 	}
 	return r.WithContext(context.WithValue(r.Context(), readAuthorizationGrantContextKey{}, true))
+}
+
+// isReadAuthorizationQuery accepts only selectors and authentication metadata
+// known not to select a different S3 operation. The basic object route also
+// receives unrecognized GET/HEAD subresources, so an unknown or malformed
+// query cannot prove that the origin authorized GetObject or HeadObject.
+func isReadAuthorizationQuery(rawQuery string) bool {
+	if rawQuery == "" {
+		return true
+	}
+
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return false
+	}
+
+	for key := range query {
+		switch key {
+		case "versionId", "partNumber", "response-cache-control", "response-content-disposition",
+			"response-content-encoding", "response-content-language", "response-content-type", "response-expires",
+			"X-Amz-Checksum-Mode", "x-amz-expected-bucket-owner", "x-amz-request-payer":
+			continue
+		}
+
+		allowedAuthOrSDKParam := false
+		for _, param := range originlessIgnoredParams {
+			if key == param {
+				allowedAuthOrSDKParam = true
+				break
+			}
+		}
+		if !allowedAuthOrSDKParam {
+			return false
+		}
+	}
+	return true
 }
 
 func hasReadAuthorizationGrant(r *http.Request) bool {
@@ -371,11 +407,12 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 }
 
 // grantReadAuthorization records bucket authorization only after an upstream
-// success from the dedicated client GetObject or HeadObject service path. The
-// request marker keeps other passthrough operations from sharing this grant.
+// success from a client GetObject or HeadObject. The service-path marker and
+// query classifier reject other operations that fall through to those handlers.
 func (f *transparentForwarder) grantReadAuthorization(resp *http.Response, r *http.Request) {
 	if f.validator == nil || f.keyUnwrapper == nil || f.authzCache == nil ||
-		resp.StatusCode < 200 || resp.StatusCode >= 300 || !hasReadAuthorizationGrant(r) {
+		resp.StatusCode < 200 || resp.StatusCode >= 300 || !hasReadAuthorizationGrant(r) ||
+		!isReadAuthorizationQuery(r.URL.RawQuery) {
 		return
 	}
 

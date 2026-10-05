@@ -38,6 +38,7 @@ type authzScopeOrigin struct {
 	envelopes map[string]string
 
 	writerReads            atomic.Int64
+	writerAttributes       atomic.Int64
 	readerReads            atomic.Int64
 	readerOtherBucketReads atomic.Int64
 	headReads              atomic.Int64
@@ -99,6 +100,18 @@ func (o *authzScopeOrigin) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "<InitiateMultipartUploadResult><UploadId>scope-upload</UploadId></InitiateMultipartUploadResult>")
+	case accessKey == authzScopeWriter && r.Method == http.MethodGet && r.URL.Path == objectPath && r.URL.Query().Has("attributes"):
+		o.writerAttributes.Add(1)
+		envelope := o.signingKeys(authzScopeWriter)
+		if envelope == "" {
+			authzScopeDeny(w)
+			return
+		}
+		w.Header().Set("X-Tigris-Proxy-Signing-Keys", envelope)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "<GetObjectAttributesOutput/>")
 	case accessKey == authzScopeWriter && r.Method == http.MethodGet && r.URL.Path == objectPath && r.URL.Query().Has("tagging"):
 		o.writerTags.Add(1)
 		envelope := o.signingKeys(authzScopeWriter)
@@ -305,6 +318,21 @@ func TestTransparentAuth_WriteOnlyMultipartDoesNotGrantCachedRead(t *testing.T) 
 	}
 	if env.AuthzCache.IsAuthorized(authzScopeWriter, authzScopeBucket) {
 		t.Fatal("successful object-tagging passthrough granted the writer cached-read access")
+	}
+
+	// GetObjectAttributes also uses GET, but its success does not prove that the
+	// client can read the object's body. The basic object route must not turn it
+	// into a bucket cache-read grant.
+	attributesRequest := authzScopeRequest(t, env.TAGServer.URL, http.MethodGet, path+"?attributes", authzScopeWriter, authzScopeWriterSecret)
+	attributesEnvelope, _ := authzScopeKeysForRequest(t, credentials, authzScopeWriter, attributesRequest)
+	origin.setSigningKeys(authzScopeWriter, attributesEnvelope)
+	attributesRequest.Header.Set("Cache-Control", "no-store")
+	status, headers, responseBody = authzScopeRead(t, client, attributesRequest)
+	if status != http.StatusOK || responseBody != "<GetObjectAttributesOutput/>" || headers.Get("X-Tigris-Proxy-Signing-Keys") != "" || origin.writerAttributes.Load() != 1 {
+		t.Fatalf("GetObjectAttributes: status=%d body=%q leaked_header=%q origin calls=%d", status, responseBody, headers.Get("X-Tigris-Proxy-Signing-Keys"), origin.writerAttributes.Load())
+	}
+	if env.AuthzCache.IsAuthorized(authzScopeWriter, authzScopeBucket) {
+		t.Fatal("successful GetObjectAttributes granted the writer cached-read access")
 	}
 
 	// Check that this request is locally verifiable from the keys learned above.
