@@ -85,6 +85,7 @@ func (cw *lazyCommitWriter) Write(p []byte) (int, error) {
 // Supports conditional requests (If-None-Match, If-Modified-Since).
 // Supports client-triggered cache revalidation via Cache-Control: no-cache/max-age=0.
 func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error {
+	r = withReadAuthorizationGrant(r, http.MethodGet)
 	if s.config.IsTiered() {
 		return s.handleTieredObject(w, r)
 	}

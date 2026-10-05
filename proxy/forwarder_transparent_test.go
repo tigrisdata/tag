@@ -1,6 +1,13 @@
 package proxy
 
 import (
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -8,6 +15,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tigrisdata/tag/auth"
 )
@@ -520,5 +528,132 @@ func TestTransparentForwarderSynchronousPathsKeepHeadersPrivate(t *testing.T) {
 				t.Error("upstream body did not observe the generated proxy header")
 			}
 		})
+	}
+}
+
+const transparentResponseTestSecret = "response-interceptor-test-secret"
+
+func transparentResponseTestEnvelope(t *testing.T, accessKey string, plaintext []byte) string {
+	t.Helper()
+	hash := sha256.Sum256([]byte(transparentResponseTestSecret))
+	block, err := aes.NewCipher(hash[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	raw := gcm.Seal(nonce, nonce, plaintext, []byte(accessKey))
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func transparentResponseTestRequest(t *testing.T, method, path, accessKey string) *http.Request {
+	t.Helper()
+	request, err := auth.NewRequestSigner("https://upstream.example.com", "us-east-1").SignRequest(
+		context.Background(), method, path, nil, "", accessKey, "client-secret", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request
+}
+
+func TestResponseInterceptorStripsSigningKeysOnFailureAndDisabledAuth(t *testing.T) {
+	const accessKey = "INTERCEPTORKEY"
+	entries, err := json.Marshal([]auth.SigningKeyEntry{{
+		Date:       "20250211",
+		Region:     "auto",
+		SigningKey: strings.Repeat("a", 64),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	validEnvelope := transparentResponseTestEnvelope(t, accessKey, entries)
+	wrongAADEnvelope := transparentResponseTestEnvelope(t, "OTHERACCESSKEY", entries)
+	corruptRaw, err := base64.StdEncoding.DecodeString(validEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corruptRaw[len(corruptRaw)-1] ^= 0x80
+	corruptEnvelope := base64.StdEncoding.EncodeToString(corruptRaw)
+	malformedEnvelope := transparentResponseTestEnvelope(t, accessKey, []byte("{"))
+	emptyEnvelope := transparentResponseTestEnvelope(t, accessKey, []byte("[]"))
+
+	tests := []struct {
+		name     string
+		status   int
+		envelope string
+		authOn   bool
+	}{
+		{name: "wrong AAD", status: http.StatusOK, envelope: wrongAADEnvelope, authOn: true},
+		{name: "corrupt ciphertext", status: http.StatusOK, envelope: corruptEnvelope, authOn: true},
+		{name: "malformed list", status: http.StatusOK, envelope: malformedEnvelope, authOn: true},
+		{name: "empty list", status: http.StatusOK, envelope: emptyEnvelope, authOn: true},
+		{name: "non-2xx response", status: http.StatusForbidden, envelope: validEnvelope, authOn: true},
+		{name: "local authentication disabled", status: http.StatusOK, envelope: validEnvelope, authOn: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			keys := auth.NewDerivedKeyStore(auth.DefaultDerivedKeyTTL)
+			authz := auth.NewAuthzCache(time.Minute)
+			fwd := &transparentForwarder{authzCache: authz}
+			if tt.authOn {
+				unwrapper, err := auth.NewKeyUnwrapper(transparentResponseTestSecret)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fwd.derivedKeyStore = keys
+				fwd.validator = auth.NewRequestValidator(keys)
+				fwd.keyUnwrapper = unwrapper
+			}
+			response := &http.Response{
+				StatusCode: tt.status,
+				Header:     http.Header{signingKeysHeader: []string{tt.envelope}},
+			}
+			fwd.interceptResponse(response, transparentResponseTestRequest(t, http.MethodPost, "/bucket/key?uploads", accessKey))
+
+			if got := response.Header.Get(signingKeysHeader); got != "" {
+				t.Fatalf("internal signing-keys header was not stripped: %q", got)
+			}
+			if keys.HasKey(accessKey) {
+				t.Fatal("failed, empty, non-2xx, or disabled response unexpectedly learned a signing key")
+			}
+			if authz.IsAuthorized(accessKey, "bucket") {
+				t.Fatal("passthrough response unexpectedly granted read authorization")
+			}
+		})
+	}
+}
+
+func TestSuccessfulObjectReadGrantsAuthorizationWithoutSigningKeyHeader(t *testing.T) {
+	const accessKey = "READWITHOUTKEYHEADER"
+	keys := auth.NewDerivedKeyStore(auth.DefaultDerivedKeyTTL)
+	authz := auth.NewAuthzCache(time.Minute)
+	unwrapper, err := auth.NewKeyUnwrapper(transparentResponseTestSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fwd := &transparentForwarder{
+		derivedKeyStore: keys,
+		validator:       auth.NewRequestValidator(keys),
+		keyUnwrapper:    unwrapper,
+		authzCache:      authz,
+	}
+	request := withReadAuthorizationGrant(transparentResponseTestRequest(t, http.MethodGet, "/bucket/key", accessKey), http.MethodGet)
+	response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}
+
+	fwd.interceptResponse(response, request)
+
+	if !authz.IsAuthorized(accessKey, "bucket") {
+		t.Fatal("successful client GetObject did not grant bucket authorization without a signing-keys header")
+	}
+	if keys.HasKey(accessKey) {
+		t.Fatal("read authorization unexpectedly created a signing key")
 	}
 }

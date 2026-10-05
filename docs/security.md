@@ -131,13 +131,13 @@ Request arrives at TAG
 
 ## Authorization Lifecycle
 
-Authorization decisions are cached per `(accessKey, bucket)` pair:
+Authorization decisions are cached per `(accessKey, bucket)` pair. TAG may learn signing keys from any successful response with the internal header. Those keys prove identity, not read permission. TAG grants bucket authorization only after a successful upstream `GetObject` or `HeadObject` response. Successful writes and other passthrough operations do not grant cached-read access.
 
-| Event                                | Action                                    |
-| ------------------------------------ | ----------------------------------------- |
-| Tigris returns 2xx with signing keys | `AuthzCache.Grant(accessKey, bucket)`     |
-| Tigris returns 403                   | `AuthzCache.Revoke(accessKey, bucket)`    |
-| TTL expires (10 min default)         | Entry removed, next request re-authorizes |
+| Event                                              | Action                                    |
+| -------------------------------------------------- | ----------------------------------------- |
+| Upstream 2xx to client `GetObject` or `HeadObject` | `AuthzCache.Grant(accessKey, bucket)`     |
+| Tigris returns 403                                 | `AuthzCache.Revoke(accessKey, bucket)`    |
+| TTL expires (10 min default)                       | Entry removed, next request re-authorizes |
 
 Authorization is strictly per-bucket. A client may have access to some buckets but not others, and TAG enforces this at the cache level.
 

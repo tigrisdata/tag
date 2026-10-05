@@ -841,6 +841,7 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 // Serves from cached metadata when available (no body fetch needed).
 // Supports cache revalidation via Cache-Control: no-cache/max-age=0.
 func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error {
+	r = withReadAuthorizationGrant(r, http.MethodHead)
 	if s.config.IsTiered() {
 		return s.handleTieredObject(w, r)
 	}

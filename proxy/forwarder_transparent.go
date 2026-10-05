@@ -41,11 +41,37 @@ func (f *transparentForwarder) initInterceptor() {
 }
 
 // interceptResponse is called by base forwarder methods after receiving the
-// upstream response but before headers are sent to the client. It extracts
-// signing keys from successful responses and revokes authZ on 403s.
+// upstream response but before headers are sent to the client. It learns
+// signing keys, grants authorization only for marked successful object reads,
+// and revokes authZ on 403s.
 func (f *transparentForwarder) interceptResponse(resp *http.Response, originalReq *http.Request) {
 	f.learnSigningKeys(resp, originalReq)
+	f.grantReadAuthorization(resp, originalReq)
 	f.handleAuthzRevocation(resp, originalReq)
+}
+
+type readAuthorizationGrantContextKey struct{}
+
+// withReadAuthorizationGrant marks requests entering the dedicated GetObject
+// or HeadObject service path. Shared response interception cannot infer an S3
+// operation from the HTTP method alone because other operations use passthrough.
+func withReadAuthorizationGrant(r *http.Request, method string) *http.Request {
+	if r.Method != method {
+		return r
+	}
+	bucket, key := ParseBucketKey(r)
+	if bucket == "" || key == "" {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), readAuthorizationGrantContextKey{}, true))
+}
+
+func hasReadAuthorizationGrant(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	marked, ok := r.Context().Value(readAuthorizationGrantContextKey{}).(bool)
+	return ok && marked
 }
 
 // shallowHeaderCopy gives the forwarded request its own header map while
@@ -286,6 +312,7 @@ func (f *transparentForwarder) DoRequestWithCreds(ctx context.Context, r *http.R
 
 // learnSigningKeys extracts and caches derived signing keys from the Tigris response.
 // The signing keys header is always stripped before the response reaches the client.
+// Learning identity keys does not grant authorization to read cached objects.
 func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Request) {
 	// Always strip the internal header, even when local auth is disabled.
 	headerVal := resp.Header.Get(signingKeysHeader)
@@ -329,7 +356,6 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 	}
 
 	bucket, _ := ParseBucketKey(r)
-	f.authzCache.Grant(authInfo.AccessKey, bucket)
 
 	if newKeys > 0 {
 		log.Debug().
@@ -341,6 +367,28 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 
 	metrics.ProxySigningKeysReceived.Inc()
 	metrics.DerivedKeyStoreSize.Set(float64(f.derivedKeyStore.Count()))
+	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
+}
+
+// grantReadAuthorization records bucket authorization only after an upstream
+// success from the dedicated client GetObject or HeadObject service path. The
+// request marker keeps other passthrough operations from sharing this grant.
+func (f *transparentForwarder) grantReadAuthorization(resp *http.Response, r *http.Request) {
+	if f.validator == nil || f.keyUnwrapper == nil || f.authzCache == nil ||
+		resp.StatusCode < 200 || resp.StatusCode >= 300 || !hasReadAuthorizationGrant(r) {
+		return
+	}
+
+	authInfo, err := auth.ParseAuthInfo(r)
+	if err != nil {
+		return
+	}
+	bucket, key := ParseBucketKey(r)
+	if bucket == "" || key == "" {
+		return
+	}
+
+	f.authzCache.Grant(authInfo.AccessKey, bucket)
 	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
 }
 
