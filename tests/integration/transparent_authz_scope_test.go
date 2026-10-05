@@ -212,6 +212,22 @@ func authzScopeRead(t *testing.T, client *http.Client, request *http.Request) (i
 	return response.StatusCode, response.Header, string(body)
 }
 
+func waitForAuthzScopeCache(env *TestEnvironment, bucket, key string, timeout time.Duration) bool {
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(timeout)
+	for {
+		if env.IsCached(bucket, key) {
+			return true
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline:
+			return false
+		}
+	}
+}
+
 func TestTransparentAuth_WriteOnlyMultipartDoesNotGrantCachedRead(t *testing.T) {
 	env, origin, credentials := newAuthzScopeTestEnvironment(t, authzScopeBucket)
 	defer env.Close()
@@ -232,7 +248,7 @@ func TestTransparentAuth_WriteOnlyMultipartDoesNotGrantCachedRead(t *testing.T) 
 	if status != http.StatusOK || responseBody != authzScopeBody || headers.Get("X-Tigris-Proxy-Signing-Keys") != "" {
 		t.Fatalf("authorized reader GetObject: status=%d body=%q leaked_header=%q", status, responseBody, headers.Get("X-Tigris-Proxy-Signing-Keys"))
 	}
-	if !env.WaitForCached(authzScopeBucket, authzScopeObject, 2*time.Second) {
+	if !waitForAuthzScopeCache(env, authzScopeBucket, authzScopeObject, 2*time.Second) {
 		t.Fatal("authorized reader did not populate the private object cache")
 	}
 	meta, found, err := env.Cache.GetMeta(context.Background(), authzScopeBucket, authzScopeObject)
@@ -346,7 +362,7 @@ func TestTransparentAuth_AuthzGrantRemainsBucketScoped(t *testing.T) {
 	if status != http.StatusOK || body != authzScopeBody || headers.Get("X-Tigris-Proxy-Signing-Keys") != "" {
 		t.Fatalf("authorized bucket-A GetObject: status=%d body=%q leaked_header=%q", status, body, headers.Get("X-Tigris-Proxy-Signing-Keys"))
 	}
-	if !env.WaitForCached(bucketA, authzScopeObject, 2*time.Second) {
+	if !waitForAuthzScopeCache(env, bucketA, authzScopeObject, 2*time.Second) {
 		t.Fatal("reader A did not populate bucket A")
 	}
 	if !env.AuthzCache.IsAuthorized(authzScopeReader, bucketA) || env.AuthzCache.IsAuthorized(authzScopeReader, bucketB) {
@@ -362,7 +378,7 @@ func TestTransparentAuth_AuthzGrantRemainsBucketScoped(t *testing.T) {
 	if status != http.StatusOK || body != authzScopeBody || headers.Get("X-Tigris-Proxy-Signing-Keys") != "" {
 		t.Fatalf("authorized bucket-B cache fill: status=%d body=%q leaked_header=%q", status, body, headers.Get("X-Tigris-Proxy-Signing-Keys"))
 	}
-	if !env.WaitForCached(bucketB, authzScopeObject, 2*time.Second) || !env.AuthzCache.IsAuthorized(authzScopeOtherReader, bucketB) {
+	if !waitForAuthzScopeCache(env, bucketB, authzScopeObject, 2*time.Second) || !env.AuthzCache.IsAuthorized(authzScopeOtherReader, bucketB) {
 		t.Fatal("other reader did not authorize and populate bucket B")
 	}
 	meta, found, err := env.Cache.GetMeta(context.Background(), bucketB, authzScopeObject)
