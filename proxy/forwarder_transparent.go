@@ -42,28 +42,12 @@ func (f *transparentForwarder) initInterceptor() {
 
 // interceptResponse is called by base forwarder methods after receiving the
 // upstream response but before headers are sent to the client. It learns
-// signing keys, grants authorization only for marked successful object reads,
-// and revokes authZ on 403s.
+// signing keys, grants authorization only for successful object reads, and
+// revokes authZ on 403s.
 func (f *transparentForwarder) interceptResponse(resp *http.Response, originalReq *http.Request) {
 	f.learnSigningKeys(resp, originalReq)
 	f.grantReadAuthorization(resp, originalReq)
 	f.handleAuthzRevocation(resp, originalReq)
-}
-
-type readAuthorizationGrantContextKey struct{}
-
-// withReadAuthorizationGrant marks requests entering the GetObject or HeadObject
-// service path. The response interceptor checks the query before granting,
-// because fallback routes can send other S3 operations through these handlers.
-func withReadAuthorizationGrant(r *http.Request, method string) *http.Request {
-	if r.Method != method {
-		return r
-	}
-	bucket, key := ParseBucketKey(r)
-	if bucket == "" || key == "" {
-		return r
-	}
-	return r.WithContext(context.WithValue(r.Context(), readAuthorizationGrantContextKey{}, true))
 }
 
 // isReadAuthorizationQuery accepts only selectors and authentication metadata
@@ -100,14 +84,6 @@ func isReadAuthorizationQuery(rawQuery string) bool {
 		}
 	}
 	return true
-}
-
-func hasReadAuthorizationGrant(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
-	marked, ok := r.Context().Value(readAuthorizationGrantContextKey{}).(bool)
-	return ok && marked
 }
 
 // shallowHeaderCopy gives the forwarded request its own header map while
@@ -407,12 +383,12 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 }
 
 // grantReadAuthorization records bucket authorization only after an upstream
-// success from a client GetObject or HeadObject. The service-path marker and
-// query classifier reject other operations that fall through to those handlers.
+// success from a client GetObject or HeadObject. The method, object path, and
+// query classifier reject other operations that can reach the basic object route.
 func (f *transparentForwarder) grantReadAuthorization(resp *http.Response, r *http.Request) {
 	if f.validator == nil || f.keyUnwrapper == nil || f.authzCache == nil ||
-		resp.StatusCode < 200 || resp.StatusCode >= 300 || !hasReadAuthorizationGrant(r) ||
-		!isReadAuthorizationQuery(r.URL.RawQuery) {
+		resp.StatusCode < 200 || resp.StatusCode >= 300 || r == nil ||
+		(r.Method != http.MethodGet && r.Method != http.MethodHead) || !isReadAuthorizationQuery(r.URL.RawQuery) {
 		return
 	}
 

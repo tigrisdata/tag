@@ -645,7 +645,7 @@ func TestSuccessfulObjectReadGrantsAuthorizationWithoutSigningKeyHeader(t *testi
 		keyUnwrapper:    unwrapper,
 		authzCache:      authz,
 	}
-	request := withReadAuthorizationGrant(transparentResponseTestRequest(t, http.MethodGet, "/bucket/key", accessKey), http.MethodGet)
+	request := transparentResponseTestRequest(t, http.MethodGet, "/bucket/key", accessKey)
 	response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}
 
 	fwd.interceptResponse(response, request)
@@ -690,12 +690,5 @@ func TestReadAuthorizationQueryClassifierAcceptsOnlyObjectReadQueries(t *testing
 				t.Fatalf("read authorization query = %v, want %v for %q", got, tt.want, tt.query)
 			}
 		})
-	}
-}
-
-func TestReadAuthorizationMarkerRequiresMatchingMethod(t *testing.T) {
-	request := httptest.NewRequest(http.MethodPost, "/bucket/key?uploads", nil)
-	if hasReadAuthorizationGrant(withReadAuthorizationGrant(request, http.MethodGet)) {
-		t.Fatal("non-GetObject method received the read-authorization marker")
 	}
 }
