@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,33 +42,47 @@ const (
 // initiate multipart uploads and read object tags, but denies its GetObject.
 // The other two identities can read the private object body or metadata only.
 type authzScopeFixture struct {
-	origin  *httptest.Server
-	gateway *httptest.Server
-	client  *http.Client
-	cache   *cache.Cache
-	keys    *auth.DerivedKeyStore
-	authz   *auth.AuthzCache
+	origin      *httptest.Server
+	gateway     *httptest.Server
+	client      *http.Client
+	cache       *cache.Cache
+	keys        *auth.DerivedKeyStore
+	authz       *auth.AuthzCache
+	credentials *auth.CredentialStore
+	envelopeMu  sync.RWMutex
+	envelopes   map[string]string
+	writerDates []string
 
 	writerReads  atomic.Int64
 	readerReads  atomic.Int64
 	headReads    atomic.Int64
 	writerTags   atomic.Int64
 	readerDenied atomic.Bool
-
-	writerDates []string
 }
 
-func authzScopeEnvelope(tb testing.TB, credentials *auth.CredentialStore, accessKey string) (string, []string) {
+func authzScopeEnvelopeForRequest(tb testing.TB, credentials *auth.CredentialStore, accessKey string, request *http.Request) (string, []string) {
+	tb.Helper()
+	authInfo, err := auth.ParseAuthInfo(request)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	date, err := time.Parse("20060102", authInfo.Date)
+	if err != nil {
+		tb.Fatalf("parse signing date %q: %v", authInfo.Date, err)
+	}
+	dates := []string{authInfo.Date, date.Add(-24 * time.Hour).Format("20060102")}
+	return authzScopeEnvelopeForDates(tb, credentials, accessKey, authInfo.Region, dates), dates
+}
+
+func authzScopeEnvelopeForDates(tb testing.TB, credentials *auth.CredentialStore, accessKey, region string, dates []string) string {
 	tb.Helper()
 	var entries []auth.SigningKeyEntry
-	now := time.Now().UTC()
-	dates := []string{now.Format("20060102"), now.Add(-24 * time.Hour).Format("20060102")}
 	for _, date := range dates {
-		key, err := credentials.GetSigningKey(accessKey, date, "auto")
+		key, err := credentials.GetSigningKey(accessKey, date, region)
 		if err != nil {
 			tb.Fatal(err)
 		}
-		entries = append(entries, auth.SigningKeyEntry{Date: date, Region: "auto", SigningKey: hex.EncodeToString(key)})
+		entries = append(entries, auth.SigningKeyEntry{Date: date, Region: region, SigningKey: hex.EncodeToString(key)})
 	}
 	plaintext, err := json.Marshal(entries)
 	if err != nil {
@@ -87,21 +102,36 @@ func authzScopeEnvelope(tb testing.TB, credentials *auth.CredentialStore, access
 		tb.Fatal(err)
 	}
 	raw := gcm.Seal(nonce, nonce, plaintext, []byte(accessKey))
-	return base64.StdEncoding.EncodeToString(raw), dates
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func (f *authzScopeFixture) setSigningKeys(accessKey, envelope string, dates []string) {
+	f.envelopeMu.Lock()
+	f.envelopes[accessKey] = envelope
+	if accessKey == authzScopeWriter {
+		f.writerDates = append([]string(nil), dates...)
+	}
+	f.envelopeMu.Unlock()
+}
+
+func (f *authzScopeFixture) signingKeys(accessKey string) string {
+	f.envelopeMu.RLock()
+	defer f.envelopeMu.RUnlock()
+	return f.envelopes[accessKey]
 }
 
 func newAuthzScopeFixture(tb testing.TB, authzTTL time.Duration) *authzScopeFixture {
 	tb.Helper()
-	fixture := &authzScopeFixture{client: &http.Client{Timeout: 5 * time.Second}}
-	credentials := auth.NewCredentialStore()
+	fixture := &authzScopeFixture{
+		client:      &http.Client{Timeout: 5 * time.Second},
+		credentials: auth.NewCredentialStore(),
+		envelopes:   make(map[string]string),
+	}
+	credentials := fixture.credentials
 	credentials.AddCredential(authzScopeWriter, authzScopeWriterSecret)
 	credentials.AddCredential(authzScopeReader, authzScopeReaderSecret)
 	credentials.AddCredential(authzScopeHeadReader, authzScopeHeadSecret)
 	originValidator := auth.NewRequestValidator(credentials)
-	writerEnvelope, writerDates := authzScopeEnvelope(tb, credentials, authzScopeWriter)
-	fixture.writerDates = writerDates
-	readerEnvelope, _ := authzScopeEnvelope(tb, credentials, authzScopeReader)
-	headEnvelope, _ := authzScopeEnvelope(tb, credentials, authzScopeHeadReader)
 
 	writeObject := func(w http.ResponseWriter, body bool, envelope string) {
 		w.Header().Set("ETag", `"scope-etag"`)
@@ -133,13 +163,18 @@ func newAuthzScopeFixture(tb testing.TB, authzTTL time.Duration) *authzScopeFixt
 
 		switch {
 		case accessKey == authzScopeWriter && r.Method == http.MethodPost && r.URL.Path == objectPath && r.URL.Query().Has("uploads"):
-			w.Header().Set("X-Tigris-Proxy-Signing-Keys", writerEnvelope)
+			envelope := fixture.signingKeys(authzScopeWriter)
+			if envelope == "" {
+				writeDenied(w)
+				return
+			}
+			w.Header().Set("X-Tigris-Proxy-Signing-Keys", envelope)
 			w.Header().Set("Content-Type", "application/xml")
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, "<InitiateMultipartUploadResult><UploadId>scope-upload</UploadId></InitiateMultipartUploadResult>")
 		case accessKey == authzScopeWriter && r.Method == http.MethodGet && r.URL.Path == objectPath && r.URL.Query().Has("tagging"):
 			fixture.writerTags.Add(1)
-			w.Header().Set("X-Tigris-Proxy-Signing-Keys", writerEnvelope)
+			w.Header().Set("X-Tigris-Proxy-Signing-Keys", fixture.signingKeys(authzScopeWriter))
 			w.Header().Set("Content-Type", "application/xml")
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, "<Tagging/>")
@@ -152,10 +187,20 @@ func newAuthzScopeFixture(tb testing.TB, authzTTL time.Duration) *authzScopeFixt
 				writeDenied(w)
 				return
 			}
-			writeObject(w, true, readerEnvelope)
+			envelope := fixture.signingKeys(authzScopeReader)
+			if envelope == "" {
+				writeDenied(w)
+				return
+			}
+			writeObject(w, true, envelope)
 		case r.URL.Path == objectPath && r.URL.RawQuery == "" && r.Method == http.MethodHead && accessKey == authzScopeHeadReader:
 			fixture.headReads.Add(1)
-			writeObject(w, false, headEnvelope)
+			envelope := fixture.signingKeys(authzScopeHeadReader)
+			if envelope == "" {
+				writeDenied(w)
+				return
+			}
+			writeObject(w, false, envelope)
 		default:
 			writeDenied(w)
 		}
@@ -239,8 +284,13 @@ func TestTransparentPassthroughWriteDoesNotGrantPrivateRead(t *testing.T) {
 	}
 
 	// A separate authorized reader fills a private cache entry using the
-	// ordinary routed GetObject path.
-	status, readerHeaders, body := authzScopeRead(t, fixture.client, authzScopeRequest(t, fixture.gateway.URL, http.MethodGet, path, authzScopeReader, authzScopeReaderSecret))
+	// ordinary routed GetObject path. Bind the response keys to this exact
+	// request date so a midnight crossing cannot turn the cache-hit control
+	// into an unknown-key forward.
+	readerRequest := authzScopeRequest(t, fixture.gateway.URL, http.MethodGet, path, authzScopeReader, authzScopeReaderSecret)
+	readerEnvelope, readerDates := authzScopeEnvelopeForRequest(t, fixture.credentials, authzScopeReader, readerRequest)
+	fixture.setSigningKeys(authzScopeReader, readerEnvelope, readerDates)
+	status, readerHeaders, body := authzScopeRead(t, fixture.client, readerRequest)
 	if status != http.StatusOK || body != authzScopeBody {
 		t.Fatalf("authorized reader GetObject: status=%d body=%q", status, body)
 	}
@@ -251,26 +301,46 @@ func TestTransparentPassthroughWriteDoesNotGrantPrivateRead(t *testing.T) {
 
 	// The successful reader GET grants access to an authorized object-cache hit.
 	readerOriginGets := fixture.readerReads.Load()
-	status, headers, body := authzScopeRead(t, fixture.client, authzScopeRequest(t, fixture.gateway.URL, http.MethodGet, path, authzScopeReader, authzScopeReaderSecret))
+	status, headers, body := authzScopeRead(t, fixture.client, readerRequest.Clone(context.Background()))
 	if status != http.StatusOK || headers.Get("X-Cache") != "HIT" || body != authzScopeBody || fixture.readerReads.Load() != readerOriginGets {
 		t.Fatalf("authorized reader cache hit: status=%d cache=%q body=%q origin GET delta=%d", status, headers.Get("X-Cache"), body, fixture.readerReads.Load()-readerOriginGets)
 	}
 
 	// A separate HeadObject-only identity earns a grant from its own successful
 	// HEAD, then may use the cached object's metadata without contacting origin.
-	status, headers, headBody := authzScopeRead(t, fixture.client, authzScopeRequest(t, fixture.gateway.URL, http.MethodHead, path, authzScopeHeadReader, authzScopeHeadSecret))
+	headRequest := authzScopeRequest(t, fixture.gateway.URL, http.MethodHead, path, authzScopeHeadReader, authzScopeHeadSecret)
+	headEnvelope, headDates := authzScopeEnvelopeForRequest(t, fixture.credentials, authzScopeHeadReader, headRequest)
+	fixture.setSigningKeys(authzScopeHeadReader, headEnvelope, headDates)
+	status, headers, headBody := authzScopeRead(t, fixture.client, headRequest)
 	if status != http.StatusOK || headBody != "" || headers.Get("X-Tigris-Proxy-Signing-Keys") != "" || headers.Get("Content-Length") != "31" || !fixture.authz.IsAuthorized(authzScopeHeadReader, authzScopeBucket) {
 		t.Fatalf("authorized HeadObject grant: status=%d body=%q content_length=%q leaked_header=%q grant=%v", status, headBody, headers.Get("Content-Length"), headers.Get("X-Tigris-Proxy-Signing-Keys"), fixture.authz.IsAuthorized(authzScopeHeadReader, authzScopeBucket))
 	}
 	headOriginGets := fixture.headReads.Load()
-	status, headers, headBody = authzScopeRead(t, fixture.client, authzScopeRequest(t, fixture.gateway.URL, http.MethodHead, path, authzScopeHeadReader, authzScopeHeadSecret))
+	status, headers, headBody = authzScopeRead(t, fixture.client, headRequest.Clone(context.Background()))
 	if status != http.StatusOK || headBody != "" || headers.Get("Content-Length") != "31" || headers.Get("X-Cache") != "HIT" || fixture.headReads.Load() != headOriginGets {
 		t.Fatalf("authorized HeadObject cache hit: status=%d body=%q cache=%q origin HEAD delta=%d", status, headBody, headers.Get("X-Cache"), fixture.headReads.Load()-headOriginGets)
 	}
 
+	// Sign the writer's later read before its multipart upload, then put the
+	// matching date window in the upstream key reply. The local key check below
+	// proves the grant assertion never passes merely because its key is stale.
+	writerReadRequest := authzScopeRequest(t, fixture.gateway.URL, http.MethodGet, path, authzScopeWriter, authzScopeWriterSecret)
+	writeRequest := authzScopeRequest(t, fixture.gateway.URL, http.MethodPost, path+"?uploads", authzScopeWriter, authzScopeWriterSecret)
+	writeAuthInfo, err := auth.ParseAuthInfo(writeRequest)
+	if err != nil {
+		t.Fatalf("parse writer InitiateMultipartUpload signature: %v", err)
+	}
+	writeDate, err := time.Parse("20060102", writeAuthInfo.Date)
+	if err != nil {
+		t.Fatalf("parse writer signing date %q: %v", writeAuthInfo.Date, err)
+	}
+	writerDates := []string{writeAuthInfo.Date, writeDate.Add(-24 * time.Hour).Format("20060102")}
+	writerEnvelope := authzScopeEnvelopeForDates(t, fixture.credentials, authzScopeWriter, writeAuthInfo.Region, writerDates)
+	fixture.setSigningKeys(authzScopeWriter, writerEnvelope, writerDates)
+
 	// A successful multipart-initiation reply still teaches both signing keys,
 	// but a write does not create a read-authorization grant.
-	status, headers, writeBody := authzScopeRead(t, fixture.client, authzScopeRequest(t, fixture.gateway.URL, http.MethodPost, path+"?uploads", authzScopeWriter, authzScopeWriterSecret))
+	status, headers, writeBody := authzScopeRead(t, fixture.client, writeRequest)
 	if status != http.StatusOK || writeBody != "<InitiateMultipartUploadResult><UploadId>scope-upload</UploadId></InitiateMultipartUploadResult>" || headers.Get("X-Tigris-Proxy-Signing-Keys") != "" {
 		t.Fatalf("multipart initiation response: status=%d body=%q leaked_header=%q", status, writeBody, headers.Get("X-Tigris-Proxy-Signing-Keys"))
 	}
@@ -296,8 +366,11 @@ func TestTransparentPassthroughWriteDoesNotGrantPrivateRead(t *testing.T) {
 
 	// The writer's next valid GetObject must reach origin and preserve its 403;
 	// no private cached bytes may be returned.
+	if _, err := auth.NewRequestValidator(fixture.keys).ValidateRequest(writerReadRequest); err != nil {
+		t.Fatalf("multipart response keys must validate the writer's exact GetObject signature: %v", err)
+	}
 	writerOriginGets := fixture.writerReads.Load()
-	status, headers, body = authzScopeRead(t, fixture.client, authzScopeRequest(t, fixture.gateway.URL, http.MethodGet, path, authzScopeWriter, authzScopeWriterSecret))
+	status, headers, body = authzScopeRead(t, fixture.client, writerReadRequest)
 	if status != http.StatusForbidden || strings.Contains(body, authzScopeBody) || fixture.writerReads.Load() != writerOriginGets+1 {
 		t.Errorf("writer GetObject must reach origin and be denied: status=%d cache=%q private_body=%v origin GET delta=%d", status, headers.Get("X-Cache"), strings.Contains(body, authzScopeBody), fixture.writerReads.Load()-writerOriginGets)
 	}
@@ -306,7 +379,10 @@ func TestTransparentPassthroughWriteDoesNotGrantPrivateRead(t *testing.T) {
 func TestTransparentReadGrantIsRevokedAfterUpstream403(t *testing.T) {
 	fixture := newAuthzScopeFixture(t, time.Minute)
 	path := "/" + authzScopeBucket + "/" + authzScopeObject
-	status, _, body := authzScopeRead(t, fixture.client, authzScopeRequest(t, fixture.gateway.URL, http.MethodGet, path, authzScopeReader, authzScopeReaderSecret))
+	readerRequest := authzScopeRequest(t, fixture.gateway.URL, http.MethodGet, path, authzScopeReader, authzScopeReaderSecret)
+	readerEnvelope, readerDates := authzScopeEnvelopeForRequest(t, fixture.credentials, authzScopeReader, readerRequest)
+	fixture.setSigningKeys(authzScopeReader, readerEnvelope, readerDates)
+	status, _, body := authzScopeRead(t, fixture.client, readerRequest)
 	if status != http.StatusOK || body != authzScopeBody || !fixture.authz.IsAuthorized(authzScopeReader, authzScopeBucket) {
 		t.Fatalf("initial authorized read: status=%d grant=%v", status, fixture.authz.IsAuthorized(authzScopeReader, authzScopeBucket))
 	}
