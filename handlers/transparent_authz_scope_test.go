@@ -209,7 +209,9 @@ func authzScopeRead(tb testing.TB, client *http.Client, request *http.Request) (
 
 func requirePrivateCacheEntry(tb testing.TB, fixture *authzScopeFixture) {
 	tb.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	timeout := time.After(2 * time.Second)
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
 	for {
 		meta, found, err := fixture.cache.GetMeta(context.Background(), authzScopeBucket, authzScopeObject)
 		if err == nil && found && meta != nil {
@@ -218,10 +220,11 @@ func requirePrivateCacheEntry(tb testing.TB, fixture *authzScopeFixture) {
 			}
 			return
 		}
-		if time.Now().After(deadline) {
+		select {
+		case <-timeout:
 			tb.Fatal("authorized reader's ordinary GET did not populate private cache metadata")
+		case <-poll.C:
 		}
-		time.Sleep(time.Millisecond)
 	}
 }
 
