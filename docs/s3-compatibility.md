@@ -80,6 +80,7 @@ Key caching behaviors:
 
 - **Request coalescing** — Multiple concurrent GETs for the same object are coalesced into a single upstream fetch using a broadcast/subscriber pattern.
 - **Range requests** — If the full object is cached, range requests are served from cache. On a range cache miss, the range is served directly from Tigris while a background fetch populates the cache with the full object.
+- **Incomplete cache ranges** — TAG checks that a cached range supplies the requested byte count. A committed block GET can recover its unwritten suffix only when the upstream ETag matches; a changed ETag is rejected. A whole-object cached Range response commits after its first byte and cannot be restarted; a later short read returns a handler error, and the 206 body may end before Content-Length. Client write failures are not retried upstream.
 - **Conditional requests** — `If-None-Match` and `If-Modified-Since` are evaluated against cached metadata and can return 304 without hitting Tigris.
 - **Write-through invalidation** — PUT, DELETE, CopyObject, and DeleteObjects invalidate the cache _before_ forwarding to Tigris to prevent stale reads.
 - **Tombstone protection** — A short-lived tombstone is written on DELETE to prevent in-flight background cache writes from resurrecting deleted objects.
