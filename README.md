@@ -101,7 +101,8 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 - Objects with `Cache-Control: no-store` or `private` are not cached
 - Among cacheable objects (within `size_threshold`), those at or above `block_size` are cached as fixed-size blocks (block caching, on by default), so a range read fetches only the covering blocks; smaller objects are whole-cached
 - Set `block_caching_enabled: false` to cache whole objects instead — a range request then triggers a background fetch of the full object (if within threshold)
-- Cached range reads are checked against the requested byte count. A committed block GET can recover an unwritten suffix only from the same ETag; a short whole-object Range response returns a handler error and may end before its advertised length
+- Cached range reads are checked against the requested byte count. A committed block GET can recover an unwritten suffix only from the same ETag
+- If a committed block GET has a changed-ETag suffix, or a whole-object Range read is short, TAG keeps the sent status and Content-Length, returns a handler error, and may end with only the cached prefix; client write failures stop without an upstream retry
 - PUT/DELETE operations invalidate the cache entry
 
 See [docs/cache-control.md](docs/cache-control.md) for detailed cache control and revalidation documentation. For tuning and sizing block caching in production, see [docs/deploy.md](docs/deploy.md#block-aligned-caching).
