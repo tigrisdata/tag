@@ -725,10 +725,13 @@ func (s *Service) serveRangeFromCache(
 	writeCacheStatus(w, XCacheHit)
 	w.WriteHeader(http.StatusPartialContent)
 
-	// Stream range from cache using counting writer to track actual bytes
+	// Stream range from cache using counting writer to track actual bytes. Stop immediately
+	// on a client write failure; continuing could drop the first byte and still look successful.
 	cw := &countingWriter{w: w}
-	cw.Write(firstByte[:n])
-	_, copyErr := io.Copy(cw, pr)
+	_, copyErr := cw.Write(firstByte[:n])
+	if copyErr == nil {
+		_, copyErr = io.Copy(cw, pr)
+	}
 	pr.Close()
 
 	// Track bytes out (even on error, some bytes may have been written)
@@ -737,15 +740,16 @@ func (s *Service) serveRangeFromCache(
 	}
 
 	if copyErr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, copyErr, time.Since(startTime).Seconds())
 		log.Warn().Err(copyErr).Str("bucket", bucket).Str("key", key).
 			Int64("start", rng.start).Int64("end", rng.end).
 			Msg("Failed to stream range from cache")
-		// Headers already sent, can't return error to client
+		// Headers already sent, can't replace the partial response with an error response.
 		return true, copyErr
 	}
 
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 

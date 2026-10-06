@@ -356,7 +356,6 @@ func (s *Service) serveFromCache(
 	// pipe and a second copy.
 	cw := &lazyCommitWriter{w: w, meta: meta}
 	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), cw)
-	status := "success"
 	if bodyErr != nil {
 		if !cw.committed {
 			return fmt.Errorf("cache body unavailable: %w", bodyErr)
@@ -367,14 +366,13 @@ func (s *Service) serveFromCache(
 		// however, so record the request as an error.
 		log.Warn().Err(bodyErr).Str("bucket", bucket).Str("key", key).
 			Msg("Failed to stream cache body after headers committed")
-		status = "error"
 	}
 	if !cw.committed {
 		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
 	}
 
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-	metrics.RecordRequest("GetObject", status, metrics.SourceLocal, time.Since(start).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, bodyErr, time.Since(start).Seconds())
 	return nil
 }
 

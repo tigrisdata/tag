@@ -206,10 +206,11 @@ func (s *Service) serveRangeFromBlockCache(
 	w.WriteHeader(http.StatusPartialContent)
 
 	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng.start, rng.end); berr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
 	}
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -371,10 +372,11 @@ func (s *Service) serveAssembledRange(
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 	}
 	if werr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, werr, time.Since(startTime).Seconds())
 		return true, werr
 	}
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	// A parquet reader's trailer probe is a few bytes, so it is served here rather
 	// than by streamBlockRange — this, not the streaming path, is where the footer
 	// signal actually arrives for a reader opening a file.
@@ -872,9 +874,10 @@ func (s *Service) serveFullObjectFromBlockCache(
 	w.WriteHeader(meta.StatusCode)
 
 	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, 0, meta.ContentLength-1); berr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
 	}
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -962,9 +965,10 @@ func (s *Service) serveCompleteFromBlocks(
 		}
 	}
 	if berr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
 	}
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
