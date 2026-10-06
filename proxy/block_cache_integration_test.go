@@ -15,6 +15,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	cacheclient "github.com/tigrisdata/ocache/client"
+	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
@@ -156,6 +157,67 @@ func newBlockServiceWithBudget(t *testing.T, mock *blockMockForwarder, blockSize
 	cfg.Cache.MaxPopulateMemoryBytes = budget
 	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
 	return NewService(mock, c, cfg), c
+}
+
+type rangeTestUpstream struct {
+	requests   atomic.Int32
+	rangeCalls atomic.Int32
+	lastRange  atomic.Value
+	invalid    atomic.Bool
+}
+
+func newRangeTestUpstream(t *testing.T, bucket, key string, object []byte, etag string) (*httptest.Server, *rangeTestUpstream) {
+	t.Helper()
+	state := &rangeTestUpstream{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		state.requests.Add(1)
+		if r.Method != http.MethodGet || r.URL.Path != "/"+bucket+"/"+key {
+			state.invalid.Store(true)
+			http.Error(w, "unexpected upstream request", http.StatusBadRequest)
+			return
+		}
+		if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+			state.rangeCalls.Add(1)
+			state.lastRange.Store(rangeHeader)
+			var start, end int64
+			if count, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil || count != 2 || start < 0 || end < start || end >= int64(len(object)) {
+				state.invalid.Store(true)
+				http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			body := object[start : end+1]
+			w.Header().Set("ETag", etag)
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(object)))
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.WriteHeader(http.StatusPartialContent)
+			if _, err := w.Write(body); err != nil {
+				state.invalid.Store(true)
+			}
+			return
+		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(object)))
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write(object); err != nil {
+			state.invalid.Store(true)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server, state
+}
+
+func newHTTPRangeService(t *testing.T, endpoint string, blockCaching bool) (*Service, *cache.Cache) {
+	t.Helper()
+	cfg := config.NewDefault()
+	cfg.Upstream.Endpoint = endpoint
+	cfg.Cache.SetBlockCachingEnabled(blockCaching)
+	if blockCaching {
+		cfg.Cache.BlockSize = 4
+		cfg.Cache.SizeThreshold = 1 << 20
+	}
+	store := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	forwarder := NewForwarder(nil, endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, auth.NewProxySigner("test-proxy-access", "test-proxy-secret"), nil)
+	return NewService(forwarder, store, cfg), store
 }
 
 // Cold range miss forwards from upstream, then block-populates in the background; a
@@ -1634,8 +1696,8 @@ func seedTwoBlockCompleteEntryWithShortTail(t *testing.T, c *cache.Cache) {
 // unwritten suffix and complete it only when the upstream ETag still matches.
 func TestBlockCache_ShortPositiveReadRecoversSameETagRemainder(t *testing.T) {
 	object := []byte("ABCDEFGH")
-	mock := newBlockMock(object, `"v1"`)
-	svc, c := newBlockService(t, mock)
+	server, upstream := newRangeTestUpstream(t, wowBucket, wowKey, object, `"v1"`)
+	svc, c := newHTTPRangeService(t, server.URL, true)
 	seedTwoBlockCompleteEntryWithShortTail(t, c)
 
 	beforeSuccesses := requestCount(t, "success")
@@ -1654,8 +1716,13 @@ func TestBlockCache_ShortPositiveReadRecoversSameETagRemainder(t *testing.T) {
 	if got := w.Header().Get(XCacheHeader); got != XCacheHit {
 		t.Errorf("%s = %q, want %q", XCacheHeader, got, XCacheHit)
 	}
-	if got := mock.blockGets.Load(); got != 1 {
-		t.Errorf("same-ETag suffix requests = %d, want exactly 1", got)
+	if got := upstream.rangeCalls.Load(); got != 1 {
+		t.Errorf("same-ETag suffix HTTP requests = %d, want exactly 1", got)
+	} else if got := upstream.lastRange.Load(); got != "bytes=6-7" {
+		t.Errorf("same-ETag upstream Range = %v, want bytes=6-7", got)
+	}
+	if got := upstream.requests.Load(); got != 1 || upstream.invalid.Load() {
+		t.Errorf("upstream requests=%d invalid=%t, want one valid suffix request", got, upstream.invalid.Load())
 	}
 	if got := requestCount(t, "success"); got != beforeSuccesses+1 {
 		t.Errorf("success requests = %v, want %v", got, beforeSuccesses+1)
@@ -1669,8 +1736,8 @@ func TestBlockCache_ShortPositiveReadRecoversSameETagRemainder(t *testing.T) {
 // ETag. A changed upstream version is surfaced as an error and its body is never
 // appended to the already-committed response.
 func TestBlockCache_ShortPositiveReadRejectsChangedETagRemainder(t *testing.T) {
-	mock := newBlockMock([]byte("abcdefgh"), `"v2"`)
-	svc, c := newBlockService(t, mock)
+	server, upstream := newRangeTestUpstream(t, wowBucket, wowKey, []byte("abcdefgh"), `"v2"`)
+	svc, c := newHTTPRangeService(t, server.URL, true)
 	seedTwoBlockCompleteEntryWithShortTail(t, c)
 
 	beforeSuccesses := requestCount(t, "success")
@@ -1686,8 +1753,13 @@ func TestBlockCache_ShortPositiveReadRejectsChangedETagRemainder(t *testing.T) {
 	if got := w.Header().Get("Content-Length"); got != "8" {
 		t.Errorf("Content-Length = %q, want 8", got)
 	}
-	if got := mock.blockGets.Load(); got != 1 {
-		t.Errorf("changed-ETag suffix requests = %d, want exactly 1", got)
+	if got := upstream.rangeCalls.Load(); got != 1 {
+		t.Errorf("changed-ETag suffix HTTP requests = %d, want exactly 1", got)
+	} else if got := upstream.lastRange.Load(); got != "bytes=6-7" {
+		t.Errorf("changed-ETag upstream Range = %v, want bytes=6-7", got)
+	}
+	if got := upstream.requests.Load(); got != 1 || upstream.invalid.Load() {
+		t.Errorf("upstream requests=%d invalid=%t, want one valid suffix request", got, upstream.invalid.Load())
 	}
 	if got := requestCount(t, "success"); got != beforeSuccesses {
 		t.Errorf("success requests = %v, want unchanged %v", got, beforeSuccesses)
@@ -1701,11 +1773,8 @@ func TestBlockCache_ShortPositiveReadRejectsChangedETagRemainder(t *testing.T) {
 // shorter than metadata says, the committed 206 must return an error and must
 // not be accounted as a complete cache hit.
 func TestWholeBodyRange_ShortPositiveReadReturnsError(t *testing.T) {
-	mock := newBlockMock([]byte("ABCDEFGH"), `"v1"`)
-	cfg := config.NewDefault()
-	cfg.Cache.SetBlockCachingEnabled(false)
-	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
-	svc := NewService(mock, c, cfg)
+	server, upstream := newRangeTestUpstream(t, wowBucket, wowKey, []byte("ABCDEFGH"), `"v1"`)
+	svc, c := newHTTPRangeService(t, server.URL, false)
 	ctx := context.Background()
 	meta := &cache.CachedObjectMeta{
 		Bucket:        wowBucket,
@@ -1734,8 +1803,8 @@ func TestWholeBodyRange_ShortPositiveReadReturnsError(t *testing.T) {
 	if got := w.Header().Get("Content-Length"); got != "8" {
 		t.Errorf("Content-Length = %q, want 8", got)
 	}
-	if got := mock.forwards.Load(); got != 0 {
-		t.Errorf("upstream whole/range forwards = %d, want 0 after response commitment", got)
+	if got := upstream.requests.Load(); got != 0 {
+		t.Errorf("upstream HTTP requests = %d, want 0 after response commitment", got)
 	}
 	if got := requestCount(t, "success"); got != beforeSuccesses {
 		t.Errorf("success requests = %v, want unchanged %v", got, beforeSuccesses)
@@ -1763,11 +1832,8 @@ func (w *failFirstResponseWrite) Write(p []byte) (int, error) {
 // a successful response.
 func TestWholeBodyRange_FirstClientWriteFailureIsError(t *testing.T) {
 	body := []byte("ABCDEFGH")
-	mock := newBlockMock(body, `"v1"`)
-	cfg := config.NewDefault()
-	cfg.Cache.SetBlockCachingEnabled(false)
-	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
-	svc := NewService(mock, c, cfg)
+	server, upstream := newRangeTestUpstream(t, wowBucket, wowKey, body, `"v1"`)
+	svc, c := newHTTPRangeService(t, server.URL, false)
 	ctx := context.Background()
 	meta := &cache.CachedObjectMeta{
 		Bucket:        wowBucket,
@@ -1797,8 +1863,8 @@ func TestWholeBodyRange_FirstClientWriteFailureIsError(t *testing.T) {
 	if got := recorder.Header().Get("Content-Length"); got != "8" {
 		t.Errorf("Content-Length = %q, want 8", got)
 	}
-	if got := mock.forwards.Load(); got != 0 {
-		t.Errorf("client write failure triggered %d upstream forwards, want 0 after commitment", got)
+	if got := upstream.requests.Load(); got != 0 {
+		t.Errorf("client write failure triggered %d upstream HTTP requests, want 0 after commitment", got)
 	}
 	if got := requestCount(t, "success"); got != beforeSuccesses {
 		t.Errorf("success requests = %v, want unchanged %v", got, beforeSuccesses)
