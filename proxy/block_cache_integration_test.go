@@ -1691,9 +1691,10 @@ func seedTwoBlockCompleteEntryWithShortTail(t *testing.T, c *cache.Cache) {
 	}
 }
 
-// A positive short nil-error cache read is not a hit: once the first block has
-// committed the response, the sequential stream must request exactly the
-// unwritten suffix and complete it only when the upstream ETag still matches.
+// A positive short nil-error cache read is not a complete block hit: after the
+// first block commits, the stream must request exactly the unwritten suffix and
+// complete it only when the upstream ETag still matches. X-Cache is already
+// committed as a request-level cache decision before this recovery.
 func TestBlockCache_ShortPositiveReadRecoversSameETagRemainder(t *testing.T) {
 	object := []byte("ABCDEFGH")
 	server, upstream := newRangeTestUpstream(t, wowBucket, wowKey, object, `"v1"`)
@@ -1713,8 +1714,8 @@ func TestBlockCache_ShortPositiveReadRecoversSameETagRemainder(t *testing.T) {
 	if got := w.Header().Get("Content-Length"); got != "8" {
 		t.Errorf("Content-Length = %q, want 8", got)
 	}
-	if got := w.Header().Get(XCacheHeader); got != XCacheHit {
-		t.Errorf("%s = %q, want %q", XCacheHeader, got, XCacheHit)
+	if got := w.Result().Header.Get(XCacheHeader); got != XCacheHit {
+		t.Errorf("committed %s = %q, want %q", XCacheHeader, got, XCacheHit)
 	}
 	if got := upstream.rangeCalls.Load(); got != 1 {
 		t.Errorf("same-ETag suffix HTTP requests = %d, want exactly 1", got)

@@ -93,7 +93,7 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 
 | Header    | Description                                          |
 | --------- | ---------------------------------------------------- |
-| `X-Cache` | Cache status: `HIT`, `MISS`, `BYPASS`, or `DISABLED` |
+| `X-Cache` | Cache decision at response commitment: `HIT`, `MISS`, `BYPASS`, or `DISABLED`; a block-mode `HIT` may include a verified upstream remainder |
 
 ### Cache Behavior
 
@@ -101,7 +101,8 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 - Objects with `Cache-Control: no-store` or `private` are not cached
 - Among cacheable objects (within `size_threshold`), those at or above `block_size` are cached as fixed-size blocks (block caching, on by default), so a range read fetches only the covering blocks; smaller objects are whole-cached
 - Set `block_caching_enabled: false` to cache whole objects instead — a range request then triggers a background fetch of the full object (if within threshold)
-- Cached range reads are checked against the requested byte count. A committed block GET can recover an unwritten suffix only from the same ETag
+- Cached range reads are checked against the requested byte count. A committed block GET can recover an unwritten suffix only from an upstream response with the same ETag
+- `X-Cache: HIT` identifies a cache-backed response selected at commitment; it does not promise that every byte came from cache or that the transfer completed
 - If a committed block GET has a changed-ETag suffix, or a whole-object Range read is short, TAG keeps the sent status and Content-Length, returns a handler error, and may end with only the cached prefix; client write failures stop without an upstream retry
 - PUT/DELETE operations invalidate the cache entry
 
@@ -143,7 +144,7 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 ### Request Flow
 
 1. **Cache Check**: TAG first checks if the object exists in its embedded cache
-2. **Cache Hit**: Returns cached object with `X-Cache: HIT` header
+2. **Cache Hit**: Serves using a cache entry with `X-Cache: HIT`; a degraded block stream may append a same-ETag upstream remainder
 3. **Cache Miss**: Forwards request to upstream Tigris, caches response, returns with `X-Cache: MISS`
 
 ### Request Coalescing

@@ -458,10 +458,11 @@ var (
 )
 
 // RecordRequest records a request with its duration and status.
-// Source label values for RecordRequest: where the response was produced.
+// Source label values identify the request path that owns response accounting,
+// not the origin of every byte in a streamed response.
 const (
-	SourceLocal    = "local"    // answered from TAG's own store or knowledge
-	SourceUpstream = "upstream" // proxied from upstream
+	SourceLocal    = "local"    // handled through TAG's local/cache path, including verified block-suffix recovery
+	SourceUpstream = "upstream" // proxied directly from upstream
 )
 
 // processMode is the operating mode stamped on every request metric. One

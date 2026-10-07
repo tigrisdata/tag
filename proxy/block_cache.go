@@ -900,9 +900,9 @@ func (s *Service) remainingMetaTTL(meta *cache.CachedObjectMeta) int {
 // commit: if it is absent (evicted since populate) it is fetched pre-commit, and if that fails
 // the response is untouched — (false, nil) lets the caller fall through to the miss path, and a
 // definitive stale signal invalidates the entry first. After commit, the remaining blocks
-// stream with an inline fetch recovering any absent one; only a fetch failure there truncates
-// (headers are already sent), which is the same terminal behavior the probe path has for a
-// block evicted between probe and stream. Hit/miss metrics count inline-fetched blocks as
+// stream with inline fetch recovering any absent one; a short cache read or failed inline fetch
+// can use the shared same-ETag remainder path. If recovery fails, the caller can only return the
+// post-commit error — it cannot fall through. Hit/miss metrics count inline-fetched blocks as
 // misses, recorded once the serve outcome is known.
 func (s *Service) serveCompleteFromBlocks(
 	ctx context.Context,
