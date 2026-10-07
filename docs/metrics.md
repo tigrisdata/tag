@@ -39,7 +39,7 @@ rate(tag_requests_total[5m])
 # Error rate
 sum(rate(tag_requests_total{status="error"}[5m])) / sum(rate(tag_requests_total[5m]))
 
-# Share of traffic answered without touching upstream (per mode)
+# Share of requests handled by TAG's local/cache path (per mode; may include upstream recovery)
 sum(rate(tag_requests_total{source="local"}[5m])) by (mode) / sum(rate(tag_requests_total[5m])) by (mode)
 
 # GetObject success rate
