@@ -921,6 +921,16 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error {
 	bucket, key := ParseBucketKey(r)
 
+	// CopyObject warming uses request Cache-Control as an admission policy just like
+	// the PUT cache path. Decide before forwarding so a rejected copy can still take
+	// both invalidation fences without starting either warmer.
+	requestRejectsCache := false
+	if !s.config.IsTiered() && s.cache.IsEnabled() && (s.config.Cache.WarmOnWrite || s.config.Cache.ParquetOptimization) {
+		if cacheControls := r.Header["Cache-Control"]; len(cacheControls) > 0 {
+			requestRejectsCache = hasNoCacheDirectives(cacheControls)
+		}
+	}
+
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleCopyObject")
 
 	// Invalidate cache for destination object BEFORE forwarding to ensure
@@ -968,8 +978,10 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 			s.convergeTieredDelete(bucket, key, cpPriorVer, cpPriorKnown)
 		} else {
 			s.convergeInvalidation(context.Background(), bucket, key)
-			s.warmOnWrite(r, bucket, key)
-			s.warmParquetFooterOnWrite(r, bucket, key)
+			if !requestRejectsCache {
+				s.warmOnWrite(r, bucket, key)
+				s.warmParquetFooterOnWrite(r, bucket, key)
+			}
 		}
 	}
 
