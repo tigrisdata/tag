@@ -41,8 +41,10 @@ the body into the local tier — streamed like the engine's PUT, so a heal
 costs fixed memory regardless of object size and the threshold is never
 budget-capped. This heals objects mis-placed by the cold-start
 window below, capping the damage at one extra upstream fetch per object
-instead of one body forward per read until TTL. The displaced upstream copy
-is left for the upstream bucket's own expiry.
+instead of one body forward per read until TTL. Each background move is bound
+to the marker version that triggered it; if a later write replaces that
+metadata, the stale move cannot change the newer entry. The displaced
+upstream copy is left for the upstream bucket's own expiry.
 
 ## Authentication
 
