@@ -42,7 +42,8 @@ TAG adds four proxy headers using HMAC-SHA256 over `forwarded_host\ntimestamp\nm
 ## Per-Bucket Authorization
 
 - `AuthzCache` keyed on `(accessKey, bucket)`. Auth for one bucket does not grant access to others.
-- Granted when Tigris returns 2xx with signing keys
+- `AuthzCache` authorization is granted only after a successful upstream client `GetObject` or `HeadObject`; writes and other passthrough operations do not grant cached-read access.
+- Signing keys may be learned from any successful Tigris response carrying the internal header; they prove identity, not read permission.
 - Revoked when Tigris returns 403
 - TTL: 10 minutes (configurable via `TAG_AUTHZ_CACHE_TTL`)
 

@@ -15,7 +15,7 @@ const DefaultAuthzCacheTTL = 10 * time.Minute
 const maxAuthzCacheSize = 1_000_000
 
 // AuthzCache caches authorization decisions at the (access_key, bucket) level.
-// Entries are granted when Tigris returns a successful response with signing keys,
+// Entries are granted after a client GetObject or HeadObject succeeds upstream,
 // revoked when Tigris returns 403, and expire after a configurable TTL.
 //
 // Uses hashicorp/golang-lru/v2/expirable for TTL-based expiration and bounded size.

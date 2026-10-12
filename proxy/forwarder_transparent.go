@@ -41,11 +41,49 @@ func (f *transparentForwarder) initInterceptor() {
 }
 
 // interceptResponse is called by base forwarder methods after receiving the
-// upstream response but before headers are sent to the client. It extracts
-// signing keys from successful responses and revokes authZ on 403s.
+// upstream response but before headers are sent to the client. It learns
+// signing keys, grants authorization only for successful object reads, and
+// revokes authZ on 403s.
 func (f *transparentForwarder) interceptResponse(resp *http.Response, originalReq *http.Request) {
 	f.learnSigningKeys(resp, originalReq)
+	f.grantReadAuthorization(resp, originalReq)
 	f.handleAuthzRevocation(resp, originalReq)
+}
+
+// isReadAuthorizationQuery accepts only selectors and authentication metadata
+// known not to select a different S3 operation. The basic object route also
+// receives unrecognized GET/HEAD subresources, so an unknown or malformed
+// query cannot prove that the origin authorized GetObject or HeadObject.
+func isReadAuthorizationQuery(rawQuery string) bool {
+	if rawQuery == "" {
+		return true
+	}
+
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return false
+	}
+
+	for key := range query {
+		switch key {
+		case "versionId", "partNumber", "response-cache-control", "response-content-disposition",
+			"response-content-encoding", "response-content-language", "response-content-type", "response-expires",
+			"X-Amz-Checksum-Mode", "x-amz-expected-bucket-owner", "x-amz-request-payer":
+			continue
+		}
+
+		allowedAuthOrSDKParam := false
+		for _, param := range originlessIgnoredParams {
+			if key == param {
+				allowedAuthOrSDKParam = true
+				break
+			}
+		}
+		if !allowedAuthOrSDKParam {
+			return false
+		}
+	}
+	return true
 }
 
 // shallowHeaderCopy gives the forwarded request its own header map while
@@ -286,6 +324,7 @@ func (f *transparentForwarder) DoRequestWithCreds(ctx context.Context, r *http.R
 
 // learnSigningKeys extracts and caches derived signing keys from the Tigris response.
 // The signing keys header is always stripped before the response reaches the client.
+// Learning identity keys does not grant authorization to read cached objects.
 func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Request) {
 	// Always strip the internal header, even when local auth is disabled.
 	headerVal := resp.Header.Get(signingKeysHeader)
@@ -329,7 +368,6 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 	}
 
 	bucket, _ := ParseBucketKey(r)
-	f.authzCache.Grant(authInfo.AccessKey, bucket)
 
 	if newKeys > 0 {
 		log.Debug().
@@ -341,6 +379,29 @@ func (f *transparentForwarder) learnSigningKeys(resp *http.Response, r *http.Req
 
 	metrics.ProxySigningKeysReceived.Inc()
 	metrics.DerivedKeyStoreSize.Set(float64(f.derivedKeyStore.Count()))
+	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
+}
+
+// grantReadAuthorization records bucket authorization only after an upstream
+// success from a client GetObject or HeadObject. The method, object path, and
+// query classifier reject other operations that can reach the basic object route.
+func (f *transparentForwarder) grantReadAuthorization(resp *http.Response, r *http.Request) {
+	if f.validator == nil || f.keyUnwrapper == nil || f.authzCache == nil ||
+		resp.StatusCode < 200 || resp.StatusCode >= 300 || r == nil ||
+		(r.Method != http.MethodGet && r.Method != http.MethodHead) || !isReadAuthorizationQuery(r.URL.RawQuery) {
+		return
+	}
+
+	authInfo, err := auth.ParseAuthInfo(r)
+	if err != nil {
+		return
+	}
+	bucket, key := ParseBucketKey(r)
+	if bucket == "" || key == "" {
+		return
+	}
+
+	f.authzCache.Grant(authInfo.AccessKey, bucket)
 	metrics.AuthzCacheSize.Set(float64(f.authzCache.Count()))
 }
 
