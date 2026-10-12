@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime/metrics"
 	"strings"
 	"testing"
 
@@ -50,6 +51,10 @@ const (
 		"?uploadId=benchmark%2Fupload%20id%25-with-a-longer-opaque-upload-token-" +
 		"000000000000000000000000000000000000000000000000000000000000&partNumber=9999"
 	signingForwarderBenchmarkUploadPartBody = "benchmark upload part body with escaped-key coverage"
+
+	// This short ordinary object target keeps the header-filter benchmark focused
+	// on forwarding and signing rather than long-path canonicalization work.
+	signingForwarderBenchmarkHeaderFilterPath = "/benchmark-bucket/object"
 )
 
 type signingForwarderBenchmarkTransport struct {
@@ -201,6 +206,91 @@ func newSigningPassthroughBenchmark(b testing.TB, method, path, body string, hea
 		validator:     auth.NewRequestValidator(store),
 	}
 	return NewService(forwarder, cache.NewDisabledCache(), config.NewDefault()), incomingRequest
+}
+
+type signingForwarderHeaderBenchmarkCase struct {
+	name          string
+	signedHeaders http.Header
+	extraHeaders  http.Header
+}
+
+func signingForwarderHeaderBenchmarkCases() []signingForwarderHeaderBenchmarkCase {
+	manySigned := make(http.Header, 16)
+	manyExtra := make(http.Header, 32)
+	for i := range 16 {
+		suffix := fmt.Sprintf("%02d", i)
+		manySigned["X-Amz-Meta-Header-"+suffix] = []string{"value-" + suffix}
+		manyExtra["X-Tigris-Proxy-Injected-"+suffix] = []string{"blocked-" + suffix}
+		manyExtra["X-Request-Id-"+suffix] = []string{"unrelated-" + suffix}
+	}
+
+	return []signingForwarderHeaderBenchmarkCase{
+		{
+			name: "zero",
+		},
+		{
+			name: "typical",
+			signedHeaders: http.Header{
+				"Content-Type":        {"application/octet-stream"},
+				"X-Amz-Meta-Color":    {"blue"},
+				"Tigris-Force-Delete": {"false"},
+			},
+			extraHeaders: http.Header{
+				"X-Tigris-Proxy-Access-Key": {"injected"},
+				"X-Tigris-Forwarded-Host":   {"evil.example.com"},
+				"X-Request-Id":              {"request-id"},
+			},
+		},
+		{
+			name:          "many",
+			signedHeaders: manySigned,
+			extraHeaders:  manyExtra,
+		},
+	}
+}
+
+// BenchmarkSigningForwarderForwardHeaderFilter measures Forward with zero,
+// typical, and many title-cased allowed, blocked, and unrelated headers. The
+// transport is controlled so the timed operation ends after request signing.
+func BenchmarkSigningForwarderForwardHeaderFilter(b *testing.B) {
+	for _, benchmarkCase := range signingForwarderHeaderBenchmarkCases() {
+		b.Run(benchmarkCase.name, func(b *testing.B) {
+			service, incomingRequest := newSigningPassthroughBenchmark(
+				b,
+				http.MethodGet,
+				signingForwarderBenchmarkHeaderFilterPath,
+				"",
+				benchmarkCase.signedHeaders,
+			)
+			for key, values := range benchmarkCase.extraHeaders {
+				incomingRequest.Header[key] = values
+			}
+
+			forwarder := service.forwarder.(*signingForwarder)
+			writer := signingForwarderBenchmarkResponseWriter{header: make(http.Header)}
+			ctx := context.Background()
+			b.ReportAllocs()
+			runtimeSamples := []metrics.Sample{
+				{Name: "/cpu/classes/user:cpu-seconds"},
+				{Name: "/gc/cycles/total:gc-cycles"},
+			}
+			metrics.Read(runtimeSamples)
+			startCPUSeconds := runtimeSamples[0].Value.Float64()
+			startGCCycles := runtimeSamples[1].Value.Uint64()
+			b.ResetTimer()
+
+			for b.Loop() {
+				if err := forwarder.Forward(ctx, &writer, incomingRequest); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			b.StopTimer()
+			metrics.Read(runtimeSamples)
+			b.ReportMetric((runtimeSamples[0].Value.Float64()-startCPUSeconds)*1e9/float64(b.N), "cpu-ns/op")
+			b.ReportMetric(float64(runtimeSamples[1].Value.Uint64()-startGCCycles)/float64(b.N), "gc-cycles/op")
+		})
+	}
 }
 
 // BenchmarkServiceHandlePassthroughSigning measures the signing-mode
