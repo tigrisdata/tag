@@ -54,9 +54,9 @@ func IsStreamingPayload(bodyHash string) bool {
 //
 //	0[;chunk-signature=<signature>]\r\n
 //
-// The reader strips the framing and returns only the raw chunk data.
-// Chunk signatures and trailing checksums are not validated (the
-// request-level signature was already verified by the auth validator).
+// The reader strips the framing and returns only the raw chunk data. It does
+// not validate chunk signatures or trailing checksums. The signing forwarder
+// verifies and stages the standard HMAC streaming-payload marker separately.
 type awsChunkedReader struct {
 	reader    *bufio.Reader
 	remaining int
@@ -191,8 +191,10 @@ func (r *awsChunkedReader) readTrailingCRLF() error {
 // decoded content length, and chunked=true. Otherwise returns the original values
 // unchanged with chunked=false.
 //
-// Supports both signed (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) and unsigned
-// (STREAMING-UNSIGNED-PAYLOAD-TRAILER) chunked formats.
+// Supports the framing of both signed (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) and
+// unsigned (STREAMING-UNSIGNED-PAYLOAD-TRAILER) chunked formats. This low-level
+// decoder does not authenticate signed chunks; the signing forwarder handles the
+// standard HMAC streaming-payload marker before forwarding.
 func decodeChunkedIfNeeded(r *http.Request) (body io.ReadCloser, bodyHash string, contentLength int64, chunked bool) {
 	bodyHash = r.Header.Get("X-Amz-Content-Sha256")
 

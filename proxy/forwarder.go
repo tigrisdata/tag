@@ -500,6 +500,17 @@ func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string
 	}
 }
 
+// headersForForwardedSigning excludes headers that are removed after decoding, so
+// the generated Authorization header matches the request sent to the upstream.
+func headersForForwardedSigning(headers http.Header, chunked bool) http.Header {
+	if !chunked {
+		return headers
+	}
+	forwarded := headers.Clone()
+	forwarded.Del("X-Amz-Decoded-Content-Length")
+	return forwarded
+}
+
 // prepareForwardedRequest sets Content-Length on the forwarded request and strips
 // AWS chunked-encoding headers when the request body was decoded from chunked format.
 func prepareForwardedRequest(fwdReq *http.Request, contentLength int64, chunked bool) {
