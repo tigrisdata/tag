@@ -155,6 +155,10 @@ When multiple concurrent requests arrive for the same uncached object:
 
 See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
 
+### Tiered Store Mode
+
+In tiered mode, validated plain-object PUTs no larger than `cache.size_threshold` are stored locally, and their metadata is authoritative. A background re-tier started by a GET is bound to the marker version seen by that GET, so it cannot replace metadata committed by a later write. See [docs/tiered-mode.md](docs/tiered-mode.md) for the full behavior.
+
 ## Performance
 
 A single TAG node saturates a 100 Gbps NIC at **~85+ Gbps** for objects 1 MiB and larger, serves **~75K ops/sec** for small objects at sub-millisecond p50, and holds low single-digit-millisecond TTFB — all while using around **12% of available CPU**.

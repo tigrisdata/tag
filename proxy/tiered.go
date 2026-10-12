@@ -120,7 +120,7 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 		// forwards through this branch too, and healing on it would launch a
 		// full-body download the triggering request never serves.
 		if r.Method == http.MethodGet && originlessPlainObject(r) {
-			s.maybeRetierOnRead(bucket, key, accessKey, secretKey, meta)
+			s.maybeRetierOnRead(bucket, key, accessKey, secretKey, meta, metaVersion)
 		}
 		// The mode's principal body traffic — record it (upstream-sourced),
 		// or a forward-heavy tiered node reads as ~100% local.
@@ -213,8 +213,9 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// the in-flight PUT serve the prior version, which is the atomic-replace
 	// behavior clients expect. The one read-triggered populate in this mode —
 	// the re-tier — cannot be ordered against this path's writes here (it
-	// performs none pre-forward); it defends itself with a claim plus its own
-	// pre-fetch decision token instead (see maybeRetierOnRead).
+	// performs none pre-forward). Its claim cancels registered work and its
+	// triggering GET's version token rejects any stale worker mutation (see
+	// maybeRetierOnRead).
 	// No post-success invalidation either: the marker overwrites the prior
 	// metadata directly (a displaced local body ages out by TTL, the engine's
 	// own overwrite semantics), which lets the marker commit under the
@@ -496,33 +497,36 @@ const (
 // that was forwarded before its key was learned. A background fetch moves the
 // body into the local tier so subsequent reads stop paying a body forward.
 //
+// The triggering GET's metadata version travels with the marker. Before any
+// upstream work, the worker verifies that this exact upstream marker is still
+// current; every later metadata mutation uses that same version, so a write
+// that wins before registration or during the fetch remains authoritative.
+//
 // Guards, in order:
 //   - dedup: one re-tier in flight per key, others ride the existing marker;
 //   - budget: STREAMED like the engine's PUT — the body goes straight into
 //     the cache under a BodyRef, so the reservation is the fixed stream
 //     weight, never the object; shed non-blocking;
+//   - snapshot: the current version and marker identity must still match the
+//     triggering GET before the upstream fetch begins;
 //   - version: the fetched ETag must match the marker's — anything else means
-//     a concurrent write replaced the object, whose state must be left alone;
+//     a concurrent upstream replacement, whose metadata may be converged only
+//     while the original marker version is still current;
 //   - identity commit: the entry is re-written only if it still IS the marker
-//     (same ETag, still upstream-tier);
+//     (same ETag, still upstream-tier), using the triggering GET's version;
 //   - write claim: PUTs write no tombstones, so a concurrent PUT could land
 //     between the identity check and the commit and be overwritten by the
 //     older version — a local-tier PUT's ONLY copy, in the worst case. Every
 //     tiered PUT therefore holds a per-key claim for its whole duration
-//     (claimRetierWrite): taking it cancels the running re-tier, and while
-//     held no new re-tier can register — a GET mid-PUT sees the old marker
-//     but cannot start a heal against it. Claim and registration share one
-//     mutex, so every interleaving lands on cancel-or-refuse. What remains is
-//     two truly concurrent commits racing in the store — the same unordered
-//     outcome S3 itself gives two concurrent writers;
-//   - decision tokens: the commit's token is read BEFORE the fetch, so a
-//     DELETE racing the re-tier enters the store provably after it and the
-//     commit is refused (DELETEs need no cancellation — the coordinator's
-//     ordering already covers them).
+//     (claimRetierWrite): taking it cancels registered work, and while held no
+//     new re-tier can register. The claim alone cannot stop a GET that read an
+//     older marker before the claim and registers after it is released; the
+//     carried version rejects that stale worker. The cache's CAS operation
+//     protects the final mutation if a write wins after the worker's snapshot.
 //
 // The upstream copy is left as an orphan for the upstream bucket's expiry —
 // deleting it here could race a concurrent write of the same key.
-func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, marker *cache.CachedObjectMeta) {
+func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, marker *cache.CachedObjectMeta, markerVersion uint64) {
 	if marker.ContentLength < 0 || marker.ContentLength > s.config.Cache.SizeThreshold {
 		return
 	}
@@ -561,11 +565,13 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		defer s.releaseCacheSlot(weight)
 		defer cancel()
 
-		// Decision token BEFORE the fetch: a DELETE (or any write) racing this
-		// populate enters the store after this token and provably refuses the
-		// commit below — the token-model form of the old stamp-before-fetch.
-		_, decToken, tfound, terr := s.cache.GetMetaWithVersion(ctx, bucket, key)
-		if terr != nil || !tfound {
+		// Verify the decision-time snapshot captured by the triggering GET
+		// before doing upstream work. A write may have completed after that
+		// GET read the marker but before this worker registered; it must not
+		// lend its newer version token to work based on the older marker.
+		current, currentVersion, tfound, terr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+		if terr != nil || !tfound || current == nil || currentVersion != markerVersion ||
+			!current.BodyUpstream || current.ETag != marker.ETag || current.ContentLength != marker.ContentLength {
 			metrics.RecordTieredRetier("changed")
 			return
 		}
@@ -598,8 +604,8 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 				if s.retierRecentMismatch != nil {
 					s.retierRecentMismatch.Add(bucket+"|"+key+"|"+etag, struct{}{})
 				}
-				// The marker is now PROVEN wrong, and the pre-fetch token is
-				// still in hand — converge it instead of leaving the
+				// The marker is now PROVEN wrong, and the triggering GET's
+				// version is still in hand — converge it instead of leaving the
 				// divergence authoritative for the marker's TTL. Gone (404 —
 				// e.g. the cache bucket's own expiry collected the body):
 				// remove the marker under the token, so HEAD stops answering
@@ -610,7 +616,7 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 				// refused or failed converge just leaves the backoff doing
 				// its job until the next attempt.
 				if resp.StatusCode == http.StatusNotFound {
-					if _, derr := s.cache.DeleteMetaIfVersion(ctx, bucket, key, decToken); derr != nil {
+					if _, derr := s.cache.DeleteMetaIfVersion(ctx, bucket, key, markerVersion); derr != nil {
 						log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Re-tier converge: marker removal failed")
 					}
 				} else {
@@ -625,7 +631,7 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 					if fresh.ContentLength < 0 && drainErr == nil {
 						fresh.ContentLength = drained
 					}
-					if _, perr := s.cache.PutMetaIfVersion(ctx, bucket, key, fresh, int(s.config.Cache.TTL.Seconds()), decToken); perr != nil {
+					if _, perr := s.cache.PutMetaIfVersion(ctx, bucket, key, fresh, int(s.config.Cache.TTL.Seconds()), markerVersion); perr != nil {
 						log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Re-tier converge: marker rewrite failed")
 					}
 				}
@@ -684,9 +690,9 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 
 		// Identity-guarded commit: only re-write the entry if it still IS the
 		// marker this re-tier was triggered by. The commit's expectation is
-		// the PRE-FETCH decision token, so anything landing after that
-		// instant — including during the fetch — refuses the commit
-		// atomically; this re-read is purely the identity guard. The
+		// the triggering GET's version, so anything landing after that
+		// snapshot — including before registration or during the fetch —
+		// refuses the commit atomically; this re-read is the identity guard. The
 		// cancellation check comes after it — a racing PUT cancels before it
 		// stores, so an alive context here means no PUT has entered the store
 		// ahead of us; the token precondition then holds the line for
@@ -716,7 +722,7 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		// to copy.
 		meta.ContentLength = src.n
 		ttl := int(s.config.Cache.TTL.Seconds())
-		wrote, werr := s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, decToken)
+		wrote, werr := s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, markerVersion)
 		if werr != nil {
 			// AMBIGUOUS commit (see the engine PUT's rule): the owner may
 			// have applied it, so the staged body must not be deleted —
@@ -726,8 +732,8 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 			return
 		}
 		if !wrote {
-			// A racer entered the store after the pre-fetch token: the object
-			// stays on its current state (marker, newer write, or deleted) —
+			// A racer entered the store after the triggering GET's snapshot:
+			// the object stays on its current state (marker, newer write, or deleted) —
 			// not a re-tier. Definitive refusal: reclaim the staged body.
 			discardRef()
 			metrics.RecordTieredRetier("changed")
