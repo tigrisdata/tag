@@ -176,9 +176,14 @@ func (f *transparentForwarder) Forward(ctx context.Context, w http.ResponseWrite
 // Response interception (signing key learning, header stripping, authZ revocation)
 // is handled by the base forwarder's response interceptor.
 func (f *transparentForwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+	capture, _, err := f.forwardWithCaptureAttempted(ctx, w, r)
+	return capture, err
+}
+
+func (f *transparentForwarder) forwardWithCaptureAttempted(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, bool, error) {
 	fwdReq, err := f.buildTransparentRequest(ctx, r)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	return f.executeAndCapture(w, fwdReq, r.ContentLength, r)

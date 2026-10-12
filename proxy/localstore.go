@@ -98,7 +98,7 @@ func (s *Service) HandleOriginlessObject(w http.ResponseWriter, r *http.Request)
 // existed before, during, and after the overwrite. One read, one decision —
 // a read racing an overwrite serves the version its snapshot saw, the legal
 // atomic-replace answer (and the hottest path saves a doubled meta read).
-func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, operation string, start time.Time, meta *cache.CachedObjectMeta, metaVersion uint64) error {
+func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, operation string, start time.Time, meta *cache.CachedObjectMeta, metaVersion cache.MetaVersionToken) error {
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
 
@@ -171,7 +171,7 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 //     NOT absence. Minting an authoritative NoSuchKey here would tell the
 //     caller a live object does not exist — so it propagates as a retryable
 //     5xx, matching this handler's meta-read and probe legs.
-func (s *Service) finishServeBodyError(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string, metaVersion uint64, serveErr error, operation string, start time.Time) error {
+func (s *Service) finishServeBodyError(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string, metaVersion cache.MetaVersionToken, serveErr error, operation string, start time.Time) error {
 	if !bodyGone(serveErr) {
 		metrics.RecordRequest(operation, "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return serveErr
@@ -301,7 +301,7 @@ func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) er
 // marker committing between two reads) and the doubled hot-path meta read.
 type putPrior struct {
 	meta    *cache.CachedObjectMeta
-	version uint64
+	version cache.MetaVersionToken
 	found   bool
 }
 
@@ -319,26 +319,23 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 		return nil
 	}
 
-	// EVERY store commits under a decision-time token read here, before the
-	// body is consumed: a DELETE (or competing PUT) that lands after this
-	// instant refuses the commit — the ordering the pre-coordinator engine got
-	// from stamping writeStartTime at handler start, now expressed as the
-	// opaque token the selected coordinator orders by (fenced version under
-	// CAS, wall-clock stamp under legacy). For an absent key the token is the
-	// nonzero absence token, never 0 (ocache v1.13 contract).
+	// EVERY store captures a decision-time token here, before the body is
+	// consumed. CAS mode uses the metadata-key version; legacy mode carries the
+	// reader-generation sidecar and tombstone timestamp. A later legacy
+	// invalidation makes that row invisible to current TAG readers, even if the
+	// plain metadata Put completes late. For an absent key, the token preserves
+	// both the sidecar observation and tombstone decision, not an unordered write.
 	//
-	// Conditional writes additionally evaluate the precondition here and then
-	// ENFORCE it at the store: a concurrent write between check and store
-	// surfaces as a refused store (answered 412) instead of a silent lost
-	// update. That closure is CAS-coordinator strength; under legacy
-	// coordination the token orders against DELETEs only, and write-vs-write
-	// remains the check-then-store race the pre-CAS engine documented as
-	// accepted. Semantics follow the ceph suite: If-Match against a MISSING
+	// Conditional writes additionally evaluate the precondition here. CAS
+	// enforces it atomically at the store. Legacy retains the check-and-plain-
+	// Put protocol for older peers; a competing write can still race that
+	// check, and older readers do not consult the generation sidecar. Semantics
+	// follow the ceph suite: If-Match against a MISSING
 	// object answers NoSuchKey (there is nothing to match), a
 	// present-but-different ETag is the 412; If-None-Match refuses when the
 	// object exists.
 	var existing *cache.CachedObjectMeta
-	var expected uint64
+	var expected cache.MetaVersionToken
 	var found bool
 	if prior != nil {
 		// The caller's snapshot IS the decision state: reuse it so the tier
@@ -577,7 +574,7 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 	// conditional writes answer the 412 their precondition earned (and
 	// reclaim the staged body), unconditional writes retry under a fresh
 	// token so the client's 200 always means the entry is visible.
-	store := func(token uint64) (bool, error) {
+	store := func(token cache.MetaVersionToken) (bool, error) {
 		return s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, token)
 	}
 	var wrote bool

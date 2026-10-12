@@ -219,12 +219,12 @@ const (
 // teeFallbackWarm when it couldn't confirm/write the version (so a read-back warm may help).
 func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte, accessKey, secretKey string) teeOutcome {
 	// Decision-time token BEFORE the HEAD (mirroring the populate paths), so
-	// the whole HEAD-to-write window is ordered: a competing overwrite whose
-	// invalidation lands after this read bumps the fence past this token and
-	// the write loses, while one that landed earlier is caught by the
-	// ETag-consistency check below. Read after this PUT's own post-forward
-	// invalidation (this goroutine runs after it), so our own fence doesn't
-	// block us.
+	// the whole HEAD-to-write window is ordered: CAS rejects a competing
+	// metadata version; legacy records this sidecar generation and current
+	// readers ignore a late plain write after invalidation. An overwrite that
+	// landed earlier is caught by the ETag-consistency check below. Read after
+	// this PUT's own post-forward invalidation (this goroutine runs after it), so
+	// our own generation does not block us.
 	_, expected, _, tokErr := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
 	if tokErr != nil {
 		// No token, no ordered commit: fall back to the warm, which reads its

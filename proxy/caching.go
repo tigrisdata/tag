@@ -165,7 +165,7 @@ func (s *Service) setupCacheListener(
 	broadcaster *broadcast.Broadcaster,
 	slotHeld bool,
 	weight int64,
-	expected uint64, // decision-time token; the meta commit's CAS precondition
+	expected cache.MetaVersionToken, // complete decision-time metadata precondition
 ) (*io.PipeWriter, chan error) {
 	// Bound concurrent cache-populate operations. When the limit is saturated,
 	// skip caching entirely: the object is still served/forwarded from upstream,
@@ -250,12 +250,10 @@ func (s *Service) setupCacheListener(
 			// read-back. The whole-vs-block boundary is size, not access pattern (RFC 0001): both
 			// full and range paths converge on one representation per size class. Sub-block objects
 			// keep the single whole-body write.
-			// The decision-time token from before the upstream fetch: when the
-			// miss path runs while metadata still exists (a forced-revalidation
-			// fall-through, an anonymous read of a non-public entry) this
-			// populate refreshes exactly the version it observed — and loses
-			// to anything newer, including a fenced delete, instead of
-			// last-write-winning stale bytes over it.
+			// The decision-time token from before the upstream fetch: a forced-
+			// revalidation fall-through or anonymous miss may still have metadata.
+			// CAS refuses a replaced row; legacy stores this generation in the
+			// metadata so current readers ignore a late plain Put after invalidation.
 			if s.isBlockEligibleSize(meta.ContentLength) {
 				meta.BlockSize = s.config.Cache.BlockSize
 				_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, expected)
@@ -389,7 +387,7 @@ func (s *Service) fetchFullObjectToCache(
 	bucket, key, accessKey, secretKey string,
 	anonymous bool,
 	prio populatePriority,
-	expected uint64, // meta-write precondition (see putMetaVersioned)
+	expected cache.MetaVersionToken, // metadata precondition (see putMetaVersioned)
 ) error {
 	// This is a background fetch whose only purpose is to populate the cache, so
 	// reserve a cache-populate slot up front. If the concurrent-write limit is
@@ -424,9 +422,11 @@ func (s *Service) fetchFullObjectToCache(
 		}
 	}()
 
-	// No stamp needed: the trigger's decision-time token (expected) predates
-	// this fetch, so an invalidation landing anywhere in the round-trip bumps
-	// the fence past it and the meta commit loses atomically.
+	// The trigger's decision-time token (expected) predates this fetch. CAS
+	// mode rejects a replaced metadata row atomically. Legacy mode carries the
+	// sidecar generation into its plain metadata Put; current TAG readers reject
+	// that row if invalidation advanced the sidecar while the body was fetched.
+	// Older readers do not consult the sidecar.
 
 	// Execute full object request (no Range header). An anonymous warm uses an
 	// unsigned request so upstream applies anonymous authorization — 200 only if the
@@ -597,20 +597,26 @@ func (s *Service) fetchFullObjectToCache(
 // key, and the commit precondition. One definition, shared with the tests that
 // wait on in-flight markers, so a format change cannot silently break their
 // waits into instant misses.
-func backgroundFetchKey(bucket, key string, expected uint64) string {
-	return fmt.Sprintf("bg:%s/%s|%d", bucket, key, expected)
+type backgroundFetchIdentity struct {
+	bucket, key string
+	expected    cache.MetaVersionToken
+}
+
+func backgroundFetchKey(bucket, key string, expected cache.MetaVersionToken) backgroundFetchIdentity {
+	return backgroundFetchIdentity{bucket: bucket, key: key, expected: expected}
 }
 
 // cached as public-read (see fetchFullObjectToCache); accessKey/secretKey are then
 // ignored. Pass anonymous=true exactly when the triggering request was anonymous, so
 // public-read is only ever inferred from a confirmed anonymous read.
-func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, expected uint64) {
+func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, expected cache.MetaVersionToken) {
 	// Coalesce only triggers with IDENTICAL commit semantics: the precondition
 	// is part of the dedup key. Keyed by bucket/key alone, a write repair
 	// arriving while an absent-gated warm is in flight would be dropped
 	// WITH its precondition — the in-flight warm then loses to the write's
-	// newer fence (its token predates it) and the repair that would have
-	// fixed the surviving state never runs. Distinct-precondition fetches for
+	// newer CAS fence, or its legacy generation is no longer served by current
+	// TAG readers; the repair that would have fixed the surviving state never runs.
+	// Distinct-precondition fetches for
 	// one key are bounded by the distinct races that spawned them, and each is
 	// budget-gated like any populate; identical triggers (a read-miss stampede)
 	// still coalesce to one fetch.
@@ -618,7 +624,7 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 
 	// Atomic check-and-set: if key exists, an equivalent fetch is already in progress
 	if _, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, struct{}{}); loaded {
-		log.Debug().Str("bucket", bucket).Str("key", key).Uint64("expected", expected).Msg("Equivalent background fetch already in progress, coalescing")
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Equivalent background fetch already in progress, coalescing")
 		return
 	}
 

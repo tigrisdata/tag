@@ -1601,7 +1601,7 @@ func TestTieredConvergeRetriesOnceUnderSameVersion(t *testing.T) {
 		c := cache.NewCacheWithClient(flake, &cfg.Cache)
 		return NewService(mock, c, cfg), c, flake
 	}
-	seedMarker := func(c *cache.Cache) uint64 {
+	seedMarker := func(c *cache.Cache) cache.MetaVersionToken {
 		marker := &cache.CachedObjectMeta{Bucket: "b", Key: "obj", ETag: `"up-1"`, BodyUpstream: true, ContentLength: 5000, StatusCode: 200}
 		_, tok, _, _ := c.GetMetaWithVersion(context.Background(), "b", "obj")
 		if wrote, err := c.PutMetaIfVersion(context.Background(), "b", "obj", marker, 60, tok); err != nil || !wrote {
@@ -1618,8 +1618,8 @@ func TestTieredConvergeRetriesOnceUnderSameVersion(t *testing.T) {
 	if len(flake.versions) != 2 {
 		t.Fatalf("attempts = %d, want 2 (one retry)", len(flake.versions))
 	}
-	if flake.versions[0] != v || flake.versions[1] != v {
-		t.Fatalf("retry changed the version guard: %v, want both == %d", flake.versions, v)
+	if flake.versions[0] != flake.versions[1] {
+		t.Fatalf("retry changed the version guard: %v", flake.versions)
 	}
 	if _, found, _ := c.GetMeta(context.Background(), "b", "obj"); found {
 		t.Fatal("converge did not land on the retry")

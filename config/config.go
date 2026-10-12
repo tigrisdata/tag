@@ -315,17 +315,17 @@ type CacheConfig struct {
 	// best-effort background GET (deduplicated and shed under the populate budget).
 	// It costs one extra upstream GET per write, so it defaults to false.
 	WarmOnWrite bool `yaml:"warm_on_write"`
-	// LegacyCoordination selects the cache's meta-key ordering mechanism
-	// (cache/coordinator.go). true (the DEFAULT when unset) runs the legacy
-	// timestamp-tombstone mechanism, byte-faithful to v1.20 — rolling upgrades
-	// from any earlier release are homogeneous under it. false runs the CAS
-	// coordinator (ocache fences + versions, no tombstones); set it only when
-	// EVERY node in the cluster runs a CAS-capable release, and flip via a
-	// brisk rolling restart (nodes in different modes order writes with
-	// different mechanisms during that window). Standalone nodes may flip
-	// immediately after upgrading. Tiered mode requires CAS and selects it
-	// automatically when this is unset; an explicit true there is rejected
-	// at startup (see validateMode).
+	// LegacyCoordination selects the cache's metadata-key protocol
+	// (cache/coordinator.go). true (the DEFAULT when unset) retains the v1.20
+	// timestamp tombstones and plain metadata operations for rolling-upgrade
+	// compatibility. Current TAG readers also validate a separate CAS
+	// generation sidecar; they fail closed when its CAS RPC is unavailable, but
+	// older readers do not consult that sidecar. false uses CAS fences and
+	// versions on the metadata key; set it only when EVERY node in the cluster
+	// runs a CAS-capable release, and flip via a brisk rolling restart. Standalone
+	// nodes may flip immediately after upgrading. Tiered mode requires CAS and
+	// selects it automatically when this is unset; an explicit true there is
+	// rejected at startup (see validateMode).
 	LegacyCoordination *bool `yaml:"legacy_coordination"`
 
 	// BlockCachingEnabled turns on block-aligned caching for large objects (RFC 0001):
@@ -362,9 +362,9 @@ func (c *CacheConfig) IsEnabled() bool {
 	return *c.Enabled
 }
 
-// IsLegacyCoordination returns whether the legacy tombstone coordinator is
-// selected (default: true when nil — the safe choice for mixed-version
-// clusters; see the field comment).
+// IsLegacyCoordination returns whether the legacy-compatible metadata
+// coordinator is selected (default: true when nil; see the field comment for
+// its mixed-version reader limit).
 func (c *CacheConfig) IsLegacyCoordination() bool {
 	if c.LegacyCoordination == nil {
 		return true

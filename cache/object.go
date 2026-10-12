@@ -88,6 +88,11 @@ type CachedObjectMeta struct {
 	// outlive its blocks. 0 (entries written before the field existed) means the age is
 	// unknown and no lifetime-sensitive rewrite is allowed.
 	CachedAt int64 `json:"cached_at,omitempty"`
+
+	// cacheGeneration is the legacy coordinator's sidecar token. It is stored
+	// in cache JSON but never exposed as an HTTP header or public field; older
+	// TAG readers ignore the unknown JSON property.
+	cacheGeneration uint64
 }
 
 // MetaFromHTTPHeaders builds CachedObjectMeta from S3 response headers.
@@ -347,7 +352,15 @@ func etagKeyComponent(etag string) string {
 // having to remember the field exists.
 func (m *CachedObjectMeta) Encode() ([]byte, error) {
 	m.ContentLengthKnown = m.ContentLength >= 0
-	return json.Marshal(m)
+	type metadataAlias CachedObjectMeta
+	type wireMeta struct {
+		metadataAlias
+		CacheGeneration uint64 `json:"cache_generation,omitempty"`
+	}
+	return json.Marshal(wireMeta{
+		metadataAlias:   metadataAlias(*m),
+		CacheGeneration: m.cacheGeneration,
+	})
 }
 
 // DecodeMeta deserializes JSON bytes to CachedObjectMeta. A row without
@@ -355,10 +368,17 @@ func (m *CachedObjectMeta) Encode() ([]byte, error) {
 // sentinel, where 0 was ambiguous between "empty" and "unknown" — it decodes
 // as unknown so a non-empty cached object is never served as empty.
 func DecodeMeta(data []byte) (*CachedObjectMeta, error) {
-	var meta CachedObjectMeta
-	if err := json.Unmarshal(data, &meta); err != nil {
+	type metadataAlias CachedObjectMeta
+	type wireMeta struct {
+		metadataAlias
+		CacheGeneration uint64 `json:"cache_generation,omitempty"`
+	}
+	var wire wireMeta
+	if err := json.Unmarshal(data, &wire); err != nil {
 		return nil, err
 	}
+	meta := CachedObjectMeta(wire.metadataAlias)
+	meta.cacheGeneration = wire.CacheGeneration
 	if !meta.ContentLengthKnown && meta.ContentLength == 0 {
 		meta.ContentLength = -1
 	}
@@ -369,6 +389,13 @@ func DecodeMeta(data []byte) (*CachedObjectMeta, error) {
 // (legacyCoordinator only; CAS mode writes none).
 func MakeTombstoneKey(bucket, key string) string {
 	return "tomb|" + bucket + "|" + key
+}
+
+// makeGenerationKey creates the independent CAS generation sidecar for a
+// legacy metadata row. It intentionally uses a different key from the
+// v1.20-compatible plain metadata protocol.
+func makeGenerationKey(bucket, key string) string {
+	return "meta-gen|" + bucket + "|" + key
 }
 
 // MakeMetaKey creates the cache key for object metadata.

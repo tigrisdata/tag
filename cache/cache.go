@@ -43,8 +43,9 @@ type Cache struct {
 	client     cacheclient.CacheClient
 	defaultTTL int64 // seconds
 	enabled    bool
-	closed     bool // coord is the meta-key ordering strategy: legacy tombstones (default)
-	// or CAS fences/versions. Selected once at construction; see coordinator.go.
+	closed     bool // coord is the meta-key strategy: legacy tombstones plus a
+	// current-reader generation sidecar (default), or CAS metadata-key fences.
+	// Selected once at construction; see coordinator.go.
 	coord metaCoordinator
 }
 
@@ -65,7 +66,12 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 	}
 	var coord metaCoordinator
 	if legacy {
-		coord = &legacyCoordinator{client: client, tombstoneTTL: TombstoneTTLSeconds(sizeThreshold)}
+		tombstoneTTL := TombstoneTTLSeconds(sizeThreshold)
+		coord = &legacyCoordinator{
+			client:        client,
+			tombstoneTTL:  tombstoneTTL,
+			generationTTL: ttl + tombstoneTTL,
+		}
 	} else {
 		coord = &casCoordinator{client: client}
 	}
@@ -94,17 +100,30 @@ func (c *Cache) IsEnabled() bool {
 // Two-Key Pattern: Metadata and Body stored separately
 // ============================================================================
 
-// VersionAny requests a version-BUMPING unconditional meta write: last-write-
-// wins like a plain Put, but implemented as a CAS loop so the row stays
-// version-stamped. This upholds the package invariant that NO meta key is ever
-// written with a plain Put — a plain Put resets the row to the storage layer's
-// legacy version, which blinds DeleteIfETag's version guard for every
-// subsequent conditional operation on the key.
+// MetaVersionToken is an opaque, comparable snapshot for a metadata commit.
+// CAS coordination carries the metadata-key version; legacy coordination also
+// carries the tombstone decision time and sidecar generation. Callers must pass
+// the value returned by GetMetaWithVersion without reconstructing its contents.
+type MetaVersionToken struct {
+	version       uint64
+	decisionTime  int64
+	unconditional bool
+}
+
+// AnyMetaVersionToken requests an unconditional last-write-wins metadata update.
+// The coordinator prepares any decision-time state required by its mode.
+func AnyMetaVersionToken() MetaVersionToken {
+	return MetaVersionToken{unconditional: true}
+}
+
+// VersionAny remains the numeric sentinel for APIs that compare raw store
+// versions. Metadata writes use MetaVersionToken so legacy timestamp and sidecar
+// state stay together.
 const VersionAny = ^uint64(0)
 
 // putMetaVersioned commits the meta bytes through the selected coordinator
 // (see coordinator.go for both mechanisms' semantics).
-func (c *Cache) putMetaVersioned(ctx context.Context, bucket, key, metaKey string, metaBytes []byte, ttl int64, expected uint64) (bool, error) {
+func (c *Cache) putMetaVersioned(ctx context.Context, bucket, key, metaKey string, metaBytes []byte, ttl int64, expected MetaVersionToken) (bool, error) {
 	return c.coord.putMeta(ctx, bucket, key, metaKey, metaBytes, ttl, expected)
 }
 func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *CachedObjectMeta, body []byte, ttl int) error {
@@ -124,6 +143,11 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 		ttl = int(c.defaultTTL)
 	}
 
+	expected, err := c.coord.prepareMetaToken(ctx, bucket, key, AnyMetaVersionToken())
+	if err != nil {
+		return err
+	}
+
 	metaKey := MakeMetaKey(bucket, key)
 	bodyKey := MakeBodyKey(bucket, key, meta.ETag)
 
@@ -141,9 +165,10 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 		return err
 	}
 
-	// Store metadata AFTER body is complete. Version-bumping unconditional:
-	// same last-write-wins semantics as before, but the row stays stamped.
-	if _, err := c.putMetaVersioned(ctx, bucket, key, metaKey, metaBytes, int64(ttl), VersionAny); err != nil {
+	// Store metadata AFTER the body is complete. CAS mode keeps the row
+	// version-stamped; legacy mode records its sidecar generation for current
+	// readers while retaining the plain metadata Put used by older peers.
+	if _, err := c.putMetaVersioned(ctx, bucket, key, metaKey, metaBytes, int64(ttl), expected); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta put error")
 		// Leave the versioned body to age out via TTL rather than deleting it
 		// synchronously: a concurrent populate of the same ETag could have a reader
@@ -163,28 +188,31 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 }
 
 // PutWithMetaStreamIfVersion is like PutWithMetaStream but commits the
-// metadata under the caller's decision-time version precondition (see
-// putMetaVersioned): body first, then the meta write that makes the entry
-// visible — refused atomically if the entry changed (including a fenced
-// delete) since the caller's token was read.
+// metadata under the caller's decision-time token (see putMetaVersioned): body
+// first, then the metadata write that makes the entry visible. CAS mode refuses
+// atomically if the metadata key changed. Legacy mode stores the separate
+// generation in the row; a late plain Put may land, but current TAG readers
+// will not serve it after that generation advances. Older readers do not check
+// the sidecar.
 //
-// The expected version is the meta write's precondition: a decision-time
-// token (live version or absence token) for an ordered populate, VersionAny
-// for last-write-wins. 0 is unordered put-if-absent under the CAS
-// coordinator but is REFUSED by the legacy coordinator (nothing to order
-// against) — production callers always carry a nonzero token.
+// The expected token carries the metadata-key version in CAS mode. Legacy mode
+// carries the sidecar version and decision-time stamp used by v1.20 tombstone
+// checks. GetMetaWithVersion creates a decision marker when absent; if that
+// marker is evicted before commit, the stale token is refused. AnyMetaVersionToken
+// requests last-write-wins. A zero-value token is invalid for legacy mode and
+// is refused.
 //
-// Returns wrote=true only when the metadata was actually written (the entry
-// is now visible). It is false when the write was skipped without error — the
-// object was not cacheable (no ETag) or the precondition was lost — so
-// callers can distinguish a no-op from a real write.
+// Returns wrote=true when the metadata write completed. It is false when the
+// write was skipped without error — the object was not cacheable (no ETag) or
+// the precondition was lost. In legacy mode a late plain Put can complete but
+// remain invisible to current TAG readers because its sidecar generation is stale.
 func (c *Cache) PutWithMetaStreamIfVersion(
 	ctx context.Context,
 	bucket, key string,
 	meta *CachedObjectMeta,
 	body io.Reader,
 	ttl int,
-	expected uint64, // decision-time version precondition for the meta write
+	expected MetaVersionToken, // decision-time token for the metadata write
 ) (wrote bool, err error) {
 	if !c.IsEnabled() {
 		return false, nil
@@ -204,6 +232,11 @@ func (c *Cache) PutWithMetaStreamIfVersion(
 	if ttl == 0 {
 		ttl = int(c.defaultTTL)
 	}
+	expected, err = c.coord.prepareMetaToken(ctx, bucket, key, expected)
+	if err != nil {
+		_, _ = io.Copy(io.Discard, body)
+		return false, err
+	}
 
 	metaKey := MakeMetaKey(bucket, key)
 	bodyKey := MakeBodyKey(bucket, key, meta.ETag)
@@ -221,16 +254,17 @@ func (c *Cache) PutWithMetaStreamIfVersion(
 		return false, err
 	}
 
-	// No tombstone gate: the version precondition below IS the invalidation
-	// guard — a fenced delete (or any write) landing after the caller's
-	// decision-time token makes this commit lose atomically. On a lost commit
-	// the just-written versioned body is left to age out via TTL rather than
-	// deleted synchronously: a concurrent populate of the same ETag could have
-	// a reader streaming this exact body key, and deleting it would truncate
-	// that reader. Without a visible meta entry the orphaned body is
-	// unreachable and harmless until it expires.
+	// The coordinator applies the decision-time token. CAS mode rejects a
+	// metadata write atomically after a fence; legacy mode tags the plain write
+	// with its sidecar generation so current readers reject a late commit. The
+	// old tombstone check remains for legacy compatibility but is not atomic.
+	// On a lost commit the just-written versioned body is left to age out via
+	// TTL rather than deleted synchronously: a concurrent populate of the same
+	// ETag could have a reader streaming this exact body key, and deleting it
+	// would truncate that reader. Without visible metadata the orphaned body is
+	// unreachable to current readers until it expires.
 
-	// Write metadata AFTER body (makes entry visible), under the version
+	// Write metadata AFTER body (makes entry visible to current readers), under the version
 	// precondition. A lost precondition leaves the newer entry in place and the
 	// just-written body to TTL.
 	wrote, err = c.putMetaVersioned(ctx, bucket, key, metaKey, metaBytes, int64(ttl), expected)
@@ -253,13 +287,14 @@ func (c *Cache) PutWithMetaStreamIfVersion(
 	return true, nil
 }
 
-// GetMetaWithVersion is GetMeta plus the decision-time TOKEN a subsequent
-// commit must carry (semantics per coordinator: a store version in CAS mode,
-// a wall-clock stamp in legacy mode). Absent entries return found=false with
-// a valid token; callers test found, never token==0.
-func (c *Cache) GetMetaWithVersion(ctx context.Context, bucket, key string) (*CachedObjectMeta, uint64, bool, error) {
+// GetMetaWithVersion is GetMeta plus the decision-time token a subsequent
+// commit must carry. The token includes the metadata-key store version in CAS
+// mode. Legacy mode retains the tombstone timestamp and generation version, and
+// creates a marker at decision time when none exists. Callers use found for
+// metadata presence.
+func (c *Cache) GetMetaWithVersion(ctx context.Context, bucket, key string) (*CachedObjectMeta, MetaVersionToken, bool, error) {
 	if !c.IsEnabled() {
-		return nil, 0, false, nil
+		return nil, MetaVersionToken{}, false, nil
 	}
 	return c.coord.getMetaWithVersion(ctx, bucket, key)
 }
@@ -267,36 +302,16 @@ func (c *Cache) GetMeta(ctx context.Context, bucket, key string) (*CachedObjectM
 	if !c.IsEnabled() {
 		return nil, false, nil
 	}
-
-	metaKey := MakeMetaKey(bucket, key)
-
-	// Get metadata
-	metaBytes, err := c.client.Get(ctx, metaKey)
+	meta, found, err := c.coord.getMeta(ctx, bucket, key)
 	if err != nil {
-		if isNotFoundError(err) {
-			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (meta only)")
-			return nil, false, nil
-		}
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta get error")
 		return nil, false, err
 	}
-
-	if metaBytes == nil {
+	if !found || meta == nil {
+		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (meta only)")
 		return nil, false, nil
 	}
-
-	// Decode metadata
-	meta, err := DecodeMeta(metaBytes)
-	if err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta decode error")
-		return nil, false, err
-	}
-
-	log.Debug().
-		Str("bucket", bucket).
-		Str("key", key).
-		Int("meta_size", len(metaBytes)).
-		Msg("Cache hit (meta only)")
+	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache hit (meta only)")
 	return meta, true, nil
 }
 
@@ -359,14 +374,20 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w i
 	return nil
 }
 
-// DeleteWithMeta removes both metadata and body from cache via the fenced CAS
-// delete: the fence it leaves is what stops an in-flight populate that
-// observed pre-delete state (including pre-delete absence) from completing.
+// DeleteWithMeta invalidates visible metadata through the selected
+// coordinator. CAS deletes fence earlier metadata-key tokens. Legacy mode
+// advances a separate CAS generation for current TAG readers, then retains the
+// v1.20 tombstone and plain metadata operations. A late legacy Put remains
+// invisible to current readers; older TAG readers do not consult the sidecar
+// and can still observe that write during a mixed-version rollout. The body is
+// left to age out via TTL rather than deleted synchronously, which could
+// truncate an in-flight reader of that version.
 //
-// Both steps are attempted even if the first fails (best-effort invalidation), but a
-// genuine backend failure of either is returned so callers don't report a successful
-// invalidation while stale metadata is still readable. A not-found metadata delete is
-// success — the entry is already gone.
+// Legacy mode attempts the sidecar advance, tombstone write, and metadata
+// deletion even if one fails.
+// A genuine backend failure is returned so callers don't report successful
+// invalidation while stale metadata is still readable. A not-found metadata
+// delete is success — the entry is already gone.
 func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	if !c.IsEnabled() {
 		return nil
@@ -374,17 +395,12 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 
 	var errs []error
 
-	// Delete only the metadata. That is sufficient to make subsequent reads miss
-	// (a read resolves the body from meta.ETag, so with meta gone there is no body
-	// lookup), and the fence left by the CAS delete blocks any in-flight
-	// token-carrying repopulation. The
-	// versioned body is intentionally left to age out via TTL rather than deleted
-	// synchronously — deleting it could truncate an in-flight reader still
-	// streaming that exact version.
-	//
-	// FENCED (ocache v1.13.0, #267): the delete goes through the CAS op family
-	// so it leaves a fence, ordering every token-carrying populate that
-	// observed pre-delete state — the sole invalidation mechanism.
+	// Delete only the metadata. With no metadata, subsequent reads do not look
+	// up the body. CAS deletion leaves a version fence; legacy deletion advances
+	// the current-reader generation sidecar, then uses the compatibility
+	// tombstone and plain metadata delete. The versioned body is left to age out
+	// via TTL rather than deleted synchronously — deleting it could truncate an
+	// in-flight reader still streaming that version.
 	if err := c.deleteMetaFenced(ctx, bucket, key); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache meta delete error")
 		errs = append(errs, fmt.Errorf("delete meta: %w", err))
@@ -398,8 +414,8 @@ func (c *Cache) DeleteWithMeta(ctx context.Context, bucket, key string) error {
 	return nil
 }
 
-// deleteMetaFenced routes the unconditional invalidation through the selected
-// coordinator (fenced CAS delete, or legacy tombstone + plain delete).
+// deleteMetaFenced routes invalidation through the selected coordinator
+// (CAS metadata fence, or legacy generation sidecar plus tombstone/plain delete).
 func (c *Cache) deleteMetaFenced(ctx context.Context, bucket, key string) error {
 	return c.coord.deleteMeta(ctx, bucket, key)
 }
@@ -417,11 +433,11 @@ func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
 // even by identical content reusing the same MD5 ETag — refuses the delete.
 // Returns (false, nil) when replaced or absent. CAS-coordinator strength; the
 // legacy coordinator refuses (see coordinator.go).
-func (c *Cache) DeleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error) {
+func (c *Cache) DeleteMetaIfVersion(ctx context.Context, bucket, key string, expected MetaVersionToken) (bool, error) {
 	if !c.IsEnabled() {
 		return false, nil
 	}
-	return c.coord.deleteMetaIfVersion(ctx, bucket, key, version)
+	return c.coord.deleteMetaIfVersion(ctx, bucket, key, expected)
 }
 
 // DeleteIfETag invalidates the object's metadata only while it still carries
@@ -720,7 +736,7 @@ func (c *Cache) PutMetaIfVersion(
 	bucket, key string,
 	meta *CachedObjectMeta,
 	ttl int,
-	expected uint64,
+	expected MetaVersionToken,
 ) (wrote bool, err error) {
 	if !c.IsEnabled() {
 		return false, nil
@@ -730,6 +746,10 @@ func (c *Cache) PutMetaIfVersion(
 	}
 	if ttl == 0 {
 		ttl = int(c.defaultTTL)
+	}
+	expected, err = c.coord.prepareMetaToken(ctx, bucket, key, expected)
+	if err != nil {
+		return false, err
 	}
 	metaKey := MakeMetaKey(bucket, key)
 	metaBytes, err := meta.Encode()
@@ -753,10 +773,8 @@ func (c *Cache) Has(ctx context.Context, bucket, key string) bool {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	// Check for metadata key
-	metaKey := MakeMetaKey(bucket, key)
-	metaBytes, err := c.client.Get(ctx, metaKey)
-	return err == nil && metaBytes != nil
+	_, found, err := c.GetMeta(ctx, bucket, key)
+	return err == nil && found
 }
 
 // ListKeys returns all keys matching the prefix.

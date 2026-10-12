@@ -75,7 +75,7 @@ func (s *Service) revalidateAndServe(
 		return s.forwardAfterCacheMiss(ctx, w, r, bucket, key, meta.ETag, revalErr, start)
 	case http.StatusOK:
 		// Full-object response (no range or upstream ignored range)
-		return s.handleRevalidation200(ctx, w, bucket, key, meta.ETag, resp, start)
+		return s.handleRevalidation200(ctx, w, bucket, key, accessKey, secretKey, meta.ETag, resp, start)
 	case http.StatusPartialContent:
 		// Range response — object changed, upstream returned only the requested range
 		return s.handleRevalidation206Range(ctx, w, r, bucket, key, accessKey, secretKey, meta.ETag, resp, start)
@@ -159,44 +159,36 @@ func (s *Service) handleRevalidation304(
 	return true, nil
 }
 
-// revalidationExpectedVersion picks the meta-write precondition for a
-// revalidation repopulate. The guarded delete that precedes the repopulate is
-// best-effort, so "expect absent" alone is wrong: a transiently failed delete
-// leaves the KNOWN-STALE row in place, and put-if-absent would then refuse the
-// replacement and keep serving stale data. Instead:
-//   - entry absent → 0 (put-if-absent);
-//   - the observed stale row still present → its version (the replacement
-//     overwrites exactly that row; if it moves first, the newer write wins);
-//   - anything else present → a racer already re-established a fresh entry →
-//     0, which is guaranteed to mismatch, skipping the write in its favor.
+// revalidationExpectedVersion picks the decision token for a revalidation
+// repopulate. The guarded delete that precedes it is best-effort, so a
+// transiently failed delete can leave the known-stale row in place. Instead:
+//   - an absent entry carries its CAS absence token or legacy generation token;
+//   - the observed stale row carries its decision token so the replacement can
+//     update that state;
+//   - any other present row belongs to a fresh racer, so the repopulate is skipped.
 //
-// A read failure returns 0 as well: refusing to overwrite is the safe
-// direction when the store cannot be consulted, and the entry converges via
-// the next revalidation or TTL.
-func (s *Service) revalidationExpectedVersion(bucket, key, staleETag string) (uint64, bool) {
+// A read failure also skips the write; never substitute an unordered token.
+func (s *Service) revalidationExpectedVersion(bucket, key, staleETag string) (cache.MetaVersionToken, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cur, version, found, err := s.cache.GetMetaWithVersion(ctx, bucket, key)
 	if err != nil {
-		// No token, no ordered commit — expected=0 is the legacy unordered
-		// put-if-absent and could publish over a fence. Skip the repopulate;
-		// the client is still served and the entry heals on a later read.
-		return 0, false
+		// Without a decision token, skip the repopulate. This includes a
+		// legacy sidecar that an older cache owner cannot version; never fall
+		// back to an unordered write.
+		return cache.MetaVersionToken{}, false
 	}
 	if !found || cur == nil {
-		// Absent: use the absence TOKEN (ocache v1.13.0), not 0 — the repopulate
-		// is then ordered against a fenced delete landing after this look.
+		// Preserve the absent-state token (CAS version or legacy generation
+		// sidecar) rather than replacing it with the unordered zero sentinel.
 		return version, true
 	}
 	if cur.ETag == staleETag {
 		return version, true
 	}
-	// A fresh racer holds the key: skip the write in its favor. There is no
-	// precondition that fails in every future — 0 mismatches the live row, but
-	// if the racer is fenced-deleted before our (asynchronous) commit, 0
-	// becomes legacy put-if-absent over absence and would publish our
-	// pre-fetch bytes over that fence.
-	return 0, false
+	// A fresh racer holds the key: skip the write in its favor rather than
+	// keeping stale bytes from this revalidation response.
+	return cache.MetaVersionToken{}, false
 }
 
 // handleRevalidation200 handles a 200 OK revalidation response (object changed).
@@ -204,7 +196,7 @@ func (s *Service) revalidationExpectedVersion(bucket, key, staleETag string) (ui
 func (s *Service) handleRevalidation200(
 	ctx context.Context,
 	w http.ResponseWriter,
-	bucket, key, staleETag string,
+	bucket, key, accessKey, secretKey, staleETag string,
 	resp *http.Response,
 	start time.Time,
 ) error {
@@ -226,14 +218,24 @@ func (s *Service) handleRevalidation200(
 	// (with the fresh version), that newer entry is left in place.
 	s.invalidateStaleMeta(bucket, key, staleETag)
 
-	// The repopulate's precondition is read AFTER the guarded delete, so our
-	// own invalidation doesn't block the write, while a concurrent DELETE
-	// arriving later bumps the fence past it and correctly does. It must be
-	// read BEFORE the not-cacheable early-return below: a failed token read
-	// downgrades this response to stream-only — never a commit with the
-	// legacy unordered expected=0.
+	// The repopulate's decision token is read AFTER the guarded delete, so our
+	// own invalidation doesn't block the write. A later CAS delete advances
+	// the metadata fence; a later legacy delete advances the reader-generation
+	// sidecar. Read before the not-cacheable return: a failed token read makes
+	// this response stream-only, never an unordered metadata commit.
 	expected, tokenOK := s.revalidationExpectedVersion(bucket, key, staleETag)
 	shouldCache = shouldCache && tokenOK
+	if shouldCache {
+		// The conditional GET may have completed after a concurrent DELETE. Its
+		// 200 body is a snapshot from before that mutation, while expected is a
+		// fresh post-invalidation token. Confirm the response still names the
+		// current strong representation before granting it that token.
+		if current, ok := s.confirmRevalidation200(ctx, bucket, key, accessKey, secretKey, newMeta); ok {
+			newMeta = current
+		} else {
+			shouldCache = false
+		}
+	}
 
 	// Write response headers to client
 	copyHeaders(w.Header(), resp.Header)
@@ -309,6 +311,36 @@ func (s *Service) handleRevalidation200(
 	}
 	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return copyErr
+}
+
+// confirmRevalidation200 checks whether the representation from a 200
+// revalidation is still current. A strong ETag plus its exact length ties the
+// already-received body to the current object; weak or unknown validators are
+// streamed to the client but not cached. The HEAD metadata is used for the new
+// entry so changed headers are not copied from the older response.
+func (s *Service) confirmRevalidation200(ctx context.Context, bucket, key, accessKey, secretKey string, responseMeta *cache.CachedObjectMeta) (*cache.CachedObjectMeta, bool) {
+	if responseMeta == nil || responseMeta.ETag == "" || strings.HasPrefix(strings.TrimSpace(responseMeta.ETag), "W/") || responseMeta.ContentLength < 0 {
+		return nil, false
+	}
+	headCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	resp, err := s.forwarder.DoConditionalHeadRequest(headCtx, bucket, key, accessKey, secretKey, "", 0)
+	if err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Revalidation 200 HEAD confirmation failed; response not cached")
+		return nil, false
+	}
+	if resp.Body != nil {
+		defer resp.Body.Close()
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	current := cache.MetaFromHTTPHeaders(bucket, key, resp.StatusCode, resp.Header)
+	if current.ETag != responseMeta.ETag || current.ContentLength != responseMeta.ContentLength ||
+		!current.IsCacheable(s.config.Cache.SizeThreshold) || s.hasNoCacheHeaders(resp.Header) {
+		return nil, false
+	}
+	return current, true
 }
 
 // serveFromCache serves an object from the cache body.

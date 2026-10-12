@@ -104,6 +104,11 @@ func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.Respons
 // Validates and re-signs like Forward, but also captures the response body
 // for caching while streaming to the client.
 func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+	capture, _, err := f.forwardWithCaptureAttempted(ctx, w, r)
+	return capture, err
+}
+
+func (f *signingForwarder) forwardWithCaptureAttempted(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, bool, error) {
 	// Decode AWS chunked encoding if present, otherwise pass through unchanged
 	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)
 
@@ -111,13 +116,13 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 	accessKey, err := f.validator.ValidateRequest(r)
 	if err != nil {
 		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
-		return nil, mapAuthError(err)
+		return nil, false, mapAuthError(err)
 	}
 
 	// Look up secret key
 	secretKey, err := f.credStore.GetSecretKey(accessKey)
 	if err != nil {
-		return nil, mapAuthError(err)
+		return nil, false, mapAuthError(err)
 	}
 
 	// Build the path with query string
@@ -129,7 +134,7 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 	// Create signed request (passes body hash, streams body directly)
 	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, r.Header)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	prepareForwardedRequest(fwdReq, contentLength, chunked)
 

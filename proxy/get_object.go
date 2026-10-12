@@ -342,9 +342,9 @@ func (s *Service) fetchAndBroadcast(
 		if upErr := broadcaster.Error(); upErr == nil ||
 			errors.Is(upErr, context.Canceled) || errors.Is(upErr, context.DeadlineExceeded) {
 			if _, tok, found, gerr := s.cache.GetMetaWithVersion(context.Background(), bucket, key); gerr == nil && !found {
-				// Absent-gated, carrying the absence TOKEN (ocache v1.13.0):
-				// the warm is ordered against a fenced delete landing after
-				// this look, where a bare put-if-absent would recreate over it.
+				// Carry the absent-state token (metadata version or legacy
+				// generation sidecar) into the warm so a later invalidation
+				// rejects its commit or makes it invisible to current readers.
 				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, tok)
 			}
 		}
@@ -366,18 +366,15 @@ func (s *Service) streamFromUpstream(
 	bucket, key, accessKey, secretKey string,
 	broadcaster *broadcast.Broadcaster,
 ) error {
-	// Stamp the cache-write start BEFORE issuing the upstream request, not after
-	// The populate's DECISION-TIME token, read before the upstream request: the
-	// commit applies only if the entry is unchanged from this instant — a
-	// fenced delete (or any write) landing while the body streams makes the
-	// commit lose atomically, never retried with the same bytes. This is the
-	// refill pattern the fence contract requires (ocache v1.13.0): a token
-	// read after the fetch could postdate a delete and resurrect pre-delete
-	// bytes. Covers presence (live version) and absence (absence token) alike.
+	// Capture the cache-write decision token BEFORE issuing the upstream request.
+	// CAS mode carries the metadata-key version; legacy mode carries both the
+	// decision-time tombstone stamp and generation-sidecar version. A later
+	// invalidation makes CAS reject the commit or makes current TAG readers reject
+	// a legacy row with an older generation. A
+	// token read after fetch could postdate the delete and label old bytes fresh.
 	_, expected, _, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
-	// Without a token the commit cannot be ordered — expected=0 is the LEGACY
-	// unordered put-if-absent, which would publish over a fence. The safe
-	// failure is not populating at all: tokenOK gates the cache listener below.
+	// Without a token the commit cannot be ordered. A read error must not fall
+	// back to VersionAny or expected=0; tokenOK gates the cache listener below.
 	tokenOK := tokErr == nil
 
 	// Execute upstream request
@@ -838,9 +835,9 @@ func (s *Service) handleRangeWithBackgroundCache(
 	} else if cacheable {
 		defer func() {
 			if _, tok, found, gerr := s.cache.GetMetaWithVersion(context.Background(), bucket, key); gerr == nil && !found {
-				// Absent-gated, carrying the absence TOKEN (ocache v1.13.0):
-				// the warm is ordered against a fenced delete landing after
-				// this look, where a bare put-if-absent would recreate over it.
+				// Carry the absent-state token (metadata version or legacy
+				// generation sidecar) into the warm so a later invalidation
+				// rejects its commit or makes it invisible to current readers.
 				s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, hasNoAuthCredentials(r), priorityReadMiss, tok)
 			}
 		}()

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
 )
 
@@ -99,7 +100,7 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	// Tiered: pre-forward tokens per key, so the post-success converge is
 	// ordered — see convergeTieredDelete.
 	type tieredPrior struct {
-		version uint64
+		version cache.MetaVersionToken
 		known   bool
 	}
 	var tieredPriors map[string]tieredPrior
@@ -124,8 +125,8 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 						// converge (see HandleDeleteObject).
 						s.claimRetierWrite(bucket, obj.Key)
 						defer s.releaseRetierWrite(bucket, obj.Key)
-						_, v, known := s.captureMarkerPrior(context.Background(), bucket, obj.Key)
-						tieredPriors[obj.Key] = tieredPrior{version: v, known: known}
+						_, token, known := s.captureMarkerPrior(context.Background(), bucket, obj.Key)
+						tieredPriors[obj.Key] = tieredPrior{version: token, known: known}
 					}
 				}
 				requestedCounts[obj.Key]++
@@ -139,18 +140,29 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 
 	// Forward request to upstream, capturing the response so we can tell which
 	// per-object deletes actually succeeded — S3 returns 200 OK with per-key
-	// <Error> elements for partial failures.
-	capture, err := s.forwarder.ForwardWithCapture(r.Context(), w, r)
+	// <Error> elements for partial failures. The concrete forwarders also report
+	// whether the HTTP client was called so a local preparation error is not
+	// mistaken for an ambiguous upstream outcome.
+	var (
+		capture   *ResponseCapture
+		attempted bool
+	)
+	if f, ok := s.forwarder.(captureAttemptForwarder); ok {
+		capture, attempted, err = f.forwardWithCaptureAttempted(r.Context(), w, r)
+	} else {
+		capture, err = s.forwarder.ForwardWithCapture(r.Context(), w, r)
+	}
 
 	// Re-invalidate AFTER upstream confirms the deletes, for the same
 	// read-after-write reason as HandleDeleteObject: a GET racing the in-flight
-	// bulk delete may have re-cached a not-yet-deleted object; this second fence bump
-	// blocks that stale repopulation. A key is re-invalidated when at least one of
-	// its requested entries was deleted — i.e. more entries were requested for the
-	// key than upstream reported as errored. Counting by key (never matching version
-	// IDs) is robust to VersionId representation differences and to Quiet mode, and
-	// can never leave a truly-deleted object cached (a success is never an <Error>).
-	// A key whose entries ALL errored keeps its refill (it's still upstream).
+	// bulk delete may have re-cached a not-yet-deleted object; this second
+	// invalidation advances its CAS fence or legacy reader generation. A key is
+	// re-invalidated when at least one requested entry for it was deleted —
+	// i.e. more entries were requested for the key than upstream reported as errored.
+	// Counting by key (never matching version IDs) is robust to VersionId
+	// representation differences and Quiet mode, and can never leave a truly-deleted
+	// object cached (a success is never an <Error>). A key whose entries ALL errored
+	// keeps its refill (it's still upstream).
 	// Routed through invalidateObject so a failed re-invalidation is recorded/logged.
 	if err == nil && capture != nil && capture.StatusCode >= 200 && capture.StatusCode < 300 && s.cache.IsEnabled() {
 		erroredCounts, parsed := erroredDeleteKeyCounts(capture.Body)
@@ -166,6 +178,22 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 			}
 			s.convergeInvalidation(context.Background(), bucket, key)
 		}
+	}
+
+	// A Do error has no authoritative per-key result: the origin may have applied
+	// the batch before its reply was lost. In proxy modes, advance the cache fence
+	// or legacy reader generation for every distinct requested key using a bounded
+	// context independent of the client. Keep tiered's success-only converge: its
+	// local entry may be the only copy.
+	if err != nil && attempted && requestedCounts != nil && tieredPriors == nil {
+		// One deadline bounds the whole batch, not each key independently.
+		// The response error still belongs to the upstream exchange; an expired
+		// cleanup context is reported by the shared invalidation helper.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		for key := range requestedCounts {
+			s.convergeInvalidation(ctx, bucket, key)
+		}
+		cancel()
 	}
 
 	// Record metrics

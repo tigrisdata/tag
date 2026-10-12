@@ -450,7 +450,8 @@ func TestCachedObjectMeta_EncodeDecodeMeta(t *testing.T) {
 		UserMetadata: map[string]string{
 			"X-Amz-Meta-Custom": "value",
 		},
-		StatusCode: http.StatusOK,
+		StatusCode:      http.StatusOK,
+		cacheGeneration: 42,
 	}
 
 	// Encode
@@ -483,6 +484,9 @@ func TestCachedObjectMeta_EncodeDecodeMeta(t *testing.T) {
 	}
 	if decoded.StatusCode != original.StatusCode {
 		t.Errorf("StatusCode = %d, want %d", decoded.StatusCode, original.StatusCode)
+	}
+	if decoded.cacheGeneration != original.cacheGeneration {
+		t.Errorf("cache generation = %d, want %d", decoded.cacheGeneration, original.cacheGeneration)
 	}
 }
 

@@ -73,10 +73,10 @@ type RequestForwarder interface {
 	// Caller is responsible for closing the response body.
 	DoConditionalGetRequest(ctx context.Context, bucket, key, accessKey, secretKey, etag string, lastModified int64, rangeHeader string) (*http.Response, error)
 
-	// DoConditionalHeadRequest executes a conditional HEAD for cache revalidation of HEAD requests.
-	// Sends If-None-Match and/or If-Modified-Since headers.
-	// Returns 304 if unchanged, 200 with headers only if changed (no body).
-	// Caller is responsible for closing the response body.
+	// DoConditionalHeadRequest executes a HEAD for cache revalidation. Non-empty
+	// validators add If-None-Match and/or If-Modified-Since; empty validators
+	// send an unconditional HEAD to confirm current object metadata. The response
+	// has headers only. Caller is responsible for closing its body.
 	DoConditionalHeadRequest(ctx context.Context, bucket, key, accessKey, secretKey, etag string, lastModified int64) (*http.Response, error)
 }
 
@@ -159,6 +159,13 @@ var (
 	_ RequestForwarder = (*signingForwarder)(nil)
 	_ RequestForwarder = (*transparentForwarder)(nil)
 )
+
+// captureAttemptForwarder exposes whether capture forwarding reached http.Client.Do.
+// An attempted call has an unknown upstream outcome when Do returns an error; it does
+// not assert that the origin received the request.
+type captureAttemptForwarder interface {
+	forwardWithCaptureAttempted(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, bool, error)
+}
 
 // ResponseInterceptor is called after receiving the upstream response but before
 // headers are sent to the client. Used by transparentForwarder to extract signing
@@ -254,7 +261,7 @@ func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *
 // executeAndCapture executes the request, streams to client, and captures the response.
 // originalReq is the original client request, passed to the response interceptor
 // for parsing auth info. It can be nil if no interceptor is set.
-func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (*ResponseCapture, error) {
+func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request) (*ResponseCapture, bool, error) {
 	if inContentLength > 0 {
 		metrics.BytesTransferred.WithLabelValues("in").Add(float64(inContentLength))
 	}
@@ -264,7 +271,7 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 	metrics.RecordUpstreamRequest(fwdReq.Method, time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
 		log.Error().Err(err).Str("method", fwdReq.Method).Str("path", fwdReq.URL.Path).Msg("Failed to forward request")
-		return nil, err
+		return nil, true, err
 	}
 	defer resp.Body.Close()
 
@@ -297,7 +304,7 @@ func (b *baseForwarder) executeAndCapture(w http.ResponseWriter, fwdReq *http.Re
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(len(capture.Body)))
 
 	logUpstreamResponse(fwdReq, originalReq, resp.StatusCode, upstreamStart)
-	return capture, nil
+	return capture, true, nil
 }
 
 // executeRequest executes the request and returns the raw response.
@@ -421,10 +428,9 @@ func (b *baseForwarder) DoConditionalGetRequest(ctx context.Context, bucket, key
 	return b.doConditionalRequest(ctx, "GET", bucket, key, accessKey, secretKey, etag, lastModified, rangeHeader)
 }
 
-// DoConditionalHeadRequest executes a conditional HEAD request to upstream.
-// Used for cache revalidation of HEAD requests: sends If-None-Match and/or
-// If-Modified-Since headers to check if a cached object is still fresh.
-// Returns 304 Not Modified if unchanged, 200 OK with headers only if changed.
+// DoConditionalHeadRequest executes a HEAD request to upstream.
+// Non-empty validators add If-None-Match and/or If-Modified-Since; empty
+// validators send an unconditional HEAD to confirm current object metadata.
 // Caller is responsible for closing the response body.
 func (b *baseForwarder) DoConditionalHeadRequest(ctx context.Context, bucket, key, accessKey, secretKey, etag string, lastModified int64) (*http.Response, error) {
 	return b.doConditionalRequest(ctx, "HEAD", bucket, key, accessKey, secretKey, etag, lastModified, "")

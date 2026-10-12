@@ -40,17 +40,29 @@ retry the same bytes with a fresh token.
 Meta invalidation/populate ordering is a strategy selected once at construction
 (`cache/coordinator.go`), never per-call if/else:
 
-- **Legacy (default)**: `cache.legacy_coordination: true` — the pre-v1.21
-  tombstone mechanism (plain Get/Put/Delete + timestamp tombstones). Safe for
-  any cluster mix, including nodes upgrading straight from ≤v1.20.
-- **CAS**: `legacy_coordination: false` — the fenced CAS pattern above.
-  Requires every node in the cluster to be CAS-capable (≥v1.21) BEFORE the
-  flip; flip via config + a brisk rolling restart (mixed-mechanism window is
-  bounded by the restart).
+- **Legacy (default)**: `cache.legacy_coordination: true` keeps the v1.20
+  metadata key and eight-byte tombstone protocol for wire-compatible rollouts;
+  it is not a fleet-wide freshness guarantee while v1.20 readers remain.
+  Current TAG also CAS-updates a separate `meta-gen|...` sidecar and records
+  its generation in new metadata; current reads require a match, so old rows
+  without a generation are misses until repopulated. A decision read creates a
+  TTL-bounded publish marker when none exists; eviction before commit makes the
+  captured token fail closed. If a cache owner lacks the sidecar CAS RPC,
+  current TAG fails closed and bypasses that cache entry. Older TAG readers
+  ignore the sidecar and can still serve a late plain metadata Put during a
+  mixed-version rollout. The v1.20 reader reads only the plain metadata key, and
+  its tombstone check precedes a separate plain Put; a writer that passed the
+  check can publish after a later delete. This old check-to-Put limitation is
+  outside the sidecar-aware current-reader guarantee.
+- **CAS**: `legacy_coordination: false` — the fenced CAS pattern above on the
+  metadata key. Requires every node in the cluster to be CAS-capable (≥v1.21)
+  BEFORE the flip; flip via config + a brisk rolling restart (mixed-mechanism
+  window is bounded by the restart).
 
-The proxy layer is mode-blind: it carries an opaque uint64 token (store version
-in CAS mode, wall-clock stamp in legacy mode) from decision to commit. Never
-branch on the mode outside the coordinator implementations.
+The proxy layer is mode-blind: it carries an opaque comparable token from
+decision to commit. CAS mode uses the metadata-key version; legacy mode carries
+the generation-sidecar observation and v1.20 tombstone timestamp. Never branch
+on the mode outside the coordinator implementations.
 
 ## Stream Multiplexing > Batching
 

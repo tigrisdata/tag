@@ -17,11 +17,14 @@ import (
 
 // mockForwarder implements RequestForwarder for revalidation unit tests.
 type mockForwarder struct {
-	conditionalResp *http.Response
-	conditionalErr  error
+	conditionalResp     *http.Response
+	conditionalErr      error
+	conditionalHeadResp *http.Response
+	conditionalHeadErr  error
 	// Track calls for verification
 	conditionalCalled bool
 	conditionalETag   string
+	headCalled        bool
 	// Optional Forward implementation for fallback tests
 	forwardFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request) error
 	// Optional ForwardWithCapture implementation for capture-gated tests
@@ -97,12 +100,24 @@ func (m *mockForwarder) DoConditionalGetRequest(ctx context.Context, bucket, key
 }
 
 func (m *mockForwarder) DoConditionalHeadRequest(ctx context.Context, bucket, key, accessKey, secretKey, etag string, lastModified int64) (*http.Response, error) {
-	m.conditionalCalled = true
-	m.conditionalETag = etag
+	m.headCalled = true
+	if m.conditionalHeadErr != nil {
+		return nil, m.conditionalHeadErr
+	}
 	if m.conditionalErr != nil {
 		return nil, m.conditionalErr
 	}
-	return m.conditionalResp, nil
+	if m.conditionalHeadResp != nil {
+		return m.conditionalHeadResp, nil
+	}
+	if m.conditionalResp == nil {
+		return nil, errors.New("mock: conditional HEAD not implemented")
+	}
+	return &http.Response{
+		StatusCode: m.conditionalResp.StatusCode,
+		Header:     m.conditionalResp.Header.Clone(),
+		Body:       http.NoBody,
+	}, nil
 }
 
 // newTestService creates a Service with an in-memory cache for unit tests.
@@ -191,13 +206,22 @@ func TestRevalidation200_StreamsNewBody(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader(newBody)),
 			Header: http.Header{
 				"Content-Type":   []string{"text/plain"},
-				"Content-Length": []string{"24"},
+				"Content-Length": []string{"25"},
 				"Etag":           []string{`"newetag"`},
 			},
 		},
+		conditionalHeadResp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type":   []string{"application/json"},
+				"Content-Length": []string{"25"},
+				"Etag":           []string{`"newetag"`},
+			},
+			Body: http.NoBody,
+		},
 	}
 
-	svc, _ := newTestService(mock, true)
+	svc, c := newTestService(mock, true)
 	ctx := context.Background()
 	bucket, key := "test-bucket", "test-key"
 
@@ -226,6 +250,12 @@ func TestRevalidation200_StreamsNewBody(t *testing.T) {
 	}
 	if w.Body.String() != newBody {
 		t.Errorf("body = %q, want %q", w.Body.String(), newBody)
+	}
+	if !mock.headCalled {
+		t.Fatal("expected a current-representation HEAD before caching the revalidation response")
+	}
+	if cached, found, err := c.GetMeta(ctx, bucket, key); err != nil || !found || cached.ETag != `"newetag"` || cached.ContentType != "application/json" {
+		t.Fatalf("confirmed 200 revalidation metadata=(%+v, found=%t, err=%v), want current HEAD metadata cached", cached, found, err)
 	}
 }
 
