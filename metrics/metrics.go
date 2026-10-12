@@ -458,10 +458,11 @@ var (
 )
 
 // RecordRequest records a request with its duration and status.
-// Source label values for RecordRequest: where the response was produced.
+// Source label values identify the request path that owns response accounting,
+// not the origin of every byte in a streamed response.
 const (
-	SourceLocal    = "local"    // answered from TAG's own store or knowledge
-	SourceUpstream = "upstream" // proxied from upstream
+	SourceLocal    = "local"    // handled through TAG's local/cache path, including verified block-suffix recovery
+	SourceUpstream = "upstream" // proxied directly from upstream
 )
 
 // processMode is the operating mode stamped on every request metric. One
@@ -480,6 +481,17 @@ func SetMode(mode string) {
 func RecordRequest(operation, status, source string, durationSeconds float64) {
 	RequestsTotal.WithLabelValues(operation, status, processMode, source).Inc()
 	RequestDuration.WithLabelValues(operation, processMode, source).Observe(durationSeconds)
+}
+
+// RecordRequestResult maps an operation result to the shared success/error status labels.
+// Callers that own specialized outcomes such as authentication or range validation use
+// RecordRequest with their explicit status instead.
+func RecordRequestResult(operation, source string, err error, durationSeconds float64) {
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	RecordRequest(operation, status, source, durationSeconds)
 }
 
 // RecordCacheHit records a cache hit.

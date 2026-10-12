@@ -28,7 +28,7 @@ Total number of requests processed by TAG.
 | `operation` | S3 operation: `GetObject`, `PutObject`, `DeleteObject`, `HeadObject` |
 | `status`    | Result: `success`, `error`, `auth_error`, `range_not_satisfiable`    |
 | `mode`      | The process's operating mode (`transparent`, `signing`, `tiered`) — one constant value per instance, for fleet-wide splits |
-| `source`    | Where the response was produced: `local` (TAG's own store or knowledge — cache hits, revalidated-304 serves, authoritative misses, auth errors) or `upstream` (proxied) |
+| `source`    | Request handling path, not per-byte provenance: `local` for TAG's cache/local-answer path (including verified block-suffix recovery), or `upstream` for a directly proxied response |
 
 **Example queries:**
 
@@ -39,7 +39,7 @@ rate(tag_requests_total[5m])
 # Error rate
 sum(rate(tag_requests_total{status="error"}[5m])) / sum(rate(tag_requests_total[5m]))
 
-# Share of traffic answered without touching upstream (per mode)
+# Share of requests handled by TAG's local/cache path (per mode; may include upstream recovery)
 sum(rate(tag_requests_total{source="local"}[5m])) by (mode) / sum(rate(tag_requests_total[5m])) by (mode)
 
 # GetObject success rate
@@ -57,7 +57,7 @@ Request duration in seconds.
 | ----------- | ------------ |
 | `operation` | S3 operation |
 | `mode`      | Operating mode (constant per instance) |
-| `source`    | `local` or `upstream` — where the response was produced |
+| `source`    | `local` or `upstream` — request handling path, not every byte's origin |
 
 **Buckets:** 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10 (the default Prometheus buckets plus extra tail resolution at 1.5, 2, 3, 4 and 7.5 seconds)
 
@@ -80,9 +80,12 @@ rate(tag_request_duration_seconds_sum[5m]) / rate(tag_request_duration_seconds_c
 
 **Type:** Counter
 
-Total number of cache hits — every request served from cache, including
-range-from-cache hits and conditional 304 (Not Modified) responses. It is
-recorded in lockstep with the `X-Cache: HIT` response header.
+Total number of requests whose cache status was committed as `X-Cache: HIT`,
+including range-from-cache hits and conditional 304 (Not Modified) responses. It
+is recorded in lockstep with that header. This is a request-level cache decision,
+not a per-byte source or successful-transfer count: a degraded block response may
+append a verified upstream suffix or later finish with an error, which is recorded
+separately in `tag_requests_total`.
 
 `tag_cache_hits_total` and `tag_cache_misses_total` count only `HIT` and `MISS`.
 `REVALIDATED` responses (object changed on upstream) are neither — they are tracked

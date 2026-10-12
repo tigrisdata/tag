@@ -206,10 +206,11 @@ func (s *Service) serveRangeFromBlockCache(
 	w.WriteHeader(http.StatusPartialContent)
 
 	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng.start, rng.end); berr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
 	}
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -371,10 +372,11 @@ func (s *Service) serveAssembledRange(
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 	}
 	if werr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, werr, time.Since(startTime).Seconds())
 		return true, werr
 	}
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	// A parquet reader's trailer probe is a few bytes, so it is served here rather
 	// than by streamBlockRange — this, not the streaming path, is where the footer
 	// signal actually arrives for a reader opening a file.
@@ -872,9 +874,10 @@ func (s *Service) serveFullObjectFromBlockCache(
 	w.WriteHeader(meta.StatusCode)
 
 	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, 0, meta.ContentLength-1); berr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
 	}
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -897,9 +900,9 @@ func (s *Service) remainingMetaTTL(meta *cache.CachedObjectMeta) int {
 // commit: if it is absent (evicted since populate) it is fetched pre-commit, and if that fails
 // the response is untouched — (false, nil) lets the caller fall through to the miss path, and a
 // definitive stale signal invalidates the entry first. After commit, the remaining blocks
-// stream with an inline fetch recovering any absent one; only a fetch failure there truncates
-// (headers are already sent), which is the same terminal behavior the probe path has for a
-// block evicted between probe and stream. Hit/miss metrics count inline-fetched blocks as
+// stream with inline fetch recovering any absent one; a short cache read or failed inline fetch
+// can use the shared same-ETag remainder path. If recovery fails, the caller can only return the
+// post-commit error — it cannot fall through. Hit/miss metrics count inline-fetched blocks as
 // misses, recorded once the serve outcome is known.
 func (s *Service) serveCompleteFromBlocks(
 	ctx context.Context,
@@ -962,9 +965,10 @@ func (s *Service) serveCompleteFromBlocks(
 		}
 	}
 	if berr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
 	}
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
