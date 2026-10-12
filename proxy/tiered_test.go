@@ -70,6 +70,155 @@ func tieredMock() (*mockForwarder, *atomic.Int64, *atomic.Int64) {
 	return m, forwards, deletes
 }
 
+var errTieredPriorSnapshotRead = errors.New("injected tiered prior snapshot read failure")
+
+type failNextTieredVersionRead struct {
+	cacheclient.CacheClient
+	failNext atomic.Bool
+}
+
+func (client *failNextTieredVersionRead) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	if client.failNext.CompareAndSwap(true, false) {
+		return nil, 0, false, errTieredPriorSnapshotRead
+	}
+	return client.CacheClient.GetWithVersion(ctx, key)
+}
+
+func TestTieredSignedChunkedPutRequiresPriorSnapshotBeforeForward(t *testing.T) {
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Upstream.Endpoint = "http://localhost:9000"
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 1
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	flakyClient := &failNextTieredVersionRead{CacheClient: cacheclient.NewMemoryCache()}
+	c := cache.NewCacheWithClient(flakyClient, &cfg.Cache)
+	var forwards atomic.Int64
+	mock := &mockForwarder{forwardFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
+		forwards.Add(1)
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}}
+	service := NewService(mock, c, cfg)
+	prior := &cache.CachedObjectMeta{
+		Bucket:        "b",
+		Key:           "obj",
+		ETag:          `"prior"`,
+		ContentLength: 5,
+		StatusCode:    http.StatusOK,
+	}
+	if err := c.PutWithMeta(context.Background(), "b", "obj", prior, []byte("prior"), 60); err != nil {
+		t.Fatalf("seed prior Tiered object: %v", err)
+	}
+	flakyClient.failNext.Store(true)
+
+	const wireBody = "8\r\nABCDEFGH\r\n5\r\nFAIL!\r\n0\r\n\r\n"
+	r := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader(wireBody))
+	r.Header.Set("X-Amz-Content-Sha256", StreamingUnsignedTrailerHash)
+	r.Header.Set("X-Amz-Decoded-Content-Length", "12")
+	w := httptest.NewRecorder()
+	if err := service.HandlePutObject(w, r); !errors.Is(err, errTieredPriorSnapshotRead) {
+		t.Fatalf("HandlePutObject error = %v, want prior-snapshot error", err)
+	}
+	if count := forwards.Load(); count != 0 {
+		t.Fatalf("upstream forwards = %d, want 0 without a prior-version snapshot", count)
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("upstream response reached the client before snapshot validation: %q", w.Body.String())
+	}
+	meta, found, err := c.GetMeta(context.Background(), "b", "obj")
+	if err != nil || !found || meta.ETag != `"prior"` {
+		t.Fatalf("prior metadata after failed snapshot: found=%t meta=%+v err=%v", found, meta, err)
+	}
+	var body bytes.Buffer
+	if err := c.GetBodyStream(context.Background(), "b", "obj", meta.ETag, &body); err != nil {
+		t.Fatalf("read prior body: %v", err)
+	}
+	if body.String() != "prior" {
+		t.Fatalf("prior body after failed snapshot = %q, want %q", body.String(), "prior")
+	}
+}
+
+func TestTieredPutInvalidatesDisplacedPriorOnlyAfterKnownUpstreamSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		recordSuccess   bool
+		concurrentWrite bool
+		rejectUpstream  bool
+		wantFound       bool
+		wantETag        string
+	}{
+		{name: "known upstream success", recordSuccess: true},
+		{name: "newer local write survives", recordSuccess: true, concurrentWrite: true, wantFound: true, wantETag: `"newer"`},
+		{name: "unknown upstream status keeps prior", wantFound: true, wantETag: `"prior"`},
+		{name: "upstream rejection keeps prior", rejectUpstream: true, wantFound: true, wantETag: `"prior"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var c *cache.Cache
+			mock := &mockForwarder{forwardFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) error {
+				if tc.concurrentWrite {
+					newer := &cache.CachedObjectMeta{
+						Bucket:        "b",
+						Key:           "obj",
+						ETag:          `"newer"`,
+						ContentLength: 5,
+						StatusCode:    http.StatusOK,
+					}
+					if err := c.PutWithMeta(context.Background(), "b", "obj", newer, []byte("newer"), 60); err != nil {
+						t.Errorf("seed concurrent local write: %v", err)
+					}
+				}
+				if tc.rejectUpstream {
+					w.WriteHeader(http.StatusForbidden)
+					return nil
+				}
+				if tc.recordSuccess {
+					recordUpstreamStatus(w, http.StatusOK)
+				}
+				return errAWSChunkExceedsDecodedLength
+			}}
+			svc, c := newTieredTestService(mock, 1)
+			prior := &cache.CachedObjectMeta{
+				Bucket:        "b",
+				Key:           "obj",
+				ETag:          `"prior"`,
+				ContentLength: 5,
+				StatusCode:    http.StatusOK,
+			}
+			if err := c.PutWithMeta(context.Background(), "b", "obj", prior, []byte("prior"), 60); err != nil {
+				t.Fatalf("seed prior tiered object: %v", err)
+			}
+
+			r := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader("aws-chunked-wire"))
+			r.Header.Set("X-Amz-Content-Sha256", StreamingUnsignedTrailerHash)
+			r.Header.Set("X-Amz-Decoded-Content-Length", "12")
+			w := httptest.NewRecorder()
+			err := svc.HandlePutObject(w, r)
+			if tc.rejectUpstream {
+				if err != nil {
+					t.Fatalf("rejected upstream PUT returned error: %v", err)
+				}
+			} else if !errors.Is(err, errAWSChunkExceedsDecodedLength) {
+				t.Fatalf("HandlePutObject error = %v, want overlong-frame error", err)
+			}
+
+			meta, found, err := c.GetMeta(context.Background(), "b", "obj")
+			if err != nil {
+				t.Fatalf("read tiered metadata: %v", err)
+			}
+			if found != tc.wantFound {
+				t.Fatalf("prior metadata found = %t, want %t", found, tc.wantFound)
+			}
+			if found && meta.ETag != tc.wantETag {
+				t.Fatalf("remaining metadata ETag = %q, want %q", meta.ETag, tc.wantETag)
+			}
+		})
+	}
+}
+
 func tieredDo(t *testing.T, svc *Service, method, path, body string, hdr map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	var req *http.Request

@@ -52,7 +52,14 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 	if err != nil {
 		return err
 	}
-	prepareForwardedRequest(fwdReq, contentLength, chunked)
+	if err := prepareForwardedRequest(fwdReq, contentLength, chunked); err != nil {
+		return err
+	}
+	if chunked && contentLength > 0 && fwdReq.Body != nil && fwdReq.Body != http.NoBody {
+		// The HTTP transport may receive a response before its concurrent body
+		// writer reaches later AWS chunk headers. Gate a 2xx on that write's result.
+		trackRequestBodyWrite(fwdReq, body)
+	}
 
 	return f.executeAndStream(w, fwdReq, contentLength, nil)
 }
@@ -93,7 +100,14 @@ func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.Respons
 	if err != nil {
 		return 0, nil, "", "", err
 	}
-	prepareForwardedRequest(fwdReq, contentLength, chunked)
+	if err := prepareForwardedRequest(fwdReq, contentLength, chunked); err != nil {
+		return 0, nil, "", "", err
+	}
+	if chunked && contentLength > 0 && fwdReq.Body != nil && fwdReq.Body != http.NoBody {
+		// Validate unread frames from body, not fwdReq.Body's tee, so this check does
+		// not append bytes that the upstream request writer did not consume.
+		trackRequestBodyWrite(fwdReq, body)
+	}
 
 	// Return the validated credentials so the caller can HEAD/warm without re-validating.
 	status, headers, err := f.executeAndStreamReturningMeta(w, fwdReq, contentLength, nil)
@@ -131,7 +145,9 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 	if err != nil {
 		return nil, err
 	}
-	prepareForwardedRequest(fwdReq, contentLength, chunked)
+	if err := prepareForwardedRequest(fwdReq, contentLength, chunked); err != nil {
+		return nil, err
+	}
 
 	return f.executeAndCapture(w, fwdReq, contentLength, nil)
 }
@@ -169,7 +185,9 @@ func (f *signingForwarder) DoRequestWithCreds(ctx context.Context, r *http.Reque
 	if err != nil {
 		return nil, err
 	}
-	prepareForwardedRequest(fwdReq, contentLength, chunked)
+	if err := prepareForwardedRequest(fwdReq, contentLength, chunked); err != nil {
+		return nil, err
+	}
 
 	return f.executeRequest(fwdReq, contentLength, nil)
 }

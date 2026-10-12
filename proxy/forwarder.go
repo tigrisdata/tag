@@ -4,9 +4,13 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -210,6 +214,38 @@ func (b *baseForwarder) executeAndStreamReturningMeta(w http.ResponseWriter, fwd
 	return b.executeAndStreamWithMeta(w, fwdReq, inContentLength, originalReq, true)
 }
 
+func (b *baseForwarder) validateSuccessfulChunkedRequest(w http.ResponseWriter, fwdReq *http.Request, status int) error {
+	if status < http.StatusOK || status >= http.StatusMultipleChoices {
+		return nil
+	}
+	tracker, ok := fwdReq.Body.(*requestBodyWriteTracker)
+	if !ok {
+		return nil
+	}
+	if err := tracker.waitForWrite(fwdReq.Context(), b.httpClient.Timeout); err != nil {
+		return err
+	}
+	if !tracker.validationPending() {
+		return tracker.validateDecodedExtent()
+	}
+
+	// The outbound transport can return an upstream response before it has read
+	// every AWS frame from the client. Bound this second read using the same
+	// timeout as the upstream request so an idle client cannot hold its 2xx.
+	timeout := b.httpClient.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	controller := http.NewResponseController(w)
+	if err := controller.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("setting request-body validation deadline: %w", err)
+	}
+	// Leave the deadline in place for the remainder of this request. If validation
+	// fails with unread body bytes, clearing it here would remove the server's read
+	// bound while net/http finishes or closes the request.
+	return tracker.validateDecodedExtent()
+}
+
 // executeAndStreamWithMeta streams an upstream response and optionally retains an
 // owned copy of its headers for a caller that needs metadata after streaming.
 func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *http.Request, inContentLength int64, originalReq *http.Request, captureMeta bool) (int, http.Header, error) {
@@ -221,10 +257,20 @@ func (b *baseForwarder) executeAndStreamWithMeta(w http.ResponseWriter, fwdReq *
 	resp, err := b.httpClient.Do(fwdReq)
 	metrics.RecordUpstreamRequest(fwdReq.Method, time.Since(upstreamStart).Seconds(), err)
 	if err != nil {
+		if resp != nil {
+			recordUpstreamStatus(w, resp.StatusCode)
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+		}
 		log.Error().Err(err).Str("method", fwdReq.Method).Str("path", fwdReq.URL.Path).Msg("Failed to forward request")
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
+	if err := b.validateSuccessfulChunkedRequest(w, fwdReq, resp.StatusCode); err != nil {
+		recordUpstreamStatus(w, resp.StatusCode)
+		return 0, nil, err
+	}
 
 	// Run response interceptor before sending headers to client
 	if b.responseInterceptor != nil {
@@ -500,10 +546,156 @@ func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string
 	}
 }
 
+// requestBodyWriteTracker serializes decoder reads between the HTTP transport and
+// a post-response validation pass. The transport can return response headers while
+// its concurrent request writer is still reading the body.
+type awsChunkExtentValidator interface {
+	validateRemainingDecodedExtent() error
+}
+
+type requestBodyWriteTracker struct {
+	body        io.ReadCloser
+	validator   awsChunkExtentValidator
+	mu          sync.Mutex
+	writeResult chan error
+	readErr     error
+	eof         bool
+	writerDone  bool
+}
+
+func trackRequestBodyWrite(req *http.Request, decodedBody io.ReadCloser) *requestBodyWriteTracker {
+	validator, _ := decodedBody.(awsChunkExtentValidator)
+	tracker := &requestBodyWriteTracker{
+		body:        req.Body,
+		validator:   validator,
+		writeResult: make(chan error, 1),
+	}
+	trace := &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
+		select {
+		case tracker.writeResult <- info.Err:
+		default:
+		}
+	}}
+	*req = *req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	req.Body = tracker
+	return tracker
+}
+
+// Read serializes the transport and validation reads of the request body.
+func (tracker *requestBodyWriteTracker) Read(p []byte) (int, error) {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if tracker.writerDone {
+		return 0, io.EOF
+	}
+	return tracker.readLocked(p)
+}
+
+func (tracker *requestBodyWriteTracker) readLocked(p []byte) (int, error) {
+	if tracker.readErr != nil {
+		return 0, tracker.readErr
+	}
+	if tracker.eof {
+		return 0, io.EOF
+	}
+	n, err := tracker.body.Read(p)
+	if errors.Is(err, io.EOF) {
+		tracker.eof = true
+	} else if err != nil {
+		tracker.readErr = err
+	}
+	return n, err
+}
+
+// Close leaves the decoder open until its owner can finish validating the body.
+// The signing body wrappers are no-ops on Close, and the inbound server owns r.Body.
+func (*requestBodyWriteTracker) Close() error { return nil }
+
+// waitForWrite waits until net/http's outgoing request-body writer has stopped so
+// validation can safely inspect any unread AWS frames. The writer's error is checked
+// by validateDecodedExtent when it came from the request body; a network write error
+// alone does not change the existing upstream-response behavior.
+func (tracker *requestBodyWriteTracker) waitForWrite(ctx context.Context, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-tracker.writeResult:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return context.DeadlineExceeded
+	}
+}
+
+func (tracker *requestBodyWriteTracker) validationPending() bool {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	return tracker.validator != nil && !tracker.eof && tracker.readErr == nil
+}
+
+// validateDecodedExtent checks unread framing on the same decoder after the
+// transport writer stops. The validator bypasses any tee so inspection cannot
+// add bytes that the upstream request writer did not read. Extent violations
+// and read timeouts reject the upstream success; other framing errors retain
+// the existing forwarding behavior.
+func (tracker *requestBodyWriteTracker) validateDecodedExtent() error {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	tracker.writerDone = true
+	if errors.Is(tracker.readErr, errAWSChunkExceedsDecodedLength) {
+		return tracker.readErr
+	}
+	if tracker.eof || tracker.readErr != nil || tracker.validator == nil {
+		return nil
+	}
+	if err := tracker.validator.validateRemainingDecodedExtent(); err != nil {
+		if errors.Is(err, errAWSChunkExceedsDecodedLength) || isRequestBodyReadTimeout(err) {
+			tracker.readErr = err
+			return err
+		}
+	}
+	return nil
+}
+
+func isRequestBodyReadTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
+}
+
+// recordUpstreamStatus lets mutating handlers distinguish an upstream success
+// from a validation failure that prevented forwarding that response to the client.
+func recordUpstreamStatus(w http.ResponseWriter, status int) {
+	if recorder, ok := w.(interface{ recordUpstreamStatus(int) }); ok {
+		recorder.recordUpstreamStatus(status)
+	}
+}
+
 // prepareForwardedRequest sets Content-Length on the forwarded request and strips
 // AWS chunked-encoding headers when the request body was decoded from chunked format.
-func prepareForwardedRequest(fwdReq *http.Request, contentLength int64, chunked bool) {
+func prepareForwardedRequest(fwdReq *http.Request, contentLength int64, chunked bool) error {
 	if chunked {
+		// A zero-length request is sent upstream with http.NoBody, so the transport
+		// would never read the decoder. Inspect its first frame header here to reject
+		// positive data chunks that exceed the zero-byte decoded extent before the
+		// body is discarded. Other read errors retain the prior empty-body behavior.
+		if contentLength == 0 && fwdReq.Body != nil && fwdReq.Body != http.NoBody {
+			var probe [1]byte
+			n, err := fwdReq.Body.Read(probe[:])
+			if n > 0 {
+				return errAWSChunkExceedsDecodedLength
+			}
+			if errors.Is(err, errAWSChunkExceedsDecodedLength) {
+				return err
+			}
+		}
+
 		fwdReq.ContentLength = contentLength
 		fwdReq.Header.Del("X-Amz-Decoded-Content-Length")
 		stripAWSChunkedEncoding(fwdReq)
@@ -517,6 +709,7 @@ func prepareForwardedRequest(fwdReq *http.Request, contentLength int64, chunked 
 	} else if contentLength > 0 {
 		fwdReq.ContentLength = contentLength
 	}
+	return nil
 }
 
 // stripAWSChunkedEncoding removes "aws-chunked" from the Content-Encoding header.
