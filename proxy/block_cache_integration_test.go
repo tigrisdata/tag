@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1128,6 +1130,12 @@ func TestBlockCache_LargeRangeServeBailsInsteadOfFanningOut(t *testing.T) {
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found {
 		t.Error("range amplify-bail wrongly invalidated the entry")
 	}
+	svc.blockFetchMu.Lock()
+	fetchStates := len(svc.blockFetches)
+	svc.blockFetchMu.Unlock()
+	if fetchStates != 0 {
+		t.Errorf("fetch states after range amplify-bail = %d, want 0", fetchStates)
+	}
 }
 
 // A cold single range read that touches more than maxRangeBlockFanout blocks must skip the
@@ -1316,6 +1324,12 @@ func TestBlockCache_ProbePathTransientFailureAbortsWithoutInvalidating(t *testin
 	}
 	if m, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || m.BlockSize != 4 {
 		t.Fatalf("entry lost after transient probe failure: found=%v", found)
+	}
+	svc.blockFetchMu.Lock()
+	fetchStates := len(svc.blockFetches)
+	svc.blockFetchMu.Unlock()
+	if fetchStates != 0 {
+		t.Errorf("fetch states after transient scan failure = %d, want 0", fetchStates)
 	}
 }
 
@@ -1747,6 +1761,136 @@ func TestBlockCache_WarmMultiBlockRangeServesPipelined(t *testing.T) {
 	}
 	if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 2) {
 		t.Error("block 2 not cached after the probe-path fetch")
+	}
+}
+
+// blockExistenceCountingClient counts the cache client's byte-zero reads by
+// block key so the request path can distinguish the outer scan from a leader's
+// redundant presence recheck.
+type blockExistenceCountingClient struct {
+	cacheclient.CacheClient
+
+	mu     sync.Mutex
+	probes map[string]int
+}
+
+func (c *blockExistenceCountingClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if start == 0 && end == 1 {
+		c.mu.Lock()
+		c.probes[key]++
+		c.mu.Unlock()
+	}
+	return c.CacheClient.GetRangeStream(ctx, key, start, end, w)
+}
+
+func (c *blockExistenceCountingClient) probeCount(key string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.probes[key]
+}
+
+func TestBlockCache_GenericFetchRetainsPresenceRecheck(t *testing.T) {
+	const etag = `"v1"`
+	object := []byte("ABCD")
+	mock := newBlockMock(object, etag)
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	client := &blockExistenceCountingClient{
+		CacheClient: cacheclient.NewMemoryCache(),
+		probes:      make(map[string]int),
+	}
+	store := cache.NewCacheWithClient(client, &cfg.Cache)
+	svc := NewService(mock, store, cfg)
+	meta := &cache.CachedObjectMeta{
+		Bucket:        wowBucket,
+		Key:           wowKey,
+		ETag:          etag,
+		ContentLength: int64(len(object)),
+		StatusCode:    http.StatusOK,
+		BlockSize:     4,
+	}
+
+	if err := svc.fetchOneBlock(context.Background(), meta.Bucket, meta.Key, "access", "secret", meta, 0); err != nil {
+		t.Fatalf("generic fetchOneBlock: %v", err)
+	}
+	blockKey := cache.MakeBlockKey(meta.Bucket, meta.Key, etag, meta.BlockSize, 0)
+	if got := client.probeCount(blockKey); got != 1 {
+		t.Errorf("generic fetch byte-zero probes=%d, want its presence recheck", got)
+	}
+	if got := mock.blockGets.Load(); got != 1 {
+		t.Errorf("generic fetch aligned upstream GETs=%d, want 1", got)
+	}
+}
+
+func TestBlockCache_ProbeFirstRangeCountsConfirmedMissProbes(t *testing.T) {
+	for _, missingCount := range []int{1, 4, 32} {
+		t.Run(fmt.Sprintf("%d_missing", missingCount), func(t *testing.T) {
+			const (
+				blockSize = int64(4)
+				etag      = `"v1"`
+			)
+			totalBlocks := missingCount + 1
+			object := make([]byte, int64(totalBlocks)*blockSize)
+			for i := range object {
+				object[i] = byte(i)
+			}
+
+			mock := newBlockMock(object, etag)
+			cfg := config.NewDefault()
+			cfg.Cache.SetBlockCachingEnabled(true)
+			cfg.Cache.BlockSize = blockSize
+			cfg.Cache.SizeThreshold = 1 << 20
+			client := &blockExistenceCountingClient{
+				CacheClient: cacheclient.NewMemoryCache(),
+				probes:      make(map[string]int),
+			}
+			store := cache.NewCacheWithClient(client, &cfg.Cache)
+			svc := NewService(mock, store, cfg)
+			meta := &cache.CachedObjectMeta{
+				Bucket:        wowBucket,
+				Key:           fmt.Sprintf("%s-%d", wowKey, missingCount),
+				ETag:          etag,
+				ContentLength: int64(len(object)),
+				StatusCode:    http.StatusOK,
+				BlockSize:     blockSize,
+			}
+			if wrote, err := store.PutMetaIfVersion(context.Background(), meta.Bucket, meta.Key, meta, 60, cache.VersionAny); err != nil || !wrote {
+				t.Fatalf("seed block metadata = (wrote=%t, err=%v)", wrote, err)
+			}
+			if err := store.PutBlock(context.Background(), meta.Bucket, meta.Key, meta.ETag, blockSize, 0, object[:blockSize], 60); err != nil {
+				t.Fatalf("seed first block: %v", err)
+			}
+
+			w := httptest.NewRecorder()
+			rangeHeader := fmt.Sprintf("bytes=0-%d", len(object)-1)
+			if err := svc.HandleGetObject(w, blockGet(meta.Bucket, meta.Key, rangeHeader)); err != nil {
+				t.Fatalf("partial cache range: %v", err)
+			}
+			if w.Code != http.StatusPartialContent || w.Header().Get("X-Cache") != XCacheHit || !bytes.Equal(w.Body.Bytes(), object) {
+				t.Fatalf("range response = (status=%d cache=%q bytes=%d), want exact 206 HIT body of %d bytes", w.Code, w.Header().Get("X-Cache"), w.Body.Len(), len(object))
+			}
+			wantContentRange := fmt.Sprintf("bytes 0-%d/%d", len(object)-1, len(object))
+			if got := w.Header().Get("Content-Range"); got != wantContentRange {
+				t.Errorf("Content-Range=%q, want %q", got, wantContentRange)
+			}
+			if got := w.Header().Get("ETag"); got != etag {
+				t.Errorf("ETag=%q, want %q", got, etag)
+			}
+			if got := mock.blockGets.Load(); got != int32(missingCount) {
+				t.Errorf("aligned origin block GETs=%d, want %d", got, missingCount)
+			}
+			if got := mock.forwards.Load(); got != 0 {
+				t.Errorf("client-range origin forwards=%d, want 0", got)
+			}
+
+			for blockIdx := int64(0); blockIdx < int64(totalBlocks); blockIdx++ {
+				blockKey := cache.MakeBlockKey(meta.Bucket, meta.Key, etag, blockSize, blockIdx)
+				if got := client.probeCount(blockKey); got != 1 {
+					t.Errorf("byte-zero probes for block %d=%d, want its single outer scan", blockIdx, got)
+				}
+			}
+		})
 	}
 }
 
