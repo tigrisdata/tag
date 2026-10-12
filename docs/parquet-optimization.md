@@ -58,7 +58,7 @@ The comparison is *not* footer size against `block_size`. It is footer size agai
 tail_bytes = ContentLength - floor((ContentLength - 1) / block_size) * block_size
 ```
 
-That is `ContentLength mod block_size` for most objects — anywhere from 1 byte to a full block — and exactly `block_size` for an object whose length happens to be a multiple of it. The prefetch does work whenever:
+That is `ContentLength mod block_size` for most objects — anywhere from 1 byte to a full block — and exactly `block_size` for an object whose length happens to be a multiple of it. An admitted prefetch needs blocks beyond the cached tail whenever:
 
 ```
 footer_bytes + 8  >  tail_bytes
@@ -73,9 +73,9 @@ For arbitrarily sized objects the tail averages half a block, so a footer of a f
 histogram_quantile(0.5, sum(rate(tag_cache_parquet_footer_bytes_bucket[1h])) by (le))
 ```
 
-`tag_cache_parquet_footer_bytes` is recorded for **every** parquet object whose trailer is read — including ones that are not prefetched — so it describes the whole population, not just the part that was acted on.
+`tag_cache_parquet_footer_bytes` records valid footer sizes from admitted read scans and write warms, including scans that find no blocks to fetch. A read trigger shed by the service-wide scan limit skips trailer inspection and is not recorded, so saturation can make this sample incomplete. Use `rate(tag_cache_parquet_footer_prefetch_shed_total[5m])` to see eligible read-trigger attempts refused by that limit. It counts declined attempts, not distinct footer samples omitted: because admission precedes per-version coalescing, a denied trigger may be for a version another scan is already handling. Treat it as a pressure signal, not a correction factor for the histogram.
 
-Compare that figure against the **tail block, not `block_size`**. Since the tail averages half a block across arbitrarily sized objects, `block_size / 2` is the practical yardstick: a median footer near or above it means the prefetch fires on a large share of your objects, and a median well below it means this optimization has little to do and should stay off. Comparing against the full `block_size` understates how often it fires and will talk you out of a change worth making.
+Compare that figure against the **tail block, not `block_size`**. Since the tail averages half a block across arbitrarily sized objects, `block_size / 2` is the practical yardstick: a median footer near or above it means footer geometry requires extra blocks for a large share of the observed population; a median well below it means the optimization has little to do. Read triggers can also be shed under saturation, as noted above. Comparing against the full `block_size` understates how often the metadata spans past the cached tail.
 
 ---
 
@@ -137,8 +137,9 @@ path, and the hit ratio answers the real question more directly.
 
 Also worth watching:
 
-- `tag_cache_parquet_footer_bytes` — the footer distribution. A shift here means a
-  schema change, and it is worth re-checking that the optimization still applies.
+- `tag_cache_parquet_footer_bytes` — the observed footer distribution. A shift can
+  reflect a schema change or, under saturation, a change in which read scans are
+  admitted; re-check the sample before deciding the optimization still applies.
 
 ## What it costs, and what bounds it
 
@@ -146,7 +147,8 @@ Fetching metadata is roughly 1% of the bytes that caching whole objects would mo
 
 - **Bounded by the object.** The block range comes from the declared metadata length, validated against the object size. A corrupt or impossible length prefetches nothing.
 - **Capped.** At most 32 blocks per object, so a pathological file cannot evict a working set.
-- **Shed, not queued.** Fetches take the populate budget non-blocking, so under load prefetching is dropped rather than competing with reads that clients are waiting on.
+- **Read scans are globally capped.** A service admits at most 32 read-triggered scans at once. Extra tail reads are shed before a background marker or goroutine is created and can retry on a later read. Write warms keep their existing path.
+- **Shed, not queued.** Block fetches take the populate budget non-blocking, so under load prefetching is dropped rather than competing with reads that clients are waiting on.
 - **Skips what is cached.** Blocks already present are never re-fetched.
 - **Coalesced.** One scan per object version at a time, with a short cooldown afterwards, so a hot object is not re-examined on every read.
 - **Off the request path.** Both triggers fire after the response is committed, so neither adds latency to the request that fired it.

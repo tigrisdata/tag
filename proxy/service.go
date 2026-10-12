@@ -123,6 +123,9 @@ type Service struct {
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
 	recentFooterWork *expirable.LRU[string, struct{}]
+	// parquetFooterPrefetchSlots bounds read-triggered scans before they create a
+	// goroutine or marker. Write-triggered warms retain their separate admission path.
+	parquetFooterPrefetchSlots chan struct{}
 }
 
 // NewService creates a new proxy service.
@@ -214,6 +217,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		blockFetches:                make(map[string]*blockFetchState),
 		retierClaims:                make(map[string]int),
 		retierInflight:              make(map[string]context.CancelFunc),
+		parquetFooterPrefetchSlots:  make(chan struct{}, maxConcurrentParquetFooterPrefetches),
 	}
 	// Allocated only when the feature that uses it is on.
 	if cfg.Cache.ParquetOptimization {

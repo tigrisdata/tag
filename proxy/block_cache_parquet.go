@@ -47,6 +47,11 @@ const (
 	// sanity checks), and prefetching it would evict more than it can repay.
 	maxParquetFooterPrefetchBlocks = 32
 
+	// maxConcurrentParquetFooterPrefetches bounds read-triggered scans per
+	// Service. Unlike the per-object block cap above, this keeps distinct slow
+	// footer probes from spawning unbounded detached work.
+	maxConcurrentParquetFooterPrefetches = 32
+
 	// Trigger labels for the prefetch counters. Precision is compared BETWEEN these,
 	// so both the prefetched and the used counter must carry them.
 	triggerReadPrefetch = "parquet_footer"
@@ -84,32 +89,57 @@ func (s *Service) maybePrefetchParquetFooter(bucket, key, accessKey, secretKey s
 		trailer = append([]byte(nil), served[off:off+parquetTrailerSize]...)
 	}
 
-	// Two separate guards, because in-flight coalescing alone does not stop the
-	// repeat work. The dedup key is released as soon as the goroutine returns, and
-	// for an already-warm object it returns almost immediately -- so every tail read
-	// would still spawn a goroutine that re-probes the metadata blocks, which are
-	// mostly remote in a cluster. The cooldown suppresses the scan itself for a
-	// while after one completes.
+	// The per-version map coalesces duplicates, but distinct versions can still
+	// create an unbounded number of workers while remote cache reads stall. Admit
+	// read-triggered work before installing a marker or starting a goroutine; a
+	// shed trigger has no marker or cooldown and can retry on a later tail read.
 	versionKey := bucket + "/" + key + "/" + meta.ETag
 	if s.recentFooterWork != nil {
 		if _, recent := s.recentFooterWork.Get(versionKey); recent {
 			return
 		}
 	}
+	if !s.tryAcquireParquetFooterPrefetch() {
+		metrics.CacheParquetFooterPrefetchShed.Inc()
+		return
+	}
+
 	dedupKey := "pq:" + versionKey
 	if _, loaded := s.activeBackgroundFetches.LoadOrStore(dedupKey, struct{}{}); loaded {
+		s.releaseParquetFooterPrefetch()
 		return
 	}
 	go func() {
-		defer s.activeBackgroundFetches.Delete(dedupKey)
-		// Cooldown ONLY on a completed scan. Recording it unconditionally would apply
-		// the full window to a budget shed or a transient fetch failure, turning one
-		// shed under load into minutes of silence and more serial footer misses --
+		// Delete the marker before freeing capacity so active read markers can
+		// never temporarily exceed the admission limit.
+		defer func() {
+			s.activeBackgroundFetches.Delete(dedupKey)
+			s.releaseParquetFooterPrefetch()
+		}()
+		// Cooldown only after a completed scan or a stable negative trailer result.
+		// Recording it unconditionally would apply the full window to a shed or
+		// transient failure, turning one miss under load into minutes of silence --
 		// precisely when the prefetch is most worth retrying.
 		if s.prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey, meta, trailer) && s.recentFooterWork != nil {
 			s.recentFooterWork.Add(versionKey, struct{}{})
 		}
 	}()
+}
+
+// tryAcquireParquetFooterPrefetch admits one read-triggered scan without
+// waiting. A nil channel (an uninitialized Service) fails closed rather than
+// bypassing the service-wide bound.
+func (s *Service) tryAcquireParquetFooterPrefetch() bool {
+	select {
+	case s.parquetFooterPrefetchSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) releaseParquetFooterPrefetch() {
+	<-s.parquetFooterPrefetchSlots
 }
 
 // parquetFooterPrefetchWanted reports whether a completed serve is the signal
@@ -131,17 +161,17 @@ func (s *Service) parquetFooterPrefetchWanted(key string, meta *cache.CachedObje
 
 // prefetchParquetFooterBlocks reads the metadata length the object declares,
 // then fetches the metadata blocks that are not already cached.
-// It reports whether the scan ran to completion; a caller may use that to decide
-// whether to suppress repeat work, which must not happen after a failure.
+// It reports whether the scan completed or found a stable negative trailer result.
+// A transient cache read or populate failure remains retryable and must not start cooldown.
 func (s *Service) prefetchParquetFooterBlocks(bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, trailer []byte) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 	defer cancel()
 
-	footerLen, ok := s.parquetFooterLength(ctx, bucket, key, meta, trailer)
+	footerLen, ok, complete := s.parquetFooterLength(ctx, bucket, key, meta, trailer)
 	if !ok {
-		// Usually a key that merely ends in ".parquet" — a stable property, so treat
-		// it as complete and stop re-examining the object on every tail read.
-		return true
+		// An invalid or unsupported trailer is a stable negative; a failed cache
+		// read is not, so leave that version retryable.
+		return complete
 	}
 	return s.ensureParquetFooterBlocks(ctx, bucket, key, accessKey, secretKey, meta, footerLen, true /*tailServedByCaller*/, triggerReadPrefetch)
 }
@@ -197,11 +227,13 @@ func (s *Service) ensureParquetFooterBlocks(ctx context.Context, bucket, key, ac
 	return true
 }
 
-// parquetFooterLength returns the declared metadata length, preferring a trailer
-// the caller already holds over a cache read that can race a detached write.
-func (s *Service) parquetFooterLength(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, trailer []byte) (int64, bool) {
+// parquetFooterLength returns the declared metadata length, whether it is valid,
+// and whether a negative result is complete/stable. It prefers a trailer the
+// caller already holds over a cache read that can race a detached write.
+func (s *Service) parquetFooterLength(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, trailer []byte) (footerLen int64, valid, complete bool) {
 	if len(trailer) == parquetTrailerSize {
-		return parseParquetTrailer(trailer, meta.ContentLength)
+		footerLen, valid = parseParquetTrailer(trailer, meta.ContentLength)
+		return footerLen, valid, true
 	}
 	return s.readParquetFooterLength(ctx, bucket, key, meta)
 }
@@ -219,27 +251,26 @@ func parseParquetTrailer(buf []byte, contentLength int64) (int64, bool) {
 	return footerLen, true
 }
 
-// readParquetFooterLength reads the object's 8-byte trailer from cache. It
-// reports false when the trailer is unreadable or does not describe a parquet
-// file, which also covers a key that merely ends in ".parquet".
-func (s *Service) readParquetFooterLength(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) (int64, bool) {
+// readParquetFooterLength reads the object's 8-byte trailer from cache. A
+// parsed trailer that does not describe a parquet file is a stable negative;
+// an unreadable cache range is incomplete and remains retryable.
+func (s *Service) readParquetFooterLength(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) (footerLen int64, valid, complete bool) {
 	tailBlock := (meta.ContentLength - 1) / meta.BlockSize
 	blockStart := tailBlock * meta.BlockSize
 	trailerStart := meta.ContentLength - parquetTrailerSize
 	if trailerStart < blockStart {
 		// A trailer straddling two blocks would need a second read; the object
 		// is degenerate enough that skipping it costs nothing.
-		return 0, false
+		return 0, false, true
 	}
 
 	buf := make([]byte, parquetTrailerSize)
 	localStart := trailerStart - blockStart
 	if err := s.readCachedBlockSlice(ctx, bucket, key, meta, tailBlock, localStart, localStart+parquetTrailerSize-1, buf); err != nil {
-		// The triggering read cached this block, so a failure here means it was
-		// evicted or the node lost it: no reason to speculate further.
-		return 0, false
+		return 0, false, false
 	}
-	return parseParquetTrailer(buf, meta.ContentLength)
+	footerLen, valid = parseParquetTrailer(buf, meta.ContentLength)
+	return footerLen, valid, true
 }
 
 // Write-time footer warming (RFC 0002).
