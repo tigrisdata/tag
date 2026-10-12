@@ -184,7 +184,7 @@ See [docs/security.md](docs/security.md) for authentication, access control, and
 
 ### Prerequisites
 
-- Go 1.24 or later
+- Go 1.27 or later
 - Tigris account with access credentials (for running TAG and integration tests)
 
 All dependencies, including Tigris's [`ocache`](https://github.com/tigrisdata/ocache) modules, are public and fetched normally by the Go toolchain — no extra configuration required.
