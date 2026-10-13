@@ -318,6 +318,36 @@ the unary byte-write fast path or the streaming fallback). Flood-safe, alertable
 populate-write failures; the per-block error is logged only at Debug. Healthy value is 0 —
 alert on any sustained rate.
 
+#### tag_cache_block_refetch_total
+
+**Type:** Counter (labeled by `previous`)
+
+Upstream block fetches for a block whose previous populate **on this pod** did not land in
+cache, so the fetch is a direct cost of a warm-caching failure rather than a cold miss.
+Counted at the start of a real upstream block fetch (after the presence recheck finds the
+block absent).
+
+| `previous` | Meaning |
+|------------|---------|
+| `write_skipped` | The earlier fetch was declined a populate slot (budget/concurrency pressure), so its bytes were served but never cached |
+| `write_failed` | The earlier fetch's `PutBlock` failed (also counted by `tag_cache_block_populate_failed_total`) |
+
+Caveats:
+- The memory of earlier failures is a per-pod, fixed-size table (1M slots), cleared on
+  restart. A block whose earlier populate failed on another pod, or whose slot was
+  overwritten by a colliding key, is not counted, so this is a lower bound.
+- A successful `PutBlock` clears the block's entry, so a later eviction of that block is
+  not attributed here.
+
+```promql
+# Re-fetches caused by warm-caching failures, by cause
+sum by (previous) (rate(tag_cache_block_refetch_total[5m]))
+
+# Share of upstream block fetches that are re-fetches of a block that should have been warm
+sum(rate(tag_cache_block_refetch_total[5m])) /
+sum(rate(tag_cache_block_populated_total[5m]) + rate(tag_cache_block_populate_failed_total[5m]))
+```
+
 #### tag_cache_block_prefetch_windows_total
 
 **Type:** Counter (labeled by `outcome`)

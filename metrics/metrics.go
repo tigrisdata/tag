@@ -311,6 +311,19 @@ var (
 		},
 	)
 
+	// CacheBlockRefetch counts upstream block fetches for a block whose previous
+	// populate on this pod was skipped (write_skipped: populate budget declined)
+	// or failed (write_failed: PutBlock error) — re-fetches caused directly by a
+	// warm-caching failure. Attribution uses a bounded per-pod table, so it is a
+	// lower bound and resets on restart.
+	CacheBlockRefetch = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_cache_block_refetch_total",
+			Help: "Upstream block fetches caused by a previous populate of the same block being skipped or failing (block-aligned caching)",
+		},
+		[]string{"previous"},
+	)
+
 	// CacheBlockPrefetchWindows counts multi-block serves by the prefetch window they were
 	// granted from the shared staging budget: "full" (requested window granted), "shrunk"
 	// (a smaller window than requested), or "sequential" (budget declined every window size —

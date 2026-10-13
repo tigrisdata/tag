@@ -1273,6 +1273,9 @@ func (s *Service) runBlockFetch(state *blockFetchState, blockKey, bucket, key, a
 		s.finishBlockFetch(blockKey, state, nil)
 		return
 	}
+	// This is a real upstream fetch; count it if the previous populate of this
+	// block on this pod was skipped or failed.
+	s.blockWriteFailures.countBlockRefetch(blockKey)
 	bStart, bEnd := blockBounds(blockIdx, meta.BlockSize, meta.ContentLength)
 	blockLen := bEnd - bStart + 1
 
@@ -1283,6 +1286,7 @@ func (s *Service) runBlockFetch(state *blockFetchState, blockKey, bucket, key, a
 	reserveWeight := s.populateWeight(blockLen)
 	if !s.acquireCacheSlot(fetchCtx, reserveWeight, priorityReadMiss) {
 		metrics.RecordCachePopulateSkipped(priorityReadMiss.metricSource())
+		s.blockWriteFailures.record(blockKey, blockWriteSkipped)
 		fail(errCachePopulateDeclined)
 		return
 	}
@@ -1348,11 +1352,13 @@ func (s *Service) runBlockFetch(state *blockFetchState, blockKey, bucket, key, a
 		if perr != nil {
 			putBlockBuf(bufp)
 			metrics.CacheBlockPopulateFailed.Inc()
+			s.blockWriteFailures.record(blockKey, blockWriteFailed)
 			state.completeServe(nil, nil, perr)
 			s.finishBlockFetch(blockKey, state, perr)
 			return
 		}
 		metrics.CacheBlockPopulated.Inc()
+		s.blockWriteFailures.clear(blockKey)
 		metrics.CacheBlockBytesPopulated.Add(float64(blockLen))
 		state.completeServe(bufp, blockBuf, nil)
 		s.finishBlockFetch(blockKey, state, nil)
@@ -1367,9 +1373,11 @@ func (s *Service) runBlockFetch(state *blockFetchState, blockKey, bucket, key, a
 		perr := s.cache.PutBlock(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, blockBuf, ttl)
 		if perr != nil {
 			metrics.CacheBlockPopulateFailed.Inc()
+			s.blockWriteFailures.record(blockKey, blockWriteFailed)
 			log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Detached remote block cache write failed")
 		} else {
 			metrics.CacheBlockPopulated.Inc()
+			s.blockWriteFailures.clear(blockKey)
 			metrics.CacheBlockBytesPopulated.Add(float64(blockLen))
 		}
 		s.releaseCacheSlot(reserveWeight)
