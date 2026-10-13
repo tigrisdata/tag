@@ -20,20 +20,57 @@ import (
 
 type testStreamCacheClient struct {
 	cacheclient.CacheClient
-	stream func(context.Context, string, io.Writer) error
+	stream      func(context.Context, string, io.Writer) error
+	rangeStream func(context.Context, string, int64, int64, io.Writer) error
 }
 
 func (c *testStreamCacheClient) GetStream(ctx context.Context, key string, w io.Writer) error {
 	return c.stream(ctx, key, w)
 }
 
+func (c *testStreamCacheClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if c.rangeStream != nil {
+		return c.rangeStream(ctx, key, start, end, w)
+	}
+	return c.CacheClient.GetRangeStream(ctx, key, start, end, w)
+}
+
 func newLargeStreamCacheService(t *testing.T, body []byte, stream func(context.Context, string, io.Writer) error) (*Service, *cache.Cache, *cache.CachedObjectMeta) {
+	return newLargeStreamCacheServiceWithTimeout(t, body, stream, config.DefaultCacheBodyReadIdleTimeout)
+}
+
+func newLargeStreamCacheServiceWithTimeout(t *testing.T, body []byte, stream func(context.Context, string, io.Writer) error, timeout time.Duration) (*Service, *cache.Cache, *cache.CachedObjectMeta) {
 	t.Helper()
 
 	cfg := config.NewDefault()
+	cfg.Cache.BodyReadIdleTimeout = timeout
 	cfg.Cache.SetBlockCachingEnabled(false)
 	base := cacheclient.NewMemoryCache()
 	client := &testStreamCacheClient{CacheClient: base, stream: stream}
+	store := cache.NewCacheWithClient(client, &cfg.Cache)
+	meta := &cache.CachedObjectMeta{
+		Bucket:        "bucket",
+		Key:           "key",
+		ETag:          `"etag"`,
+		ContentType:   "text/plain",
+		ContentLength: int64(len(body)),
+		StatusCode:    http.StatusOK,
+	}
+	if err := store.PutWithMeta(context.Background(), meta.Bucket, meta.Key, meta, body, 0); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	return NewService(&mockForwarder{}, store, cfg), store, meta
+}
+
+func newRangeStreamCacheServiceWithTimeout(t *testing.T, body []byte, stream func(context.Context, string, int64, int64, io.Writer) error, timeout time.Duration) (*Service, *cache.Cache, *cache.CachedObjectMeta) {
+	t.Helper()
+
+	cfg := config.NewDefault()
+	cfg.Cache.BodyReadIdleTimeout = timeout
+	cfg.Cache.SetBlockCachingEnabled(false)
+	base := cacheclient.NewMemoryCache()
+	client := &testStreamCacheClient{CacheClient: base, rangeStream: stream}
 	store := cache.NewCacheWithClient(client, &cfg.Cache)
 	meta := &cache.CachedObjectMeta{
 		Bucket:        "bucket",
@@ -98,6 +135,249 @@ func TestServeFromCache_LargeObjectUncommittedBeforeFirstByte(t *testing.T) {
 	}
 	if w.Body.Len() != 0 {
 		t.Fatalf("body length = %d, want 0", w.Body.Len())
+	}
+}
+
+func TestHandleGetObject_RangeCacheHitIdleTimeoutFallsBackBeforeHeaders(t *testing.T) {
+	const idleTimeout = 20 * time.Millisecond
+	body := bytes.Repeat([]byte("cached body"), 8192)
+	stream := func(ctx context.Context, _ string, _, _ int64, _ io.Writer) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	svc, _, _ := newRangeStreamCacheServiceWithTimeout(t, body, stream, idleTimeout)
+
+	var upstreamCalls atomic.Int32
+	svc.forwarder = &mockForwarder{
+		doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusPartialContent,
+				Header: http.Header{
+					"Content-Length": []string{"8"},
+					"Content-Range":  []string{"bytes 0-7/8"},
+					"Content-Type":   []string{"text/plain"},
+					"ETag":           []string{`"upstream"`},
+				},
+				Body: io.NopCloser(bytes.NewReader([]byte("upstream"))),
+			}, nil
+		},
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	r.Header.Set("Range", "bytes=0-7")
+	started := time.Now()
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled range cache hit returned after %v", elapsed)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+	if w.Code != http.StatusPartialContent || w.Header().Get(XCacheHeader) != XCacheMiss {
+		t.Fatalf("fallback response = status %d, X-Cache %q, want 206/MISS", w.Code, w.Header().Get(XCacheHeader))
+	}
+	if got := w.Body.String(); got != "upstream" {
+		t.Fatalf("body = %q, want upstream", got)
+	}
+}
+
+func TestHandleGetObject_LateCacheChunkAfterIdleTimeoutFallsBackBeforeHeaders(t *testing.T) {
+	const idleTimeout = 20 * time.Millisecond
+	body := bytes.Repeat([]byte("cached body"), 8192)
+	stream := func(ctx context.Context, _ string, w io.Writer) error {
+		<-ctx.Done()
+		// Ignore the writer error and return nil to prove that the cache wrapper,
+		// rather than the cache peer, owns the no-late-commit boundary.
+		_, _ = w.Write(body[:32768])
+		return nil
+	}
+	svc, _, _ := newLargeStreamCacheServiceWithTimeout(t, body, stream, idleTimeout)
+
+	var upstreamCalls atomic.Int32
+	svc.forwarder = &mockForwarder{
+		doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Length": []string{"14"},
+					"Content-Type":   []string{"text/plain"},
+					"ETag":           []string{`"upstream"`},
+				},
+				Body: io.NopCloser(bytes.NewReader([]byte("upstream body"))),
+			}, nil
+		},
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject() error = %v", err)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+	if w.Code != http.StatusOK || w.Header().Get(XCacheHeader) != XCacheMiss {
+		t.Fatalf("fallback response = status %d, X-Cache %q, want 200/MISS", w.Code, w.Header().Get(XCacheHeader))
+	}
+	if got := w.Body.String(); got != "upstream body" {
+		t.Fatalf("body = %q, want upstream body", got)
+	}
+}
+
+func TestHandleGetObject_SmallCacheHitIdleTimeoutFallsBackBeforeHeaders(t *testing.T) {
+	const idleTimeout = 20 * time.Millisecond
+	body := []byte("small cached body")
+	stream := func(ctx context.Context, _ string, _ io.Writer) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	svc, _, _ := newLargeStreamCacheServiceWithTimeout(t, body, stream, idleTimeout)
+
+	var upstreamCalls atomic.Int32
+	svc.forwarder = &mockForwarder{
+		doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Length": []string{"14"},
+					"Content-Type":   []string{"text/plain"},
+					"ETag":           []string{`"upstream"`},
+				},
+				Body: io.NopCloser(bytes.NewReader([]byte("upstream body"))),
+			}, nil
+		},
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	started := time.Now()
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled small cache hit returned after %v", elapsed)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+	if w.Code != http.StatusOK || w.Header().Get(XCacheHeader) != XCacheMiss {
+		t.Fatalf("fallback response = status %d, X-Cache %q, want 200/MISS", w.Code, w.Header().Get(XCacheHeader))
+	}
+	if got := w.Body.String(); got != "upstream body" {
+		t.Fatalf("body = %q, want upstream body", got)
+	}
+}
+
+func TestHandleGetObject_LargeCacheHitIdleTimeoutBeforeHeadersFallsBack(t *testing.T) {
+	const idleTimeout = 20 * time.Millisecond
+	body := bytes.Repeat([]byte("cached body"), 8192)
+	stream := func(ctx context.Context, _ string, _ io.Writer) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	svc, _, _ := newLargeStreamCacheServiceWithTimeout(t, body, stream, idleTimeout)
+
+	var upstreamCalls atomic.Int32
+	svc.forwarder = &mockForwarder{
+		doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Length": []string{"14"},
+					"Content-Type":   []string{"text/plain"},
+					"ETag":           []string{`"upstream"`},
+				},
+				Body: io.NopCloser(bytes.NewReader([]byte("upstream body"))),
+			}, nil
+		},
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject() error = %v", err)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+	if w.Code != http.StatusOK || w.Header().Get(XCacheHeader) != XCacheMiss {
+		t.Fatalf("fallback response = status %d, X-Cache %q, want 200/MISS", w.Code, w.Header().Get(XCacheHeader))
+	}
+	if w.Body.String() != "upstream body" {
+		t.Fatalf("body = %q, want upstream body", w.Body.String())
+	}
+}
+
+func TestHandleGetObject_LargeCacheHitIdleTimeoutAfterCommitDoesNotFallBack(t *testing.T) {
+	const idleTimeout = 20 * time.Millisecond
+	body := bytes.Repeat([]byte("cached body"), 8192)
+	firstChunk := body[:32768]
+	stream := func(ctx context.Context, _ string, w io.Writer) error {
+		if _, err := w.Write(firstChunk); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	svc, _, _ := newLargeStreamCacheServiceWithTimeout(t, body, stream, idleTimeout)
+
+	var upstreamCalls atomic.Int32
+	svc.forwarder = &mockForwarder{
+		doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			return nil, errors.New("unexpected upstream request")
+		},
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject() error = %v", err)
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("upstream calls = %d, want 0 after committed cache response", got)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get(XCacheHeader); got != XCacheHit {
+		t.Fatalf("%s = %q, want %q", XCacheHeader, got, XCacheHit)
+	}
+	if !bytes.Equal(w.Body.Bytes(), firstChunk) {
+		t.Fatalf("body length = %d, want %d", w.Body.Len(), len(firstChunk))
+	}
+}
+
+func TestServeFromCache_LongHealthyStreamCompletesWithinIdlePolicy(t *testing.T) {
+	const idleTimeout = 30 * time.Millisecond
+	body := bytes.Repeat([]byte("cached body"), 8192)
+	stream := func(_ context.Context, _ string, w io.Writer) error {
+		for _, chunk := range [][]byte{body[:1], body[1:32768], body[32768:]} {
+			if _, err := w.Write(chunk); err != nil {
+				return err
+			}
+			time.Sleep(idleTimeout / 3)
+		}
+		return nil
+	}
+	svc, _, meta := newLargeStreamCacheServiceWithTimeout(t, body, stream, idleTimeout)
+
+	w := httptest.NewRecorder()
+	if err := svc.serveFromCache(context.Background(), w, meta.Bucket, meta.Key, meta, time.Now()); err != nil {
+		t.Fatalf("serveFromCache() error = %v, want nil", err)
+	}
+	if got := w.Header().Get(XCacheHeader); got != XCacheHit {
+		t.Fatalf("%s = %q, want %q", XCacheHeader, got, XCacheHit)
+	}
+	if !bytes.Equal(w.Body.Bytes(), body) {
+		t.Fatalf("body length = %d, want %d", w.Body.Len(), len(body))
 	}
 }
 
