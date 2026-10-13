@@ -254,10 +254,14 @@ func (s *Service) readParquetFooterLength(ctx context.Context, bucket, key strin
 // during it. A just-written file is inside the window by definition; this schedules
 // a fetch rather than guessing at one.
 
-// warmParquetFooterOnWrite caches a freshly written parquet object's metadata blocks.
-// It returns immediately; the work runs detached, after the client's write response
-// has already been committed.
+// warmParquetFooterOnWrite schedules a detached warm for a completed write.
 func (s *Service) warmParquetFooterOnWrite(r *http.Request, bucket, key string) {
+	s.warmParquetFooterOnWriteWithETag(r, bucket, key, "")
+}
+
+// warmParquetFooterOnWriteWithETag lets a completed multipart request require
+// that the suffix response identifies the version its response committed.
+func (s *Service) warmParquetFooterOnWriteWithETag(r *http.Request, bucket, key, writtenETag string) {
 	if s.config == nil || !s.config.Cache.ParquetOptimization || !s.cache.IsEnabled() {
 		return
 	}
@@ -274,10 +278,10 @@ func (s *Service) warmParquetFooterOnWrite(r *http.Request, bucket, key string) 
 		return
 	}
 
-	// One warm per object in flight, reusing the read-path coalescer, so a retried
-	// CompleteMultipartUpload does not warm twice. Deliberately NOT keyed by version:
-	// the ETag is only learned from the trailer read below, so it cannot be in the
-	// key. A second write landing mid-warm is therefore skipped, and that version is
+	// One warm per object in flight, so a retried CompleteMultipartUpload does not
+	// warm twice. The key remains version-independent: PUT/copy callers learn the ETag
+	// from the suffix read, while multipart callers use the write ETag only to validate
+	// that response. A second write landing mid-warm is skipped, and that version is
 	// warmed by the read-triggered path on its first read instead -- one cold read,
 	// not a permanent gap.
 	dedupKey := "pqw:" + bucket + "/" + key
@@ -286,13 +290,13 @@ func (s *Service) warmParquetFooterOnWrite(r *http.Request, bucket, key string) 
 	}
 	go func() {
 		defer s.activeBackgroundFetches.Delete(dedupKey)
-		s.warmParquetFooterBlocks(bucket, key, accessKey, secretKey)
+		s.warmParquetFooterBlocks(bucket, key, accessKey, secretKey, writtenETag)
 	}()
 }
 
 // warmParquetFooterBlocks resolves the object's size, ETag and metadata length with a
 // single suffix-range read, then populates the blocks the metadata spans.
-func (s *Service) warmParquetFooterBlocks(bucket, key, accessKey, secretKey string) {
+func (s *Service) warmParquetFooterBlocks(bucket, key, accessKey, secretKey, writtenETag string) {
 	ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 	defer cancel()
 
@@ -304,24 +308,47 @@ func (s *Service) warmParquetFooterBlocks(bucket, key, accessKey, secretKey stri
 	// cached performs NO upstream validation and would happily re-publish meta for
 	// a deleted object. meta_on_write.go and write_through.go both stamp before
 	// Decision-time token BEFORE the footer work; no token, no ordered commit.
-	_, expected, found, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
-	if tokErr != nil || found {
+	existingMeta, expected, found, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+	if tokErr != nil {
+		return
+	}
+	if found && !s.compatibleParquetFooterMeta(existingMeta, writtenETag) {
+		// A HEAD may publish block-mode metadata before this worker checks. Presence
+		// alone does not mean its footer blocks are present: only continue when this
+		// is the same cacheable block layout and the successful write's ETag.
 		return
 	}
 
 	meta, footerLen, ok := s.readParquetTrailerFromUpstream(ctx, bucket, key, accessKey, secretKey)
-	if !ok {
+	if !ok || (writtenETag != "" && meta.ETag != writtenETag) {
+		return
+	}
+	if found && (existingMeta.ETag != meta.ETag || existingMeta.ContentLength != meta.ContentLength || existingMeta.BlockSize != meta.BlockSize) {
+		// The suffix response and an already-visible entry must describe the same
+		// immutable object version and block layout before either can name its blocks.
 		return
 	}
 	if !s.ensureParquetFooterBlocks(ctx, bucket, key, accessKey, secretKey, meta, footerLen, false /*tailServedByCaller*/, triggerWriteWarm) {
-		// Blocks did not land, so publishing the entry would advertise a block-mode
-		// object with nothing behind it that this write put there.
+		// Blocks did not land, so publishing a new entry would advertise a block-mode
+		// object with nothing behind it that this write put there. An existing entry
+		// remains usable and can retry missing blocks on a later read.
+		return
+	}
+	if found {
+		// The existing metadata entry is already the visibility gate. Do not rewrite
+		// it or extend its TTL; the ETag-scoped blocks are now available to it.
 		return
 	}
 
 	// Meta last, version-preconditioned -- the RFC 0001 visibility gate. Blocks stay useful
 	// even if this backs off, since they are keyed by ETag.
 	s.finalizeBlockModeMeta(ctx, bucket, key, meta, 0, expected)
+}
+
+func (s *Service) compatibleParquetFooterMeta(meta *cache.CachedObjectMeta, writtenETag string) bool {
+	return writtenETag != "" && meta != nil && meta.ETag == writtenETag &&
+		meta.BlockSize > 0 && meta.BlockSize == s.config.Cache.BlockSize &&
+		meta.ContentLength >= meta.BlockSize && meta.IsCacheable(s.config.Cache.SizeThreshold)
 }
 
 // readParquetTrailerFromUpstream fetches the object's last 8 bytes. A suffix range is
