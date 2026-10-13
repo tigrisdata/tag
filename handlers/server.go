@@ -304,6 +304,10 @@ func (rt *responseTracker) Flush() {
 	}
 }
 
+func (rt *responseTracker) Unwrap() http.ResponseWriter {
+	return rt.ResponseWriter
+}
+
 // handleWithError calls a handler function and handles any returned error.
 // If headers have already been committed (e.g., the handler started streaming
 // a response before encountering an error), the error is logged but no error
