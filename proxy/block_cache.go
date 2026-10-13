@@ -1403,39 +1403,66 @@ func (s *Service) invalidateStaleMeta(bucket, key, staleETag string) {
 	}
 }
 
-// ensureBlocksCached makes covering blocks [b0,bK] present in cache: it probes the range once,
-// fetches any that are missing, and records per-block hits/misses plus whether the serve was a
-// full or partial hit. It returns an error only when a missing block could not be populated
-// (budget shed, upstream/ETag failure) — the caller then falls through to upstream.
+// ensureBlocksCached makes covering blocks [b0,bK] present in cache, fetches any that are missing,
+// and records per-block hits/misses plus whether the serve was a full or partial hit. It returns an
+// error only when a missing block could not be populated (budget shed, upstream/ETag failure) — the
+// caller then falls through to upstream.
 //
 // It returns errBlockAssemblyWouldAmplify — without fetching or recording serve metrics — when
 // fanning out into per-block fetches would be a large amplification versus one streaming fetch, so
 // the caller falls through instead. Two amplification gates: bailIfMostlyMissing (the full-object
 // serve path) bails when a MAJORITY of covering blocks are absent (assemble only a mostly-cached
-// object, else stream it once); maxFetchFanout>0 (the range serve path) bails on an ABSOLUTE count
-// of absent blocks, so a footer/row-group read still assembles its few blocks but a pathologically
-// large client range doesn't fan out into hundreds of aligned GETs.
+// object, else stream it once); maxFetchFanout>0 (the range serve path) probes bounded pages and
+// bails on an ABSOLUTE count of absent blocks, so a pathologically large range does not fan out into
+// hundreds of aligned GETs. Range pages use the optional owner-grouped presence operation when the
+// cache client supports it; clients without it retain the per-key BlockExistsErr probe.
 //
-// Probing uses BlockExistsErr so a transient probe failure (canceled ctx, cluster gRPC blip) is
-// NOT counted as a missing block: it returns that error immediately instead, so a network hiccup
-// can't inflate the missing count into a false amplify-bail (which the full-object caller would
-// then act on by DELETING a still-valid entry).
+// A presence error (including cancellation, storage, or routing failure) is never counted as a
+// missing block. This keeps a transient cache failure from inflating the missing count into a false
+// amplify-bail that the full-object caller could then act on by DELETING a still-valid entry.
 func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, b0, bK int64, bailIfMostlyMissing bool, maxFetchFanout int64) error {
+	total := bK - b0 + 1
 	var missing []int64
-	for i := b0; i <= bK; i++ {
-		present, perr := s.cache.BlockExistsErr(ctx, bucket, key, meta.ETag, meta.BlockSize, i)
-		if perr != nil {
-			return perr // transient probe failure — abort without bailing or invalidating
+	if maxFetchFanout > 0 {
+		// Range preflight uses bounded, owner-grouped pages. Stop once this range has
+		// enough confirmed misses to take its existing single-upstream fall-through.
+		// The full-object caller (maxFetchFanout == 0) deliberately keeps its original
+		// complete scan and error precedence before the mostly-missing decision.
+		for pageStart := b0; pageStart <= bK; {
+			pageCount := min(int64(maxRangeBlockFanout), bK-pageStart+1)
+			indices := make([]int64, int(pageCount))
+			for i := range indices {
+				indices[i] = pageStart + int64(i)
+			}
+
+			present, perr := s.cache.BlockExistsBatchErr(ctx, bucket, key, meta.ETag, meta.BlockSize, indices)
+			if perr != nil {
+				return perr // transient probe failure — abort without bailing or invalidating
+			}
+			for i, found := range present {
+				if !found {
+					missing = append(missing, indices[i])
+				}
+			}
+			if (bailIfMostlyMissing && int64(len(missing))*2 > total) || int64(len(missing)) > maxFetchFanout {
+				return errBlockAssemblyWouldAmplify
+			}
+			pageStart += pageCount
 		}
-		if !present {
-			missing = append(missing, i)
+	} else {
+		for i := b0; i <= bK; i++ {
+			present, perr := s.cache.BlockExistsErr(ctx, bucket, key, meta.ETag, meta.BlockSize, i)
+			if perr != nil {
+				return perr // transient probe failure — abort without bailing or invalidating
+			}
+			if !present {
+				missing = append(missing, i)
+			}
 		}
 	}
-	total := bK - b0 + 1
-	// Decided from the single probe above — no second scan. Hit/miss and serve metrics are all
-	// recorded ONLY on a committed block-cache serve below, so a bail or a failed fetch (both fall
-	// through to upstream, not a block serve) records none — matching CacheBlockRangeServed and
-	// avoiding a hit-ratio skew (failed fetches correlate with more-missing requests).
+
+	// A bail or failed fetch falls through to upstream, not a block serve, so hit/miss
+	// and serve metrics remain aligned with committed block-cache responses.
 	if (bailIfMostlyMissing && int64(len(missing))*2 > total) ||
 		(maxFetchFanout > 0 && int64(len(missing)) > maxFetchFanout) {
 		return errBlockAssemblyWouldAmplify

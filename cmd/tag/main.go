@@ -255,6 +255,8 @@ func main() {
 			CompactionBytesPerSecond: cfg.Cache.CompactionBytesPerSecond,
 		}
 
+		presenceServer := &blockPresenceServer{}
+
 		// Configure gRPC auth for cache cluster communication
 		if cfg.Cache.IsGRPCAuthEnabled() {
 			accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
@@ -267,12 +269,15 @@ func main() {
 			embeddedCfg.GRPCDialOptions = auth.GRPCDialOptions(grpcToken)
 			log.Info().Msg("Cache gRPC auth enabled")
 		}
+		embeddedCfg.GRPCServerOptions = append(embeddedCfg.GRPCServerOptions, presenceServer.serverOption())
 
 		embeddedCache, err := embedded.New(embeddedCfg)
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize embedded cache")
 		}
-		defer embeddedCache.Close()
+		presenceServer.client = embeddedCache
+		blockCacheClient := newEmbeddedBlockCacheClient(embeddedCache, embeddedCfg.GRPCDialOptions...)
+		defer blockCacheClient.Close()
 
 		// Start gRPC server for cluster routing
 		if err := embeddedCache.StartGRPCServer(); err != nil {
@@ -288,7 +293,7 @@ func main() {
 		readyCancel()
 
 		// Wrap embedded cache with the cache.Cache interface.
-		objectCache = cache.NewCacheWithClient(newEmbeddedBlockCacheClient(embeddedCache), &cfg.Cache)
+		objectCache = cache.NewCacheWithClient(blockCacheClient, &cfg.Cache)
 		if cfg.Cache.IsLegacyCoordination() {
 			log.Info().Msg("Cache meta coordination: legacy tombstones (set cache.legacy_coordination=false for fenced CAS once all nodes support it)")
 		} else {
