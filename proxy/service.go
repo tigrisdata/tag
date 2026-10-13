@@ -659,11 +659,11 @@ func (s *Service) releaseCacheSlot(weight int64) {
 }
 
 // statusRecorder wraps http.ResponseWriter to capture the response status code
-// written while forwarding an upstream response. Forward() returns nil even when
-// upstream responds 4xx/5xx (the response streamed successfully), so mutating
-// handlers use this to gate post-forward cache re-invalidation on an actual 2xx —
-// otherwise a rejected PUT/DELETE/COPY would still fence the destination and
-// discard a valid racing refill, causing later reads to miss unnecessarily.
+// written while forwarding an upstream response. Mutating handlers use the
+// upstream status to gate post-forward cache re-invalidation on an actual 2xx,
+// even when response delivery later fails; otherwise a rejected PUT/DELETE/COPY
+// would still fence the destination and discard a valid racing refill, causing
+// later reads to miss unnecessarily.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -730,7 +730,8 @@ func (s *Service) HandlePutObject(w http.ResponseWriter, r *http.Request) error 
 	// would only discard a valid racing refill and cause an unnecessary later miss.
 	// Routed through invalidateObject (like the pre-forward call) so a failure of this
 	// read-after-write-critical invalidation is recorded and logged, not discarded.
-	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
+	// The upstream 2xx confirms the mutation even if delivery of its response body failed.
+	if rec.wroteSuccess() && s.cache.IsEnabled() {
 		s.convergeInvalidation(context.Background(), bucket, key)
 		teeHandled := requestRejectsCache
 		if teed != nil {
@@ -820,7 +821,8 @@ func (s *Service) HandleDeleteObject(w http.ResponseWriter, r *http.Request) err
 	// fence bump blocks that stale repopulation.
 	// Gated on a 2xx: a rejected DELETE leaves the object present, so re-invalidating
 	// would only discard a valid racing refill and cause an unnecessary later miss.
-	if err == nil && rec.wroteSuccess() && s.cache.IsEnabled() {
+	// The upstream status remains authoritative when response-body delivery fails.
+	if rec.wroteSuccess() && s.cache.IsEnabled() {
 		if s.config.IsTiered() {
 			s.convergeTieredDelete(bucket, key, delPriorVer, delPriorKnown)
 		} else {

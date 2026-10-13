@@ -208,13 +208,15 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// that makes this object exist in TAG's authoritative view.
 	//
 	// No pre-forward invalidation, unlike HandlePutObject: for a local-tier
-	// prior the cache holds the ONLY copy, and a failed forward must leave it
-	// intact — S3 semantics say a rejected PUT changes nothing. Reads racing
-	// the in-flight PUT serve the prior version, which is the atomic-replace
-	// behavior clients expect. The one read-triggered populate in this mode —
-	// the re-tier — cannot be ordered against this path's writes here (it
-	// performs none pre-forward); it defends itself with a claim plus its own
-	// pre-fetch decision token instead (see maybeRetierOnRead).
+	// prior the cache holds the ONLY copy, and an upstream-rejected PUT must
+	// leave it intact — S3 semantics say a rejected mutation changes nothing.
+	// The status recorder distinguishes that rejection from a response-delivery
+	// error after upstream has confirmed the write. Reads racing the in-flight
+	// PUT serve the prior version, which is the atomic-replace behavior clients
+	// expect. The one read-triggered populate in this mode — the re-tier — cannot
+	// be ordered against this path's writes here (it performs none pre-forward); it
+	// defends itself with a claim plus its own pre-fetch decision token instead
+	// (see maybeRetierOnRead).
 	// No post-success invalidation either: the marker overwrites the prior
 	// metadata directly (a displaced local body ages out by TTL, the engine's
 	// own overwrite semantics), which lets the marker commit under the
@@ -243,7 +245,8 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	rec := &statusRecorder{ResponseWriter: w}
 	err = s.forwarder.Forward(ctx, rec, r)
 
-	if err == nil && rec.wroteSuccess() && markerOwning && s.cache.IsEnabled() {
+	// A confirmed upstream 2xx still needs its marker if response-body delivery fails.
+	if rec.wroteSuccess() && markerOwning && s.cache.IsEnabled() {
 		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, prior, priorVersion, priorKnown)
 	}
 

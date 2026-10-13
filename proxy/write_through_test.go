@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/tigrisdata/tag/cache"
 )
 
 // teeMockForwarder is a mockForwarder that also implements bodyTeeingForwarder, so
@@ -21,8 +23,8 @@ import (
 type teeMockForwarder struct {
 	*mockForwarder
 	teeFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, string, string, error)
-	// headHook, if set, runs when the tee issues its authoritative HEAD — used to simulate a
-	// competing write landing during the HEAD window.
+	// headHook, if set, runs when the tee issues its authoritative HEAD — used to gate that
+	// work or simulate a competing write during the HEAD window.
 	headHook func()
 }
 
@@ -60,6 +62,94 @@ func headResp(etag, contentType string, contentLength int64) *http.Response {
 	h.Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	h.Set("Last-Modified", "Wed, 21 Oct 2026 07:28:00 GMT")
 	return &http.Response{StatusCode: http.StatusOK, Header: h, Body: http.NoBody, ContentLength: contentLength}
+}
+
+// A response delivery error after the upstream PUT's 2xx still converges the cache, and the
+// tee reservation remains owned until its asynchronous cache write finishes and releases it.
+func TestHandlePutObject_WriteThroughTee_ResponseCopyErrorInvalidatesAndReleasesReservation(t *testing.T) {
+	copyErr := errors.New("response body delivery failed")
+	body := "tee-body-after-successful-upstream-put"
+	headStarted := make(chan struct{}, 1)
+	releaseHead := make(chan struct{})
+	headReleased := false
+	defer func() {
+		if !headReleased {
+			close(releaseHead)
+		}
+	}()
+
+	var c *cache.Cache
+	forwarder := &teeMockForwarder{
+		mockForwarder: &mockForwarder{
+			conditionalResp: headResp(`"tee-etag"`, "text/plain", int64(len(body))),
+		},
+		teeFunc: func(_ context.Context, w http.ResponseWriter, r *http.Request, tee io.Writer) (int, http.Header, string, string, error) {
+			if _, err := io.Copy(tee, r.Body); err != nil {
+				return 0, nil, "", "", err
+			}
+			bucket, key := ParseBucketKey(r)
+			stale := &cache.CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"stale"`, ContentLength: 5, StatusCode: http.StatusOK}
+			if err := c.PutWithMeta(context.Background(), bucket, key, stale, []byte("stale"), 60); err != nil {
+				return 0, nil, "", "", err
+			}
+			headers := http.Header{}
+			headers.Set("ETag", `"tee-etag"`)
+			w.Header().Set("ETag", `"tee-etag"`)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "response prefix")
+			return http.StatusOK, headers, "access", "secret", copyErr
+		},
+		headHook: func() {
+			headStarted <- struct{}{}
+			<-releaseHead
+		},
+	}
+	service, c := newTestService(forwarder, true)
+	service.config.Cache.WarmOnWrite = true
+	service.config.Cache.SizeThreshold = 1 << 20
+	service.config.Cache.BlockSize = 1 << 20
+	service.cacheSemaphore = make(chan struct{}, 1)
+
+	request := authedPut(wowBucket, wowKey, body)
+	writer := httptest.NewRecorder()
+	if err := service.HandlePutObject(writer, request); !errors.Is(err, copyErr) {
+		t.Fatalf("HandlePutObject error = %v, want %v", err, copyErr)
+	}
+	if writer.Code != http.StatusOK {
+		t.Fatalf("upstream status = %d, want %d", writer.Code, http.StatusOK)
+	}
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
+		t.Fatal("the 2xx PUT's post-forward invalidation did not remove the racing refill")
+	}
+	select {
+	case <-headStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("write-through worker did not reach its gated HEAD")
+	}
+	select {
+	case service.cacheSemaphore <- struct{}{}:
+		<-service.cacheSemaphore
+		t.Fatal("tee reservation was released before its asynchronous owner finished using the body")
+	default:
+	}
+
+	slotAcquired := make(chan struct{})
+	go func() {
+		service.cacheSemaphore <- struct{}{}
+		close(slotAcquired)
+	}()
+	close(releaseHead)
+	headReleased = true
+	select {
+	case <-slotAcquired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tee reservation was not released after the write-through owner completed")
+	}
+	<-service.cacheSemaphore
+	if !service.acquireCacheSlot(context.Background(), int64(len(body)), priorityReadMiss) {
+		t.Fatal("tee completion did not release both the count slot and byte reservation")
+	}
+	service.releaseCacheSlot(int64(len(body)))
 }
 
 // A single authenticated PutObject within the size threshold is cached by teeing the body,
