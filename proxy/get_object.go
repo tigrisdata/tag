@@ -62,6 +62,13 @@ type lazyCommitWriter struct {
 	meta      *cache.CachedObjectMeta
 	written   int64
 	committed bool
+
+	// A range response needs different headers and status than a full-body
+	// response, but it has the same lazy-commit contract.
+	rangeResponse bool
+	rangeStart    int64
+	rangeEnd      int64
+	rangeTotal    int64
 }
 
 func (cw *lazyCommitWriter) Write(p []byte) (int, error) {
@@ -69,14 +76,23 @@ func (cw *lazyCommitWriter) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 	if !cw.committed {
-		cw.meta.WriteHeaders(cw.w)
-		writeCacheStatus(cw.w, XCacheHit)
-		cw.w.WriteHeader(cw.meta.StatusCode)
+		if cw.rangeResponse {
+			cw.meta.WriteHeaders(cw.w, cache.WithRangeHeaders(cw.rangeStart, cw.rangeEnd, cw.rangeTotal))
+			writeCacheStatus(cw.w, XCacheHit)
+			cw.w.WriteHeader(http.StatusPartialContent)
+		} else {
+			cw.meta.WriteHeaders(cw.w)
+			writeCacheStatus(cw.w, XCacheHit)
+			cw.w.WriteHeader(cw.meta.StatusCode)
+		}
 		cw.committed = true
 	}
 
 	n, err := cw.w.Write(p)
 	cw.written += int64(n)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
 	return n, err
 }
 
@@ -693,57 +709,51 @@ func (s *Service) serveRangeFromCache(
 
 	rng := ranges[0]
 
-	// Probe the body BEFORE committing 206 status + headers: stream the range
-	// through a pipe and read the first byte. If the versioned body is not
-	// resolvable, no headers have been sent yet, so we report served=false and let
-	// the caller forward to upstream instead of streaming a truncated 206 that the
-	// client cannot distinguish from a valid short read.
-	pr, pw := io.Pipe()
-	go func() {
-		streamErr := s.cache.GetRangeStream(ctx, bucket, key, meta.BodyDiscriminator(), rng.start, rng.end, pw)
-		if streamErr != nil {
-			pw.CloseWithError(streamErr)
-		} else {
-			pw.Close()
-		}
-	}()
+	// Stream directly to a writer that commits 206 only when the cache produces
+	// its first nonempty chunk. An absent or empty body therefore leaves the
+	// response untouched for the caller's upstream fallback, without staging the
+	// range through an io.Pipe and a second copy.
+	cw := &lazyCommitWriter{
+		w:             w,
+		meta:          meta,
+		rangeResponse: true,
+		rangeStart:    rng.start,
+		rangeEnd:      rng.end,
+		rangeTotal:    meta.ContentLength,
+	}
+	streamErr := s.cache.GetRangeStream(ctx, bucket, key, meta.BodyDiscriminator(), rng.start, rng.end, cw)
 
-	firstByte := make([]byte, 1)
-	n, readErr := pr.Read(firstByte)
-	if readErr != nil {
-		pr.Close()
-		log.Debug().Err(readErr).Str("bucket", bucket).Str("key", key).
+	if streamErr != nil {
+		if !cw.committed {
+			log.Debug().Err(streamErr).Str("bucket", bucket).Str("key", key).
+				Int64("start", rng.start).Int64("end", rng.end).
+				Msg("Range cache body unavailable before headers - falling through to upstream")
+			// Report the underlying error, not just served=false: the caller uses it to
+			// tell a genuinely-missing body (invalidate the orphaned meta) from a
+			// transient failure like a canceled client (leave the entry alone).
+			return false, streamErr
+		}
+
+		if cw.written > 0 {
+			metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+		}
+		log.Warn().Err(streamErr).Str("bucket", bucket).Str("key", key).
 			Int64("start", rng.start).Int64("end", rng.end).
-			Msg("Range cache body unavailable before headers - falling through to upstream")
-		// Report the underlying error, not just served=false: the caller uses it to
-		// tell a genuinely-missing body (invalidate the orphaned meta) from a
-		// transient failure like a canceled client (leave the entry alone).
-		return false, readErr
+			Msg("Failed to stream range from cache")
+		// Headers already sent, can't return an upstream response after the partial
+		// cache body.
+		return true, streamErr
 	}
 
-	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
-	writeCacheStatus(w, XCacheHit)
-	w.WriteHeader(http.StatusPartialContent)
+	if !cw.committed {
+		// Cache.GetRangeStream normally maps a no-write read to ErrNotFound. Keep
+		// this guard in case a future cache implementation returns nil instead.
+		return false, fmt.Errorf("cache range body empty for %s/%s", bucket, key)
+	}
 
-	// Stream range from cache using counting writer to track actual bytes
-	cw := &countingWriter{w: w}
-	cw.Write(firstByte[:n])
-	_, copyErr := io.Copy(cw, pr)
-	pr.Close()
-
-	// Track bytes out (even on error, some bytes may have been written)
 	if cw.written > 0 {
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
 	}
-
-	if copyErr != nil {
-		log.Warn().Err(copyErr).Str("bucket", bucket).Str("key", key).
-			Int64("start", rng.start).Int64("end", rng.end).
-			Msg("Failed to stream range from cache")
-		// Headers already sent, can't return error to client
-		return true, copyErr
-	}
-
 	metrics.RecordRangeFromCacheHit()
 	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
 	return true, nil
