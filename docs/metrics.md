@@ -112,10 +112,16 @@ Total number of cache misses.
 
 Total number of cache operations.
 
-| Label       | Description                               |
-| ----------- | ----------------------------------------- |
-| `operation` | Operation type: `get`, `put`, `delete`    |
-| `result`    | Result: `hit`, `miss`, `success`, `error` |
+| Label       | Description                                                              |
+| ----------- | ------------------------------------------------------------------------ |
+| `operation` | Operation type: `get`, `put`, `meta_put`, `delete`                       |
+| `result`    | Result: `hit`, `miss`, `success`, `error`, `precondition_lost`           |
+
+`meta_put` denotes metadata publication outcomes. `precondition_lost` means an
+ordered metadata write was refused: in legacy coordination, no decision token was
+supplied (`expected == 0`) or a newer tombstone was observed; in CAS coordination,
+a `PutIfVersion` version mismatch occurred. With legacy coordination, an unreadable
+or malformed tombstone is recorded as `error` and the write is refused.
 
 **Example queries:**
 
