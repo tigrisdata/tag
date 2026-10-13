@@ -1172,6 +1172,49 @@ func (p *blockReadFaultClient) GetRangeStream(ctx context.Context, key string, s
 	return p.CacheClient.GetRangeStream(ctx, key, start, end, w)
 }
 
+// countingBlockReadClient distinguishes block payload reads from metadata operations. A complete
+// range must issue exactly one payload read for each covering block; the old probe-first path
+// issued a second byte-zero read for every one of them.
+type countingBlockReadClient struct {
+	cacheclient.CacheClient
+	reads atomic.Int32
+}
+
+func (c *countingBlockReadClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if strings.HasPrefix(key, "blk|") {
+		c.reads.Add(1)
+	}
+	return c.CacheClient.GetRangeStream(ctx, key, start, end, w)
+}
+
+func seedCompleteBlockEntry(tb testing.TB, c *cache.Cache, base cacheclient.CacheClient, bucket, key, etag string, object []byte, blockSize int64) *cache.CachedObjectMeta {
+	tb.Helper()
+	meta := &cache.CachedObjectMeta{
+		Bucket:         bucket,
+		Key:            key,
+		ETag:           etag,
+		ContentLength:  int64(len(object)),
+		StatusCode:     http.StatusOK,
+		BlockSize:      blockSize,
+		BlocksComplete: true,
+		CachedAt:       time.Now().Unix(),
+	}
+	for idx := int64(0); idx*blockSize < int64(len(object)); idx++ {
+		start := idx * blockSize
+		end := start + blockSize
+		if end > int64(len(object)) {
+			end = int64(len(object))
+		}
+		if err := base.Put(context.Background(), cache.MakeBlockKey(bucket, key, etag, blockSize, idx), object[start:end], 60); err != nil {
+			tb.Fatalf("seed block %d: %v", idx, err)
+		}
+	}
+	if wrote, err := c.PutMetaIfVersion(context.Background(), bucket, key, meta, 60, cache.VersionAny); err != nil || !wrote {
+		tb.Fatalf("seed complete metadata: wrote=%t err=%v", wrote, err)
+	}
+	return meta
+}
+
 // A warm range that spans a block boundary is assembled byte-exact from both blocks with no
 // upstream fetch (the probe-free assembled path).
 func TestBlockCache_AssembledRangeSpansBlockBoundary(t *testing.T) {
@@ -1747,6 +1790,226 @@ func TestBlockCache_WarmMultiBlockRangeServesPipelined(t *testing.T) {
 	}
 	if !c.BlockExists(context.Background(), wowBucket, wowKey, `"v1"`, 4, 2) {
 		t.Error("block 2 not cached after the probe-path fetch")
+	}
+}
+
+// A BlocksComplete entry serves an unaligned multi-block range with one payload read per
+// covering block. The first requested slice is staged before the 206, while the remainder uses
+// the ordered streamer without repeating byte-zero presence probes.
+func TestBlockCache_CompleteEntryWarmMultiBlockRangeReadsEachBlockOnce(t *testing.T) {
+	const (
+		bucket = "complete-range-bucket"
+		key    = "complete-range"
+		etag   = `"v1"`
+	)
+	object := []byte("abcdefghijkl") // three 4-byte blocks
+	base := cacheclient.NewMemoryCache()
+	client := &countingBlockReadClient{CacheClient: base}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(client, &cfg.Cache)
+	svc := NewService(newBlockMock(object, etag), c, cfg)
+	seedCompleteBlockEntry(t, c, base, bucket, key, etag, object, 4)
+	client.reads.Store(0)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(bucket, key, "bytes=1-10")); err != nil {
+		t.Fatalf("complete multi-block range: %v", err)
+	}
+	if w.Code != http.StatusPartialContent || w.Body.String() != "bcdefghijk" {
+		t.Fatalf("complete multi-block range: code=%d body=%q, want 206 bcdefghijk", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Content-Range"); got != "bytes 1-10/12" {
+		t.Errorf("Content-Range=%q, want bytes 1-10/12", got)
+	}
+	if got := w.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
+	}
+	if got := client.reads.Load(); got != 3 {
+		t.Errorf("warm complete range block reads = %d, want exactly 3 payload reads (no probes)", got)
+	}
+}
+
+// The first requested block may be a later, partial block. It is recovered before headers are
+// committed, so an eviction does not turn the range response into a truncated prefix.
+func TestBlockCache_CompleteRangeRecoversEvictedFirstSlice(t *testing.T) {
+	const (
+		bucket = "first-slice-bucket"
+		key    = "first-slice"
+		etag   = `"v1"`
+	)
+	object := []byte("ABCDEFGHIJ")
+	mock := newBlockMock(object, etag)
+	base := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(base, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+	seedCompleteBlockEntry(t, c, base, bucket, key, etag, object, 4)
+	if err := base.Delete(context.Background(), cache.MakeBlockKey(bucket, key, etag, 4, 1)); err != nil {
+		t.Fatalf("evict first requested block: %v", err)
+	}
+
+	before := mock.blockGets.Load()
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(bucket, key, "bytes=5-9")); err != nil {
+		t.Fatalf("range with evicted first slice: %v", err)
+	}
+	if w.Code != http.StatusPartialContent || w.Body.String() != "FGHIJ" {
+		t.Fatalf("range with evicted first slice: code=%d body=%q, want 206 FGHIJ", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Cache"); got != XCacheHit {
+		t.Errorf("X-Cache=%q, want %q", got, XCacheHit)
+	}
+	if got := mock.blockGets.Load() - before; got != 1 {
+		t.Errorf("first-slice recovery upstream fetches = %d, want 1", got)
+	}
+}
+
+// If the staged first slice cannot be recovered, no range headers or prefix are committed; the
+// request uses the ordinary upstream range fallback instead of returning a partial cache body.
+func TestBlockCache_CompleteRangeFirstSliceFailureFallsThrough(t *testing.T) {
+	const (
+		bucket = "first-failure-bucket"
+		key    = "first-failure"
+		etag   = `"v1"`
+	)
+	object := []byte("ABCDEFGHIJ")
+	mock := newBlockMock(object, etag)
+	base := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(base, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+	seedCompleteBlockEntry(t, c, base, bucket, key, etag, object, 4)
+	if err := base.Delete(context.Background(), cache.MakeBlockKey(bucket, key, etag, 4, 1)); err != nil {
+		t.Fatalf("evict first requested block: %v", err)
+	}
+	mock.blockGetTransient = true
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(bucket, key, "bytes=5-9")); err != nil {
+		t.Fatalf("range with failed first slice: %v", err)
+	}
+	if w.Code != http.StatusPartialContent || w.Body.String() != "FGHIJ" {
+		t.Fatalf("first-slice fallback: code=%d body=%q, want 206 FGHIJ", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Cache"); got != XCacheMiss {
+		t.Errorf("X-Cache=%q, want %q after clean upstream fallback", got, XCacheMiss)
+	}
+}
+
+// A budget decline after the first block has been staged is salvaged from one uncached remainder
+// range. The range remains byte-exact and the still-valid complete metadata is retained.
+func TestBlockCache_CompleteRangeMidStreamDeclineSalvagesRemainder(t *testing.T) {
+	const (
+		bucket = "midstream-budget-bucket"
+		key    = "midstream-budget"
+		etag   = `"v1"`
+	)
+	object := []byte("ABCDEFGHIJ")
+	mock := newBlockMock(object, etag)
+	base := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	cfg.Cache.MaxPopulateMemoryBytes = 6 // first 3-byte slice fits; a 4-byte recovery does not
+	c := cache.NewCacheWithClient(base, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+	seedCompleteBlockEntry(t, c, base, bucket, key, etag, object, 4)
+	if err := base.Delete(context.Background(), cache.MakeBlockKey(bucket, key, etag, 4, 2)); err != nil {
+		t.Fatalf("evict mid-stream block: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(bucket, key, "bytes=1-9")); err != nil {
+		t.Fatalf("range with mid-stream budget decline: %v", err)
+	}
+	if w.Code != http.StatusPartialContent || w.Body.String() != "BCDEFGHIJ" {
+		t.Fatalf("mid-stream salvage: code=%d body=%q, want 206 BCDEFGHIJ", w.Code, w.Body.String())
+	}
+	if got, found, _ := c.GetMeta(context.Background(), bucket, key); !found || got.ETag != etag {
+		t.Fatalf("complete metadata after transient decline: found=%t meta=%+v", found, got)
+	}
+}
+
+// A changed ETag discovered after the 206 is committed must not be salvaged with a different
+// version. The committed prefix remains, but the stale metadata is invalidated and no v2 bytes
+// enter the response.
+func TestBlockCache_CompleteRangeMidStreamETagMismatchDoesNotMixVersions(t *testing.T) {
+	const (
+		bucket = "midstream-etag-bucket"
+		key    = "midstream-etag"
+		etag   = `"v1"`
+	)
+	object := []byte("ABCDEFGHIJ")
+	mock := newBlockMock(object, etag)
+	base := cacheclient.NewMemoryCache()
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(base, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+	seedCompleteBlockEntry(t, c, base, bucket, key, etag, object, 4)
+	if err := base.Delete(context.Background(), cache.MakeBlockKey(bucket, key, etag, 4, 2)); err != nil {
+		t.Fatalf("evict mid-stream block: %v", err)
+	}
+	mock.blockGetETag = `"v2"`
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(bucket, key, "bytes=1-9")); err == nil {
+		t.Fatal("mid-stream ETag mismatch: want an error, got nil")
+	}
+	if w.Code != http.StatusPartialContent || w.Body.String() != "BCDEFGH" {
+		t.Fatalf("mid-stream ETag mismatch: code=%d body=%q, want committed v1 prefix", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "I") || strings.Contains(w.Body.String(), "J") {
+		t.Fatalf("mid-stream ETag mismatch mixed a new-version suffix: body=%q", w.Body.String())
+	}
+	if _, found, _ := c.GetMeta(context.Background(), bucket, key); found {
+		t.Fatal("stale complete metadata survived a mid-stream ETag mismatch")
+	}
+}
+
+// A complete-range first-slice staging decline deliberately keeps the old conservative path:
+// every covering block is probed before the 206, then streamed. This is a safety fallback, not
+// the probe-free optimization.
+func TestBlockCache_CompleteRangeStagingDeclineUsesProbePath(t *testing.T) {
+	const (
+		bucket = "range-budget-bucket"
+		key    = "range-budget"
+		etag   = `"v1"`
+	)
+	object := []byte("ABCDEFGH")
+	base := cacheclient.NewMemoryCache()
+	client := &countingBlockReadClient{CacheClient: base}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	cfg.Cache.MaxPopulateMemoryBytes = 6 // staging cap is 3, less than the 4-byte first slice
+	c := cache.NewCacheWithClient(client, &cfg.Cache)
+	svc := NewService(&mockForwarder{}, c, cfg)
+	seedCompleteBlockEntry(t, c, base, bucket, key, etag, object, 4)
+	client.reads.Store(0)
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(bucket, key, "bytes=0-7")); err != nil {
+		t.Fatalf("complete range under staging decline: %v", err)
+	}
+	if w.Code != http.StatusPartialContent || w.Body.String() != string(object) {
+		t.Fatalf("staging-decline range: code=%d body=%q, want 206 %q", w.Code, w.Body.String(), object)
+	}
+	if got := client.reads.Load(); got != 4 {
+		t.Errorf("staging-decline block reads = %d, want two probes plus two payload reads", got)
 	}
 }
 
