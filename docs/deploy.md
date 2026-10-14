@@ -214,6 +214,10 @@ What to watch:
 
 Because segments must pass the age gate first, reclaim begins roughly two hours after a pod restart, not immediately.
 
+### Graceful shutdown
+
+On SIGINT or SIGTERM, TAG gives HTTP request draining its existing 30-second timeout. After a successful drain, it cancels the Service lifetime and joins admitted detached cache work before closing embedded storage. This join has no deadline: a cache call that does not return after cancellation can extend process shutdown. An admitted tiered cleanup continues under its own timeout so it may finish its conditional S3 delete and metadata repair; Stop still waits for the task. The bundled StatefulSet uses `terminationGracePeriodSeconds: 30`, so Kubernetes can terminate TAG before an uncooperative operation returns; adjust that grace for your workload, but no fixed value guarantees completion. This ordering does not cover handlers that survive the HTTP drain deadline.
+
 ### Health Checks
 
 TAG exposes a health endpoint:

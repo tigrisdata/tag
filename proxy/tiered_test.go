@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -788,6 +789,81 @@ func TestTieredCleanupRepairsRacedSameETagMarker(t *testing.T) {
 			t.Fatal("raced-in same-ETag marker survived the cleanup repair (repair chain not exercised?)")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A successful upstream DELETE is an irreversible step. Shutdown may cancel
+// the cleanup worker at that point, but its observed-version metadata repair
+// still has to finish before Stop releases the embedded cache.
+func TestTieredCleanupFinishesMarkerRepairDuringServiceStop(t *testing.T) {
+	mock, _, _ := tieredMock()
+	var c *cache.Cache
+	deleteStarted := make(chan struct{})
+	releaseDelete := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseDelete) }) }
+	mock.doObjectDeleteFunc = func(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error) {
+		marker := &cache.CachedObjectMeta{
+			Bucket: bucket, Key: key, ETag: etag,
+			BodyUpstream: true, StatusCode: http.StatusOK, ContentLength: 18,
+		}
+		_, token, _, err := c.GetMetaWithVersion(ctx, bucket, key)
+		if err != nil {
+			return nil, err
+		}
+		if wrote, err := c.PutMetaIfVersion(ctx, bucket, key, marker, 60, token); err != nil || !wrote {
+			return nil, fmt.Errorf("raced marker re-establishment: wrote=%v err=%v", wrote, err)
+		}
+		close(deleteStarted)
+		<-releaseDelete // Service.Stop cancels the lifetime while this task remains owned
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("in-flight cleanup context was canceled: %w", err)
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+	}
+	var svc *Service
+	svc, c = newTieredTestService(mock, 8)
+	defer svc.Stop()
+	defer release()
+
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "way past threshold", nil); w.Code != http.StatusOK {
+		t.Fatalf("large PUT status = %d", w.Code)
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "tiny", nil); w.Code != http.StatusOK {
+		t.Fatalf("small PUT status = %d", w.Code)
+	}
+	select {
+	case <-deleteStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup DELETE did not reach the controlled upstream operation")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		svc.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-svc.workers.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not cancel the service lifetime")
+	}
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned while the upstream cleanup was still active")
+	default:
+	}
+
+	release()
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not wait for the post-delete metadata repair")
+	}
+	if _, found, err := c.GetMeta(context.Background(), "b", "obj"); err != nil {
+		t.Fatalf("read metadata after Stop: %v", err)
+	} else if found {
+		t.Fatal("same-ETag marker survived the post-delete repair during Stop")
 	}
 }
 

@@ -399,5 +399,10 @@ func main() {
 		log.Error().Err(err).Msg("Error during server shutdown")
 	}
 
+	// HTTP draining stops new requests and waits for handlers, but detached
+	// cache work may still be using embedded storage. Seal and join that work
+	// before the deferred embeddedCache.Close runs.
+	service.Stop()
+
 	log.Info().Msg("TAG shutdown complete")
 }

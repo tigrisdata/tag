@@ -395,8 +395,8 @@ func (s *Service) stampUpstreamMarkerAfterCompletion(bucket, key, etag, accessKe
 	if accessKey == "" || secretKey == "" {
 		return
 	}
-	go func() {
-		hctx, hcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	s.startBackgroundTask(nil, func(taskCtx context.Context) {
+		hctx, hcancel := context.WithTimeout(taskCtx, 10*time.Second)
 		defer hcancel()
 		full, ok := s.headObjectMeta(hctx, bucket, key, accessKey, secretKey, etag)
 		if !ok {
@@ -421,7 +421,7 @@ func (s *Service) stampUpstreamMarkerAfterCompletion(bucket, key, etag, accessKe
 		if _, perr := s.cache.PutMetaIfVersion(hctx, bucket, key, full, ttl, curVersion); perr != nil {
 			log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Completion marker upgrade failed; unknown-length marker serves until TTL")
 		}
-	}()
+	})
 }
 
 // headObjectMeta HEADs the object with TAG-signed credentials and builds its
@@ -537,9 +537,14 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 			return
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), retierFetchTimeout)
+	taskCtx, taskDone, admitted := s.beginBackgroundTask(nil)
+	if !admitted {
+		return
+	}
+	ctx, cancel := context.WithTimeout(taskCtx, retierFetchTimeout)
 	if !s.tryRegisterRetier(bucket, key, cancel) {
 		cancel()
+		taskDone()
 		return
 	}
 
@@ -548,15 +553,17 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 	// weight is the fixed stream buffering, never the object — a threshold
 	// sized above the populate budget no longer makes markers unhealable.
 	weight := int64(originlessPutStreamWeight)
-	if !s.acquireCacheSlot(context.Background(), weight, priorityReadMiss) {
+	if !s.acquireCacheSlot(ctx, weight, priorityReadMiss) {
 		s.unregisterRetier(bucket, key)
 		cancel()
+		taskDone()
 		metrics.RecordTieredRetier("shed")
 		return
 	}
 
 	etag := marker.ETag
 	go func() {
+		defer taskDone()
 		defer s.unregisterRetier(bucket, key)
 		defer s.releaseCacheSlot(weight)
 		defer cancel()
@@ -651,7 +658,7 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 			// Detached context: the fetch ctx is CANCELED by a racing PUT —
 			// precisely the interleaving whose staged body most needs
 			// reclaiming — so the delete must not ride it.
-			dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+			dctx, dcancel := context.WithTimeout(s.workers.ctx, 10*time.Second)
 			defer dcancel()
 			if derr := s.cache.DeleteBody(dctx, bucket, key, ref); derr != nil {
 				log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Re-tier staged body delete failed; orphan ages out by TTL")
@@ -850,8 +857,12 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 		metrics.RecordTieredCleanupSkipped("unverified_backend")
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), tieredCleanupTimeout)
+	s.startBackgroundTask(nil, func(parent context.Context) {
+		// This conditional upstream DELETE and its cache repair are one cleanup
+		// task. Once admitted, retain their own timeout: canceling after dispatch
+		// can leave the remote result unknown and a same-ETag marker unrepaired.
+		// Stop still waits for this task before embedded storage closes.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), tieredCleanupTimeout)
 		defer cancel()
 		// The If-Match guard below cannot protect a LIVE upstream object that
 		// carries the SAME ETag: plain-PUT ETags are content MD5, so a
@@ -905,6 +916,8 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 		// commit) that landed after this read; the version guard refuses
 		// exactly those. One outcome is recorded per cleanup: deleted,
 		// marker_repaired, or repair_failed.
+		// This task keeps its own timeout after a successful DELETE so its
+		// observed-version marker repair is not cut short by Service.Stop.
 		cur, curVersion, found, gerr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 		if gerr != nil {
 			// The repair check could not run: a raced-in same-ETag marker may
@@ -930,5 +943,5 @@ func (s *Service) deleteUpstreamObjectAsync(bucket, key, etag, accessKey, secret
 			// keeps its metadata; the cleanup itself still completed.
 			metrics.RecordTieredCleanup(resp.StatusCode, nil)
 		}
-	}()
+	})
 }

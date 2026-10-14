@@ -261,14 +261,17 @@ func (s *Service) handleRevalidation200(
 	// whole-mode entry that grew into a block-eligible object must not be re-stored as one whole
 	// blob. Sub-block objects keep the whole-body write.
 	cacheErrCh := make(chan error, 1)
-	go func() {
+	if !s.startBackgroundTask(nil, func(parent context.Context) {
+		cacheCtx, cacheCancel := context.WithTimeout(parent, cacheWriteTimeoutForSize(newMeta.ContentLength))
+		defer cacheCancel()
+
 		var cacheErr error
 		if s.isBlockEligibleSize(newMeta.ContentLength) {
 			newMeta.BlockSize = s.config.Cache.BlockSize
-			_, cacheErr = s.putBlocksFromStream(context.Background(), bucket, key, newMeta, pr, ttl, expected)
+			_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, newMeta, pr, ttl, expected)
 		} else {
 			_, cacheErr = s.cache.PutWithMetaStreamIfVersion(
-				context.Background(), bucket, key, newMeta, pr, ttl, expected,
+				cacheCtx, bucket, key, newMeta, pr, ttl, expected,
 			)
 		}
 		if cacheErr != nil {
@@ -279,7 +282,20 @@ func (s *Service) handleRevalidation200(
 			io.Copy(io.Discard, pr)
 		}
 		cacheErrCh <- cacheErr
-	}()
+	}) {
+		_ = pr.CloseWithError(context.Canceled)
+		_ = pw.CloseWithError(context.Canceled)
+		// Service shutdown has already closed worker admission. Keep the already
+		// committed upstream response independent of cache availability.
+		n, copyErr := io.Copy(w, resp.Body)
+		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+		status := "success"
+		if copyErr != nil {
+			status = "error"
+		}
+		metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
+		return copyErr
+	}
 
 	// Foreground: stream to client via TeeReader (also writes to pipe for cache)
 	teeReader := io.TeeReader(resp.Body, pw)
