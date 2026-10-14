@@ -497,6 +497,9 @@ func (e *TestEnvironment) Close() {
 	if e.TAGServer != nil {
 		e.TAGServer.Close()
 	}
+	if e.Service != nil {
+		e.Service.Stop()
+	}
 	if e.UpstreamServer != nil {
 		e.UpstreamServer.Close()
 	}

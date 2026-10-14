@@ -839,8 +839,8 @@ func (s *Service) serveFullObjectFromBlockCache(
 	// full GET probes again.
 	if !meta.BlocksComplete && promoTokenOK && s.remainingMetaTTL(meta) > 0 {
 		expectETag := meta.ETag
-		go func() {
-			pctx, cancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
+		s.startBackgroundTask(nil, func(taskCtx context.Context) {
+			pctx, cancel := context.WithTimeout(taskCtx, cacheWriteTimeout)
 			defer cancel()
 			// Re-read for the CONTENT to promote (a promoted copy of a stale
 			// snapshot must never clobber a fresh entry) — but commit under
@@ -864,7 +864,7 @@ func (s *Service) serveFullObjectFromBlockCache(
 			if _, perr := s.cache.PutMetaIfVersion(pctx, bucket, key, &promoted, remaining, promoToken); perr != nil {
 				log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Blocks-complete promotion failed")
 			}
-		}()
+		})
 	}
 
 	meta.WriteHeaders(w)
@@ -1092,7 +1092,12 @@ func (s *Service) beginBlockFetch(blockKey, bucket, key, accessKey, secretKey st
 	s.blockFetches[blockKey] = state
 	s.blockFetchMu.Unlock()
 
-	go s.runBlockFetch(state, blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, knownMissing)
+	if !s.startBackgroundTask(nil, func(ctx context.Context) {
+		s.runBlockFetch(ctx, state, blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, knownMissing)
+	}) {
+		state.completeServe(nil, nil, context.Canceled)
+		s.finishBlockFetch(blockKey, state, context.Canceled)
+	}
 	return state
 }
 
@@ -1253,8 +1258,8 @@ func (s *Service) fetchBlocksForAssembly(ctx context.Context, bucket, key, acces
 // buffer to a remote writer only after io.ReadFull has completed. Local owners
 // (and clients that cannot report ownership) retain the prior synchronous write
 // behavior; remote owners publish the immutable bytes to assemblers first.
-func (s *Service) runBlockFetch(state *blockFetchState, blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) {
-	fetchCtx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+func (s *Service) runBlockFetch(parent context.Context, state *blockFetchState, blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) {
+	fetchCtx, cancel := context.WithTimeout(parent, backgroundFetchTimeout)
 	fail := func(err error) {
 		state.completeServe(nil, nil, err)
 		cancel()
@@ -1360,22 +1365,20 @@ func (s *Service) runBlockFetch(state *blockFetchState, blockKey, bucket, key, a
 	}
 
 	// Remote persistence is intentionally detached from the assembled response.
-	// The state retains both the slot and buffer until PutBlock has consumed the
-	// bytes, so this cannot create unbounded writers or recycle a live pool buffer.
+	// This runBlockFetch task remains its owner after publishing the validated
+	// bytes, and releases the slot and buffer only after PutBlock actually exits.
 	state.completeServe(bufp, blockBuf, nil)
-	go func() {
-		perr := s.cache.PutBlock(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, blockBuf, ttl)
-		if perr != nil {
-			metrics.CacheBlockPopulateFailed.Inc()
-			log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Detached remote block cache write failed")
-		} else {
-			metrics.CacheBlockPopulated.Inc()
-			metrics.CacheBlockBytesPopulated.Add(float64(blockLen))
-		}
-		s.releaseCacheSlot(reserveWeight)
-		cancel()
-		s.finishBlockFetch(blockKey, state, perr)
-	}()
+	perr := s.cache.PutBlock(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, blockBuf, ttl)
+	if perr != nil {
+		metrics.CacheBlockPopulateFailed.Inc()
+		log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Detached remote block cache write failed")
+	} else {
+		metrics.CacheBlockPopulated.Inc()
+		metrics.CacheBlockBytesPopulated.Add(float64(blockLen))
+	}
+	s.releaseCacheSlot(reserveWeight)
+	cancel()
+	s.finishBlockFetch(blockKey, state, perr)
 }
 
 // invalidateStaleMeta deletes the object's cache entry only if the stored meta
@@ -1538,8 +1541,8 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 		log.Debug().Str("bucket", bucket).Str("key", key).Int("touched", len(touched)).Msg("Block-mode populate skipped - range touches too many blocks (would amplify)")
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+	s.startBackgroundTask(nil, func(parent context.Context) {
+		ctx, cancel := context.WithTimeout(parent, backgroundFetchTimeout)
 		defer cancel()
 
 		// Decision-time token BEFORE fetching, so an invalidation that lands
@@ -1558,7 +1561,7 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 			return
 		}
 		s.finalizeBlockModeMeta(ctx, bucket, key, meta, len(touched), expected)
-	}()
+	})
 }
 
 // finalizeBlockModeMeta stamps the block-mode meta once its blocks have landed — the

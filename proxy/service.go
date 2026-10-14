@@ -90,6 +90,7 @@ type Service struct {
 	forwarder                   RequestForwarder
 	cache                       *cache.Cache
 	config                      *config.Config
+	workers                     *serviceWorkers    // Owns detached work until Stop joins it
 	cacheSemaphore              chan struct{}      // Count ceiling on concurrent cache-populate ops (nil = unlimited)
 	populateBudget              *byteBudget        // Byte budget bounding all cache buffering — populate + block-serve staging (nil = unlimited)
 	perPopulateCap              int64              // Max bytes a foreground broadcast populate can buffer
@@ -205,6 +206,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		forwarder:                   forwarder,
 		cache:                       cache,
 		config:                      cfg,
+		workers:                     newServiceWorkers(),
 		cacheSemaphore:              cacheSem,
 		enginePutSlots:              enginePutSlots,
 		populateBudget:              populateBudget,
@@ -1152,7 +1154,7 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 		// succeeded, the surviving stale row's live version if it failed — the
 		// warm then repairs exactly that state and loses to anything newer,
 		// including a fenced delete landing mid-fetch.
-		warmTok, ok := s.warmToken(bucket, key)
+		warmTok, ok := s.warmToken(s.workers.ctx, bucket, key)
 		if !ok {
 			return
 		}
@@ -1165,7 +1167,7 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 	if err != nil || accessKey == "" || secretKey == "" {
 		return
 	}
-	warmTok, ok := s.warmToken(bucket, key)
+	warmTok, ok := s.warmToken(s.workers.ctx, bucket, key)
 	if !ok {
 		return
 	}
@@ -1176,8 +1178,8 @@ func (s *Service) warmOnWrite(r *http.Request, bucket, key string) {
 // warmToken reads a warm trigger's decision-time token. ok=false means the
 // token could not be read and the warm must be SKIPPED: expected=0 is the
 // legacy unordered put-if-absent and would publish over a fence.
-func (s *Service) warmToken(bucket, key string) (uint64, bool) {
-	_, tok, _, err := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
+func (s *Service) warmToken(ctx context.Context, bucket, key string) (uint64, bool) {
+	_, tok, _, err := s.cache.GetMetaWithVersion(ctx, bucket, key)
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Warm skipped - decision-time token unavailable")
 		return 0, false

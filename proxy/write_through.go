@@ -170,14 +170,14 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 	body := ts.buf.buf
 	accessKey, secretKey := ts.accessKey, ts.secretKey
 	weight := ts.weight
-	go func() {
-		// Hold the tee's populate reservation for the whole goroutine: it accounts for the
+	if !s.startBackgroundTask(nil, func(ctx context.Context) {
+		// Hold the tee's populate reservation for the whole task: it accounts for the
 		// object-sized teed body, which stays live until this returns. Releasing it early
 		// (before a fallback allocates) would let the body coexist unaccounted with the
 		// fallback's buffers and push live populate memory past the budget.
 		defer s.releaseCacheSlot(weight)
 
-		outcome := s.cacheTeedBodyFromHead(bucket, key, putETag, body, accessKey, secretKey)
+		outcome := s.cacheTeedBodyFromHead(ctx, bucket, key, putETag, body, accessKey, secretKey)
 		if outcome != teeFallbackWarm {
 			// teeCached: already cached. teeNotCacheable: the authoritative HEAD says the object
 			// isn't cacheable (Cache-Control no-store/private, or over threshold), so a warm would
@@ -193,13 +193,16 @@ func (s *Service) writeThroughCache(bucket, key string, ts *teeState) bool {
 		// the slot, which the warm's (separate) blocking acquire then observes.
 		// Token at trigger time, like warmOnWrite: repairs exactly the state
 		// this write left (absence, or the survivor of a failed invalidation).
-		warmTok, ok := s.warmToken(bucket, key)
+		warmTok, ok := s.warmToken(ctx, bucket, key)
 		if !ok {
 			return
 		}
 		metrics.WarmOnWriteTriggered.Inc()
 		s.triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey, false /*anonymous*/, priorityWarmWrite, warmTok)
-	}()
+	}) {
+		s.releaseCacheSlot(weight)
+		return false
+	}
 	return true
 }
 
@@ -217,7 +220,7 @@ const (
 // the teed body. It returns teeCached on a successful write, teeNotCacheable when the HEAD
 // authoritatively shows the object should not be cached (so warming is pointless), and
 // teeFallbackWarm when it couldn't confirm/write the version (so a read-back warm may help).
-func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte, accessKey, secretKey string) teeOutcome {
+func (s *Service) cacheTeedBodyFromHead(ctx context.Context, bucket, key, putETag string, body []byte, accessKey, secretKey string) teeOutcome {
 	// Decision-time token BEFORE the HEAD (mirroring the populate paths), so
 	// the whole HEAD-to-write window is ordered: a competing overwrite whose
 	// invalidation lands after this read bumps the fence past this token and
@@ -225,14 +228,14 @@ func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte
 	// ETag-consistency check below. Read after this PUT's own post-forward
 	// invalidation (this goroutine runs after it), so our own fence doesn't
 	// block us.
-	_, expected, _, tokErr := s.cache.GetMetaWithVersion(context.Background(), bucket, key)
+	_, expected, _, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 	if tokErr != nil {
 		// No token, no ordered commit: fall back to the warm, which reads its
 		// own token (and skips likewise if the store is still failing).
 		return teeFallbackWarm
 	}
 
-	headCtx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+	headCtx, cancel := context.WithTimeout(ctx, backgroundFetchTimeout)
 	defer cancel()
 
 	// Empty etag/lastModified => a plain (non-conditional) HEAD.
@@ -268,7 +271,7 @@ func (s *Service) cacheTeedBodyFromHead(bucket, key, putETag string, body []byte
 	}
 
 	ttl := int(s.config.Cache.TTL.Seconds())
-	cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
+	cacheCtx, cacheCancel := context.WithTimeout(ctx, cacheWriteTimeoutForSize(meta.ContentLength))
 	defer cacheCancel()
 	// Put-if-absent: this tee follows the PUT's own invalidation; a racer that
 	// re-established the entry (a warm) caches the current version and wins.

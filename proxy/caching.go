@@ -187,8 +187,15 @@ func (s *Service) setupCacheListener(
 		}
 	}
 
+	taskCtx, taskDone, admitted := s.beginBackgroundTask(ctx)
+	if !admitted {
+		s.releaseCacheSlot(weight)
+		return nil, nil
+	}
+
 	listener := broadcaster.Subscribe()
 	if listener == nil {
+		taskDone()
 		s.releaseCacheSlot(weight)
 		return nil, nil
 	}
@@ -199,11 +206,14 @@ func (s *Service) setupCacheListener(
 
 	// Start goroutine to consume chunks, build metadata, and write to cache
 	go func() {
+		defer taskDone()
 		defer s.releaseCacheSlot(weight)
 		defer close(errCh)
 
-		// Wait for headers to build metadata
-		statusCode, headers, err := listener.WaitForHeaders(ctx)
+		// Wait for headers to build metadata. This context includes both the
+		// request lifetime and the service lifetime; after headers arrive the
+		// cache write below detaches from the request but not from the service.
+		statusCode, headers, err := listener.WaitForHeaders(taskCtx)
 		if err != nil {
 			pipeWriter.CloseWithError(err)
 			listener.DrainAndRelease() // Return any buffered pooled chunks
@@ -223,7 +233,7 @@ func (s *Service) setupCacheListener(
 
 		// Use a detached context for cache writes to avoid cancellation when HTTP request completes.
 		// Scale timeout by content length so large objects have enough time to write.
-		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
+		cacheCtx, cacheCancel := context.WithTimeout(s.workers.ctx, cacheWriteTimeoutForSize(meta.ContentLength))
 		defer cacheCancel()
 
 		ttl := int(s.config.Cache.TTL.Seconds())
@@ -245,6 +255,16 @@ func (s *Service) setupCacheListener(
 		cacheErrCh := make(chan error, 1)
 		go func() {
 			var cacheErr error
+			// Some cache clients can return before consuming their input (for example,
+			// when a remote stream is canceled). Close the reader as soon as its owner
+			// exits so the relay cannot block writing bytes no cache operation will read.
+			defer func() {
+				if cacheErr != nil {
+					_ = pipeReader.CloseWithError(cacheErr)
+				} else {
+					_ = pipeReader.Close()
+				}
+			}()
 			// Block-eligible objects (>= block_size, block caching on) are stored as fixed-size
 			// blocks regardless of how they were fetched — a full-GET read miss or a warm-on-write
 			// read-back. The whole-vs-block boundary is size, not access pattern (RFC 0001): both
@@ -526,7 +546,7 @@ func (s *Service) fetchFullObjectToCache(
 		}
 	}
 
-	cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
+	cacheCtx, cacheCancel := context.WithTimeout(s.workers.ctx, cacheWriteTimeoutForSize(meta.ContentLength))
 	defer cacheCancel()
 	// Embedded local storage reaches storage.Put through a non-seekable reader and
 	// does not observe the context itself. Close the upstream body when the detached
@@ -542,27 +562,39 @@ func (s *Service) fetchFullObjectToCache(
 	// the writer until it actually exits; releasing it while an uncooperative cache
 	// client still holds buffers would break the aggregate memory bound.
 	cacheErrCh := make(chan error, 1)
-	go func() {
-		var cacheErr error
-		// Block-eligible full fetches retain the size-based representation used by the
-		// foreground miss path: blocks are written first and version-preconditioned metadata is
-		// published last. Smaller objects use the whole-body stream writer.
-		// The precondition is the trigger's decision-time token: the absence
-		// token for the absent-gated re-warms, the revalidation picker's
-		// verdict for a revalidation re-warm (so a FAILED guarded delete
-		// cannot leave known-stale state the repopulate refuses to repair),
-		// and warmToken for the warm-after-write paths. A trigger that cannot
-		// read a token does not fire.
-		if blockMode {
-			meta.BlockSize = s.config.Cache.BlockSize
-			_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, expected)
-		} else {
-			_, cacheErr = s.cache.PutWithMetaStreamIfVersion(
-				cacheCtx, bucket, key, meta, body, ttl, expected,
+	if !s.startBackgroundTask(cacheCtx, func(writerCtx context.Context) {
+		// The count and byte reservation belong to the actual cache writer, not
+		// its supervisor. It can outlive the supervisor's timeout if the cache
+		// client does not return when its context is canceled.
+		cacheErr := func() error {
+			defer s.releaseCacheSlot(weight)
+			// Block-eligible full fetches retain the size-based representation used by the
+			// foreground miss path: blocks are written first and version-preconditioned metadata is
+			// published last. Smaller objects use the whole-body stream writer.
+			// The precondition is the trigger's decision-time token: the absence
+			// token for the absent-gated re-warms, the revalidation picker's
+			// verdict for a revalidation re-warm (so a FAILED guarded delete
+			// cannot leave known-stale state the repopulate refuses to repair),
+			// and warmToken for the warm-after-write paths. A trigger that cannot
+			// read a token does not fire.
+			if blockMode {
+				meta.BlockSize = s.config.Cache.BlockSize
+				_, err := s.putBlocksFromStream(writerCtx, bucket, key, meta, body, ttl, expected)
+				return err
+			}
+			_, err := s.cache.PutWithMetaStreamIfVersion(
+				writerCtx, bucket, key, meta, body, ttl, expected,
 			)
-		}
+			return err
+		}()
+		// Publish only after the reservation is released, so a completed result
+		// retains the prior synchronous ownership boundary.
 		cacheErrCh <- cacheErr
-	}()
+	}) {
+		return context.Canceled
+	}
+	// From here the registered writer owns the reservation through its actual exit.
+	slotOwned = false
 
 	cacheErr, timedOut := waitForCacheWrite(cacheCtx, cacheErrCh)
 	if timedOut {
@@ -570,11 +602,6 @@ func (s *Service) fetchFullObjectToCache(
 		// queued when the context case wins, and net/http bodies use Close to unblock Read.
 		_ = resp.Body.Close()
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Background cache write timeout")
-		slotOwned = false
-		go func() {
-			<-cacheErrCh
-			s.releaseCacheSlot(weight)
-		}()
 		return errors.New("cache write timeout")
 	}
 	if cacheErr != nil {
@@ -624,12 +651,11 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 
 	metrics.RecordBackgroundFetchTriggered()
 	metrics.ActiveBackgroundFetches.Inc()
-
-	go func() {
+	if !s.startBackgroundTask(s.workers.ctx, func(parent context.Context) {
 		defer metrics.ActiveBackgroundFetches.Dec()
 		defer s.activeBackgroundFetches.Delete(bcastKey)
 
-		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+		ctx, cancel := context.WithTimeout(parent, backgroundFetchTimeout)
 		defer cancel()
 
 		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, prio, expected)
@@ -646,7 +672,11 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background cache fetch completed")
 			metrics.RecordBackgroundFetchSucceeded()
 		}
-	}()
+	}) {
+		metrics.ActiveBackgroundFetches.Dec()
+		s.activeBackgroundFetches.Delete(bcastKey)
+		return
+	}
 }
 
 // hasNoCacheDirectives reports whether any Cache-Control field has a directive that
