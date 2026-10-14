@@ -255,6 +255,16 @@ func (s *Service) setupCacheListener(
 		cacheErrCh := make(chan error, 1)
 		go func() {
 			var cacheErr error
+			// Some cache clients can return before consuming their input (for example,
+			// when a remote stream is canceled). Close the reader as soon as its owner
+			// exits so the relay cannot block writing bytes no cache operation will read.
+			defer func() {
+				if cacheErr != nil {
+					_ = pipeReader.CloseWithError(cacheErr)
+				} else {
+					_ = pipeReader.Close()
+				}
+			}()
 			// Block-eligible objects (>= block_size, block caching on) are stored as fixed-size
 			// blocks regardless of how they were fetched — a full-GET read miss or a warm-on-write
 			// read-back. The whole-vs-block boundary is size, not access pattern (RFC 0001): both
