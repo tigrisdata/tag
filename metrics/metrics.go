@@ -482,6 +482,16 @@ func RecordRequest(operation, status, source string, durationSeconds float64) {
 	RequestDuration.WithLabelValues(operation, processMode, source).Observe(durationSeconds)
 }
 
+// RecordRequestOutcome maps an error to the shared request status label. Callers
+// retain ownership of deciding whether their path produced an error.
+func RecordRequestOutcome(operation, source string, durationSeconds float64, outcomeErr error) {
+	status := "success"
+	if outcomeErr != nil {
+		status = "error"
+	}
+	RecordRequest(operation, status, source, durationSeconds)
+}
+
 // RecordCacheHit records a cache hit.
 func RecordCacheHit() {
 	CacheHits.Inc()

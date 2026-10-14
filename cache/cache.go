@@ -424,6 +424,26 @@ func (c *Cache) DeleteMetaIfVersion(ctx context.Context, bucket, key string, ver
 	return c.coord.deleteMetaIfVersion(ctx, bucket, key, version)
 }
 
+// MarkBodyLengthMismatch records an advisory, TTL-bound hint for a positive
+// whole-body length mismatch. The selected coordinator decides whether it needs
+// a hint; readers must revalidate the current body before treating it as absent.
+func (c *Cache) MarkBodyLengthMismatch(ctx context.Context, bucket, key, discriminator string, length int64) error {
+	if !c.IsEnabled() || discriminator == "" || length <= 0 {
+		return nil
+	}
+	return c.coord.markBodyLengthMismatch(ctx, bucket, key, discriminator, length, c.defaultTTL)
+}
+
+// HasBodyLengthMismatch reports whether the selected coordinator has a hint for
+// this exact body identity and expected length. A positive result is not proof
+// of corruption; callers recheck the current body before changing the response.
+func (c *Cache) HasBodyLengthMismatch(ctx context.Context, bucket, key, discriminator string, length int64) (bool, error) {
+	if !c.IsEnabled() || discriminator == "" || length <= 0 {
+		return false, nil
+	}
+	return c.coord.hasBodyLengthMismatch(ctx, bucket, key, discriminator, length)
+}
+
 // DeleteIfETag invalidates the object's metadata only while it still carries
 // the given ETag, through the selected coordinator: an atomic versioned CAS
 // in CAS mode; the pre-CAS narrowed compare-then-delete in legacy mode.

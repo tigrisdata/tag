@@ -2,6 +2,7 @@ package broadcast
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -277,6 +278,146 @@ func TestBroadcasterHeadersWinOverConcurrentCancellation(t *testing.T) {
 	}
 	if got := gotHeaders.Get("ETag"); got != `"ready"` {
 		t.Errorf("ETag = %q, want %q", got, `"ready"`)
+	}
+}
+
+func TestBroadcasterCompleteBeforeHeadersNotifiesListener(t *testing.T) {
+	b := NewBroadcaster(1)
+	listener := b.Subscribe()
+	wantErr := errors.New("upstream request failed")
+
+	b.Complete(wantErr)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	assertPreHeaderError(t, listener, wantErr, ctx)
+}
+
+func TestBroadcasterLateSubscriberReceivesPreHeaderError(t *testing.T) {
+	b := NewBroadcaster(1)
+	wantErr := errors.New("upstream request failed")
+	b.Complete(wantErr)
+
+	listener := b.Subscribe()
+	if listener == nil {
+		t.Fatal("Subscribe returned nil for a completed non-streaming broadcast")
+	}
+	assertPreHeaderError(t, listener, wantErr, context.Background())
+}
+
+func TestBroadcasterLateSubscriberReceivesEmptyCompletion(t *testing.T) {
+	b := NewBroadcaster(1)
+	headers := http.Header{"Content-Length": []string{"0"}}
+	b.SetHeaders(http.StatusOK, headers)
+	b.Complete(nil)
+
+	listener := b.Subscribe()
+	if listener == nil {
+		t.Fatal("Subscribe returned nil for a completed empty broadcast")
+	}
+	status, gotHeaders, err := listener.WaitForHeaders(context.Background())
+	if err != nil {
+		t.Fatalf("WaitForHeaders: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want %d", status, http.StatusOK)
+	}
+	if got := gotHeaders.Get("Content-Length"); got != "0" {
+		t.Errorf("Content-Length = %q, want 0", got)
+	}
+	select {
+	case chunk, ok := <-listener.Chunks():
+		if ok && (chunk.Err != nil || len(chunk.Data) != 0) {
+			t.Fatalf("unexpected chunk after empty completion: %+v", chunk)
+		}
+		if ok {
+			select {
+			case _, ok := <-listener.Chunks():
+				if ok {
+					t.Fatal("listener received more than one terminal chunk")
+				}
+			default:
+				t.Fatal("completed listener channel remains open")
+			}
+		}
+	default:
+		t.Fatal("completed listener channel remains open")
+	}
+}
+
+func TestBroadcasterLateSubscriberReceivesPostHeaderError(t *testing.T) {
+	b := NewBroadcaster(1)
+	headers := http.Header{"Content-Length": []string{"3"}}
+	wantErr := errors.New("upstream body failed")
+	b.SetHeaders(http.StatusOK, headers)
+	b.Complete(wantErr)
+
+	listener := b.Subscribe()
+	if listener == nil {
+		t.Fatal("Subscribe returned nil for a completed non-streaming broadcast")
+	}
+	status, gotHeaders, err := listener.WaitForHeaders(context.Background())
+	if err != nil {
+		t.Fatalf("WaitForHeaders returned %v, want headers before body error", err)
+	}
+	if status != http.StatusOK || gotHeaders.Get("Content-Length") != "3" {
+		t.Fatalf("headers = %d/%v, want 200 and Content-Length 3", status, gotHeaders)
+	}
+	chunk, ok := <-listener.Chunks()
+	if !ok || !errors.Is(chunk.Err, wantErr) {
+		t.Fatalf("terminal chunk = %+v, open=%v, want %v", chunk, ok, wantErr)
+	}
+	if _, ok := <-listener.Chunks(); ok {
+		t.Fatal("listener channel remains open after terminal error")
+	}
+}
+
+func TestBroadcasterCompleteAfterPrefixKeepsHeadersAndErrorInChunkOrder(t *testing.T) {
+	b := NewBroadcaster(2)
+	listener := b.Subscribe()
+	headers := http.Header{"Content-Length": []string{"6"}}
+	wantErr := errors.New("upstream body failed")
+	b.SetHeaders(http.StatusOK, headers)
+	b.Broadcast([]byte("foo"))
+	b.Complete(wantErr)
+
+	status, gotHeaders, err := listener.WaitForHeaders(context.Background())
+	if err != nil {
+		t.Fatalf("WaitForHeaders returned %v after headers were published", err)
+	}
+	if status != http.StatusOK || gotHeaders.Get("Content-Length") != "6" {
+		t.Fatalf("headers = %d/%v, want 200 and Content-Length 6", status, gotHeaders)
+	}
+	prefix, ok := <-listener.Chunks()
+	if !ok || string(prefix.Data) != "foo" || prefix.Err != nil {
+		t.Fatalf("first chunk = %+v, open=%v, want body prefix", prefix, ok)
+	}
+	prefix.Release()
+	terminal, ok := <-listener.Chunks()
+	if !ok || !errors.Is(terminal.Err, wantErr) {
+		t.Fatalf("terminal chunk = %+v, open=%v, want %v", terminal, ok, wantErr)
+	}
+	if _, ok := <-listener.Chunks(); ok {
+		t.Fatal("listener channel remains open after terminal error")
+	}
+}
+
+func assertPreHeaderError(t *testing.T, listener *Listener, wantErr error, ctx context.Context) {
+	t.Helper()
+
+	select {
+	case <-listener.headerCh:
+	default:
+		t.Fatal("pre-header completion did not notify the listener")
+	}
+	if _, _, err := listener.WaitForHeaders(ctx); !errors.Is(err, wantErr) {
+		t.Fatalf("WaitForHeaders error = %v, want %v", err, wantErr)
+	}
+	for chunk := range listener.Chunks() {
+		if chunk.Err != nil && !errors.Is(chunk.Err, wantErr) {
+			t.Errorf("terminal chunk error = %v, want %v", chunk.Err, wantErr)
+		}
+		chunk.Release()
 	}
 }
 

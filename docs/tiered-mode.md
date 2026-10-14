@@ -17,9 +17,22 @@ memory, so the threshold can be sized to the workload without a per-request
 memory cost. The MD5 ETag is computed over the decoded bytes as they stream;
 because the ETag cannot exist before the last byte, the body is keyed by a
 per-write id carried in the metadata (`BodyRef`), and the metadata commit is
-what makes the entry visible. `If-Match`/`If-None-Match` are honored; GET,
-HEAD, and DELETE are served entirely locally. Reads and writes of small
+what makes the entry visible. `If-Match`/`If-None-Match` are honored for a local entry whose body is
+present; GET, HEAD, and DELETE are served locally. Reads and writes of small
 objects generate zero upstream traffic.
+
+For a positive-length whole-object local hit, TAG checks the cache stream length against metadata. A
+present but short or overlong buffered body is discarded; TAG attempts version-guarded metadata
+cleanup, records a local request error, and returns the authoritative `NoSuchKey` miss so the caller
+can fall back to its system of record. A body absent at the existing first-byte probe continues to
+follow the ordinary `NoSuchKey` miss path.
+
+If a large local body is found short or overlong after streaming commits headers, the response
+cannot be replaced. TAG records a local request error, attempts version-guarded cleanup, and does
+not append an upstream body. Cleanup is best effort. Positive-length HEAD and matching conditional
+304 responses also verify the body length with a final-byte range probe before answering from
+metadata; a confirmed mismatch returns `NoSuchKey` instead of implying that the local body is
+servable.
 
 **Large objects are the upstream tier.** The PUT passes through to upstream and
 TAG stores a metadata marker locally. HEAD answers from the marker; GET

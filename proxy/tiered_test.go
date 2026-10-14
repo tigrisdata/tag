@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
+	"github.com/tigrisdata/tag/metrics"
 )
 
 // newTieredTestService builds a Service in tiered mode with an in-memory cache
@@ -1078,6 +1080,141 @@ func TestTieredStreamedPutBodyRefRoundTrip(t *testing.T) {
 	}
 	if w := tieredDo(t, svc, http.MethodGet, "/b/small", "", nil); w.Code != http.StatusOK || w.Body.String() != "tiny" {
 		t.Fatalf("small GET = %d %q", w.Code, w.Body.String())
+	}
+}
+
+func TestTieredLargeShortBodyInvalidatesForNextGet(t *testing.T) {
+	body := string(cacheTestBodyAboveSmallObjectThreshold("cached body"))
+	prefix := body[:shortCacheBodyPrefixSize]
+	mock, forwards, _ := tieredMock()
+	svc, store := newTieredTestService(mock, int64(len(body)+1))
+	if w := tieredDo(t, svc, http.MethodPut, "/bucket/key", body, nil); w.Code != http.StatusOK {
+		t.Fatalf("local PUT status = %d", w.Code)
+	}
+	meta, found, err := store.GetMeta(context.Background(), "bucket", "key")
+	if err != nil || !found || meta == nil || meta.BodyRef == "" {
+		t.Fatalf("local metadata = %+v found=%v err=%v", meta, found, err)
+	}
+	if err := store.PutBodyStream(context.Background(), "bucket", "key", meta.BodyRef, strings.NewReader(prefix), 0); err != nil {
+		t.Fatalf("truncate local-tier body: %v", err)
+	}
+
+	beforeErrors := requestCountFrom(t, "error", metrics.SourceLocal)
+	first := tieredDo(t, svc, http.MethodGet, "/bucket/key", "", nil)
+	if first.Code != http.StatusOK || first.Header().Get(XCacheHeader) != XCacheHit || first.Header().Get("Content-Length") != strconv.Itoa(len(body)) || first.Body.String() != string(prefix) {
+		t.Fatalf("first GET = %d headers=%v body_bytes=%d, want HIT with short prefix", first.Code, first.Header(), first.Body.Len())
+	}
+	if _, found, err := store.GetMeta(context.Background(), "bucket", "key"); err != nil || found {
+		t.Fatalf("short local-tier metadata remains: found=%v err=%v", found, err)
+	}
+	if got := requestCountFrom(t, "error", metrics.SourceLocal); got != beforeErrors+1 {
+		t.Errorf("local error count delta = %v, want 1", got-beforeErrors)
+	}
+	if got := forwards.Load(); got != 0 {
+		t.Errorf("tiered upstream forwards = %d, want 0", got)
+	}
+
+	second := tieredDo(t, svc, http.MethodGet, "/bucket/key", "", nil)
+	if second.Code != http.StatusNotFound || second.Header().Get(XCacheHeader) != XCacheMiss {
+		t.Fatalf("second GET = %d X-Cache=%q, want authoritative 404 miss", second.Code, second.Header().Get(XCacheHeader))
+	}
+	if got := forwards.Load(); got != 0 {
+		t.Errorf("tiered upstream forwards after missing local entry = %d, want 0", got)
+	}
+}
+
+func TestTieredLargeShortBodyCleanupKeepsNewerSameETagPut(t *testing.T) {
+	body := cacheTestBodyAboveSmallObjectThreshold("cached body")
+	prefix := body[:shortCacheBodyPrefixSize]
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = int64(len(body) + 1)
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	mem := cacheclient.NewMemoryCache()
+	bodyKey := ""
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseBody := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseBody()
+	var firstRead atomic.Bool
+	client := &testStreamCacheClient{
+		CacheClient: mem,
+		stream: func(ctx context.Context, key string, w io.Writer) error {
+			if key == bodyKey && !firstRead.Swap(true) {
+				_, err := w.Write(prefix)
+				close(started)
+				if err != nil {
+					return err
+				}
+				<-release
+				return nil
+			}
+			return mem.GetStream(ctx, key, w)
+		},
+	}
+	store := cache.NewCacheWithClient(client, &cfg.Cache)
+	mock, forwards, _ := tieredMock()
+	svc := NewService(mock, store, cfg)
+	bucket, key := "bucket", "key"
+
+	if w := tieredDo(t, svc, http.MethodPut, "/"+bucket+"/"+key, string(body), nil); w.Code != http.StatusOK {
+		t.Fatalf("initial local PUT status = %d", w.Code)
+	}
+	oldMeta, oldVersion, found, err := store.GetMetaWithVersion(context.Background(), bucket, key)
+	if err != nil || !found || oldMeta == nil || oldMeta.BodyRef == "" {
+		t.Fatalf("initial local metadata = %+v found=%v err=%v", oldMeta, found, err)
+	}
+	bodyKey = cache.MakeBodyKey(bucket, key, oldMeta.BodyRef)
+	if err := store.PutBodyStream(context.Background(), bucket, key, oldMeta.BodyRef, bytes.NewReader(prefix), 0); err != nil {
+		t.Fatalf("truncate local-tier test body: %v", err)
+	}
+
+	first := httptest.NewRecorder()
+	firstResult := make(chan error, 1)
+	firstRequest := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
+	go func() { firstResult <- svc.HandleGetObject(first, firstRequest) }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("local-tier GET did not commit its first cached chunk")
+	}
+
+	if w := tieredDo(t, svc, http.MethodPut, "/"+bucket+"/"+key, string(body), nil); w.Code != http.StatusOK {
+		t.Fatalf("replacement local PUT status = %d", w.Code)
+	}
+	newMeta, newVersion, found, err := store.GetMetaWithVersion(context.Background(), bucket, key)
+	if err != nil || !found || newMeta == nil {
+		t.Fatalf("replacement metadata = %+v found=%v err=%v", newMeta, found, err)
+	}
+	if newVersion == oldVersion || newMeta.ETag != oldMeta.ETag || newMeta.BodyRef == oldMeta.BodyRef {
+		t.Fatalf("replacement version/ref/etag = %d/%q/%q, old = %d/%q/%q", newVersion, newMeta.BodyRef, newMeta.ETag, oldVersion, oldMeta.BodyRef, oldMeta.ETag)
+	}
+
+	releaseBody()
+	if err := <-firstResult; err != nil {
+		t.Fatalf("first GET error = %v", err)
+	}
+	if first.Code != http.StatusOK || first.Header().Get(XCacheHeader) != XCacheHit || first.Header().Get("Content-Length") != strconv.Itoa(len(body)) || !bytes.Equal(first.Body.Bytes(), prefix) {
+		t.Fatalf("first committed GET = %d headers=%v body_bytes=%d, want HIT with the short prefix", first.Code, first.Header(), first.Body.Len())
+	}
+	if got := forwards.Load(); got != 0 {
+		t.Errorf("tiered upstream forwards = %d, want 0", got)
+	}
+	if _, currentVersion, found, err := store.GetMetaWithVersion(context.Background(), bucket, key); err != nil || !found || currentVersion != newVersion {
+		t.Fatalf("version-guarded cleanup lost replacement: found=%v version=%d want=%d err=%v", found, currentVersion, newVersion, err)
+	}
+
+	second := tieredDo(t, svc, http.MethodGet, "/"+bucket+"/"+key, "", nil)
+	if second.Code != http.StatusOK || second.Header().Get(XCacheHeader) != XCacheHit || !bytes.Equal(second.Body.Bytes(), body) {
+		t.Fatalf("second GET = %d X-Cache=%q body_bytes=%d, want full replacement body", second.Code, second.Header().Get(XCacheHeader), second.Body.Len())
+	}
+	if got := forwards.Load(); got != 0 {
+		t.Errorf("tiered upstream forwards after replacement GET = %d, want 0", got)
 	}
 }
 

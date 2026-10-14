@@ -125,6 +125,15 @@ func newTestService(forwarder RequestForwarder, cacheEnabled bool) (*Service, *c
 	return svc, c
 }
 
+func revalidationMetaVersion(t *testing.T, svc *Service, meta *cache.CachedObjectMeta) uint64 {
+	t.Helper()
+	_, version, _, err := svc.cache.GetMetaWithVersion(context.Background(), meta.Bucket, meta.Key)
+	if err != nil {
+		t.Fatalf("GetMetaWithVersion: %v", err)
+	}
+	return version
+}
+
 func TestRevalidation304_ServesCachedBody(t *testing.T) {
 	// Setup: mock upstream returns 304 Not Modified
 	mock := &mockForwarder{
@@ -157,7 +166,7 @@ func TestRevalidation304_ServesCachedBody(t *testing.T) {
 	// Execute revalidation
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
-	err = svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now())
+	err = svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, revalidationMetaVersion(t, svc, meta), time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServe() error = %v", err)
 	}
@@ -212,7 +221,7 @@ func TestRevalidation200_StreamsNewBody(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
-	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, revalidationMetaVersion(t, svc, meta), time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServe() error = %v", err)
 	}
@@ -262,7 +271,7 @@ func TestRevalidation200_UncacheableDeletesStale(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
-	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, revalidationMetaVersion(t, svc, meta), time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServe() error = %v", err)
 	}
@@ -304,7 +313,7 @@ func TestRevalidationError_ServesStale(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
-	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, revalidationMetaVersion(t, svc, meta), time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServe() error = %v", err)
 	}
@@ -347,7 +356,7 @@ func TestRevalidationUnexpectedStatus_ServesStale(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
-	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, revalidationMetaVersion(t, svc, meta), time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServe() error = %v", err)
 	}
@@ -499,7 +508,7 @@ func TestServeFromCache_ZeroByteObject(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	err := svc.serveFromCache(context.Background(), w, "b", "k", meta, time.Now())
+	err := svc.serveFromCache(context.Background(), w, "b", "k", meta, time.Now(), func() {})
 	if err != nil {
 		t.Fatalf("serveFromCache() error = %v", err)
 	}
@@ -533,7 +542,7 @@ func TestServeFromCache_SmallObject(t *testing.T) {
 	_ = c.PutWithMeta(ctx, bucket, key, meta, body, 0)
 
 	w := httptest.NewRecorder()
-	err := svc.serveFromCache(ctx, w, bucket, key, meta, time.Now())
+	err := svc.serveFromCache(ctx, w, bucket, key, meta, time.Now(), func() {})
 	if err != nil {
 		t.Fatalf("serveFromCache() error = %v", err)
 	}
@@ -579,7 +588,7 @@ func TestRevalidationRange304_ServesCachedRange(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
 	r.Header.Set("Range", "bytes=0-4")
-	err = svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now())
+	err = svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, revalidationMetaVersion(t, svc, meta), time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServe() error = %v", err)
 	}
@@ -651,7 +660,7 @@ func TestRevalidationRange304_BodyEvictedForwardsUpstream(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
 	r.Header.Set("Range", "bytes=0-4")
-	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now()); err != nil {
+	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, revalidationMetaVersion(t, svc, meta), time.Now()); err != nil {
 		t.Fatalf("revalidateAndServe() error = %v", err)
 	}
 
@@ -709,7 +718,7 @@ func TestRevalidationRange206_StreamsRangeFromUpstream(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
 	r.Header.Set("Range", "bytes=0-9")
-	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, revalidationMetaVersion(t, svc, meta), time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServe() error = %v", err)
 	}
@@ -756,7 +765,7 @@ func TestRevalidationRangeError_ServesStaleRange(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
 	r.Header.Set("Range", "bytes=0-4")
-	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, revalidationMetaVersion(t, svc, meta), time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServe() error = %v", err)
 	}
@@ -817,7 +826,7 @@ func TestRevalidation304_CacheBodyUnavailable_FallsThrough(t *testing.T) {
 	// Execute revalidation — should fall through to Forward
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/test-bucket/test-key", nil)
-	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, time.Now())
+	err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", meta, revalidationMetaVersion(t, svc, meta), time.Now())
 	if err != nil {
 		t.Fatalf("revalidateAndServe() error = %v (expected fallback to upstream)", err)
 	}

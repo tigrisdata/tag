@@ -10,6 +10,7 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -106,17 +107,9 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 		return s.originlessMiss(w, r, operation, start)
 	}
 
-	// ONE existence gate for the whole handler: an entry is visible only when its
-	// data is fully present — every block of a block-mode entry, the body of a
-	// whole-object one. Every answer below (304, HEAD 200, any serve) implies
-	// existence, and each of HEAD, conditionals, and the serve paths independently
-	// answering that question is exactly how three review rounds of
-	// existence-vs-serveability disagreements happened. An incomplete entry is
-	// simply invisible: metadata alone cannot be served, and claiming existence
-	// from it makes HEAD-as-existence callers — anything that skips re-population
-	// when a HEAD says the object exists — skip the healing that would make the
-	// entry servable again. A probe-to-serve race can still truncate a
-	// concurrent eviction; the gate narrows the window, nothing can close it.
+	// First rule out a genuinely absent local body. Metadata-only answers then
+	// verify the declared end byte below; a full GET checks the bytes it actually
+	// reads in serveFromCache.
 	servable, servErr := s.entryServable(ctx, bucket, key, meta)
 	if servErr != nil {
 		// A transient probe failure is not absence: 500-retry, never a false miss.
@@ -127,10 +120,35 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 		return s.originlessMiss(w, r, operation, start)
 	}
 
-	// Conditional requests are answered from the cached metadata; there is no
-	// upstream for a client's Cache-Control to revalidate against, so no-cache and
-	// no-store are simply not consulted — the cached copy is the only copy.
-	if s.answerConditionalsFromMeta(w, r, meta, operation, start) {
+	// For a body that passed the first-byte presence check, preserve S3
+	// precondition precedence before checking the full length. A failed If-Match
+	// or If-Unmodified-Since answers 412 from metadata even if that body is short.
+	if writePreconditionFailed(w, r, meta) {
+		metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
+	}
+
+	// HEAD and conditional GETs whose validators match may be answered from
+	// metadata alone, including a Range request that returns 304 before reading
+	// its range. For a positive declared length, verify the final byte before
+	// returning HEAD 200 or a cached 304; body GETs are checked while serving.
+	metadataOnly := r.Method == http.MethodHead ||
+		(r.Method == http.MethodGet && cacheMetaMatchesNotModifiedRequest(r, meta))
+	if metadataOnly && meta.ContentLength > 0 {
+		lengthMatches, probeErr := s.bodyLengthMatches(ctx, bucket, key, meta)
+		if probeErr != nil {
+			metrics.RecordRequestOutcome(operation, metrics.SourceLocal, time.Since(start).Seconds(), probeErr)
+			return probeErr
+		}
+		if !lengthMatches {
+			s.invalidateMetaIfVersion(ctx, bucket, key, metaVersion)
+			return s.originlessMissWithRequestError(w, r, operation, start, errCacheBodyLengthMismatch)
+		}
+	}
+
+	// Conditional requests are answered from cached metadata; there is no
+	// upstream for this mode to revalidate against.
+	if s.writeNotModifiedFromCache(w, r, meta, operation, start) {
 		return nil
 	}
 
@@ -151,29 +169,31 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 		return s.finishServeBodyError(ctx, w, r, bucket, key, metaVersion, rangeErr, operation, start)
 	}
 
-	if bodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); bodyErr != nil {
-		// serveFromCache fails before committing headers, so a miss response is
+	if bodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start, func() {
+		// The stream has committed, so guarded cleanup must not turn the partial
+		// response into a miss response.
+		s.invalidateMetaIfVersion(ctx, bucket, key, metaVersion)
+	}); bodyErr != nil {
+		// serveFromCache errors before committing headers, so a miss response is
 		// still writable.
 		return s.finishServeBodyError(ctx, w, r, bucket, key, metaVersion, bodyErr, operation, start)
 	}
 	return nil
 }
 
-// finishServeBodyError disposes of a pre-commit body-serve failure. It
-// distinguishes two cases the mode must not conflate:
-//   - The body is GENUINELY GONE (evicted under a live meta): an
-//     authoritative miss, and the orphaned meta is invalidated — but
-//     ETag-GUARDED (DeleteIfETag), never an unconditional delete, so a
-//     concurrent PUT's just-committed newer version is never wiped. The
-//     guard resolves against the served snapshot's discriminator identity;
-//     a different current entry keeps the key.
-//   - Anything else is TRANSIENT (a cluster-peer gRPC blip, a deadline):
-//     NOT absence. Minting an authoritative NoSuchKey here would tell the
-//     caller a live object does not exist — so it propagates as a retryable
-//     5xx, matching this handler's meta-read and probe legs.
+// finishServeBodyError disposes of a pre-commit body-serve failure. A confirmed
+// length mismatch is an authoritative miss counted as an error; its invalidation
+// uses the version read with the served snapshot. A genuinely missing body is an
+// authoritative miss with best-effort version cleanup. Other failures (for
+// example, a peer error or deadline) are transient and remain retryable errors.
 func (s *Service) finishServeBodyError(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string, metaVersion uint64, serveErr error, operation string, start time.Time) error {
+	if errors.Is(serveErr, errCacheBodyLengthMismatch) {
+		// serveFromCache already attempted version-guarded cleanup before
+		// returning this pre-commit mismatch.
+		return s.originlessMissWithRequestError(w, r, operation, start, serveErr)
+	}
 	if !bodyGone(serveErr) {
-		metrics.RecordRequest(operation, "error", metrics.SourceLocal, time.Since(start).Seconds())
+		metrics.RecordRequestOutcome(operation, metrics.SourceLocal, time.Since(start).Seconds(), serveErr)
 		return serveErr
 	}
 	// VERSION-guarded against the SERVED snapshot: a concurrent PUT's newer
@@ -188,10 +208,9 @@ func (s *Service) finishServeBodyError(ctx context.Context, w http.ResponseWrite
 	return s.originlessMiss(w, r, operation, start)
 }
 
-// entryServable is the handler's single existence answer: all blocks present for
-// a block-mode entry, the body present for a whole-object one. Everything the
-// handler says — 304, HEAD 200, a served body — flows from this one predicate, so
-// existence and serveability cannot disagree.
+// entryServable is the inexpensive first-byte presence check for a whole-body
+// local entry. Positive-length HEAD and conditional answers additionally verify
+// the declared end byte; body GETs verify the full count while serving.
 func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta) (bool, error) {
 	// A zero-length object is vacuously servable: no byte can be missing, and the
 	// first-byte probe below cannot see one anyway — the embedded backend returns
@@ -206,9 +225,15 @@ func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *c
 
 // originlessMiss answers the one thing a miss can be in this mode.
 func (s *Service) originlessMiss(w http.ResponseWriter, r *http.Request, operation string, start time.Time) error {
+	return s.originlessMissWithRequestError(w, r, operation, start, nil)
+}
+
+// originlessMissWithRequestError emits the authoritative NoSuchKey response and
+// records the outcome that led to the miss through the shared metrics mapping.
+func (s *Service) originlessMissWithRequestError(w http.ResponseWriter, r *http.Request, operation string, start time.Time, requestErr error) error {
 	writeCacheStatus(w, XCacheMiss)
 	s3err.WriteError(w, r, s3err.ErrNoSuchKey)
-	metrics.RecordRequest(operation, "success", metrics.SourceLocal, time.Since(start).Seconds())
+	metrics.RecordRequestOutcome(operation, metrics.SourceLocal, time.Since(start).Seconds(), requestErr)
 	return nil
 }
 

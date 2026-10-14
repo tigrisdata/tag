@@ -65,6 +65,11 @@ type metaCoordinator interface {
 	// coordinator strength: legacy coordination stores no versions to compare
 	// and refuses with (false, nil).
 	deleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error)
+	// Body-length hints are advisory and keyed separately from metadata. Legacy
+	// records them because it cannot delete a specific metadata version; CAS
+	// relies on its version-guarded delete and does not retain a hint.
+	markBodyLengthMismatch(ctx context.Context, bucket, key, discriminator string, length, ttl int64) error
+	hasBodyLengthMismatch(ctx context.Context, bucket, key, discriminator string, length int64) (bool, error)
 }
 
 // ============================================================================
@@ -214,6 +219,14 @@ func (c *casCoordinator) deleteMetaIfVersion(ctx context.Context, bucket, key st
 		return false, fmt.Errorf("version-guarded meta delete: %w", derr)
 	}
 	return true, nil
+}
+
+func (c *casCoordinator) markBodyLengthMismatch(context.Context, string, string, string, int64, int64) error {
+	return nil
+}
+
+func (c *casCoordinator) hasBodyLengthMismatch(context.Context, string, string, string, int64) (bool, error) {
+	return false, nil
 }
 
 // ============================================================================
@@ -369,10 +382,31 @@ func (c *legacyCoordinator) tombstoneTimestamp(ctx context.Context, bucket, key 
 }
 
 // deleteMetaIfVersion is a CAS-strength identity delete: legacy coordination
-// stores no versions (its tokens are wall-clock stamps never persisted with
-// the row), so there is nothing to compare the caller's token against and the
-// only safe answer is to refuse. Its sole caller (the tiered cleanup repair)
-// runs under CAS coordination by construction — tiered mode rejects legacy.
+// stores no versions (its tokens are wall-clock stamps never persisted with the
+// row), so there is nothing to compare the caller's token against and the only
+// safe answer is to refuse. Callers treat this as best-effort cleanup rather
+// than risk deleting a same-ETag replacement through a non-atomic comparison.
 func (c *legacyCoordinator) deleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error) {
 	return false, nil
+}
+
+// markBodyLengthMismatch keeps a TTL-bounded quarantine hint separate from the
+// mutable metadata key. A reader must recheck the current body before acting on
+// it, so a same-ETag replacement is not hidden by an old mismatch report.
+func (c *legacyCoordinator) markBodyLengthMismatch(ctx context.Context, bucket, key, discriminator string, length, ttl int64) error {
+	if ttl <= 0 {
+		ttl = c.tombstoneTTL
+	}
+	return c.client.Put(ctx, makeBodyLengthMismatchKey(bucket, key, discriminator, length), []byte{1}, ttl)
+}
+
+func (c *legacyCoordinator) hasBodyLengthMismatch(ctx context.Context, bucket, key, discriminator string, length int64) (bool, error) {
+	value, err := c.client.Get(ctx, makeBodyLengthMismatchKey(bucket, key, discriminator, length))
+	if err != nil {
+		if isNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return len(value) > 0, nil
 }

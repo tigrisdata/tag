@@ -1403,6 +1403,26 @@ func (s *Service) invalidateStaleMeta(bucket, key, staleETag string) {
 	}
 }
 
+// invalidateMetaIfVersion removes only the metadata snapshot that the failed
+// body read used. The coordinator owns the token semantics: CAS deletes exactly
+// that version, while legacy coordination refuses a version delete rather than
+// risk deleting a same-ETag replacement through its non-atomic ETag guard.
+func (s *Service) invalidateMetaIfVersion(ctx context.Context, bucket, key string, version uint64) {
+	if !s.cache.IsEnabled() {
+		return
+	}
+	deleted, err := s.cache.DeleteMetaIfVersion(ctx, bucket, key, version)
+	if err != nil {
+		metrics.RecordCacheOperation("delete", "error")
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).
+			Msg("Mismatched cache meta invalidation failed; entry may remain until TTL")
+		return
+	}
+	if deleted {
+		metrics.RecordCacheOperation("delete", "success")
+	}
+}
+
 // ensureBlocksCached makes covering blocks [b0,bK] present in cache: it probes the range once,
 // fetches any that are missing, and records per-block hits/misses plus whether the serve was a
 // full or partial hit. It returns an error only when a missing block could not be populated

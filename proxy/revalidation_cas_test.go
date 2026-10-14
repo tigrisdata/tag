@@ -72,7 +72,7 @@ func TestRevalidation200_ReplacesStaleEntryAfterFailedDelete(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/b/k", nil)
-	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", stale, time.Now()); err != nil {
+	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", stale, revalidationMetaVersion(t, svc, stale), time.Now()); err != nil {
 		t.Fatalf("revalidateAndServe: %v", err)
 	}
 	if w.Body.String() != newBody {
@@ -135,7 +135,7 @@ func TestRevalidation206_BackgroundFetchReplacesStaleAfterFailedDelete(t *testin
 	r.Header.Set("Cache-Control", "no-cache")
 	// A credentialed request, so the background repair uses the signed fetch.
 	r.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=access/20260907/auto/s3/aws4_request")
-	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", stale, time.Now()); err != nil {
+	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", stale, revalidationMetaVersion(t, svc, stale), time.Now()); err != nil {
 		t.Fatalf("revalidateAndServe: %v", err)
 	}
 	if w.Code != http.StatusPartialContent {
@@ -326,15 +326,16 @@ func TestRevalidation200_TokenFailureSkipsCaching(t *testing.T) {
 	if err := c.PutWithMeta(ctx, bucket, key, stale, []byte("stale"), 0); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	metaVersion := revalidationMetaVersion(t, svc, stale)
 
 	// Fail exactly the picker's read. GetWithVersion call ledger: the seed's
-	// PutWithMeta VersionAny loop is #1, the guarded delete's own read is #2
-	// (succeeds — the stale row is removed and fenced), the picker's is #3.
-	wrapped.failOn = 3
+	// PutWithMeta VersionAny loop is #1, the request snapshot is #2, the guarded
+	// delete's own read is #3, and the picker's read is #4.
+	wrapped.failOn = 4
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/b/k", nil)
-	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", stale, time.Now()); err != nil {
+	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", stale, metaVersion, time.Now()); err != nil {
 		t.Fatalf("revalidateAndServe: %v", err)
 	}
 	if w.Body.String() != newBody {
@@ -379,6 +380,7 @@ func TestRevalidation200_FreshRacerSkipsCaching(t *testing.T) {
 	if err := c.PutWithMeta(ctx, bucket, key, stale, []byte("stale"), 0); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	metaVersion := revalidationMetaVersion(t, svc, stale)
 
 	// After the guarded delete clears the stale row, a racer re-establishes
 	// the entry with a different ETag, and is then fenced-deleted — the exact
@@ -401,7 +403,7 @@ func TestRevalidation200_FreshRacerSkipsCaching(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/b/k", nil)
-	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", stale, time.Now()); err != nil {
+	if err := svc.revalidateAndServe(ctx, w, r, bucket, key, "access", "secret", stale, metaVersion, time.Now()); err != nil {
 		t.Fatalf("revalidateAndServe: %v", err)
 	}
 	if w.Body.String() != newBody {

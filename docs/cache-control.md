@@ -28,7 +28,14 @@ curl -H "Cache-Control: no-cache" -H "Range: bytes=0-99" \
   http://localhost:8080/my-bucket/my-key
 ```
 
-If the revalidation request to upstream fails, TAG serves the stale cached copy as a fallback.
+In proxy modes, a failed revalidation tries to serve stale cached content. A body-bearing
+positive-length whole-object response is complete only when its cache body matches metadata length;
+proxy HEAD and metadata-only conditional 304 responses retain their validator-based behavior.
+
+A short body or other cache error found before headers commit triggers a fresh upstream request; if
+that request also fails, TAG returns the error. If a length mismatch or stream error is found after
+large-response headers commit, TAG records an incomplete response as an error and does not append an
+upstream body. Range body reads use their separate range path.
 
 ## Bypass Cache
 

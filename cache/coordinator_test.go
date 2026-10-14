@@ -15,6 +15,35 @@ func newLegacyTestCache() (*Cache, *cacheclient.MemoryCache) {
 	return NewCacheWithClient(mem, &cfg.Cache), mem
 }
 
+// A legacy mismatch hint is scoped to the body identity and expected length.
+// CAS relies on its versioned delete and does not retain a hint.
+func TestLegacyBodyLengthMismatchHintIsLengthScoped(t *testing.T) {
+	ctx := context.Background()
+	legacy, _ := newLegacyTestCache()
+	if err := legacy.MarkBodyLengthMismatch(ctx, "b", "k", `"etag"`, 100); err != nil {
+		t.Fatalf("MarkBodyLengthMismatch: %v", err)
+	}
+	if found, err := legacy.HasBodyLengthMismatch(ctx, "b", "k", `"etag"`, 100); err != nil || !found {
+		t.Fatalf("legacy hint = (%v, %v), want (true, nil)", found, err)
+	}
+	if found, err := legacy.HasBodyLengthMismatch(ctx, "b", "k", `"etag"`, 101); err != nil || found {
+		t.Fatalf("different length hint = (%v, %v), want (false, nil)", found, err)
+	}
+	if found, err := legacy.HasBodyLengthMismatch(ctx, "b", "k", `"replacement"`, 100); err != nil || found {
+		t.Fatalf("different body hint = (%v, %v), want (false, nil)", found, err)
+	}
+
+	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false)
+	cas := NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	if err := cas.MarkBodyLengthMismatch(ctx, "b", "k", `"etag"`, 100); err != nil {
+		t.Fatalf("CAS MarkBodyLengthMismatch: %v", err)
+	}
+	if found, err := cas.HasBodyLengthMismatch(ctx, "b", "k", `"etag"`, 100); err != nil || found {
+		t.Fatalf("CAS hint = (%v, %v), want (false, nil)", found, err)
+	}
+}
+
 // The default configuration selects the legacy coordinator: a fresh install or
 // an untouched upgrade must run the v1.20-compatible mechanism.
 func TestCoordinator_DefaultIsLegacy(t *testing.T) {

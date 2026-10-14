@@ -206,6 +206,26 @@ Client                 TAG                    Embedded Cache
   │  X-Cache: HIT       │                       │
 ```
 
+For a positive-length whole-object cache entry, TAG checks stream length against metadata before
+counting a local GET as successful. In transparent and signing modes, a short buffered GET falls
+back upstream before headers commit. If upstream fails before headers arrive, TAG returns the error
+without committing the cached prefix. A committed short or overlong stream is recorded as a local
+error; no upstream body is appended. Proxy HEAD and metadata-based conditional 304 responses retain
+their existing metadata behavior.
+
+Tiered-local GETs have no upstream body fallback. A buffered mismatch returns the authoritative
+`NoSuchKey` miss without cached bytes; a committed mismatch is recorded as a local error without an
+upstream append. Positive-length tiered HEAD and matching conditional 304 responses verify body
+length with a final-byte range probe before returning metadata. Zero-length and unknown-length
+objects retain their existing paths. Range body reads use separate helpers.
+
+CAS cleanup removes the metadata version observed by the request. Legacy coordination cannot safely
+delete that row by version, so it stores a TTL-bound hint keyed by body identity and expected
+length. While the hint remains present, updated legacy whole-body readers look it up and range-check
+flagged bodies before streaming. A still-incomplete entry falls back before commitment, while an
+exact same-ETag replacement remains usable. The metadata row may remain until TTL; older TAG nodes
+ignore the hint, and an uncacheable origin response still requires an upstream fetch.
+
 ### GET Object (Cache Miss)
 
 ```text
@@ -228,6 +248,8 @@ Client                 TAG                    Embedded Cache         Tigris
   │  200 OK + body      │                       │                    │
   │  X-Cache: MISS      │                       │                    │
 ```
+
+If an upstream fetch fails before response headers are published, TAG returns the error before committing a success response.
 
 ### GET Object (Cluster Mode - Remote Key)
 

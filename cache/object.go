@@ -14,11 +14,12 @@ import (
 )
 
 const (
-	// Cache key prefixes for separate metadata and body storage
-	metaKeyPrefix  = "meta|"
-	bodyKeyPrefix  = "body|"
-	blockKeyPrefix = "blk|"
-	tombKeyPrefix  = "tomb|"
+	// Cache key prefixes for metadata, bodies, blocks, tombstones, and mismatch hints.
+	metaKeyPrefix     = "meta|"
+	bodyKeyPrefix     = "body|"
+	blockKeyPrefix    = "blk|"
+	tombKeyPrefix     = "tomb|"
+	mismatchKeyPrefix = "length-mismatch|"
 )
 
 // CachedObjectMeta represents cached S3 object metadata.
@@ -413,6 +414,13 @@ func MakeBodyKey(bucket, key, etag string) string {
 		return bodyKeyPrefix + bucket + "|" + key
 	}
 	return bodyKeyPrefix + bucket + "|" + key + "|" + etagKeyComponent(etag)
+}
+
+// makeBodyLengthMismatchKey identifies a TTL-bound hint for one whole-body key
+// and declared length. Readers still verify the current body before acting on
+// the hint, so a replacement that now has the expected length remains usable.
+func makeBodyLengthMismatchKey(bucket, key, discriminator string, length int64) string {
+	return mismatchKeyPrefix + MakeBodyKey(bucket, key, discriminator) + "|" + strconv.FormatInt(length, 10)
 }
 
 // MakeBlockKey creates the cache key for a single block of a block-mode object body

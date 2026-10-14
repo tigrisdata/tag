@@ -54,19 +54,25 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// lazyCommitWriter counts a cache body stream and commits the response when
-// the first nonempty chunk arrives. Empty and failed streams can therefore be
-// handled by the cache-miss fallback without sending cache headers first.
+// lazyCommitWriter counts bytes offered by the cache and commits the response
+// when the first nonempty chunk arrives. Empty and failed streams can therefore
+// be handled by the cache-miss fallback without sending cache headers first.
 type lazyCommitWriter struct {
 	w         http.ResponseWriter
 	meta      *cache.CachedObjectMeta
-	written   int64
+	written   int64 // bytes accepted by the downstream writer
+	offered   int64 // bytes read from the cache, including a chunk the writer rejects
+	overlong  bool
 	committed bool
 }
 
 func (cw *lazyCommitWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
+	}
+	cw.offered += int64(len(p))
+	if cw.meta.ContentLength > 0 && cw.offered > cw.meta.ContentLength {
+		cw.overlong = true
 	}
 	if !cw.committed {
 		cw.meta.WriteHeaders(cw.w)
@@ -77,6 +83,9 @@ func (cw *lazyCommitWriter) Write(p []byte) (int, error) {
 
 	n, err := cw.w.Write(p)
 	cw.written += int64(n)
+	if err == nil && n != len(p) {
+		return n, io.ErrShortWrite
+	}
 	return n, err
 }
 
@@ -122,7 +131,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	isAnonymous := isAnonymousRequest(r, result, err)
 
 	if (result == AuthValidated || isAnonymous) && !bypassCache && s.cache.IsEnabled() {
-		meta, found, cacheErr := s.cache.GetMeta(ctx, bucket, key)
+		meta, metaVersion, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 		cacheHit := cacheErr == nil && found && meta != nil
 		// Anonymous requests can only be served from cache if the object's ACL allows it
 		if cacheHit && isAnonymous && !meta.IsPublicRead() {
@@ -141,7 +150,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 					Str("bucket", bucket).
 					Str("key", key).
 					Msg("Cache hit requires revalidation (client-triggered)")
-				return s.revalidateAndServe(ctx, w, r, bucket, key, accessKey, secretKey, meta, start)
+				return s.revalidateAndServe(ctx, w, r, bucket, key, accessKey, secretKey, meta, metaVersion, start)
 			}
 
 			// If the client forced revalidation but there is no whole-body entry to revalidate
@@ -219,15 +228,16 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 						return assembleErr
 					}
 					// Fall through to cache miss path
-				} else if cacheBodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); cacheBodyErr != nil {
+				} else if cacheBodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start, func() {
+					s.invalidateMetaIfVersion(ctx, bucket, key, metaVersion)
+				}); cacheBodyErr != nil {
 					log.Warn().Err(cacheBodyErr).Str("bucket", bucket).Str("key", key).Msg("Cache body unavailable, falling through to upstream")
-					// Invalidate only when the body is genuinely gone: the metadata is then
-					// orphaned, and clearing it stops a meta-hit/body-miss loop that repeats
-					// the failed cache read on every request before refetching. A transient
-					// failure (e.g. the client disconnected mid-read) must not evict a
-					// still-valid hot entry. serveFromCache errors before committing
-					// headers, so falling through to the miss path below is safe either way.
-					if bodyGone(cacheBodyErr) {
+					// Invalidate genuinely missing bodies to stop a meta-hit/body-miss loop.
+					// Length mismatches already used the served snapshot's version guard;
+					// do not retry them with ETag, which can match a replacement. Transient
+					// read failures also leave the entry alone. serveFromCache errors before
+					// committing, so the miss path below is still safe.
+					if bodyGone(cacheBodyErr) && !errors.Is(cacheBodyErr, errCacheBodyLengthMismatch) {
 						s.invalidateStaleMeta(bucket, key, meta.ETag)
 					}
 					// Fall through to cache miss path
@@ -864,27 +874,30 @@ func (s *Service) handleRangeWithBackgroundCache(
 	return nil
 }
 
-// writeNotModifiedFromCache answers a conditional request with 304 when the
-// cached entry satisfies the request's validators. Per RFC 7232 §3.3, a
-// request carrying If-None-Match is judged by it ALONE — If-Modified-Since is
-// ignored, matching or not: LastModified is second-granular, so falling back
-// to it could 304 a client across a same-second overwrite it should see.
-// Returns true when it wrote the response. Shared by the proxying GET hit
-// path and the origin-less handler so the two cannot drift.
-func (s *Service) writeNotModifiedFromCache(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, operation string, start time.Time) bool {
+// cacheMetaMatchesNotModifiedRequest reports whether cached metadata satisfies
+// the request's 304 validators without committing a response. Per RFC 7232 §3.3,
+// If-None-Match is judged alone; If-Modified-Since is ignored when it is present.
+// LastModified has only second precision, so falling back to the date could
+// 304 across a same-second overwrite that the ETag would reject.
+func cacheMetaMatchesNotModifiedRequest(r *http.Request, meta *cache.CachedObjectMeta) bool {
 	if inm := r.Header.Get("If-None-Match"); inm != "" {
-		if !meta.MatchesETagHeader(inm, false) {
-			return false
-		}
-	} else {
-		ims := r.Header.Get("If-Modified-Since")
-		if ims == "" {
-			return false
-		}
-		t, parseErr := http.ParseTime(ims)
-		if parseErr != nil || meta.IsModifiedSince(t) {
-			return false
-		}
+		return meta.MatchesETagHeader(inm, false)
+	}
+	ims := r.Header.Get("If-Modified-Since")
+	if ims == "" {
+		return false
+	}
+	t, parseErr := http.ParseTime(ims)
+	return parseErr == nil && !meta.IsModifiedSince(t)
+}
+
+// writeNotModifiedFromCache answers a conditional request with 304 when the
+// cached entry satisfies the request's validators. Returns true when it wrote
+// the response. Shared by the proxying GET hit path and the origin-less handler
+// so the two cannot drift.
+func (s *Service) writeNotModifiedFromCache(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, operation string, start time.Time) bool {
+	if !cacheMetaMatchesNotModifiedRequest(r, meta) {
+		return false
 	}
 	writeCacheStatus(w, XCacheHit)
 	w.Header().Set("ETag", meta.ETag)

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,11 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
+)
+
+var (
+	errCacheBodyLengthMismatch        = errors.New("cache body length mismatch")
+	errCacheBodyLengthHintUnavailable = errors.New("cache body length hint unavailable")
 )
 
 // revalidateAndServe sends a conditional GET to upstream and serves the result.
@@ -26,6 +32,7 @@ func (s *Service) revalidateAndServe(
 	r *http.Request,
 	bucket, key, accessKey, secretKey string,
 	meta *cache.CachedObjectMeta,
+	metaVersion uint64,
 	start time.Time,
 ) error {
 	metrics.RecordRevalidationTriggered()
@@ -47,7 +54,7 @@ func (s *Service) revalidateAndServe(
 		// Upstream error — serve stale from cache
 		log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("Revalidation failed, serving stale")
 		metrics.RecordRevalidationFailed()
-		served, staleErr := s.serveStaleFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		served, staleErr := s.serveStaleFromCache(ctx, w, r, bucket, key, meta, metaVersion, rangeHeader, start)
 		if served {
 			metrics.RecordRevalidationStaleServed()
 			return staleErr
@@ -60,7 +67,7 @@ func (s *Service) revalidateAndServe(
 
 	switch resp.StatusCode {
 	case http.StatusNotModified:
-		served, revalErr := s.handleRevalidation304(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		served, revalErr := s.handleRevalidation304(ctx, w, r, bucket, key, meta, metaVersion, rangeHeader, start)
 		if served {
 			// A response (full body, range, or a committed-then-failed stream) was
 			// produced; propagate its result. Headers are already sent on error, so
@@ -88,7 +95,7 @@ func (s *Service) revalidateAndServe(
 			Str("key", key).
 			Msg("Revalidation got unexpected status, serving stale")
 		metrics.RecordRevalidationFailed()
-		served, staleErr := s.serveStaleFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
+		served, staleErr := s.serveStaleFromCache(ctx, w, r, bucket, key, meta, metaVersion, rangeHeader, start)
 		if served {
 			metrics.RecordRevalidationStaleServed()
 			return staleErr
@@ -112,8 +119,10 @@ func (s *Service) forwardAfterCacheMiss(ctx context.Context, w http.ResponseWrit
 	// because the normal re-warm paths are gated on the metadata being absent.
 	// Deleting it makes the next request a clean miss that repopulates the cache.
 	// A transient failure (e.g. a canceled context from a disconnected client) must
-	// not evict a still-valid entry, so bodyGone gates the delete.
-	if s.cache.IsEnabled() && bodyGone(bodyErr) {
+	// not evict a still-valid entry, so bodyGone gates the delete. A length
+	// mismatch already used the served snapshot's version guard; it must not be
+	// retried here through the weaker ETag comparison.
+	if s.cache.IsEnabled() && bodyGone(bodyErr) && !errors.Is(bodyErr, errCacheBodyLengthMismatch) {
 		// ETag-guarded: only the entry whose body was observed gone is removed,
 		// never one a concurrent request re-established under a newer version.
 		s.invalidateStaleMeta(bucket, key, staleETag)
@@ -141,19 +150,22 @@ func (s *Service) handleRevalidation304(
 	r *http.Request,
 	bucket, key string,
 	meta *cache.CachedObjectMeta,
+	metaVersion uint64,
 	rangeHeader string,
 	start time.Time,
 ) (served bool, err error) {
 	metrics.RecordRevalidationNotModified()
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("Revalidation 304 - object unchanged")
 
-	// Serve range or full body from cache. Both serveRangeFromCache (via its
-	// pre-header probe) and serveFromCache report an unresolvable body without
-	// writing headers, so the caller can safely forward to upstream.
+	// Serve range or full body from cache. The range helper reports served=true
+	// once it commits, and the whole-object helper returns nil after a committed
+	// stream; only a pre-commit failure leaves the caller free to fetch upstream.
 	if rangeHeader != "" {
 		return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
 	}
-	if bodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); bodyErr != nil {
+	if bodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start, func() {
+		s.invalidateMetaIfVersion(ctx, bucket, key, metaVersion)
+	}); bodyErr != nil {
 		return false, bodyErr
 	}
 	return true, nil
@@ -311,14 +323,17 @@ func (s *Service) handleRevalidation200(
 	return copyErr
 }
 
-// serveFromCache serves an object from the cache body.
-// Used as fallback during revalidation (304 or error paths).
+// serveFromCache serves a whole object from the cache body. A retained legacy
+// length hint rechecks the current body before streaming. Buffered mismatches
+// return before headers commit; committed mismatches are accounted locally and
+// never trigger an upstream append.
 func (s *Service) serveFromCache(
 	ctx context.Context,
 	w http.ResponseWriter,
 	bucket, key string,
 	meta *cache.CachedObjectMeta,
 	start time.Time,
+	invalidateOnLengthMismatch func(),
 ) error {
 	// Zero-byte objects: no body to serve
 	if meta.ContentLength == 0 {
@@ -326,21 +341,63 @@ func (s *Service) serveFromCache(
 		return nil
 	}
 
-	// Small objects: buffer and serve
+	// A legacy mismatch hint is only a reason to recheck, never proof that a
+	// same-ETag replacement is bad. Keep the check at the shared whole-body
+	// serve boundary so normal, revalidated, and stale reads take the same path.
+	if meta.ContentLength > 0 {
+		hinted, err := s.cache.HasBodyLengthMismatch(ctx, bucket, key, meta.BodyDiscriminator(), meta.ContentLength)
+		if err != nil {
+			return fmt.Errorf("%w: %w", errCacheBodyLengthHintUnavailable, err)
+		}
+		if hinted {
+			matches, err := s.bodyLengthMatches(ctx, bucket, key, meta)
+			if err != nil {
+				return fmt.Errorf("%w: %w", errCacheBodyLengthHintUnavailable, err)
+			}
+			if !matches {
+				s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
+				if invalidateOnLengthMismatch != nil {
+					invalidateOnLengthMismatch()
+				}
+				return fmt.Errorf("%w for %s/%s: quarantined body still differs from metadata length %d", errCacheBodyLengthMismatch, bucket, key, meta.ContentLength)
+			}
+		}
+	}
+
+	// Small objects: buffer and verify before committing the response.
 	if meta.ContentLength <= smallObjectThreshold {
 		bodyBuf := bufferPool.Get().(*bytes.Buffer)
 		bodyBuf.Reset()
 
 		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), bodyBuf)
-		if bodyErr == nil && bodyBuf.Len() > 0 {
-			meta.WriteHeaders(w)
-			writeCacheStatus(w, XCacheHit)
-			w.WriteHeader(meta.StatusCode)
-			n, _ := w.Write(bodyBuf.Bytes())
-			metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-			metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
+		bodyLen := int64(bodyBuf.Len())
+		if bodyErr != nil && meta.ContentLength > 0 && bodyLen < meta.ContentLength && errors.Is(bodyErr, io.ErrUnexpectedEOF) {
 			putBuffer(bodyBuf)
-			return nil
+			s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
+			if invalidateOnLengthMismatch != nil {
+				invalidateOnLengthMismatch()
+			}
+			return fmt.Errorf("%w for %s/%s: got %d bytes, want %d: %w", errCacheBodyLengthMismatch, bucket, key, bodyLen, meta.ContentLength, bodyErr)
+		}
+		if bodyErr == nil {
+			if meta.ContentLength > 0 && bodyLen != meta.ContentLength {
+				putBuffer(bodyBuf)
+				s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
+				if invalidateOnLengthMismatch != nil {
+					invalidateOnLengthMismatch()
+				}
+				return fmt.Errorf("%w for %s/%s: got %d bytes, want %d", errCacheBodyLengthMismatch, bucket, key, bodyLen, meta.ContentLength)
+			}
+			if bodyLen > 0 {
+				meta.WriteHeaders(w)
+				writeCacheStatus(w, XCacheHit)
+				w.WriteHeader(meta.StatusCode)
+				n, _ := w.Write(bodyBuf.Bytes())
+				metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+				metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(start).Seconds())
+				putBuffer(bodyBuf)
+				return nil
+			}
 		}
 		putBuffer(bodyBuf)
 		// Body unavailable — return error (caller may fall through to upstream)
@@ -350,31 +407,60 @@ func (s *Service) serveFromCache(
 		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
 	}
 
-	// Large objects: stream directly to a writer that commits only when the
-	// cache produces its first nonempty chunk. This preserves the pre-commit
-	// fallback for an absent or empty body without staging the stream through a
-	// pipe and a second copy.
+	// Large objects stream directly to a writer that commits on its first
+	// nonempty chunk. The writer tracks bytes offered by the cache separately
+	// from bytes accepted downstream, so a Content-Length rejection still proves
+	// an overlong cache entry.
 	cw := &lazyCommitWriter{w: w, meta: meta}
 	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), cw)
-	status := "success"
-	if bodyErr != nil {
-		if !cw.committed {
-			return fmt.Errorf("cache body unavailable: %w", bodyErr)
+	if bodyErr != nil && !cw.committed {
+		if meta.ContentLength > 0 && errors.Is(bodyErr, io.ErrUnexpectedEOF) {
+			s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
+			if invalidateOnLengthMismatch != nil {
+				invalidateOnLengthMismatch()
+			}
+			return fmt.Errorf("%w for %s/%s: got 0 bytes, want %d: %w", errCacheBodyLengthMismatch, bucket, key, meta.ContentLength, bodyErr)
 		}
-		// The response is already committed. Do not return the error to the
-		// caller: HandleGetObject would otherwise try to append an upstream
-		// response to the partial cached body. The response is incomplete,
-		// however, so record the request as an error.
-		log.Warn().Err(bodyErr).Str("bucket", bucket).Str("key", key).
-			Msg("Failed to stream cache body after headers committed")
-		status = "error"
+		return fmt.Errorf("cache body unavailable: %w", bodyErr)
 	}
 	if !cw.committed {
+		if bodyErr == nil && meta.ContentLength > 0 {
+			s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
+			if invalidateOnLengthMismatch != nil {
+				invalidateOnLengthMismatch()
+			}
+			return fmt.Errorf("%w for %s/%s: got 0 bytes, want %d", errCacheBodyLengthMismatch, bucket, key, meta.ContentLength)
+		}
 		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
 	}
 
+	var requestErr error
+	lengthMismatch := cw.overlong || (bodyErr == nil && meta.ContentLength > 0 && cw.written != meta.ContentLength)
+	if lengthMismatch {
+		log.Warn().Err(bodyErr).
+			Str("bucket", bucket).
+			Str("key", key).
+			Int64("expected_bytes", meta.ContentLength).
+			Int64("written_bytes", cw.written).
+			Int64("offered_bytes", cw.offered).
+			Msg("Cache body length mismatch after headers committed")
+		s.rememberBodyLengthMismatch(ctx, bucket, key, meta)
+		if invalidateOnLengthMismatch != nil {
+			invalidateOnLengthMismatch()
+		}
+		requestErr = errCacheBodyLengthMismatch
+	} else if bodyErr != nil {
+		// The response is already committed. Do not return the error to the
+		// caller: HandleGetObject would otherwise append an upstream response to
+		// the partial cache body. A non-length stream or writer error is not
+		// proof that the cache entry itself is damaged.
+		log.Warn().Err(bodyErr).Str("bucket", bucket).Str("key", key).
+			Msg("Failed to stream cache body after headers committed")
+		requestErr = bodyErr
+	}
+
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-	metrics.RecordRequest("GetObject", status, metrics.SourceLocal, time.Since(start).Seconds())
+	metrics.RecordRequestOutcome("GetObject", metrics.SourceLocal, time.Since(start).Seconds(), requestErr)
 	return nil
 }
 
@@ -433,22 +519,26 @@ func (s *Service) handleRevalidation206Range(
 }
 
 // serveStaleFromCache serves stale content from cache, handling both full and
-// range requests. It returns served=false, without writing any response bytes,
-// when the cached body cannot be resolved so the caller can fall back to a direct
-// upstream fetch instead of emitting a truncated or empty response.
+// range requests. It returns served=false only when no response was committed,
+// allowing the caller to fetch upstream. A committed stream that later proves
+// incomplete is accounted for by the serve helper and cannot be replaced by an
+// upstream response.
 func (s *Service) serveStaleFromCache(
 	ctx context.Context,
 	w http.ResponseWriter,
 	r *http.Request,
 	bucket, key string,
 	meta *cache.CachedObjectMeta,
+	metaVersion uint64,
 	rangeHeader string,
 	start time.Time,
 ) (served bool, err error) {
 	if rangeHeader != "" {
 		return s.serveRangeFromCache(ctx, w, r, bucket, key, meta, rangeHeader, start)
 	}
-	if bodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start); bodyErr != nil {
+	if bodyErr := s.serveFromCache(ctx, w, bucket, key, meta, start, func() {
+		s.invalidateMetaIfVersion(ctx, bucket, key, metaVersion)
+	}); bodyErr != nil {
 		return false, bodyErr
 	}
 	return true, nil
