@@ -340,7 +340,7 @@ In **transparent proxy mode** (the default), the upstream endpoint must be one o
 - `*.tigris.dev` (e.g., `fly.storage.tigris.dev`)
 - `*.storage.dev` (e.g., `t3.storage.dev`)
 
-This restriction exists because transparent mode adds `X-Tigris-Proxy-*` identity headers that are only meaningful to Tigris. In **signing mode** (`transparent_proxy: false`) the endpoint is not restricted — see below.
+This restriction exists because transparent mode adds `X-Tigris-Proxy-*` identity headers that are only meaningful to Tigris. In **signing mode** (`transparent_proxy: false`) the endpoint is not restricted — see below. **Tiered mode** is not restricted either: it forwards transparently on a Tigris domain (`*.tigris.dev`, `*.storage.dev`) and by signing on any other endpoint, including `localhost` (see [tiered-mode.md](tiered-mode.md#authentication)).
 
 **Transparent Proxy Mode:**
 
