@@ -169,7 +169,7 @@ func payloadSHA256(body []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (f *tieredPayloadHashFixture) signedRequest(t *testing.T, method, key string, body []byte, bodyHash, contentMD5 string) *http.Request {
+func (f *tieredPayloadHashFixture) signedRequest(t *testing.T, method, key string, body []byte, bodyHash, contentMD5 string, extraHeaders ...http.Header) *http.Request {
 	t.Helper()
 
 	r := httptest.NewRequest(method, "http://s3.test/"+payloadHashTestBucket+"/"+key, bytes.NewReader(body))
@@ -177,6 +177,16 @@ func (f *tieredPayloadHashFixture) signedRequest(t *testing.T, method, key strin
 	r.Header.Set("X-Amz-Content-Sha256", bodyHash)
 	if contentMD5 != "" {
 		r.Header.Set("Content-MD5", contentMD5)
+	}
+	if len(extraHeaders) > 1 {
+		t.Fatal("signed request accepts at most one extra header map")
+	}
+	if len(extraHeaders) == 1 {
+		for name, values := range extraHeaders[0] {
+			for _, value := range values {
+				r.Header.Add(name, value)
+			}
+		}
 	}
 	credentials := aws.Credentials{
 		AccessKeyID:     payloadHashTestAccessKey,
@@ -196,10 +206,10 @@ func (f *tieredPayloadHashFixture) signedRequest(t *testing.T, method, key strin
 	return r
 }
 
-func (f *tieredPayloadHashFixture) do(t *testing.T, method, key string, body []byte, bodyHash, contentMD5 string) *httptest.ResponseRecorder {
+func (f *tieredPayloadHashFixture) do(t *testing.T, method, key string, body []byte, bodyHash, contentMD5 string, extraHeaders ...http.Header) *httptest.ResponseRecorder {
 	t.Helper()
 
-	r := f.signedRequest(t, method, key, body, bodyHash, contentMD5)
+	r := f.signedRequest(t, method, key, body, bodyHash, contentMD5, extraHeaders...)
 	result, _, _, err := f.forwarder.ValidateAndGetCredentials(r)
 	if err != nil || result != AuthValidated {
 		t.Fatalf("independently signed %s %s did not pass %T authentication: result=%v err=%v authorization=%q host=%q url=%s headers=%v", method, key, f.forwarder, result, err, r.Header.Get("Authorization"), r.Host, r.URL, r.Header)
@@ -334,7 +344,7 @@ func TestTieredLocalPayloadHashIntegrity(t *testing.T) {
 			}
 			metaWrites = fixture.client.metaPutCount()
 			bodyPuts, bodyDeletes = fixture.client.bodyCounts()
-			w = fixture.do(t, http.MethodPut, "overwrite-key", mutatedBody, payloadSHA256(trustedBody), "")
+			w = fixture.do(t, http.MethodPut, "overwrite-key", mutatedBody, payloadSHA256(trustedBody), "", http.Header{"If-Match": []string{oldMeta.ETag}})
 			newMeta, found, err := fixture.cache.GetMeta(context.Background(), payloadHashTestBucket, "overwrite-key")
 			if err != nil || !found || newMeta == nil {
 				t.Fatalf("read overwrite metadata after rejection: meta=%+v found=%v err=%v", newMeta, found, err)
