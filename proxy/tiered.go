@@ -192,7 +192,8 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 			// Thread the SAME snapshot into the engine: the tier decision
 			// above and the engine's precondition/token now share one read,
 			// so a marker committing in between cannot make them disagree.
-			err := s.handleOriginlessPut(rec, r, &putPrior{meta: priorMeta, version: priorVersion, found: found})
+			expectedSHA256 := concretePayloadSHA256(r)
+			err := s.handleOriginlessPut(rec, r, &putPrior{meta: priorMeta, version: priorVersion, found: found}, expectedSHA256)
 			if err == nil && rec.wroteSuccess() && prior != nil && prior.BodyUpstream {
 				// Small write displaced an upstream-tier version: remove the
 				// upstream copy so it doesn't linger as an orphan. Bound to the

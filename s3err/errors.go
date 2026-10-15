@@ -29,6 +29,7 @@ const (
 	ErrPreconditionFailed           ErrorCode = "PreconditionFailed"
 	ErrInvalidDigest                ErrorCode = "InvalidDigest"
 	ErrBadDigest                    ErrorCode = "BadDigest"
+	ErrContentSHA256Mismatch        ErrorCode = "XAmzContentSHA256Mismatch"
 	ErrNoSuchUpload                 ErrorCode = "NoSuchUpload"
 	ErrInvalidAccessKeyId           ErrorCode = "InvalidAccessKeyId"
 	ErrSignatureDoesNotMatch        ErrorCode = "SignatureDoesNotMatch"
@@ -81,6 +82,7 @@ var errorMap = map[ErrorCode]errorInfo{
 	ErrPreconditionFailed:           {http.StatusPreconditionFailed, ErrPreconditionFailed, "At least one of the pre-conditions you specified did not hold"},
 	ErrInvalidDigest:                {http.StatusBadRequest, ErrInvalidDigest, "The Content-MD5 you specified is not valid"},
 	ErrBadDigest:                    {http.StatusBadRequest, ErrBadDigest, "The Content-MD5 you specified did not match what we received"},
+	ErrContentSHA256Mismatch:        {http.StatusBadRequest, ErrContentSHA256Mismatch, "The provided 'x-amz-content-sha256' header does not match what was computed"},
 	ErrNoSuchUpload:                 {http.StatusNotFound, ErrNoSuchUpload, "The specified multipart upload does not exist"},
 	ErrInvalidAccessKeyId:           {http.StatusForbidden, ErrInvalidAccessKeyId, "The AWS access key ID you provided does not exist in our records"},
 	ErrSignatureDoesNotMatch:        {http.StatusForbidden, ErrSignatureDoesNotMatch, "The request signature we calculated does not match the signature you provided"},
