@@ -17,8 +17,10 @@ memory, so the threshold can be sized to the workload without a per-request
 memory cost. The MD5 ETag is computed over the decoded bytes as they stream;
 because the ETag cannot exist before the last byte, the body is keyed by a
 per-write id carried in the metadata (`BodyRef`), and the metadata commit is
-what makes the entry visible. A concrete SigV4 payload hash on a PUT routed
-to the local tier is checked against the streamed bytes before that commit.
+what makes the entry visible. After admission and any local precondition pass
+and the full body passes its declared-length and any Content-MD5 checks, a PUT
+routed to the local tier checks a concrete SigV4 payload hash against the
+streamed bytes before that commit.
 Conditional writes against an upstream-tier marker stay on the forwarding
 path. `UNSIGNED-PAYLOAD` and aws-chunked streaming markers retain their
 existing handling. `If-Match`/`If-None-Match` are honored; GET, HEAD, and
