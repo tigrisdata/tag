@@ -2,12 +2,15 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -30,14 +33,21 @@ type Server struct {
 	// admissionSem bounds concurrently-served S3 requests. nil disables admission
 	// control (unlimited).
 	admissionSem chan struct{}
+
+	lifecycleMu    sync.Mutex
+	activeHandlers sync.WaitGroup
+	stopping       bool
+	cancelRequests context.CancelFunc
 }
 
 // NewServer creates a new HTTP server.
 func NewServer(service *proxy.Service, bindIP string, port int, pprofEnabled bool, maxInflight int) *Server {
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
 	s := &Server{
-		service:      service,
-		bindAddr:     fmt.Sprintf("%s:%d", bindIP, port),
-		pprofEnabled: pprofEnabled,
+		service:        service,
+		bindAddr:       fmt.Sprintf("%s:%d", bindIP, port),
+		pprofEnabled:   pprofEnabled,
+		cancelRequests: cancelRequests,
 	}
 
 	if maxInflight > 0 {
@@ -45,6 +55,16 @@ func NewServer(service *proxy.Service, bindIP string, port int, pprofEnabled boo
 	}
 
 	s.router = s.setupRouter()
+	s.httpServer = &http.Server{
+		Addr:         s.bindAddr,
+		Handler:      s.foregroundHandlerMiddleware(s.router),
+		ReadTimeout:  5 * time.Minute,
+		WriteTimeout: 5 * time.Minute,
+		IdleTimeout:  120 * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			return requestCtx
+		},
+	}
 	return s
 }
 
@@ -60,6 +80,25 @@ func (s *Server) connectionTrackingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		metrics.ActiveConnections.Inc()
 		defer metrics.ActiveConnections.Dec()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// foregroundHandlerMiddleware closes handler admission before Stop starts draining.
+// The count covers the handler's full synchronous lifetime, including any final
+// cache consistency work after the response has been forwarded.
+func (s *Server) foregroundHandlerMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.lifecycleMu.Lock()
+		if s.stopping {
+			s.lifecycleMu.Unlock()
+			http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		s.activeHandlers.Add(1)
+		s.lifecycleMu.Unlock()
+
+		defer s.activeHandlers.Done()
 		next.ServeHTTP(w, r)
 	})
 }
@@ -247,14 +286,6 @@ func (s *Server) setupRouter() *mux.Router {
 // Start starts the HTTP server.
 // If TLS is configured via SetTLS, the server listens with HTTPS.
 func (s *Server) Start() error {
-	s.httpServer = &http.Server{
-		Addr:         s.bindAddr,
-		Handler:      s.router,
-		ReadTimeout:  5 * time.Minute,
-		WriteTimeout: 5 * time.Minute,
-		IdleTimeout:  120 * time.Second,
-	}
-
 	if s.tlsCertFile != "" && s.tlsKeyFile != "" {
 		log.Info().Str("addr", s.bindAddr).Msg("Starting HTTPS server (TLS enabled)")
 		return s.httpServer.ListenAndServeTLS(s.tlsCertFile, s.tlsKeyFile)
@@ -269,14 +300,55 @@ func (s *Server) Router() http.Handler {
 	return s.router
 }
 
-// Stop gracefully stops the HTTP server.
+// Stop gracefully stops the HTTP server. If ctx ends during the drain or
+// handler join, it cancels active request contexts and closes connections. It
+// always waits for every admitted handler to finish before returning.
 func (s *Server) Stop(ctx context.Context) error {
-	if s.httpServer == nil {
+	server := s.httpServer
+	if server == nil {
 		return nil
 	}
 
+	s.lifecycleMu.Lock()
+	s.stopping = true
+	s.lifecycleMu.Unlock()
+
 	log.Info().Msg("Stopping HTTP server")
-	return s.httpServer.Shutdown(ctx)
+	err := server.Shutdown(ctx)
+	var closeErr error
+	var stopDeadline func() bool
+	var deadlineCloseErr <-chan error
+	if err != nil {
+		if s.cancelRequests != nil {
+			s.cancelRequests()
+		}
+		closeErr = server.Close()
+	} else {
+		closeResult := make(chan error, 1)
+		deadlineCloseErr = closeResult
+		stopDeadline = context.AfterFunc(ctx, func() {
+			if s.cancelRequests != nil {
+				s.cancelRequests()
+			}
+			closeResult <- server.Close()
+		})
+	}
+
+	// Admission is closed before Wait, so no positive Add can race with it.
+	s.activeHandlers.Wait()
+	if stopDeadline != nil && !stopDeadline() {
+		closeErr = <-deadlineCloseErr
+	}
+	if s.cancelRequests != nil {
+		s.cancelRequests()
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+		err = errors.Join(err, ctxErr)
+	}
+	if closeErr != nil {
+		err = errors.Join(err, closeErr)
+	}
+	return err
 }
 
 // responseTracker wraps http.ResponseWriter to track whether headers have been
