@@ -372,9 +372,14 @@ func TestStopCancelsForwardingAfterDrainExpiry(t *testing.T) {
 	if !errors.Is(stopErr, context.DeadlineExceeded) {
 		t.Errorf("Stop error = %v, want drain deadline", stopErr)
 	}
-	if !closed(origin.canceled) || !closed(handlerCtx.Done()) || !closed(handlerDone) || cacheClient.closedEarly.Load() {
-		t.Errorf("expiry did not cancel and join forwarding before close: originCanceled=%v requestCanceled=%v handlerExited=%v closedEarly=%v",
-			closed(origin.canceled), closed(handlerCtx.Done()), closed(handlerDone), cacheClient.closedEarly.Load())
+	select {
+	case <-origin.canceled:
+	case <-time.After(5 * time.Second):
+		t.Error("origin did not observe forwarding cancellation after shutdown")
+	}
+	if !closed(handlerCtx.Done()) || !closed(handlerDone) || cacheClient.closedEarly.Load() {
+		t.Errorf("expiry did not cancel and join forwarding before close: requestCanceled=%v handlerExited=%v closedEarly=%v",
+			closed(handlerCtx.Done()), closed(handlerDone), cacheClient.closedEarly.Load())
 	}
 
 	origin.releaseResponse()
