@@ -13,14 +13,18 @@ func BenchmarkServerHTTPHandler(b *testing.B) {
 	handler := server.httpServer.Handler
 	request := httptest.NewRequest(http.MethodGet, "/health", nil)
 
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		b.Fatalf("health response status = %v, want %d", response.Code, http.StatusOK)
+	}
+
 	b.ReportAllocs()
 	b.ResetTimer()
-	var response *httptest.ResponseRecorder
-	for b.Loop() {
-		response = httptest.NewRecorder()
-		handler.ServeHTTP(response, request)
-	}
-	if response == nil || response.Code != http.StatusOK {
-		b.Fatalf("health response status = %v, want %d", response, http.StatusOK)
-	}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+		}
+	})
 }

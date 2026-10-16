@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -19,6 +20,11 @@ import (
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy"
 	"github.com/tigrisdata/tag/s3err"
+)
+
+const (
+	handlerStoppingBit uint64 = 1 << 63
+	handlerCountMask   uint64 = handlerStoppingBit - 1
 )
 
 // Server is the HTTP server for S3-compatible API.
@@ -34,10 +40,10 @@ type Server struct {
 	// control (unlimited).
 	admissionSem chan struct{}
 
-	lifecycleMu    sync.Mutex
-	activeHandlers sync.WaitGroup
-	stopping       bool
-	cancelRequests context.CancelFunc
+	handlerState    atomic.Uint64
+	handlerDoneOnce sync.Once
+	handlersDone    chan struct{}
+	cancelRequests  context.CancelFunc
 }
 
 // NewServer creates a new HTTP server.
@@ -47,6 +53,7 @@ func NewServer(service *proxy.Service, bindIP string, port int, pprofEnabled boo
 		service:        service,
 		bindAddr:       fmt.Sprintf("%s:%d", bindIP, port),
 		pprofEnabled:   pprofEnabled,
+		handlersDone:   make(chan struct{}),
 		cancelRequests: cancelRequests,
 	}
 
@@ -84,21 +91,42 @@ func (s *Server) connectionTrackingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// enterHandler increments before checking the stop bit to order admission against
+// shutdown. A late request drops the count and is rejected before calling next.
+func (s *Server) enterHandler() bool {
+	state := s.handlerState.Add(1)
+	if state&handlerStoppingBit != 0 {
+		s.leaveHandler()
+		return false
+	}
+	return true
+}
+
+func (s *Server) leaveHandler() {
+	state := s.handlerState.Add(^uint64(0))
+	if state&handlerStoppingBit != 0 && state&handlerCountMask == 0 {
+		s.handlerDoneOnce.Do(func() { close(s.handlersDone) })
+	}
+}
+
+func (s *Server) closeHandlerAdmission() {
+	state := s.handlerState.Or(handlerStoppingBit)
+	if state&handlerCountMask == 0 {
+		s.handlerDoneOnce.Do(func() { close(s.handlersDone) })
+	}
+}
+
 // foregroundHandlerMiddleware closes handler admission before Stop starts draining.
 // The count covers the handler's full synchronous lifetime, including any final
 // cache consistency work after the response has been forwarded.
 func (s *Server) foregroundHandlerMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.lifecycleMu.Lock()
-		if s.stopping {
-			s.lifecycleMu.Unlock()
+		if !s.enterHandler() {
 			s.rejectShutdownRequest(w, r)
 			return
 		}
-		s.activeHandlers.Add(1)
-		s.lifecycleMu.Unlock()
 
-		defer s.activeHandlers.Done()
+		defer s.leaveHandler()
 		next.ServeHTTP(w, r)
 	})
 }
@@ -193,11 +221,8 @@ func (s *Server) setupRouter() *mux.Router {
 	r := mux.NewRouter()
 	r.SkipClean(true) // Preserve path for S3 compatibility
 
-	// Apply connection tracking middleware
-	r.Use(s.connectionTrackingMiddleware)
-
-	// Bound concurrently-served S3 requests (sheds with 503 SlowDown when full)
-	r.Use(s.admissionMiddleware)
+	// Mux rebuilds Router.Use chains on every match. Wrap the static route
+	// handlers once after registration to preserve the same middleware order.
 
 	// Health check endpoint
 	r.HandleFunc("/health", s.handleHealth).Methods("GET")
@@ -315,6 +340,14 @@ func (s *Server) setupRouter() *mux.Router {
 	// List buckets (service level)
 	r.HandleFunc("/", s.handleListBuckets).Methods("GET")
 
+	if err := r.Walk(func(route *mux.Route, _ *mux.Router, _ []*mux.Route) error {
+		if handler := route.GetHandler(); handler != nil {
+			route.Handler(s.connectionTrackingMiddleware(s.admissionMiddleware(handler)))
+		}
+		return nil
+	}); err != nil {
+		panic(err)
+	}
 	return r
 }
 
@@ -344,9 +377,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		return nil
 	}
 
-	s.lifecycleMu.Lock()
-	s.stopping = true
-	s.lifecycleMu.Unlock()
+	s.closeHandlerAdmission()
 
 	log.Info().Msg("Stopping HTTP server")
 	err := server.Shutdown(ctx)
@@ -369,8 +400,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		})
 	}
 
-	// Admission is closed before Wait, so no positive Add can race with it.
-	s.activeHandlers.Wait()
+	<-s.handlersDone
 	if stopDeadline != nil && !stopDeadline() {
 		closeErr = <-deadlineCloseErr
 	}
