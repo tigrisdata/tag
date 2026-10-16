@@ -315,7 +315,7 @@ func waitForServerListener(addr string, wantOpen, useTLS bool) error {
 		if open == wantOpen {
 			return nil
 		}
-		time.Sleep(10 * time.Millisecond)
+		<-time.After(10 * time.Millisecond)
 	}
 	if wantOpen {
 		return fmt.Errorf("listener did not open")
