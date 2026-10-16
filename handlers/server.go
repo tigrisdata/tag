@@ -92,7 +92,7 @@ func (s *Server) foregroundHandlerMiddleware(next http.Handler) http.Handler {
 		s.lifecycleMu.Lock()
 		if s.stopping {
 			s.lifecycleMu.Unlock()
-			http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+			s.rejectShutdownRequest(w, r)
 			return
 		}
 		s.activeHandlers.Add(1)
@@ -142,7 +142,10 @@ func (s *Server) admissionMiddleware(next http.Handler) http.Handler {
 // a request to /debug/pprof/large-key matches the object route whose template is
 // "/{bucket}/{object:.+}", so it is correctly subject to admission.
 func isExemptFromAdmission(r *http.Request) bool {
-	route := mux.CurrentRoute(r)
+	return isOperationalRoute(mux.CurrentRoute(r))
+}
+
+func isOperationalRoute(route *mux.Route) bool {
 	if route == nil {
 		return false
 	}
@@ -151,6 +154,38 @@ func isExemptFromAdmission(r *http.Request) bool {
 		return false
 	}
 	return tmpl == "/health" || tmpl == "/metrics" || strings.HasPrefix(tmpl, "/debug/pprof/")
+}
+
+// rejectShutdownRequest keeps S3 errors in TAG's XML wire format while leaving
+// operational and unmatched paths on the ordinary HTTP 503 response.
+func (s *Server) rejectShutdownRequest(w http.ResponseWriter, r *http.Request) {
+	if s.matchesS3Operation(r) {
+		s3err.WriteError(w, r, s3err.ErrServiceUnavailable)
+		return
+	}
+	http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+}
+
+func (s *Server) matchesS3Operation(r *http.Request) bool {
+	var match mux.RouteMatch
+	if s.router.Match(r, &match) {
+		return match.Route != nil && !isOperationalRoute(match.Route)
+	}
+	if match.MatchErr != mux.ErrMethodMismatch {
+		return false
+	}
+
+	// Unsupported methods still belong to an S3 route when another supported
+	// method matches the same path and query.
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost, http.MethodDelete} {
+		candidate := r.Clone(r.Context())
+		candidate.Method = method
+		var candidateMatch mux.RouteMatch
+		if s.router.Match(candidate, &candidateMatch) && candidateMatch.Route != nil && !isOperationalRoute(candidateMatch.Route) {
+			return true
+		}
+	}
+	return false
 }
 
 // setupRouter configures the S3-compatible routes.

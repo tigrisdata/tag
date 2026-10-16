@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/proxy"
+	"github.com/tigrisdata/tag/s3err"
 )
 
 type shutdownCacheClient struct {
@@ -420,6 +422,21 @@ func TestStopRejectsRequestsAfterClosingAdmission(t *testing.T) {
 	server.httpServer.Handler.ServeHTTP(response, request)
 	if response.Code != http.StatusServiceUnavailable {
 		t.Errorf("request after shutdown status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	if response.Header().Get("Content-Type") != "application/xml" {
+		t.Errorf("shutdown S3 error content type = %q, want application/xml", response.Header().Get("Content-Type"))
+	}
+	var errorResponse s3err.ErrorResponse
+	if err := xml.Unmarshal(response.Body.Bytes(), &errorResponse); err != nil {
+		t.Errorf("decode shutdown S3 error: %v", err)
+	} else if errorResponse.Code != s3err.ErrServiceUnavailable {
+		t.Errorf("shutdown S3 error code = %q, want %q", errorResponse.Code, s3err.ErrServiceUnavailable)
+	}
+	operational := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(operational, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if operational.Code != http.StatusServiceUnavailable || operational.Header().Get("Content-Type") != "text/plain; charset=utf-8" {
+		t.Errorf("health endpoint during shutdown = status %d, content type %q; want plain HTTP 503",
+			operational.Code, operational.Header().Get("Content-Type"))
 	}
 	if originCalls.Load() != 0 || cacheClient.deleteCalls.Load() != 0 {
 		t.Errorf("post-stop request reached dependencies: origin calls=%d cache deletes=%d", originCalls.Load(), cacheClient.deleteCalls.Load())
