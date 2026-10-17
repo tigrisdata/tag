@@ -147,12 +147,13 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 
 ### Request Coalescing
 
-When multiple concurrent requests arrive for the same uncached object:
+Concurrent full-object GETs for the same uncached object share one upstream fetch only when callers
+subscribe before the first upstream body chunk starts:
 
 1. First request becomes the "fetcher" and streams from upstream
-2. Subsequent requests join as "listeners" to the same broadcast
-3. All listeners receive data simultaneously as it streams from upstream
-4. Only one upstream request is made, regardless of concurrent client count
+2. Other requests that subscribe before streaming starts join as "listeners" to the same broadcast
+3. Those listeners receive the same upstream response as it streams
+4. A GET arriving after streaming starts cannot join that broadcast and starts its own upstream fetch
 
 See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
 
