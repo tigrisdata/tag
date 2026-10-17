@@ -250,7 +250,10 @@ Client                 TAG-1                   TAG-2 (owns key)       Tigris
 
 ### Request Coalescing (Multiple Concurrent Requests)
 
-When multiple clients request the same uncached object simultaneously:
+Concurrent full-object GETs for the same uncached object share one upstream fetch only when callers
+subscribe before the first upstream body chunk begins. The diagram shows callers that join during that
+window. A GET arriving after streaming starts cannot join that broadcast and starts its own upstream
+fetch.
 
 ```text
 Client1                TAG                              Tigris
@@ -284,10 +287,10 @@ Client3                 │                                  │
 
 **Key Points:**
 
-- First request becomes the "fetcher" and initiates upstream request
-- Subsequent requests before streaming starts join as "listeners"
-- All clients receive data simultaneously as chunks arrive
-- Only ONE upstream request regardless of concurrent client count
+- First request becomes the "fetcher" and initiates the upstream request
+- Requests that subscribe before streaming starts join as "listeners"
+- All listeners of a broadcast receive the same upstream response as chunks arrive
+- Once streaming starts, later requests cannot join that broadcast and start their own upstream fetch
 - Memory usage scales with listeners, not object size
 
 ### Range Request Caching
