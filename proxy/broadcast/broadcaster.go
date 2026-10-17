@@ -189,6 +189,16 @@ func (b *Broadcaster) Subscribe() *Listener {
 		close(l.headerCh)
 	}
 
+	// A response that completes without broadcasting a body never sets
+	// streaming. A caller may already hold this broadcaster when Complete
+	// finishes, so replay the terminal chunk instead of registering a listener
+	// that will never close.
+	if b.done && b.headerSet {
+		l.ch <- Chunk{Err: b.err}
+		close(l.ch)
+		return l
+	}
+
 	b.listeners = append(b.listeners, l)
 	return l
 }

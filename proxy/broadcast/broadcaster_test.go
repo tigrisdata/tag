@@ -2,6 +2,7 @@ package broadcast
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -141,6 +142,110 @@ func TestBroadcasterNoLateJoiners(t *testing.T) {
 	}
 
 	b.Complete(nil)
+
+	listener3 := b.Subscribe()
+	if listener3 != nil {
+		t.Error("Subscribe should still reject late joiners after a nonempty broadcast completes")
+	}
+}
+
+func TestBroadcasterLateSubscriberReplaysTerminalState(t *testing.T) {
+	upstreamErr := errors.New("upstream failed after headers")
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "empty successful response"},
+		{name: "error after headers", err: upstreamErr},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := NewManager(4)
+			const key = "bucket/object"
+			b, isFirst := manager.GetOrCreate(key)
+			if !isFirst {
+				t.Fatal("first lookup did not create a broadcaster")
+			}
+
+			original := b.Subscribe()
+			if original == nil {
+				t.Fatal("initial subscriber was rejected")
+			}
+
+			headers := make(http.Header)
+			headers.Set("Content-Length", "0")
+			headers.Set("Content-Type", "application/octet-stream")
+			headers.Set("ETag", `"empty-object"`)
+			b.SetHeaders(http.StatusOK, headers)
+			b.Complete(tt.err)
+			manager.Remove(key)
+			if got := manager.ActiveCount(); got != 0 {
+				t.Fatalf("active broadcasters = %d, want 0 after removal", got)
+			}
+
+			assertListenerHeaders(t, original)
+			assertListenerTerminal(t, original, tt.err)
+
+			// Keep the broadcaster pointer across removal, as a full GET follower
+			// does between GetOrCreate and Subscribe.
+			late := b.Subscribe()
+			if late == nil {
+				t.Fatal("late subscriber was rejected before body streaming")
+			}
+			assertListenerHeaders(t, late)
+			assertListenerTerminal(t, late, tt.err)
+		})
+	}
+}
+
+func assertListenerHeaders(t *testing.T, listener *Listener) {
+	t.Helper()
+
+	status, headers, err := listener.WaitForHeaders(context.Background())
+	if err != nil {
+		t.Fatalf("WaitForHeaders() error = %v", err)
+	}
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want %d", status, http.StatusOK)
+	}
+	for name, want := range map[string]string{
+		"Content-Length": "0",
+		"Content-Type":   "application/octet-stream",
+		"ETag":           `"empty-object"`,
+	} {
+		if got := headers.Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func assertListenerTerminal(t *testing.T, listener *Listener, wantErr error) {
+	t.Helper()
+
+	gotErr := false
+	for {
+		select {
+		case chunk, ok := <-listener.Chunks():
+			if !ok {
+				if gotErr != (wantErr != nil) {
+					t.Errorf("terminal error observed = %v, want %v", gotErr, wantErr)
+				}
+				return
+			}
+			if len(chunk.Data) != 0 {
+				t.Errorf("unexpected body data in empty response: %q", chunk.Data)
+			}
+			if chunk.Err != nil {
+				if wantErr == nil || chunk.Err != wantErr || gotErr {
+					t.Errorf("terminal chunk error = %v, want %v", chunk.Err, wantErr)
+				}
+				gotErr = true
+			}
+		default:
+			t.Fatal("chunk channel remains open after completion")
+		}
+	}
 }
 
 func TestBroadcasterSlowConsumerDisconnect(t *testing.T) {
