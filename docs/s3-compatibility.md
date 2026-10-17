@@ -78,7 +78,7 @@ TAG adds a caching layer for read operations. The `X-Cache` response header indi
 
 Key caching behaviors:
 
-- **Request coalescing** — Multiple concurrent GETs for the same object are coalesced into a single upstream fetch using a broadcast/subscriber pattern.
+- **Request coalescing** — Multiple concurrent GETs for the same object are coalesced into a single upstream fetch using a broadcast/subscriber pattern. For live requests, a fetch failure before response commitment returns TAG's existing S3 error response to waiting GETs; errors after commitment terminate the stream.
 - **Range requests** — If the full object is cached, range requests are served from cache. On a range cache miss, the range is served directly from Tigris while a background fetch populates the cache with the full object.
 - **Conditional requests** — `If-None-Match` and `If-Modified-Since` are evaluated against cached metadata and can return 304 without hitting Tigris.
 - **Write-through invalidation** — PUT, DELETE, CopyObject, and DeleteObjects invalidate the cache _before_ forwarding to Tigris to prevent stale reads.
