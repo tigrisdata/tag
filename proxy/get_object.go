@@ -254,14 +254,14 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	broadcaster, isFirstCaller := s.broadcastManager.GetOrCreate(bcastKey)
 
 	// Update active broadcasts metric
-	metrics.SetActiveBroadcasts(s.broadcastManager.ActiveCount())
+	s.setActiveBroadcasts()
 
 	if isFirstCaller {
 		// I'm the fetcher - stream from upstream and broadcast to all listeners
 		metrics.RecordBroadcastFetch()
 		defer func() {
 			s.broadcastManager.Remove(bcastKey)
-			metrics.SetActiveBroadcasts(s.broadcastManager.ActiveCount())
+			s.setActiveBroadcasts()
 		}()
 		return s.fetchAndBroadcast(ctx, w, r, bucket, key, accessKey, secretKey, broadcaster, start, xCache)
 	}
@@ -269,12 +269,16 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// I'm a listener - try to subscribe
 	listener := broadcaster.Subscribe()
 	if listener == nil {
-		// Streaming already started (no late joiners) - start own fetch
+		// Streaming already started (no late joiners). This request needs an
+		// independent broadcast: sharing a late key would let multiple upstream
+		// producers send different response headers and chunks to the same listeners.
 		metrics.RecordBroadcastFetch()
-		newBroadcaster, _ := s.broadcastManager.GetOrCreate(bcastKey + ":late")
+		newBroadcaster := broadcast.NewBroadcaster(s.config.Broadcast.ChannelBuffer)
+		s.activeIndependentBroadcasts.Add(1)
+		s.setActiveBroadcasts()
 		defer func() {
-			s.broadcastManager.Remove(bcastKey + ":late")
-			metrics.SetActiveBroadcasts(s.broadcastManager.ActiveCount())
+			s.activeIndependentBroadcasts.Add(-1)
+			s.setActiveBroadcasts()
 		}()
 		return s.fetchAndBroadcast(ctx, w, r, bucket, key, accessKey, secretKey, newBroadcaster, start, xCache)
 	}

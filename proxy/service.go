@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
@@ -95,6 +96,7 @@ type Service struct {
 	perPopulateCap              int64              // Max bytes a foreground broadcast populate can buffer
 	backgroundPopulateWriterCap int64              // Bytes reserved for direct writer buffers before response inspection
 	broadcastManager            *broadcast.Manager // For streaming request coalescing
+	activeIndependentBroadcasts atomic.Int64       // Late GET broadcasts not keyed in the coalescing manager
 	activeBackgroundFetches     sync.Map           // Dedup for background full-object fetches (range caching)
 	// retier coordinates tiered-mode re-tier-on-read populates with writes:
 	// claims[key] counts PUTs in flight (a claim cancels and excludes re-tiers
@@ -123,6 +125,11 @@ type Service struct {
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
 	recentFooterWork *expirable.LRU[string, struct{}]
+}
+
+// setActiveBroadcasts includes private late-GET broadcasts alongside the manager's keyed broadcasts.
+func (s *Service) setActiveBroadcasts() {
+	metrics.SetActiveBroadcasts(s.broadcastManager.ActiveCount() + int(s.activeIndependentBroadcasts.Load()))
 }
 
 // NewService creates a new proxy service.
