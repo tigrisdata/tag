@@ -289,6 +289,7 @@ Client3                 │                                  │
 - All clients receive data simultaneously as chunks arrive
 - Only ONE upstream request regardless of concurrent client count
 - Memory usage scales with listeners, not object size
+- For live requests, an upstream failure before response commitment is returned through the existing S3 error mapping for each waiting GET; after commitment, the stream cannot be replaced by an error document
 
 ### Range Request Caching
 
@@ -410,10 +411,10 @@ TAG returns S3-compatible XML error responses:
 
 ### Error Mapping
 
-| Internal Error     | S3 Error Code         | HTTP Status |
-| ------------------ | --------------------- | ----------- |
-| Invalid signature  | SignatureDoesNotMatch | 403         |
-| Unknown access key | InvalidAccessKeyId    | 403         |
-| Request expired    | RequestTimeTooSkewed  | 403         |
-| Slow consumer      | InternalError         | 500         |
-| Upstream error     | InternalError         | 502         |
+| Internal Error                         | S3 Error Code         | HTTP Status |
+| -------------------------------------- | --------------------- | ----------- |
+| Invalid signature                     | SignatureDoesNotMatch | 403         |
+| Unknown access key                    | InvalidAccessKeyId    | 403         |
+| Request expired                       | RequestTimeTooSkewed  | 403         |
+| Slow consumer                         | InternalError         | 500         |
+| Uncommitted upstream error            | InternalError         | 500         |

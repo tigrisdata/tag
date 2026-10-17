@@ -154,6 +154,8 @@ When multiple concurrent requests arrive for the same uncached object:
 3. All listeners receive data simultaneously as it streams from upstream
 4. Only one upstream request is made, regardless of concurrent client count
 
+If an upstream fetch fails before TAG commits the client response while requests are still live, each GET waiting on that broadcast can return TAG's normal S3 error response. After commitment, the stream cannot be replaced by an error document.
+
 See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
 
 ## Performance
