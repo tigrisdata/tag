@@ -23,10 +23,11 @@ import (
 )
 
 const (
-	broadcastErrorChunkSize  = 1024
-	broadcastErrorCacheQueue = 64
-	broadcastErrorBucket     = "cache-errors"
-	broadcastErrorKey        = "whole-object"
+	broadcastErrorChunkSize       = 512
+	broadcastErrorCacheQueue      = 64
+	broadcastErrorInlineThreshold = 64 * 1024 // OCache v1.13.0 storage default
+	broadcastErrorBucket          = "cache-errors"
+	broadcastErrorKey             = "whole-object"
 )
 
 func TestBroadcastErrorsDoNotPublishIncompleteWholeObject(t *testing.T) {
@@ -116,7 +117,7 @@ func runFullGetUpstreamFailure(t *testing.T) {
 		fullBody := makeBroadcastErrorBody(fullChunks)
 		partialBody := newBroadcastErrorBodyReader()
 		healthyBody := newBroadcastErrorBodyReader()
-		upstreamErr := errors.New("upstream body read failed")
+		upstreamErr := io.ErrUnexpectedEOF
 		cacheClient := newBroadcastErrorCacheClient()
 		defer cacheClient.releaseFirst()
 
@@ -322,7 +323,7 @@ func checkBroadcastErrorCacheEntry(t *testing.T, cacheStore *cache.Cache, want [
 func newBroadcastErrorCacheClient() *broadcastErrorCacheClient {
 	release := make(chan struct{})
 	client := &broadcastErrorCacheClient{
-		CacheClient:   cacheclient.NewMemoryCache(),
+		CacheClient:   &inlineStorageCacheClient{CacheClient: cacheclient.NewMemoryCache()},
 		firstStarted:  make(chan struct{}),
 		release:       release,
 		firstDone:     make(chan error, 1),
@@ -330,6 +331,20 @@ func newBroadcastErrorCacheClient() *broadcastErrorCacheClient {
 		secondDone:    make(chan error, 1),
 	}
 	return client
+}
+
+// inlineStorageCacheClient mirrors embedded storage's small-value read: it treats
+// io.ErrUnexpectedEOF as a normal short value while probing the inline threshold.
+type inlineStorageCacheClient struct {
+	cacheclient.CacheClient
+}
+
+func (c *inlineStorageCacheClient) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
+	data, err := io.ReadAll(r)
+	if err != nil && (err != io.ErrUnexpectedEOF || len(data) > broadcastErrorInlineThreshold) {
+		return err
+	}
+	return c.CacheClient.Put(ctx, key, data, ttlSeconds)
 }
 
 type broadcastErrorCacheClient struct {
