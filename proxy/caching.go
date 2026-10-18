@@ -135,6 +135,17 @@ func (r *contextBoundReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// cachePipeReadError keeps EOF-shaped terminal failures distinguishable from a
+// clean short value. The embedded cache's inline size probe accepts io.EOF and
+// io.ErrUnexpectedEOF as normal short-value terminators, so a failed broadcast
+// carrying either sentinel must be wrapped before it reaches that reader.
+func cachePipeReadError(err error) error {
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return fmt.Errorf("cache stream failed: %w", err)
+	}
+	return err
+}
+
 // waitForCacheWrite waits for a detached cache writer while retaining the
 // deadline that bounds the background fetch. The result channel is buffered by
 // the caller so a writer that ignores cancellation can still finish later.
@@ -346,9 +357,9 @@ func (s *Service) setupCacheListener(
 
 		// Close the pipe to signal EOF to the reader
 		if chunkErr != nil {
-			pipeWriter.CloseWithError(chunkErr)
+			pipeWriter.CloseWithError(cachePipeReadError(chunkErr))
 		} else if pipeWriteErr != nil {
-			pipeWriter.CloseWithError(pipeWriteErr)
+			pipeWriter.CloseWithError(cachePipeReadError(pipeWriteErr))
 		} else {
 			pipeWriter.Close()
 		}
