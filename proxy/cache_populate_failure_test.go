@@ -241,10 +241,41 @@ func TestCacheableFullGet_StoreFailureReleasesRelayAndReservation(t *testing.T) 
 	}
 }
 
-// deadlinePausedCacheClient models the local embedded CAS path: ocache v1.13.0's
-// non-seekable body put and local PutIfVersion delegate to storage without
-// observing the caller's context. MemoryCache backs the stored values, while
-// these two methods deliberately ignore cancellation like those local methods.
+// embeddedStorageInlineThreshold mirrors ocache v1.13.0's default inline threshold.
+const embeddedStorageInlineThreshold = 64 << 10
+
+// deadlinePausedReader models a local embedded store that does not use ctx to
+// interrupt a non-seekable read. It gives the storage sniff read seven bytes,
+// then waits for the real cache deadline before reading the remaining pipe.
+type deadlinePausedReader struct {
+	reader          io.Reader
+	ctx             context.Context
+	firstRead       chan cachePutFailureResult
+	deadlineReached chan struct{}
+	resume          <-chan struct{}
+	first           bool
+	resumed         bool
+}
+
+func (r *deadlinePausedReader) Read(p []byte) (int, error) {
+	if !r.first {
+		r.first = true
+		n, err := io.ReadFull(r.reader, p[:7])
+		r.firstRead <- cachePutFailureResult{bytesRead: int64(n), readErr: err}
+		return n, err
+	}
+	if !r.resumed {
+		<-r.ctx.Done()
+		close(r.deadlineReached)
+		<-r.resume
+		r.resumed = true
+	}
+	return r.reader.Read(p)
+}
+
+// deadlinePausedCacheClient mirrors the local embedded storage path: it reads
+// threshold+1 bytes, accepts EOF/ErrUnexpectedEOF for inline values, and ignores
+// ctx for the local body and CAS metadata writes. MemoryCache backs stored values.
 type deadlinePausedCacheClient struct {
 	cacheclient.CacheClient
 	calls           atomic.Int32
@@ -259,21 +290,36 @@ func (c *deadlinePausedCacheClient) PutStream(ctx context.Context, key string, r
 		return c.CacheClient.PutStream(ctx, key, r, ttl)
 	}
 
-	var body bytes.Buffer
-	first := cachePutFailureResult{}
-	first.bytesRead, first.readErr = io.CopyN(&body, r, 7)
-	c.firstRead <- first
-	if first.readErr != nil {
-		return first.readErr
+	paused := &deadlinePausedReader{
+		reader:          r,
+		ctx:             ctx,
+		firstRead:       c.firstRead,
+		deadlineReached: c.deadlineReached,
+		resume:          c.resume,
+	}
+	firstChunk := make([]byte, embeddedStorageInlineThreshold+1)
+	n, err := io.ReadFull(paused, firstChunk)
+	result := cachePutFailureResult{bytesRead: int64(n), readErr: err}
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		c.finalRead <- result
+		return err
 	}
 
-	<-ctx.Done()
-	close(c.deadlineReached)
-	<-c.resume
-	more, err := io.Copy(&body, r)
-	c.finalRead <- cachePutFailureResult{bytesRead: first.bytesRead + more, readErr: err}
-	if err != nil {
-		return err
+	var body bytes.Buffer
+	_, _ = body.Write(firstChunk[:n])
+	if n > embeddedStorageInlineThreshold {
+		more, copyErr := io.Copy(&body, paused)
+		result.bytesRead += more
+		result.readErr = copyErr
+		c.finalRead <- result
+		if copyErr != nil {
+			return copyErr
+		}
+	} else {
+		// Storage.Put accepts a short inline value when ReadFull returns EOF or
+		// ErrUnexpectedEOF. The test verifies that a context error is not mistaken
+		// for either and allowed to publish metadata.
+		c.finalRead <- result
 	}
 	return c.CacheClient.PutStream(context.Background(), key, bytes.NewReader(body.Bytes()), ttl)
 }
@@ -283,119 +329,132 @@ func (c *deadlinePausedCacheClient) PutIfVersion(_ context.Context, key string, 
 }
 
 func TestCacheableFullGet_DeadlineDoesNotPublishPartialBody(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		const (
-			bucket        = "cache-deadline-bucket"
-			key           = "cache-deadline-key"
-			bodySize      = 128 << 10
-			chunkSize     = 1024
-			channelBuffer = 256
-		)
-		bodyText := strings.Repeat("x", bodySize)
-		cfg := config.NewDefault()
-		cfg.Mode = config.ModeTransparent
-		cfg.Cache.BlockSize = config.DefaultCacheBlockSize
-		if cfg.IsTiered() || int64(bodySize) >= cfg.Cache.BlockSize {
-			t.Fatal("test must exercise a non-tiered whole-body populate")
-		}
-		cfg.Cache.SetLegacyCoordination(false)
-		cfg.Cache.MaxConcurrentWrites = 1
-		cfg.Cache.MaxPopulateMemoryBytes = int64(bodySize)
-		cfg.Broadcast.ChunkSize = chunkSize
-		cfg.Broadcast.ChannelBuffer = channelBuffer
+	tests := []struct {
+		name      string
+		bodySize  int
+		chunkSize int
+	}{
+		{name: "raw_file", bodySize: 128 << 10, chunkSize: 1024},
+		{name: "inline", bodySize: 40 << 10, chunkSize: 512},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const (
+					bucket        = "cache-deadline-bucket"
+					key           = "cache-deadline-key"
+					channelBuffer = 256
+				)
+				bodyText := strings.Repeat("x", tt.bodySize)
+				cfg := config.NewDefault()
+				cfg.Mode = config.ModeTransparent
+				cfg.Cache.BlockSize = config.DefaultCacheBlockSize
+				if cfg.IsTiered() || int64(tt.bodySize) >= cfg.Cache.BlockSize {
+					t.Fatal("test must exercise a non-tiered whole-body populate")
+				}
+				cfg.Cache.SetLegacyCoordination(false)
+				cfg.Cache.MaxConcurrentWrites = 1
+				cfg.Cache.MaxPopulateMemoryBytes = int64(tt.bodySize)
+				cfg.Broadcast.ChunkSize = tt.chunkSize
+				cfg.Broadcast.ChannelBuffer = channelBuffer
+				if tt.bodySize/tt.chunkSize <= channelBuffer/4+1 {
+					t.Fatalf("%d chunks do not fill the 64-entry cache queue", tt.bodySize/tt.chunkSize)
+				}
 
-		deadlineErr := context.DeadlineExceeded
-		cacheClient := &deadlinePausedCacheClient{
-			CacheClient:     cacheclient.NewMemoryCache(),
-			firstRead:       make(chan cachePutFailureResult, 1),
-			finalRead:       make(chan cachePutFailureResult, 1),
-			deadlineReached: make(chan struct{}),
-			resume:          make(chan struct{}),
-		}
-		cacheStore := cache.NewCacheWithClient(cacheClient, &cfg.Cache)
-		forwarder := &mockForwarder{
-			doRequestFunc: func(_ context.Context, _ *http.Request, _ string, _ string) (*http.Response, error) {
-				return cacheableGetResponse(bodyText, `"cache-deadline-etag"`), nil
-			},
-		}
-		svc := NewService(forwarder, cacheStore, cfg)
+				deadlineErr := context.DeadlineExceeded
+				cacheClient := &deadlinePausedCacheClient{
+					CacheClient:     cacheclient.NewMemoryCache(),
+					firstRead:       make(chan cachePutFailureResult, 1),
+					finalRead:       make(chan cachePutFailureResult, 1),
+					deadlineReached: make(chan struct{}),
+					resume:          make(chan struct{}),
+				}
+				cacheStore := cache.NewCacheWithClient(cacheClient, &cfg.Cache)
+				forwarder := &mockForwarder{
+					doRequestFunc: func(_ context.Context, _ *http.Request, _ string, _ string) (*http.Response, error) {
+						return cacheableGetResponse(bodyText, `"cache-deadline-etag"`), nil
+					},
+				}
+				svc := NewService(forwarder, cacheStore, cfg)
 
-		logs := &cacheWriteFailureLogWriter{
-			errorText: deadlineErr.Error(),
-			returned:  make(chan struct{}, 1),
-			observed:  make(chan struct{}, 1),
-		}
-		previousLogger := log.Logger
-		log.Logger = zerolog.New(logs).Level(zerolog.DebugLevel)
-		defer func() { log.Logger = previousLogger }()
+				logs := &cacheWriteFailureLogWriter{
+					errorText: deadlineErr.Error(),
+					returned:  make(chan struct{}, 1),
+					observed:  make(chan struct{}, 1),
+				}
+				previousLogger := log.Logger
+				log.Logger = zerolog.New(logs).Level(zerolog.DebugLevel)
+				defer func() { log.Logger = previousLogger }()
 
-		recorder := httptest.NewRecorder()
-		request := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
-		if err := svc.HandleGetObject(recorder, request); err != nil {
-			t.Fatalf("HandleGetObject: %v", err)
-		}
-		response := recorder.Result()
-		defer response.Body.Close()
-		responseBody, err := io.ReadAll(response.Body)
-		if err != nil {
-			t.Fatalf("read GET response: %v", err)
-		}
-		if response.StatusCode != http.StatusOK || response.Header.Get("X-Cache") != XCacheMiss ||
-			response.Header.Get("Content-Length") != strconv.Itoa(bodySize) ||
-			response.Header.Get("Content-Type") != "text/plain" ||
-			response.Header.Get("ETag") != `"cache-deadline-etag"` || string(responseBody) != bodyText {
-			t.Fatalf("GET response changed: status=%d headers=%v body-bytes=%d", response.StatusCode, response.Header, len(responseBody))
-		}
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
+				if err := svc.HandleGetObject(recorder, request); err != nil {
+					t.Fatalf("HandleGetObject: %v", err)
+				}
+				response := recorder.Result()
+				defer response.Body.Close()
+				responseBody, err := io.ReadAll(response.Body)
+				if err != nil {
+					t.Fatalf("read GET response: %v", err)
+				}
+				if response.StatusCode != http.StatusOK || response.Header.Get("X-Cache") != XCacheMiss ||
+					response.Header.Get("Content-Length") != strconv.Itoa(tt.bodySize) ||
+					response.Header.Get("Content-Type") != "text/plain" ||
+					response.Header.Get("ETag") != `"cache-deadline-etag"` || string(responseBody) != bodyText {
+					t.Fatalf("GET response changed: status=%d headers=%v body-bytes=%d", response.StatusCode, response.Header, len(responseBody))
+				}
 
-		// The 128 one-KiB chunks exceed the 64-entry cache queue. The cache
-		// reader consumes seven bytes then waits, leaving the pipe write blocked
-		// and the queue full before the actual one-minute write deadline.
-		synctest.Wait()
-		first := <-cacheClient.firstRead
-		if first.bytesRead != 7 || first.readErr != nil {
-			t.Fatalf("cache reader did not pause after seven bytes: %+v", first)
-		}
-		time.Sleep(cacheWriteTimeoutForSize(bodySize))
-		synctest.Wait()
-		select {
-		case <-cacheClient.deadlineReached:
-		default:
-			t.Fatal("cache client did not reach its write deadline")
-		}
-		close(cacheClient.resume)
-		synctest.Wait()
+				// The body has more than the 64-entry cache queue can hold. The store
+				// consumes seven bytes then pauses, leaving the pipe write blocked and
+				// the relay waiting to enqueue when the actual deadline fires.
+				synctest.Wait()
+				first := <-cacheClient.firstRead
+				if first.bytesRead != 7 || first.readErr != nil {
+					t.Fatalf("cache reader did not pause after seven bytes: %+v", first)
+				}
+				time.Sleep(cacheWriteTimeoutForSize(int64(tt.bodySize)))
+				synctest.Wait()
+				select {
+				case <-cacheClient.deadlineReached:
+				default:
+					t.Fatal("cache client did not reach its write deadline")
+				}
+				close(cacheClient.resume)
+				synctest.Wait()
 
-		resumed := <-cacheClient.finalRead
-		if resumed.bytesRead >= int64(bodySize) {
-			t.Fatalf("cache reader received %d bytes, want a truncated stream after deadline", resumed.bytesRead)
-		}
-		if !errors.Is(resumed.readErr, context.DeadlineExceeded) {
-			t.Errorf("cache reader error = %v, want deadline error rather than clean EOF", resumed.readErr)
-		}
-		select {
-		case <-logs.returned:
-		default:
-			t.Error("cache write did not report the deadline error")
-		}
-		select {
-		case <-logs.observed:
-		default:
-			t.Error("cache deadline error was not observed after the GET completed")
-		}
+				resumed := <-cacheClient.finalRead
+				if resumed.bytesRead >= int64(tt.bodySize) {
+					t.Fatalf("cache reader received %d bytes, want a truncated stream after deadline", resumed.bytesRead)
+				}
+				if !errors.Is(resumed.readErr, context.DeadlineExceeded) {
+					t.Errorf("cache reader error = %v, want deadline error rather than clean EOF", resumed.readErr)
+				}
+				select {
+				case <-logs.returned:
+				default:
+					t.Error("cache write did not report the deadline error")
+				}
+				select {
+				case <-logs.observed:
+				default:
+					t.Error("cache deadline error was not observed after the GET completed")
+				}
 
-		if meta, found, err := cacheStore.GetMeta(context.Background(), bucket, key); err != nil {
-			t.Errorf("GetMeta after timed-out populate: %v", err)
-		} else if found {
-			var cachedBody bytes.Buffer
-			bodyErr := cacheStore.GetBodyStream(context.Background(), bucket, key, meta.ETag, &cachedBody)
-			t.Errorf("timed-out partial body became visible: metadata length=%d, stored bytes=%d, body read error=%v", meta.ContentLength, cachedBody.Len(), bodyErr)
-		}
+				if meta, found, err := cacheStore.GetMeta(context.Background(), bucket, key); err != nil {
+					t.Errorf("GetMeta after timed-out populate: %v", err)
+				} else if found {
+					var cachedBody bytes.Buffer
+					bodyErr := cacheStore.GetBodyStream(context.Background(), bucket, key, meta.ETag, &cachedBody)
+					t.Errorf("timed-out partial body became visible: metadata length=%d, stored bytes=%d, body read error=%v", meta.ContentLength, cachedBody.Len(), bodyErr)
+				}
 
-		weight := svc.populateWeight(int64(bodySize))
-		if !svc.acquireCacheSlot(context.Background(), weight, priorityReadMiss) {
-			t.Errorf("cache reservation (%d bytes) was not released after the cache reader exited", weight)
-		} else {
-			svc.releaseCacheSlot(weight)
-		}
-	})
+				weight := svc.populateWeight(int64(tt.bodySize))
+				if !svc.acquireCacheSlot(context.Background(), weight, priorityReadMiss) {
+					t.Errorf("cache reservation (%d bytes) was not released after the cache reader exited", weight)
+				} else {
+					svc.releaseCacheSlot(weight)
+				}
+			})
+		})
+	}
 }
