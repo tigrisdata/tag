@@ -360,6 +360,11 @@ func (s *Service) setupCacheListener(
 			pipeWriter.CloseWithError(chunkErr)
 		} else if pipeWriteErr != nil {
 			pipeWriter.CloseWithError(pipeWriteErr)
+		} else if relayErr != nil {
+			// A relay deadline can stop forwarding after the cache queue fills.
+			// Do not turn that incomplete stream into a clean EOF that can publish
+			// metadata for a truncated whole-body cache entry.
+			pipeWriter.CloseWithError(relayErr)
 		} else {
 			pipeWriter.Close()
 		}

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -238,4 +239,163 @@ func TestCacheableFullGet_StoreFailureReleasesRelayAndReservation(t *testing.T) 
 			}
 		})
 	}
+}
+
+// deadlinePausedCacheClient models the local embedded CAS path: ocache v1.13.0's
+// non-seekable body put and local PutIfVersion delegate to storage without
+// observing the caller's context. MemoryCache backs the stored values, while
+// these two methods deliberately ignore cancellation like those local methods.
+type deadlinePausedCacheClient struct {
+	cacheclient.CacheClient
+	calls           atomic.Int32
+	firstRead       chan cachePutFailureResult
+	finalRead       chan cachePutFailureResult
+	deadlineReached chan struct{}
+	resume          chan struct{}
+}
+
+func (c *deadlinePausedCacheClient) PutStream(ctx context.Context, key string, r io.Reader, ttl int64) error {
+	if c.calls.Add(1) != 1 {
+		return c.CacheClient.PutStream(ctx, key, r, ttl)
+	}
+
+	var body bytes.Buffer
+	first := cachePutFailureResult{}
+	first.bytesRead, first.readErr = io.CopyN(&body, r, 7)
+	c.firstRead <- first
+	if first.readErr != nil {
+		return first.readErr
+	}
+
+	<-ctx.Done()
+	close(c.deadlineReached)
+	<-c.resume
+	more, err := io.Copy(&body, r)
+	c.finalRead <- cachePutFailureResult{bytesRead: first.bytesRead + more, readErr: err}
+	if err != nil {
+		return err
+	}
+	return c.CacheClient.PutStream(context.Background(), key, bytes.NewReader(body.Bytes()), ttl)
+}
+
+func (c *deadlinePausedCacheClient) PutIfVersion(_ context.Context, key string, data []byte, ttl int64, expected uint64) (uint64, error) {
+	return c.CacheClient.PutIfVersion(context.Background(), key, data, ttl, expected)
+}
+
+func TestCacheableFullGet_DeadlineDoesNotPublishPartialBody(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			bucket        = "cache-deadline-bucket"
+			key           = "cache-deadline-key"
+			bodySize      = 128 << 10
+			chunkSize     = 1024
+			channelBuffer = 256
+		)
+		bodyText := strings.Repeat("x", bodySize)
+		cfg := config.NewDefault()
+		cfg.Mode = config.ModeTransparent
+		cfg.Cache.BlockSize = config.DefaultCacheBlockSize
+		if cfg.IsTiered() || int64(bodySize) >= cfg.Cache.BlockSize {
+			t.Fatal("test must exercise a non-tiered whole-body populate")
+		}
+		cfg.Cache.SetLegacyCoordination(false)
+		cfg.Cache.MaxConcurrentWrites = 1
+		cfg.Cache.MaxPopulateMemoryBytes = int64(bodySize)
+		cfg.Broadcast.ChunkSize = chunkSize
+		cfg.Broadcast.ChannelBuffer = channelBuffer
+
+		deadlineErr := context.DeadlineExceeded
+		cacheClient := &deadlinePausedCacheClient{
+			CacheClient:     cacheclient.NewMemoryCache(),
+			firstRead:       make(chan cachePutFailureResult, 1),
+			finalRead:       make(chan cachePutFailureResult, 1),
+			deadlineReached: make(chan struct{}),
+			resume:          make(chan struct{}),
+		}
+		cacheStore := cache.NewCacheWithClient(cacheClient, &cfg.Cache)
+		forwarder := &mockForwarder{
+			doRequestFunc: func(_ context.Context, _ *http.Request, _ string, _ string) (*http.Response, error) {
+				return cacheableGetResponse(bodyText, `"cache-deadline-etag"`), nil
+			},
+		}
+		svc := NewService(forwarder, cacheStore, cfg)
+
+		logs := &cacheWriteFailureLogWriter{
+			errorText: deadlineErr.Error(),
+			returned:  make(chan struct{}, 1),
+			observed:  make(chan struct{}, 1),
+		}
+		previousLogger := log.Logger
+		log.Logger = zerolog.New(logs).Level(zerolog.DebugLevel)
+		defer func() { log.Logger = previousLogger }()
+
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
+		if err := svc.HandleGetObject(recorder, request); err != nil {
+			t.Fatalf("HandleGetObject: %v", err)
+		}
+		response := recorder.Result()
+		defer response.Body.Close()
+		responseBody, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatalf("read GET response: %v", err)
+		}
+		if response.StatusCode != http.StatusOK || response.Header.Get("X-Cache") != XCacheMiss ||
+			response.Header.Get("Content-Length") != strconv.Itoa(bodySize) ||
+			response.Header.Get("Content-Type") != "text/plain" ||
+			response.Header.Get("ETag") != `"cache-deadline-etag"` || string(responseBody) != bodyText {
+			t.Fatalf("GET response changed: status=%d headers=%v body-bytes=%d", response.StatusCode, response.Header, len(responseBody))
+		}
+
+		// The 128 one-KiB chunks exceed the 64-entry cache queue. The cache
+		// reader consumes seven bytes then waits, leaving the pipe write blocked
+		// and the queue full before the actual one-minute write deadline.
+		synctest.Wait()
+		first := <-cacheClient.firstRead
+		if first.bytesRead != 7 || first.readErr != nil {
+			t.Fatalf("cache reader did not pause after seven bytes: %+v", first)
+		}
+		time.Sleep(cacheWriteTimeoutForSize(bodySize))
+		synctest.Wait()
+		select {
+		case <-cacheClient.deadlineReached:
+		default:
+			t.Fatal("cache client did not reach its write deadline")
+		}
+		close(cacheClient.resume)
+		synctest.Wait()
+
+		resumed := <-cacheClient.finalRead
+		if resumed.bytesRead >= int64(bodySize) {
+			t.Fatalf("cache reader received %d bytes, want a truncated stream after deadline", resumed.bytesRead)
+		}
+		if !errors.Is(resumed.readErr, context.DeadlineExceeded) {
+			t.Errorf("cache reader error = %v, want deadline error rather than clean EOF", resumed.readErr)
+		}
+		select {
+		case <-logs.returned:
+		default:
+			t.Error("cache write did not report the deadline error")
+		}
+		select {
+		case <-logs.observed:
+		default:
+			t.Error("cache deadline error was not observed after the GET completed")
+		}
+
+		if meta, found, err := cacheStore.GetMeta(context.Background(), bucket, key); err != nil {
+			t.Errorf("GetMeta after timed-out populate: %v", err)
+		} else if found {
+			var cachedBody bytes.Buffer
+			bodyErr := cacheStore.GetBodyStream(context.Background(), bucket, key, meta.ETag, &cachedBody)
+			t.Errorf("timed-out partial body became visible: metadata length=%d, stored bytes=%d, body read error=%v", meta.ContentLength, cachedBody.Len(), bodyErr)
+		}
+
+		weight := svc.populateWeight(int64(bodySize))
+		if !svc.acquireCacheSlot(context.Background(), weight, priorityReadMiss) {
+			t.Errorf("cache reservation (%d bytes) was not released after the cache reader exited", weight)
+		} else {
+			svc.releaseCacheSlot(weight)
+		}
+	})
 }
