@@ -229,6 +229,8 @@ Client                 TAG                    Embedded Cache         Tigris
   │  X-Cache: MISS      │                       │                    │
 ```
 
+Cache population is best-effort. If the cache writer returns an error after a successful upstream response, TAG keeps that response and releases the populate reservation after the cache relay and its buffer holders finish. A cache writer that never returns has no completion guarantee.
+
 ### GET Object (Cluster Mode - Remote Key)
 
 ```text
