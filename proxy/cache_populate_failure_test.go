@@ -412,13 +412,8 @@ func TestCacheableFullGet_DeadlineDoesNotPublishPartialBody(t *testing.T) {
 				if first.bytesRead != 7 || first.readErr != nil {
 					t.Fatalf("cache reader did not pause after seven bytes: %+v", first)
 				}
-				time.Sleep(cacheWriteTimeoutForSize(int64(tt.bodySize)))
+				<-cacheClient.deadlineReached // synctest advances to the pending cache deadline
 				synctest.Wait()
-				select {
-				case <-cacheClient.deadlineReached:
-				default:
-					t.Fatal("cache client did not reach its write deadline")
-				}
 				close(cacheClient.resume)
 				synctest.Wait()
 
