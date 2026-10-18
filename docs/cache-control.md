@@ -51,6 +51,8 @@ TAG automatically invalidates cached objects when they are modified through TAG:
 - **DeleteObjects** (bulk) — Cache entries deleted for all keys in the request
 - **CopyObject** — Cache entry deleted for the destination key
 
+For a cacheable whole-object GET miss, metadata becomes visible only after its cache write consumes the broadcast stream successfully. If the cache listener is dropped or the upstream body read fails, the partial body is not published as a new entry.
+
 Objects modified directly on Tigris (bypassing TAG) remain in cache until they expire (default TTL: 24 hours, configurable via `TAG_CACHE_TTL`) or are revalidated via `Cache-Control: no-cache`.
 
 ## Verifying Cache Behavior

@@ -120,6 +120,29 @@ func (l *Listener) Chunks() <-chan Chunk {
 	return l.ch
 }
 
+// closeWithError queues the terminal chunk and closes the listener. The caller
+// must hold Broadcaster.mu, which excludes other senders. If a non-nil error
+// cannot fit, it displaces one queued chunk and releases its buffer; the
+// nonblocking receive handles a consumer draining concurrently. No sender can
+// refill the resulting slot, so the terminal error send cannot wait on a reader.
+// A nil error preserves queued data and keeps the existing best-effort empty
+// completion chunk.
+func (l *Listener) closeWithError(err error) {
+	select {
+	case l.ch <- Chunk{Err: err}:
+	default:
+		if err != nil {
+			select {
+			case displaced := <-l.ch:
+				displaced.Release()
+			default:
+			}
+			l.ch <- Chunk{Err: err}
+		}
+	}
+	close(l.ch)
+}
+
 // DrainAndRelease drains remaining chunks from the listener channel,
 // returning pooled buffers. Runs in a background goroutine since the
 // channel may not yet be closed (broadcaster still streaming).
@@ -249,11 +272,7 @@ func (b *Broadcaster) Broadcast(data []byte) {
 			// Return pooled buffer since this chunk won't be consumed.
 			chunk.Release()
 			l.disconnected = true
-			select {
-			case l.ch <- Chunk{Err: ErrSlowConsumer}:
-			default:
-			}
-			close(l.ch)
+			l.closeWithError(ErrSlowConsumer)
 			log.Warn().Msg("Disconnecting slow consumer from broadcast (buffer full)")
 		}
 	}
@@ -273,17 +292,12 @@ func (b *Broadcaster) Complete(err error) {
 	b.err = err
 	close(b.doneCh)
 
-	// Send final chunk and close all listener channels.
-	// Non-blocking send: if buffer is full, skip the error chunk.
-	// Correctness is guaranteed by the version preconditions on cache writes,
-	// which prevents stale data from being cached even if error delivery fails.
+	// Send the final chunk and close all listener channels. Non-nil errors
+	// displace one queued chunk if needed so they cannot become a successful EOF;
+	// a nil completion retains every queued data chunk.
 	for _, l := range b.listeners {
 		if !l.disconnected {
-			select {
-			case l.ch <- Chunk{Err: err}:
-			default:
-			}
-			close(l.ch)
+			l.closeWithError(err)
 		}
 	}
 }
