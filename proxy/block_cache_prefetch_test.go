@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -31,6 +32,8 @@ const prefetchTestBlockSize = 64 << 10
 // records them at a real gRPC cache-owner server, after the RPC has arrived.
 type blockReadSpan struct {
 	key      string
+	start    int64
+	end      int64
 	started  time.Duration
 	finished time.Duration
 }
@@ -54,9 +57,13 @@ func (t *blockReadTrace) reset() {
 }
 
 func (t *blockReadTrace) begin(key string) func() {
+	return t.beginRange(key, -1, -1)
+}
+
+func (t *blockReadTrace) beginRange(key string, start, end int64) func() {
 	t.mu.Lock()
 	span := len(t.spans)
-	t.spans = append(t.spans, blockReadSpan{key: key, started: time.Since(t.started)})
+	t.spans = append(t.spans, blockReadSpan{key: key, start: start, end: end, started: time.Since(t.started)})
 	t.inFlight++
 	if t.inFlight > t.maxInFlight {
 		t.maxInFlight = t.inFlight
@@ -69,6 +76,24 @@ func (t *blockReadTrace) begin(key string) func() {
 		t.inFlight--
 		t.mu.Unlock()
 	}
+}
+
+func (t *blockReadTrace) count() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.spans)
+}
+
+func (t *blockReadTrace) probes() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	count := 0
+	for _, span := range t.spans {
+		if span.start == 0 && span.end == 1 {
+			count++
+		}
+	}
+	return count
 }
 
 func (t *blockReadTrace) peak() int {
@@ -114,7 +139,11 @@ func (c *blockReadController) configure(gate <-chan struct{}, started chan<- str
 }
 
 func (c *blockReadController) begin(ctx context.Context, key string) (func(), error) {
-	finish := c.trace.begin(key)
+	return c.beginRange(ctx, key, -1, -1)
+}
+
+func (c *blockReadController) beginRange(ctx context.Context, key string, start, end int64) (func(), error) {
+	finish := c.trace.beginRange(key, start, end)
 
 	c.mu.Lock()
 	gate, started := c.gate, c.started
@@ -145,7 +174,7 @@ type localBlockReadClient struct {
 func (*localBlockReadClient) IsLocal(string) bool { return true }
 
 func (c *localBlockReadClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
-	finish, err := c.controller.begin(ctx, key)
+	finish, err := c.controller.beginRange(ctx, key, start, end)
 	defer finish()
 	if err != nil {
 		return err
@@ -172,7 +201,7 @@ type prefetchBlockReadServer struct {
 }
 
 func (s *prefetchBlockReadServer) Get(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
-	finish, err := s.controller.begin(stream.Context(), req.Key)
+	finish, err := s.controller.beginRange(stream.Context(), req.Key, req.Start, req.End)
 	defer finish()
 	if err != nil {
 		return err
@@ -295,6 +324,108 @@ func (f *blockPrefetchFixture) newWriter() *pacedBlockWriter {
 	return &pacedBlockWriter{
 		expected: f.body,
 		markers:  make([]blockWriteMarker, 0, f.blockCount),
+	}
+}
+
+// A delayed remote owner sees one payload read per certified block and no byte-zero
+// BlockExistsErr preflight. All requested slices are staged before the response commits.
+func TestBlockCache_CertifiedRangeRemoteOwnerStagesWithoutPreflight(t *testing.T) {
+	for _, blocks := range []int{2, 4, 8, 32} {
+		t.Run(fmt.Sprintf("blocks-%d", blocks), func(t *testing.T) {
+			fixture := newBlockPrefetchFixture(t, true, blocks)
+			fixture.meta.RangeBlockSpan = &cache.BlockSpan{First: 0, Last: int64(blocks - 1)}
+
+			gate := make(chan struct{})
+			started := make(chan struct{}, blocks*2)
+			fixture.controller.configure(gate, started)
+			rangeHeader := fmt.Sprintf("bytes=0-%d", len(fixture.body)-1)
+			req := httptest.NewRequest(http.MethodGet, "http://example/benchmark/prefetch", nil)
+			req.Header.Set("Range", rangeHeader)
+			w := httptest.NewRecorder()
+			type result struct {
+				served bool
+				err    error
+			}
+			results := make(chan result, 1)
+			go func() {
+				served, err := fixture.service.serveRangeFromBlockCache(context.Background(), w, req, fixture.bucket, fixture.key, "access", "secret", fixture.meta, rangeHeader, time.Now())
+				results <- result{served: served, err: err}
+			}()
+
+			waitForBlockReadStarts(t, started, blocks)
+			if w.Body.Len() != 0 || w.Header().Get("X-Cache") != "" {
+				t.Fatalf("certified response committed before all payload reads finished: status=%d cache=%q body=%d", w.Code, w.Header().Get("X-Cache"), w.Body.Len())
+			}
+			close(gate)
+
+			var got result
+			select {
+			case got = <-results:
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for certified remote range")
+			}
+			if got.err != nil || !got.served {
+				t.Fatalf("certified remote range = (served=%t, err=%v)", got.served, got.err)
+			}
+			if w.Code != http.StatusPartialContent || !bytes.Equal(w.Body.Bytes(), fixture.body) {
+				t.Fatalf("remote response = (status=%d, bytes=%d), want (206, %d exact bytes)", w.Code, w.Body.Len(), len(fixture.body))
+			}
+			if got := fixture.trace.probes(); got != 0 {
+				t.Fatalf("remote BlockExistsErr reads = %d, want 0", got)
+			}
+			if got := fixture.trace.count(); got != blocks {
+				t.Fatalf("remote cache reads = %d, want %d payload reads", got, blocks)
+			}
+		})
+	}
+}
+
+// Cancellation while a certified range is still reading its block slices must release the
+// full-range reservation without committing a response.
+func TestBlockCache_CertifiedRangeCancellationReleasesStaging(t *testing.T) {
+	const blocks = 4
+	fixture := newBlockPrefetchFixture(t, false, blocks)
+	fixture.meta.RangeBlockSpan = &cache.BlockSpan{First: 0, Last: blocks - 1}
+
+	gate := make(chan struct{})
+	started := make(chan struct{}, blocks)
+	fixture.controller.configure(gate, started)
+	initialRemaining := fixture.service.populateBudget.remaining
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "http://example/benchmark/prefetch", nil)
+	rangeHeader := fmt.Sprintf("bytes=0-%d", len(fixture.body)-1)
+	req.Header.Set("Range", rangeHeader)
+	w := httptest.NewRecorder()
+	result := make(chan struct {
+		served bool
+		err    error
+	}, 1)
+	go func() {
+		served, err := fixture.service.serveRangeFromBlockCache(ctx, w, req, fixture.bucket, fixture.key, "access", "secret", fixture.meta, rangeHeader, time.Now())
+		result <- struct {
+			served bool
+			err    error
+		}{served: served, err: err}
+	}()
+
+	waitForBlockReadStarts(t, started, blocks)
+	cancel()
+	close(gate)
+	select {
+	case got := <-result:
+		if got.served || !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("cancelled certified range = (served=%t, err=%v), want (false, context canceled)", got.served, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for certified range cancellation")
+	}
+	if w.Flushed || w.Body.Len() != 0 {
+		t.Fatalf("cancelled certified response = (flushed=%t, bytes=%d), want uncommitted", w.Flushed, w.Body.Len())
+	}
+	remaining, inUse := fixture.service.populateBudget.remaining, fixture.service.populateBudget.stagingInUse
+	if remaining != initialRemaining || inUse != 0 {
+		t.Fatalf("staging budget after certified cancellation = (remaining=%d, in_use=%d), want (%d, 0)", remaining, inUse, initialRemaining)
 	}
 }
 

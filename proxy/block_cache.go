@@ -29,6 +29,12 @@ const maxConcurrentBlockFetches = 4
 // size this is ~128 MiB of range before the cap engages.
 const maxRangeBlockFanout = 32
 
+// certifiedRangeReadTimeout bounds only the speculative pre-commit reads for a certified span.
+// It is derived from the caller context (so a shorter request deadline wins) and matches the
+// existing five-second cache-read bound used by Cache.Has. A timeout abandons this optimization
+// while the original request context can still perform its upstream fallback.
+const certifiedRangeReadTimeout = 5 * time.Second
+
 // errBlockETagMismatch means a block fetched from upstream belongs to a different object
 // version than the meta we hold (a concurrent overwrite), so it must not be cached.
 var errBlockETagMismatch = errors.New("block etag mismatch")
@@ -86,6 +92,46 @@ func (s *Service) isBlockEligibleSize(contentLength int64) bool {
 		contentLength >= s.config.Cache.BlockSize
 }
 
+// blockSpanForRange turns the range that created a block-mode entry into a bounded,
+// write-once hint. The caller invokes this only after fetchBlocksToCache has returned
+// successfully, so publishing the span cannot claim blocks that were not durable.
+func blockSpanForRange(meta *cache.CachedObjectMeta, touched []int64) *cache.BlockSpan {
+	if meta == nil || meta.BlockSize <= 0 || meta.ContentLength <= 0 || len(touched) == 0 ||
+		len(touched) > maxRangeBlockFanout {
+		return nil
+	}
+	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
+	if touched[0] < 0 || touched[len(touched)-1] > lastBlock {
+		return nil
+	}
+	for i := 1; i < len(touched); i++ {
+		if touched[i] != touched[i-1]+1 {
+			return nil
+		}
+	}
+	if touched[len(touched)-1]-touched[0]+1 != int64(len(touched)) {
+		return nil
+	}
+	return &cache.BlockSpan{First: touched[0], Last: touched[len(touched)-1]}
+}
+
+// certifiedRangeBlockSpanCovers accepts a span only when it is still meaningful
+// for this metadata row's ETag and block layout. The certificate is advisory: a
+// later eviction is detected by the payload read and returned to the old pre-commit gate.
+func certifiedRangeBlockSpanCovers(meta *cache.CachedObjectMeta, b0, bK int64) bool {
+	if meta == nil || meta.ETag == "" || meta.BlockSize <= 0 || meta.ContentLength <= 0 ||
+		meta.RangeBlockSpan == nil || b0 < 0 || bK < b0 {
+		return false
+	}
+	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
+	span := meta.RangeBlockSpan
+	if span.First < 0 || span.Last < span.First || span.Last > lastBlock ||
+		span.Last-span.First+1 > maxRangeBlockFanout {
+		return false
+	}
+	return span.First <= b0 && bK <= span.Last
+}
+
 // blockBounds returns the inclusive object-byte bounds [start,end] of block i for an object
 // of contentLength bytes cached at blockSize granularity. The last block is clamped to the
 // object end.
@@ -129,9 +175,10 @@ func touchedBlocks(rangeHeader string, totalSize, blockSize int64) []int64 {
 // serveRangeFromBlockCache serves a single-range request from a block-mode cache entry
 // (meta.BlockSize > 0). A range no longer than one block — the hot footer/row-group pattern —
 // is assembled probe-free into a pooled buffer (serveAssembledRange): each present block is
-// read exactly once, with the read itself acting as the existence check. Larger ranges (and
-// small ones the assembly-buffer budget declines) take the probe-first path: probe the
-// covering blocks, fetch any missing, then stream.
+// read exactly once, with the read itself acting as the existence check. A larger range covered
+// by a range-created span certificate stages every requested payload slice before commitment;
+// other larger ranges (and requests whose full-range staging budget declines) take the probe-first
+// path: probe the covering blocks, fetch any missing, then stream.
 //
 // It returns served=true when it has produced a complete client response (a 206 body, or a
 // definitive 416). It returns served=false, without having written anything to w, when the
@@ -155,6 +202,7 @@ func (s *Service) serveRangeFromBlockCache(
 		return true, nil
 	}
 	rng := ranges[0]
+	rangeLen := rng.end - rng.start + 1
 
 	// Probe-free hot path: a range no longer than one block covers at most two blocks, so the
 	// requested bytes are assembled into a pooled buffer BEFORE anything is committed. Each
@@ -169,7 +217,7 @@ func (s *Service) serveRangeFromBlockCache(
 	// A fetch failure inside assembly (including a populate-budget decline) returns with the
 	// response untouched and the caller forwards upstream — the probe path's own fetch draws
 	// on the same populate budget, so retrying there could only repeat the outcome.
-	if rangeLen := rng.end - rng.start + 1; rangeLen <= meta.BlockSize {
+	if rangeLen <= meta.BlockSize {
 		weight := s.stagingWeight(rangeLen)
 		if s.populateBudget == nil || s.populateBudget.tryAcquireStaging(weight) {
 			assembled, aerr := s.serveAssembledRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng, startTime)
@@ -182,6 +230,28 @@ func (s *Service) serveRangeFromBlockCache(
 	}
 
 	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
+
+	// A range-created entry carries a bounded hint for the contiguous blocks that were durable
+	// when its metadata was published. For a later multi-block request wholly inside that span,
+	// stage every requested payload slice before committing headers. An all-hit result replaces the
+	// presence preflight with the reads needed for the response. If any slice is missing or transient,
+	// discard the speculative buffer and use the established probe/fetch/stream path; it remains the
+	// owner of missing-block recovery and pre-commit stale-version handling. The hint stays advisory
+	// because blocks can evict independently. A short range that crosses a block boundary keeps its
+	// existing assembled path, and a staging-budget decline keeps probe-first behavior.
+	if rangeLen > meta.BlockSize && bK > b0 && certifiedRangeBlockSpanCovers(meta, b0, bK) {
+		weight := s.stagingWeight(rangeLen)
+		if s.populateBudget == nil || s.populateBudget.tryAcquireStaging(weight) {
+			served, retryProbe, rangeErr := s.serveCertifiedRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng, startTime, weight)
+			if served || !retryProbe {
+				return served, rangeErr
+			}
+			// A miss or ordinary transient abandons the optimization. The existing gate rechecks
+			// every block before commitment and preserves its fetch/remainder behavior.
+		} else {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Certified range staging budget declined - serving via probe path")
+		}
+	}
 
 	// Make the covering blocks present (probe + fetch any missing, coalesced/concurrent). Cap the
 	// per-request fan-out (maxRangeBlockFanout): a normal footer/row-group read assembles its few
@@ -213,6 +283,204 @@ func (s *Service) serveRangeFromBlockCache(
 	return true, nil
 }
 
+// serveCertifiedRange is an all-hit fast path for a range-created span certificate. It stages the
+// exact requested bytes before committing, so a missing block or stale version still reaches the
+// existing probe/fetch gate before headers. The certified reads run concurrently; the first slice
+// is observed separately so a later error can cancel an earlier stalled read instead of being hidden
+// behind ordered waiting. Only a complete payload hit skips the ordinary presence preflight.
+func (s *Service) serveCertifiedRange(
+	ctx context.Context,
+	w http.ResponseWriter,
+	bucket, key, accessKey, secretKey string,
+	meta *cache.CachedObjectMeta,
+	rng byteRange,
+	startTime time.Time,
+	stagingWeight int64,
+) (served bool, retryProbe bool, err error) {
+	if s.populateBudget != nil {
+		defer s.populateBudget.releaseStaging(stagingWeight)
+	}
+	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
+	rangeLen := rng.end - rng.start + 1
+
+	type blockSlice struct {
+		idx, localStart, localEnd, n int64
+	}
+	type readFailure struct {
+		idx int64
+		err error
+	}
+	reads := make([]blockSlice, int(bK-b0+1))
+	off := int64(0)
+	for i := b0; i <= bK; i++ {
+		localStart, localEnd := blockLocalRange(i, rng.start, rng.end, meta.BlockSize, meta.ContentLength)
+		n := localEnd - localStart + 1
+		reads[int(i-b0)] = blockSlice{idx: i, localStart: localStart, localEnd: localEnd, n: n}
+		off += n
+	}
+	if off != rangeLen {
+		return false, false, fmt.Errorf("block range assembly: staged %d of %d bytes", off, rangeLen)
+	}
+
+	// Keep one exact-sized pooled buffer per block slice. A single range-sized allocation would
+	// be discarded whenever it exceeds maxPooledBlockBufBytes, turning each large warm hit into a
+	// full-range allocation even though the ordinary stream path reuses block-sized buffers.
+	buffers := make([]*[]byte, len(reads))
+	defer func() {
+		for _, bufp := range buffers {
+			if bufp != nil {
+				putBlockBuf(bufp)
+			}
+		}
+	}()
+	for i, rr := range reads {
+		buffers[i] = getExactBlockBuf(rr.n)
+	}
+
+	// The speculative gate is bounded by both the request's remaining time and a shorter cache-read
+	// deadline. A timeout abandons this path while the parent request can still fall back upstream.
+	readCtx, cancelRead := context.WithTimeout(ctx, certifiedRangeReadTimeout)
+	defer cancelRead()
+	tailCtx, cancelTail := context.WithCancel(readCtx)
+	defer cancelTail()
+
+	first := reads[0]
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- s.readCachedBlockSlice(readCtx, bucket, key, meta, first.idx, first.localStart, first.localEnd, (*buffers[0])[:first.n])
+	}()
+
+	// Start the later slices concurrently, but report the first tail failure immediately. The
+	// caller will re-run the established probe/fetch/stream path after these readers are canceled
+	// and joined; it must not wait for an earlier slow slice before observing a later failure.
+	tailFailures := make(chan readFailure, 1)
+	var tailWG sync.WaitGroup
+	for i := 1; i < len(reads); i++ {
+		rr := reads[i]
+		dst := (*buffers[i])[:rr.n]
+		tailWG.Add(1)
+		go func(rr blockSlice, dst []byte) {
+			defer tailWG.Done()
+			if rerr := s.readCachedBlockSlice(tailCtx, bucket, key, meta, rr.idx, rr.localStart, rr.localEnd, dst); rerr != nil {
+				select {
+				case tailFailures <- readFailure{idx: rr.idx, err: rerr}:
+				default:
+				}
+				cancelTail()
+			}
+		}(rr, dst)
+	}
+	tailDone := make(chan struct{})
+	go func() {
+		tailWG.Wait()
+		close(tailDone)
+	}()
+
+	firstFinished, tailsFinished := false, false
+	var firstErr error
+	var tailFailure *readFailure
+	finishReads := func() {
+		cancelRead()
+		cancelTail()
+		if !firstFinished {
+			firstErr = <-firstDone
+			firstFinished = true
+		}
+		if !tailsFinished {
+			<-tailDone
+			tailsFinished = true
+		}
+	}
+	for !firstFinished || !tailsFinished {
+		select {
+		case firstErr = <-firstDone:
+			firstFinished = true
+		case failure := <-tailFailures:
+			tailFailure = &failure
+		case <-tailDone:
+			tailDone = nil // disable the closed channel while the first slice is pending
+			tailsFinished = true
+			// Every worker publishes its failure before Done; if tailDone wins the select,
+			// consume that already-buffered failure before considering the read a hit.
+			select {
+			case failure := <-tailFailures:
+				tailFailure = &failure
+			default:
+			}
+		case <-readCtx.Done():
+			parentErr := ctx.Err()
+			stageErr := readCtx.Err()
+			finishReads()
+			if parentErr != nil {
+				return false, false, parentErr
+			}
+			return false, false, stageErr
+		}
+
+		if tailFailure != nil {
+			parentErr := ctx.Err()
+			stageErr := readCtx.Err()
+			finishReads()
+			if parentErr != nil {
+				return false, false, parentErr
+			}
+			if stageErr != nil || errors.Is(tailFailure.err, context.Canceled) || errors.Is(tailFailure.err, context.DeadlineExceeded) {
+				return false, false, blockReadSliceError(tailFailure.idx, tailFailure.err)
+			}
+			if errors.Is(tailFailure.err, cache.ErrNotFound) {
+				return false, true, nil
+			}
+			// A transient payload error retries the original preflight/stream path. It can
+			// recover inline or use the validated upstream remainder exactly as before.
+			return false, true, nil
+		}
+		if firstFinished && firstErr != nil {
+			parentErr := ctx.Err()
+			stageErr := readCtx.Err()
+			finishReads()
+			if parentErr != nil {
+				return false, false, parentErr
+			}
+			if stageErr != nil || errors.Is(firstErr, context.Canceled) || errors.Is(firstErr, context.DeadlineExceeded) {
+				return false, false, blockReadSliceError(b0, firstErr)
+			}
+			if errors.Is(firstErr, cache.ErrNotFound) {
+				return false, true, nil
+			}
+			// A transient in the commitment slice must take the clean upstream fallback.
+			return false, false, blockReadSliceError(b0, firstErr)
+		}
+	}
+	if ctx.Err() != nil {
+		return false, false, ctx.Err()
+	}
+
+	// The complete-cache block counters are recorded at the response-commit boundary, before
+	// headers, matching the existing probe-first and assembled-range paths if the client write fails.
+	recordBlockServeMetrics(bK-b0+1, 0)
+	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
+	writeCacheStatus(w, XCacheHit)
+	w.WriteHeader(http.StatusPartialContent)
+	for i, rr := range reads {
+		n, werr := w.Write((*buffers[i])[:rr.n])
+		if n > 0 {
+			metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+		}
+		if werr == nil && int64(n) != rr.n {
+			werr = io.ErrShortWrite
+		}
+		if werr != nil {
+			return true, false, werr
+		}
+	}
+	metrics.RecordRangeFromCacheHit()
+	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	// Preserve the ordinary post-serve footer hint. This path passes no retained body slice, so
+	// the helper reads any needed trailer from cache in its detached work.
+	s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, rng.start, rng.end, nil)
+	return true, false, nil
+}
+
 // sliceWriter writes into a fixed destination slice, failing on overflow. Used to land a
 // block's bytes at their exact offset in a pre-commit assembly buffer.
 type sliceWriter struct {
@@ -238,10 +506,9 @@ var maxPooledBlockBufBytes atomic.Int64
 
 func init() { maxPooledBlockBufBytes.Store(4 << 20) }
 
-// blockBufPool recycles block-sized scratch buffers: pre-commit range/first-block assembly on
-// the serve paths, and the block staging buffers on the populate paths (fetchOneBlock,
-// putBlocksFromStream). Buffers are handed out by capacity; a request larger than a pooled
-// buffer's capacity allocates fresh.
+// blockBufPool recycles scratch buffers for pre-commit range assembly, certified-range staging,
+// and block-populate paths (fetchOneBlock, putBlocksFromStream). Buffers are handed out by
+// capacity; a request larger than a pooled buffer's capacity allocates fresh.
 var blockBufPool sync.Pool
 
 func getBlockBuf(n int64) *[]byte {
@@ -256,8 +523,8 @@ func getBlockBuf(n int64) *[]byte {
 	return &b
 }
 
-// getExactBlockBuf returns a scratch buffer whose capacity is exactly n. The direct
-// full-object writer reserves the configured block size; it must not activate a larger
+// getExactBlockBuf returns a scratch buffer whose capacity is exactly n. Certified-range and
+// direct full-object writers reserve the requested byte count; they must not activate a larger
 // process-wide pooled buffer that another service caused to be retained.
 func getExactBlockBuf(n int64) *[]byte {
 	bp := getBlockBuf(n)
@@ -1541,24 +1808,36 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
-
-		// Decision-time token BEFORE fetching, so an invalidation that lands
-		// mid-populate bumps the fence past it and the meta commit loses
-		// (mirrors the whole-object paths). No token, no ordered commit: skip.
-		// An entry present at decision time does NOT skip: the blocks are
-		// ETag-keyed and useful to it, and finalizeBlockModeMeta's own
-		// re-check backs off the meta write in its favor.
-		_, expected, _, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
-		if tokErr != nil {
-			return
-		}
-
-		if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, touched); err != nil {
-			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block-mode populate skipped - block fetch failed")
-			return
-		}
-		s.finalizeBlockModeMeta(ctx, bucket, key, meta, len(touched), expected)
+		s.populateBlockMode(ctx, bucket, key, accessKey, secretKey, meta, touched)
 	}()
+}
+
+// populateBlockMode captures the decision-time token before fetching and commits the block-mode
+// metadata only after every touched block is durable. Keeping the operation body synchronous makes
+// its token-failure and mid-fetch invalidation outcomes directly testable at the publication owner;
+// triggerBlockModePopulate still runs it under the same detached, bounded context.
+func (s *Service) populateBlockMode(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, touched []int64) {
+	// Decision-time token BEFORE fetching, so an invalidation that lands
+	// mid-populate bumps the fence past it and the meta commit loses
+	// (mirrors the whole-object paths). No token, no ordered commit: skip.
+	// An entry present at decision time does NOT skip: the blocks are
+	// ETag-keyed and useful to it, and finalizeBlockModeMeta's own
+	// re-check backs off the meta write in its favor.
+	_, expected, _, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+	if tokErr != nil {
+		return
+	}
+
+	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, touched); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block-mode populate skipped - block fetch failed")
+		return
+	}
+	// Publish the certificate only after every touched block has reached its cache owner.
+	// Keep it on this fresh metadata copy: later range reads never extend the original
+	// span, and the version-preconditioned meta write remains the sole publication point.
+	publishedMeta := *meta
+	publishedMeta.RangeBlockSpan = blockSpanForRange(meta, touched)
+	s.finalizeBlockModeMeta(ctx, bucket, key, &publishedMeta, len(touched), expected)
 }
 
 // finalizeBlockModeMeta stamps the block-mode meta once its blocks have landed — the

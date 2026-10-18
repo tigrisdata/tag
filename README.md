@@ -101,6 +101,7 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 - Objects with `Cache-Control: no-store` or `private` are not cached
 - CopyObject requests with `Cache-Control: no-store` or `private` still invalidate the destination but skip post-copy cache warming
 - Among cacheable objects (within `size_threshold`), those at or above `block_size` are cached as fixed-size blocks (block caching, on by default), so a range read fetches only the covering blocks; smaller objects are whole-cached
+- A later multi-block Range within a range-created entry's recorded span stages its payload blocks before `206`, skipping probes only on a complete hit. The ETag/layout-bound hint is advisory; misses keep existing recovery, and speculative reads fall back upstream after five seconds while the request is live.
 - Set `block_caching_enabled: false` to cache whole objects instead — a range request then triggers a background fetch of the full object (if within threshold)
 - PUT/DELETE operations invalidate the cache entry
 
