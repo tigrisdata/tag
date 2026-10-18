@@ -274,8 +274,8 @@ func (c *handlerPrefetchCacheClient) GetRangeStream(ctx context.Context, key str
 	return c.CacheClient.GetRangeStream(ctx, key, start, end, w)
 }
 
-// handlerPrefetchForwarder is only reached for auth on this warm-cache
-// benchmark. Any upstream operation is a fixture failure.
+// handlerPrefetchForwarder supplies a fixed test identity and rejects
+// unexpected upstream calls; tests can override operations they need.
 type handlerPrefetchForwarder struct{}
 
 func (handlerPrefetchForwarder) Forward(context.Context, http.ResponseWriter, *http.Request) error {

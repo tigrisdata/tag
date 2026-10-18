@@ -165,6 +165,7 @@ func TestBroadcasterSlowConsumerDisconnect(t *testing.T) {
 				return
 			}
 			fastReceived = append(fastReceived, chunk.Data...)
+			chunk.Release()
 		}
 	}()
 
@@ -189,8 +190,9 @@ func TestBroadcasterSlowConsumerDisconnect(t *testing.T) {
 				return
 			}
 			received += len(chunk.Data)
+			chunk.Release()
 		}
-		// Channel closed without error chunk (buffer was full)
+		// A close without an error is the failure this test is meant to catch.
 		slowResult <- struct {
 			err          error
 			receivedData int
@@ -209,16 +211,12 @@ func TestBroadcasterSlowConsumerDisconnect(t *testing.T) {
 
 	<-fastDone
 
-	// Slow consumer should either:
-	// 1. Get ErrSlowConsumer if error chunk was sent before buffer filled
-	// 2. Get channel closed with partial data (buffer was completely full when disconnected)
+	// A slow consumer must receive the terminal error even when its queue was full.
 	select {
 	case result := <-slowResult:
-		if result.err != nil && result.err != ErrSlowConsumer {
-			t.Errorf("Slow consumer got unexpected error: %v", result.err)
+		if result.err != ErrSlowConsumer {
+			t.Errorf("Slow consumer error = %v, want %v", result.err, ErrSlowConsumer)
 		}
-		// Either ErrSlowConsumer or nil (channel closed) is acceptable
-		// The important thing is that slow consumer was disconnected (received less data than fast)
 		t.Logf("Slow consumer received %d bytes, err=%v", result.receivedData, result.err)
 	case <-time.After(2 * time.Second):
 		t.Error("Timeout waiting for slow consumer to finish")
