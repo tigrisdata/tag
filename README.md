@@ -179,7 +179,7 @@ See [docs/metrics.md](docs/metrics.md) for complete metrics reference.
 
 TAG supports transparent proxy mode (default) with local SigV4 validation and per-bucket authorization caching, as well as signing mode with local credential stores.
 
-After key learning and bucket authorization, local auth can validate a valid SigV4 presigned GET without an `X-Amz-Content-Sha256` header; header-authenticated requests still require it.
+After key learning and bucket authorization, local auth can validate a valid SigV4 presigned GET without an `X-Amz-Content-Sha256` header; header-authenticated requests and other methods still require it.
 
 See [docs/security.md](docs/security.md) for authentication, access control, and security architecture.
 

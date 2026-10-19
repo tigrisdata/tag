@@ -16,6 +16,7 @@ import (
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/tag/auth"
+	"github.com/tigrisdata/tag/config"
 )
 
 func newSDKPresignedRequestForLocalAuthTest(t *testing.T, endpoint, method, bucket, key, accessKey, secretKey string, signingTime time.Time, expiry time.Duration) *http.Request {
@@ -205,4 +206,45 @@ func TestTransparentAuth_PresignedGETWithoutContentHash(t *testing.T) {
 	require.NoError(t, err)
 	headerSigned.Header.Del("X-Amz-Content-Sha256")
 	requirePresignedFallbackForLocalAuthTest(t, env, headerSigned, content)
+}
+
+func TestTieredTransparentAuth_PresignedGETWithoutContentHashForwardsOnMetadataMiss(t *testing.T) {
+	backend := s3mem.New()
+	env := NewTestEnvironmentWithTransparentAuth(t, newSigningKeysUpstreamHandler(t, backend))
+	env.S3Backend = backend
+	env.Config.Mode = config.ModeTiered
+	defer env.Close()
+
+	bucket := fmt.Sprintf("tiered-presigned-local-auth-%x", time.Now().UnixNano())
+	key := "upstream-object"
+	content := []byte("object exists at the controlled origin")
+	require.NoError(t, env.PutTestObject(bucket, key, content))
+
+	warmResp, err := env.DoSignedRequest(http.MethodGet, "/"+bucket+"/"+key, nil)
+	require.NoError(t, err)
+	warmBody, err := io.ReadAll(warmResp.Body)
+	require.NoError(t, err)
+	require.NoError(t, warmResp.Body.Close())
+	require.Equal(t, http.StatusOK, warmResp.StatusCode)
+	require.Equal(t, content, warmBody)
+	require.True(t, env.DerivedKeyStore.HasKey(TestAccessKey))
+	require.True(t, env.AuthzCache.IsAuthorized(TestAccessKey, bucket))
+	require.False(t, env.IsCached(bucket, key), "tiered mode has no local metadata for this upstream-only object")
+	upstreamBefore := env.GetUpstreamRequestCount()
+
+	urlOnly := newSDKPresignedRequestForLocalAuthTest(
+		t,
+		env.TAGServer.URL,
+		http.MethodGet,
+		bucket,
+		key,
+		TestAccessKey,
+		TestSecretKey,
+		time.Now().UTC().Truncate(time.Second),
+		5*time.Minute,
+	)
+	status, _, body := performLocalAuthRequestForTest(t, urlOnly)
+	require.Equal(t, http.StatusOK, status)
+	require.Equal(t, content, body)
+	require.Greater(t, env.GetUpstreamRequestCount(), upstreamBefore, "a tiered metadata miss must keep the URL-only request on the origin path")
 }
