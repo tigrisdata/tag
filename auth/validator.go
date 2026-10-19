@@ -44,20 +44,24 @@ func NewRequestValidator(keyProvider KeyProvider) *RequestValidator {
 }
 
 // ValidateRequest validates the AWS SigV4 signature of an incoming request.
-// This requires the X-Amz-Content-Sha256 header to be present (all AWS SDKs set this).
-// This enables zero-copy streaming of the request body.
+// Header-authenticated requests and non-GET requests require X-Amz-Content-Sha256.
+// Presigned GETs use UNSIGNED-PAYLOAD and may omit the header.
+// The header lets uploads be validated without buffering the request body.
 // Returns the access key if validation succeeds, or an error if it fails.
 func (v *RequestValidator) ValidateRequest(r *http.Request) (string, error) {
-	// Require X-Amz-Content-Sha256 header - all AWS SDKs set this
 	bodyHash := r.Header.Get("X-Amz-Content-Sha256")
-	if bodyHash == "" {
-		return "", ErrMissingContentHash
-	}
 
-	// Parse auth info
+	// Classify the authentication form before enforcing the hash requirement:
+	// a presigned GET uses UNSIGNED-PAYLOAD and does not need this header.
 	authInfo, err := ParseAuthInfo(r)
 	if err != nil {
+		if bodyHash == "" {
+			return "", ErrMissingContentHash
+		}
 		return "", fmt.Errorf("failed to parse auth: %w", err)
+	}
+	if bodyHash == "" && (!authInfo.IsPresigned || r.Method != http.MethodGet) {
+		return "", ErrMissingContentHash
 	}
 
 	// Get the date string for signing key lookup
