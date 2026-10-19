@@ -78,6 +78,21 @@ func requirePresignedFallbackForLocalAuthTest(t *testing.T, env *TestEnvironment
 	require.Greater(t, env.GetUpstreamRequestCount(), before, "request should be forwarded rather than served from cache")
 }
 
+func waitForReadableCachedObjectForLocalAuthTest(t *testing.T, env *TestEnvironment, bucket, key string, timeout time.Duration) ([]byte, bool) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		if body, found := env.GetCachedObject(bucket, key); found {
+			return body, true
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-deadline:
+			return nil, false
+		}
+	}
+}
+
 // TestTransparentAuth_PresignedGETWithoutContentHash exercises the actual
 // handlers.Server.Router and transparent local-auth cache gate. The object is
 // private by default in s3mem; only a successful controlled-origin read warms it.
@@ -102,8 +117,7 @@ func TestTransparentAuth_PresignedGETWithoutContentHash(t *testing.T) {
 	require.Equal(t, content, warmBody)
 	require.True(t, env.DerivedKeyStore.HasKey(TestAccessKey), "origin response should teach TAG the derived signing key")
 	require.True(t, env.AuthzCache.IsAuthorized(TestAccessKey, bucket), "origin response should grant authorization for this bucket")
-	require.True(t, env.WaitForCached(bucket, key, 2*time.Second), "origin read should warm cache metadata")
-	cachedBody, found := env.GetCachedObject(bucket, key)
+	cachedBody, found := waitForReadableCachedObjectForLocalAuthTest(t, env, bucket, key, 2*time.Second)
 	require.True(t, found, "cache metadata and body should be readable")
 	require.Equal(t, content, cachedBody)
 	upstreamAfterWarm := env.GetUpstreamRequestCount()
