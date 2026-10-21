@@ -320,7 +320,9 @@ var errCacheBodyLengthMismatch = errors.New("cache body length mismatch")
 
 // checkCachedBodyLength compares the bytes a cache body produced with the
 // metadata's Content-Length. A negative ContentLength (unknown upstream
-// length) has nothing to compare against.
+// length) has nothing to compare against. For a body cut off mid-stream by
+// lengthBoundedWriter, got is the count the body would have reached, so it is
+// a lower bound rather than the stored size.
 func checkCachedBodyLength(bucket, key string, meta *cache.CachedObjectMeta, got int64) error {
 	if meta.ContentLength < 0 || got == meta.ContentLength {
 		return nil
@@ -328,6 +330,34 @@ func checkCachedBodyLength(bucket, key string, meta *cache.CachedObjectMeta, got
 	metrics.RecordCacheOperation("get", "length_mismatch")
 	return fmt.Errorf("%w for %s/%s: body is %d bytes, metadata says %d",
 		errCacheBodyLengthMismatch, bucket, key, got, meta.ContentLength)
+}
+
+// lengthBoundedWriter sits in front of the streamed path's committing writer
+// and refuses the chunk that would carry the body past meta.ContentLength. The
+// excess never reaches net/http: its own Content-Length enforcement would
+// reject it with http.ErrContentLength, which serveFromCache could not tell
+// from a transient stream failure, so the over-long entry would stay cached
+// and fail every later request the same way until its TTL. Refusing here
+// classifies the excess as errCacheBodyLengthMismatch instead, exactly like a
+// short body. Nothing of the offending chunk is written, so the client sees at
+// most ContentLength bytes; if the very first chunk is already too long the
+// response is still uncommitted and the caller falls through to upstream.
+type lengthBoundedWriter struct {
+	w       io.Writer
+	bucket  string
+	key     string
+	meta    *cache.CachedObjectMeta
+	written int64
+}
+
+func (bw *lengthBoundedWriter) Write(p []byte) (int, error) {
+	next := bw.written + int64(len(p))
+	if bw.meta.ContentLength >= 0 && next > bw.meta.ContentLength {
+		return 0, checkCachedBodyLength(bw.bucket, bw.key, bw.meta, next)
+	}
+	n, err := bw.w.Write(p)
+	bw.written += int64(n)
+	return n, err
 }
 
 // serveFromCache serves an object from the cache body.
@@ -384,8 +414,11 @@ func (s *Service) serveFromCache(
 	// cache produces its first nonempty chunk. This preserves the pre-commit
 	// fallback for an absent or empty body without staging the stream through a
 	// pipe and a second copy.
+	// An over-long body is caught chunk by chunk, before the excess reaches
+	// the response writer; a short one only once the stream ends cleanly.
 	cw := &lazyCommitWriter{w: w, meta: meta}
-	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), cw)
+	bw := &lengthBoundedWriter{w: cw, bucket: bucket, key: key, meta: meta}
+	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), bw)
 	if !cw.committed {
 		if bodyErr != nil {
 			return fmt.Errorf("cache body unavailable: %w", bodyErr)
@@ -397,6 +430,12 @@ func (s *Service) serveFromCache(
 		// A failed stream is already incomplete and may be transient, so it is
 		// not treated as a corrupt entry.
 		bodyErr = checkCachedBodyLength(bucket, key, meta, cw.written)
+	} else if errors.Is(bodyErr, http.ErrContentLength) {
+		// Belt and braces: lengthBoundedWriter should have refused the excess
+		// first, but a writer that enforces Content-Length ahead of it reports
+		// the same over-long body this way.
+		metrics.RecordCacheOperation("get", "length_mismatch")
+		bodyErr = fmt.Errorf("%w for %s/%s: %w", errCacheBodyLengthMismatch, bucket, key, bodyErr)
 	}
 	status := "success"
 	if bodyErr != nil {

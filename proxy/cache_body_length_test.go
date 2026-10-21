@@ -57,14 +57,43 @@ func (c *countingCacheClient) DeleteIfVersion(ctx context.Context, key string, e
 	return c.CacheClient.DeleteIfVersion(ctx, key, expected)
 }
 
+// chunkedCacheClient streams bodies in fixed-size chunks. The memory cache
+// hands a body to the writer in a single Write, which can never commit headers
+// and then overflow; chunking reproduces a real cache stream whose excess
+// arrives after the response is committed.
+type chunkedCacheClient struct {
+	cacheclient.CacheClient
+	chunk int
+}
+
+func (c *chunkedCacheClient) GetStream(ctx context.Context, key string, w io.Writer) error {
+	data, err := c.CacheClient.Get(ctx, key)
+	if err != nil {
+		return err
+	}
+	for len(data) > 0 {
+		n := min(c.chunk, len(data))
+		if _, err := w.Write(data[:n]); err != nil {
+			return err
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
 // newBodyLengthService seeds a whole-object entry whose metadata claims
 // claimedLength bytes while the stored body is exactly storedBody.
 func newBodyLengthService(t *testing.T, storedBody []byte, claimedLength int64) (*Service, *cache.Cache, *countingCacheClient, *cache.CachedObjectMeta) {
 	t.Helper()
+	return newBodyLengthServiceWithClient(t, cacheclient.NewMemoryCache(), storedBody, claimedLength)
+}
+
+func newBodyLengthServiceWithClient(t *testing.T, base cacheclient.CacheClient, storedBody []byte, claimedLength int64) (*Service, *cache.Cache, *countingCacheClient, *cache.CachedObjectMeta) {
+	t.Helper()
 
 	cfg := config.NewDefault()
 	cfg.Cache.SetBlockCachingEnabled(false)
-	client := &countingCacheClient{CacheClient: cacheclient.NewMemoryCache()}
+	client := &countingCacheClient{CacheClient: base}
 	store := cache.NewCacheWithClient(client, &cfg.Cache)
 	meta := &cache.CachedObjectMeta{
 		Bucket:        "bucket",
@@ -144,6 +173,253 @@ func TestHandleGetObject_ShortCachedBodyFallsThroughToUpstream(t *testing.T) {
 	}
 	if got := lengthMismatchCount(t) - beforeMismatches; got != 1 {
 		t.Fatalf("length_mismatch count delta = %v, want 1", got)
+	}
+}
+
+// A small (buffered) entry whose stored body is longer than its Content-Length
+// is rejected the same way as a short one: before any header, with the request
+// falling through to upstream and the entry invalidated.
+func TestHandleGetObject_LongCachedSmallBodyFallsThroughToUpstream(t *testing.T) {
+	stored := bytes.Repeat([]byte("x"), 100)
+	svc, store, client, meta := newBodyLengthService(t, stored, 60)
+	beforeMismatches := lengthMismatchCount(t)
+
+	upstreamBody := bytes.Repeat([]byte("y"), 60)
+	var upstreamCalls atomic.Int32
+	svc.forwarder = &mockForwarder{
+		doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Length": []string{strconv.Itoa(len(upstreamBody))},
+					"Content-Type":   []string{"text/plain"},
+					"ETag":           []string{`"fresh"`},
+				},
+				Body: io.NopCloser(bytes.NewReader(upstreamBody)),
+			}, nil
+		},
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject() error = %v", err)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+	if got := w.Header().Get(XCacheHeader); got != XCacheMiss {
+		t.Fatalf("%s = %q, want %q", XCacheHeader, got, XCacheMiss)
+	}
+	if !bytes.Equal(w.Body.Bytes(), upstreamBody) {
+		t.Fatalf("body = %d bytes, want the %d-byte upstream body", w.Body.Len(), len(upstreamBody))
+	}
+	if got := client.deletes.Load(); got != 1 {
+		t.Fatalf("guarded deletes = %d, want 1", got)
+	}
+	if cur, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key); err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	} else if found && cur.ETag == meta.ETag {
+		t.Fatal("long-body entry still cached under its stale ETag")
+	}
+	if got := lengthMismatchCount(t) - beforeMismatches; got != 1 {
+		t.Fatalf("length_mismatch count delta = %v, want 1", got)
+	}
+}
+
+// A large entry whose whole over-long body arrives in one chunk (as the memory
+// cache delivers it) is refused before that chunk commits anything: the client
+// never sees a cache byte, the request falls through to upstream, and the
+// entry is invalidated.
+func TestHandleGetObject_LargeLongCachedBodyFallsThroughToUpstream(t *testing.T) {
+	stored := bytes.Repeat([]byte("x"), 70*1024)
+	claimed := int64(68 * 1024)
+	svc, store, client, meta := newBodyLengthService(t, stored, claimed)
+	beforeMismatches := lengthMismatchCount(t)
+
+	upstreamBody := bytes.Repeat([]byte("y"), int(claimed))
+	var upstreamCalls atomic.Int32
+	svc.forwarder = &mockForwarder{
+		doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Length": []string{strconv.Itoa(len(upstreamBody))},
+					"Content-Type":   []string{"text/plain"},
+					"ETag":           []string{`"fresh"`},
+				},
+				Body: io.NopCloser(bytes.NewReader(upstreamBody)),
+			}, nil
+		},
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject() error = %v", err)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+	if got := w.Header().Get(XCacheHeader); got != XCacheMiss {
+		t.Fatalf("%s = %q, want %q", XCacheHeader, got, XCacheMiss)
+	}
+	if !bytes.Equal(w.Body.Bytes(), upstreamBody) {
+		t.Fatalf("body = %d bytes, want the %d-byte upstream body and no cache bytes", w.Body.Len(), len(upstreamBody))
+	}
+	if got := client.deletes.Load(); got != 1 {
+		t.Fatalf("guarded deletes = %d, want 1", got)
+	}
+	if cur, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key); err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	} else if found && cur.ETag == meta.ETag {
+		t.Fatal("long-body entry still cached under its stale ETag")
+	}
+	if got := lengthMismatchCount(t) - beforeMismatches; got != 1 {
+		t.Fatalf("length_mismatch count delta = %v, want 1", got)
+	}
+}
+
+// A large entry streamed in chunks commits on its first chunk, so the excess
+// is only seen mid-stream. The chunk that would overrun Content-Length must
+// never reach the response writer (net/http would reject it with
+// http.ErrContentLength and the entry would survive as a transient failure):
+// the client gets fewer than Content-Length bytes, the request is counted as
+// an error, the entry is invalidated, and the next request is a clean miss.
+func TestHandleGetObject_LargeLongCachedBodyAbortsAfterCommit(t *testing.T) {
+	const chunk = 16 * 1024
+	stored := bytes.Repeat([]byte("x"), 70*1024)
+	claimed := int64(68 * 1024)
+	svc, store, client, meta := newBodyLengthServiceWithClient(t,
+		&chunkedCacheClient{CacheClient: cacheclient.NewMemoryCache(), chunk: chunk}, stored, claimed)
+	beforeErrors := requestCount(t, "error")
+	beforeSuccesses := requestCount(t, "success")
+	beforeMismatches := lengthMismatchCount(t)
+
+	var upstreamCalls atomic.Int32
+	svc.forwarder = &mockForwarder{
+		doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			return nil, errors.New("upstream unavailable")
+		},
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject() error = %v", err)
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("upstream calls = %d, want 0 after committed cache response", got)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get(XCacheHeader); got != XCacheHit {
+		t.Fatalf("%s = %q, want %q", XCacheHeader, got, XCacheHit)
+	}
+	if got := w.Header().Get("Content-Length"); got != strconv.FormatInt(claimed, 10) {
+		t.Fatalf("Content-Length = %q, want %d", got, claimed)
+	}
+	// Four whole chunks fit under 68 KiB; the fifth would overrun and is dropped
+	// in full, so the response is left short of its declared length.
+	wantDelivered := (int(claimed) / chunk) * chunk
+	if w.Body.Len() != wantDelivered {
+		t.Fatalf("body = %d bytes, want %d (every whole chunk under Content-Length, nothing past it)", w.Body.Len(), wantDelivered)
+	}
+	if int64(w.Body.Len()) > claimed {
+		t.Fatalf("body = %d bytes, exceeds Content-Length %d", w.Body.Len(), claimed)
+	}
+	if got := requestCount(t, "error"); got != beforeErrors+1 {
+		t.Fatalf("error request count = %v, want %v", got, beforeErrors+1)
+	}
+	if got := requestCount(t, "success"); got != beforeSuccesses {
+		t.Fatalf("success request count = %v, want %v", got, beforeSuccesses)
+	}
+	if got := lengthMismatchCount(t) - beforeMismatches; got != 1 {
+		t.Fatalf("length_mismatch count delta = %v, want 1", got)
+	}
+	if got := client.deletes.Load(); got != 1 {
+		t.Fatalf("guarded deletes = %d, want 1", got)
+	}
+	if _, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key); err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	} else if found {
+		t.Fatal("long-body entry still cached after a committed length mismatch")
+	}
+
+	// The corrupt entry is gone, so the next request cannot repeat the failure:
+	// it goes to upstream.
+	w2 := httptest.NewRecorder()
+	r2 := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	_ = svc.HandleGetObject(w2, r2)
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls after invalidation = %d, want 1", got)
+	}
+	if got := w2.Header().Get(XCacheHeader); got == XCacheHit {
+		t.Fatalf("%s = %q on the request after invalidation, want a non-hit", XCacheHeader, got)
+	}
+}
+
+// contentLengthEnforcingWriter mimics net/http's own check: a write that would
+// carry the body past limit fails with http.ErrContentLength.
+type contentLengthEnforcingWriter struct {
+	http.ResponseWriter
+	limit   int64
+	written int64
+}
+
+func (w *contentLengthEnforcingWriter) Write(p []byte) (int, error) {
+	if w.written+int64(len(p)) > w.limit {
+		return 0, http.ErrContentLength
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.written += int64(n)
+	return n, err
+}
+
+// Belt and braces for the committed path: if a response writer enforces a
+// length ahead of the proxy's own bound, its http.ErrContentLength is still
+// classified as a corrupt entry and invalidated, not left to recur as a
+// transient stream failure.
+func TestServeFromCache_ContentLengthErrorAfterCommitInvalidates(t *testing.T) {
+	const chunk = 16 * 1024
+	stored := bytes.Repeat([]byte("x"), 70*1024)
+	claimed := int64(68 * 1024)
+	svc, store, client, meta := newBodyLengthServiceWithClient(t,
+		&chunkedCacheClient{CacheClient: cacheclient.NewMemoryCache(), chunk: chunk}, stored, claimed)
+	beforeErrors := requestCount(t, "error")
+	beforeMismatches := lengthMismatchCount(t)
+
+	// The writer trips at 60 KiB, on the fourth chunk (48 -> 64 KiB), which the
+	// proxy's own 68 KiB bound would still have let through.
+	rec := httptest.NewRecorder()
+	w := &contentLengthEnforcingWriter{ResponseWriter: rec, limit: 60 * 1024}
+	err := svc.serveFromCache(context.Background(), w, meta.Bucket, meta.Key, meta, time.Now())
+	if err != nil {
+		t.Fatalf("serveFromCache() error = %v, want nil after a committed failure", err)
+	}
+	if got := rec.Header().Get(XCacheHeader); got != XCacheHit {
+		t.Fatalf("%s = %q, want %q (response must have committed)", XCacheHeader, got, XCacheHit)
+	}
+	if rec.Body.Len() != 3*chunk {
+		t.Fatalf("body = %d bytes, want %d (chunks before the writer refused)", rec.Body.Len(), 3*chunk)
+	}
+	if got := requestCount(t, "error"); got != beforeErrors+1 {
+		t.Fatalf("error request count = %v, want %v", got, beforeErrors+1)
+	}
+	if got := lengthMismatchCount(t) - beforeMismatches; got != 1 {
+		t.Fatalf("length_mismatch count delta = %v, want 1", got)
+	}
+	if got := client.deletes.Load(); got != 1 {
+		t.Fatalf("guarded deletes = %d, want 1", got)
+	}
+	if _, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key); err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	} else if found {
+		t.Fatal("entry still cached after http.ErrContentLength on a committed stream")
 	}
 }
 
