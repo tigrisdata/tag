@@ -68,7 +68,8 @@ Deploy as a StatefulSet with an embedded distributed cache using the Kustomize m
 kubectl apply -k deploy/kubernetes/base/
 ```
 
-See [docs/deploy.md](docs/deploy.md) for the full guide.
+See [docs/deploy.md](docs/deploy.md) for the full guide. On SIGTERM, TAG gives HTTP requests a 30-second drain window and keeps the embedded cache open until admitted handlers finish their synchronous cleanup.
+Kubernetes may enforce a separate termination grace period (see [graceful shutdown](docs/deploy.md#graceful-shutdown)).
 
 ### Build from source
 
@@ -103,6 +104,7 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 - Among cacheable objects (within `size_threshold`), those at or above `block_size` are cached as fixed-size blocks (block caching, on by default), so a range read fetches only the covering blocks; smaller objects are whole-cached
 - A later multi-block Range within a range-created entry's recorded span stages its payload blocks before `206`, skipping probes only on a complete hit. The ETag/layout-bound hint is advisory; misses keep existing recovery, and speculative reads fall back upstream after five seconds while the request is live.
 - Set `block_caching_enabled: false` to cache whole objects instead — a range request then triggers a background fetch of the full object (if within threshold)
+- A dropped whole-object cache listener or upstream body-read error does not publish the partial body as a new cache entry
 - In tiered mode, a PUT routed to the local tier checks a concrete SigV4 `X-Amz-Content-Sha256` digest after admission and any local precondition pass and the full body passes its declared-length and any Content-MD5 checks; conditional writes against upstream-tier markers, `UNSIGNED-PAYLOAD`, and aws-chunked uploads keep their existing paths
 - PUT/DELETE operations invalidate affected cache entries. For cache-enabled bulk DeleteObjects requests with a nonempty parsed key list, TAG completes an upstream 2xx response only after the post-success invalidation attempts return, bounded by a 10-second fence timeout; a fence that does not converge in time is logged as a warning and the 2xx is still returned.
 - If a whole-object cache write returns an error during a successful GET, the upstream response is unchanged and the cache-populate slot becomes available after relay cleanup, so a later eligible GET can retry. A store call that never returns has no completion guarantee.
@@ -147,6 +149,10 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 1. **Cache Check**: TAG first checks if the object exists in its embedded cache
 2. **Cache Hit**: Returns cached object with `X-Cache: HIT` header
 3. **Cache Miss**: Forwards request to upstream Tigris, caches response, returns with `X-Cache: MISS`
+
+For directly streamed upstream responses, TAG aborts the downstream response if copying the body fails. It does not complete a truncated prefix as a successful response. Clients may see a transport or body-read error.
+
+For streamed PUT and DELETE operations, an upstream 2xx still triggers cache invalidation or a tiered marker when caching is enabled. A delivery error alone does not prove the mutation failed.
 
 ### Request Coalescing
 
