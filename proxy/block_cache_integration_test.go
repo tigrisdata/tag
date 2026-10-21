@@ -12,9 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
+	"github.com/tigrisdata/tag/metrics"
 )
 
 // blockMockForwarder serves range GETs from a backing object, for both the initial
@@ -51,6 +53,25 @@ func newBlockMock(object []byte, etag string) *blockMockForwarder {
 		return m.wholeObject(m.etag), nil
 	}
 	return m
+}
+
+// countingBlockClient separates the byte-zero presence probes from payload reads. The
+// production cache wrapper turns BlockExistsErr into the backend's [0,1] read (the cache
+// layer widens [0,0] for backends that cannot return a single byte), while a block serve
+// asks for a non-empty block-local range.
+type countingBlockClient struct {
+	cacheclient.CacheClient
+	presenceReads atomic.Int64
+	payloadReads  atomic.Int64
+}
+
+func (c *countingBlockClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if start == 0 && end == 1 {
+		c.presenceReads.Add(1)
+	} else {
+		c.payloadReads.Add(1)
+	}
+	return c.CacheClient.GetRangeStream(ctx, key, start, end, w)
 }
 
 // wholeObject returns the whole object as a 200 with the given ETag.
@@ -155,6 +176,29 @@ func newBlockServiceWithBudget(t *testing.T, mock *blockMockForwarder, blockSize
 	return NewService(mock, c, cfg), c
 }
 
+func newCountingBlockService(t *testing.T, mock *blockMockForwarder, blockSize int64) (*Service, *cache.Cache, *countingBlockClient) {
+	t.Helper()
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = blockSize
+	cfg.Cache.SizeThreshold = 1 << 20
+	client := &countingBlockClient{CacheClient: cacheclient.NewMemoryCache()}
+	store := cache.NewCacheWithClient(client, &cfg.Cache)
+	return NewService(mock, store, cfg), store, client
+}
+
+func newCountingBlockServiceWithBudget(t *testing.T, mock *blockMockForwarder, blockSize, budget int64) (*Service, *cache.Cache, *countingBlockClient) {
+	t.Helper()
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = blockSize
+	cfg.Cache.SizeThreshold = 1 << 20
+	cfg.Cache.MaxPopulateMemoryBytes = budget
+	client := &countingBlockClient{CacheClient: cacheclient.NewMemoryCache()}
+	store := cache.NewCacheWithClient(client, &cfg.Cache)
+	return NewService(mock, store, cfg), store, client
+}
+
 // Cold range miss forwards from upstream, then block-populates in the background; a
 // subsequent range read within a populated block is served from cache with no re-fetch.
 func TestBlockCache_ColdMissPopulatesThenServesFromBlocks(t *testing.T) {
@@ -193,6 +237,474 @@ func TestBlockCache_ColdMissPopulatesThenServesFromBlocks(t *testing.T) {
 	}
 	if after := mock.blockGets.Load(); after != before {
 		t.Errorf("block re-fetched on a hit: blockGets %d -> %d", before, after)
+	}
+}
+
+// A range-created entry records its initial contiguous span only after the blocks are durable.
+// Later same-span and contained multi-block requests read payloads directly without paying the
+// byte-zero presence preflight, while the response remains byte-exact.
+func TestBlockCache_RangeCertificatePayloadReadsAndBudgetFallback(t *testing.T) {
+	for _, blocks := range []int{2, 4, 8, 32} {
+		t.Run(fmt.Sprintf("blocks-%d", blocks), func(t *testing.T) {
+			body := make([]byte, blocks*4)
+			for i := range body {
+				body[i] = byte('A' + i%26)
+			}
+			mock := newBlockMock(body, `"v1"`)
+			svc, c, client := newCountingBlockService(t, mock, 4)
+			fullRange := fmt.Sprintf("bytes=0-%d", len(body)-1)
+
+			cold := httptest.NewRecorder()
+			if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, fullRange)); err != nil {
+				t.Fatalf("cold range miss: %v", err)
+			}
+			if cold.Code != http.StatusPartialContent || cold.Body.String() != string(body) {
+				t.Fatalf("cold response = (%d, %d bytes), want (206, %d exact bytes)", cold.Code, cold.Body.Len(), len(body))
+			}
+			if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+				t.Fatal("range-created metadata was not published")
+			}
+			meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+			if meta.BlocksComplete {
+				t.Fatal("range-created entry was incorrectly marked BlocksComplete")
+			}
+			if meta.RangeBlockSpan == nil || meta.RangeBlockSpan.First != 0 || meta.RangeBlockSpan.Last != int64(blocks-1) {
+				t.Fatalf("RangeBlockSpan = %#v, want [0,%d]", meta.RangeBlockSpan, blocks-1)
+			}
+
+			defaultStagingCap := svc.populateBudget.stagingCap
+			for _, tc := range []struct {
+				rangeHeader   string
+				want          string
+				payloadReads  int64
+				presenceReads int64
+				stagingCap    int64
+			}{
+				{rangeHeader: fullRange, want: string(body), payloadReads: int64(blocks)},
+				{rangeHeader: "bytes=1-6", want: string(body[1:7]), payloadReads: 2},
+				// The requested bytes do not fit this deliberately small stage cap, so the
+				// probe-first fallback checks both covering blocks before the 206.
+				{rangeHeader: "bytes=2-6", want: string(body[2:7]), payloadReads: 2, presenceReads: 2, stagingCap: 3},
+			} {
+				svc.populateBudget.stagingCap = defaultStagingCap
+				if tc.stagingCap > 0 {
+					svc.populateBudget.stagingCap = tc.stagingCap
+				}
+				client.presenceReads.Store(0)
+				client.payloadReads.Store(0)
+				warm := httptest.NewRecorder()
+				if err := svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, tc.rangeHeader)); err != nil {
+					t.Fatalf("warm range %s: %v", tc.rangeHeader, err)
+				}
+				if warm.Code != http.StatusPartialContent || warm.Body.String() != tc.want {
+					t.Fatalf("warm response %s = (%d, %q), want (206, %q)", tc.rangeHeader, warm.Code, warm.Body.String(), tc.want)
+				}
+				if got := client.presenceReads.Load(); got != tc.presenceReads {
+					t.Errorf("presence probes for certified range %s = %d, want %d", tc.rangeHeader, got, tc.presenceReads)
+				}
+				if got := client.payloadReads.Load(); got != tc.payloadReads {
+					t.Errorf("payload reads for certified range %s = %d, want %d", tc.rangeHeader, got, tc.payloadReads)
+				}
+			}
+		})
+	}
+}
+
+// A request that extends beyond the recorded span retains probe-first behavior, including
+// fetching the newly covered edge blocks before commitment.
+func TestBlockCache_RangeCertificateOutsideSpanUsesProbePath(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJKLMNOPQRST"), `"v1"`) // five 4-byte blocks
+	svc, c, client := newCountingBlockService(t, mock, 4)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=4-11")); err != nil {
+		t.Fatalf("cold interior range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("range-created metadata was not published")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if meta.RangeBlockSpan == nil || meta.RangeBlockSpan.First != 1 || meta.RangeBlockSpan.Last != 2 {
+		t.Fatalf("RangeBlockSpan = %#v, want [1,2]", meta.RangeBlockSpan)
+	}
+
+	client.presenceReads.Store(0)
+	warm := httptest.NewRecorder()
+	if err := svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("range outside certificate: %v", err)
+	}
+	if warm.Code != http.StatusPartialContent || warm.Body.String() != "ABCDEFGHIJKLMNOP" {
+		t.Fatalf("outside-span response = (%d, %q), want (206, full range)", warm.Code, warm.Body.String())
+	}
+	if got := client.presenceReads.Load(); got != 6 {
+		t.Fatalf("outside-span presence probes = %d, want 6 (four covering probes plus two fetch rechecks)", got)
+	}
+}
+
+// Older metadata has no span certificate; a complete hit must retain the probe-first behavior.
+func TestBlockCache_LegacyMetadataKeepsProbePath(t *testing.T) {
+	body := []byte("ABCDEFGHIJKLMNOP")
+	mock := newBlockMock(body, `"v1"`)
+	svc, c, client := newCountingBlockService(t, mock, 4)
+	meta := &cache.CachedObjectMeta{
+		Bucket:        wowBucket,
+		Key:           wowKey,
+		ETag:          `"v1"`,
+		ContentLength: int64(len(body)),
+		StatusCode:    http.StatusOK,
+		BlockSize:     4,
+	}
+	if wrote, err := c.PutMetaIfVersion(context.Background(), wowBucket, wowKey, meta, 60, cache.VersionAny); err != nil || !wrote {
+		t.Fatalf("legacy-style metadata write = (wrote=%t, err=%v)", wrote, err)
+	}
+	for block := int64(0); block < 4; block++ {
+		start := block * 4
+		blockKey := cache.MakeBlockKey(wowBucket, wowKey, meta.ETag, meta.BlockSize, block)
+		if err := client.CacheClient.Put(context.Background(), blockKey, body[start:start+4], 0); err != nil {
+			t.Fatalf("seed legacy block %d: %v", block, err)
+		}
+	}
+
+	warm := httptest.NewRecorder()
+	if err := svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("legacy metadata range: %v", err)
+	}
+	if warm.Code != http.StatusPartialContent || warm.Body.String() != string(body) || warm.Header().Get("X-Cache") != XCacheHit {
+		t.Fatalf("legacy metadata response = (%d, %q, cache=%q), want exact 206/HIT", warm.Code, warm.Body.String(), warm.Header().Get("X-Cache"))
+	}
+	if got := client.presenceReads.Load(); got != 4 {
+		t.Fatalf("legacy metadata presence probes = %d, want 4", got)
+	}
+	if got := client.payloadReads.Load(); got != 4 {
+		t.Fatalf("legacy metadata payload reads = %d, want 4", got)
+	}
+	if got := mock.forwards.Load(); got != 0 {
+		t.Fatalf("legacy metadata origin forwards = %d, want 0", got)
+	}
+}
+
+// A certified-range staging decline retains the old probe-first serve instead of changing
+// response behavior or forcing an upstream round trip.
+func TestBlockCache_CertifiedRangeStagingDeclineUsesProbePath(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJKLMNOP"), `"v1"`)
+	svc, c, client := newCountingBlockServiceWithBudget(t, mock, 4, 16)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("range-created metadata was not published")
+	}
+	beforeFetches := mock.blockGets.Load()
+	client.presenceReads.Store(0)
+	svc.populateBudget.stagingCap = 3 // smaller than the certified requested range
+
+	warm := httptest.NewRecorder()
+	if err := svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("certified range with staging decline: %v", err)
+	}
+	if warm.Code != http.StatusPartialContent || warm.Body.String() != "ABCDEFGHIJKLMNOP" {
+		t.Fatalf("staging-declined response = (%d, %q), want (206, full range)", warm.Code, warm.Body.String())
+	}
+	if got := mock.blockGets.Load(); got != beforeFetches {
+		t.Fatalf("staging-declined warm range fetched %d new blocks, want 0", got-beforeFetches)
+	}
+	if got := client.presenceReads.Load(); got != 4 {
+		t.Fatalf("staging-declined presence probes = %d, want 4", got)
+	}
+}
+
+// A certificate is advisory. If its first requested block has evicted and recovery fails,
+// the cache path must leave the response untouched so the handler can use its upstream fallback.
+func TestBlockCache_RangeCertificateFirstBlockFailureFallsThroughCleanly(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJKLMNOP"), `"v1"`)
+	svc, c, client := newCountingBlockService(t, mock, 4)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("range-created metadata was not published")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if err := client.CacheClient.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, meta.ETag, meta.BlockSize, 0)); err != nil {
+		t.Fatalf("evict first block: %v", err)
+	}
+	mock.blockGetTransient = true
+
+	beforeForwards := mock.forwards.Load()
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("first-block failure fallback: %v", err)
+	}
+	if w.Code != http.StatusPartialContent || w.Body.String() != "ABCDEFGHIJKLMNOP" {
+		t.Fatalf("first-block failure fallback = (%d, %q), want upstream 206 body", w.Code, w.Body.String())
+	}
+	if got := mock.forwards.Load() - beforeForwards; got != 1 {
+		t.Fatalf("first-block failure upstream forwards = %d, want 1", got)
+	}
+}
+
+// A later certified block that is absent when its payload is read is recovered before the
+// full-range response commits; the certificate does not turn into a presence invariant.
+func TestBlockCache_RangeCertificateLaterBlockEvictionRecovers(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJKLMNOP"), `"v1"`)
+	svc, c, client := newCountingBlockService(t, mock, 4)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("range-created metadata was not published")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if err := client.CacheClient.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, meta.ETag, meta.BlockSize, 2)); err != nil {
+		t.Fatalf("evict middle block: %v", err)
+	}
+	beforeFetches := mock.blockGets.Load()
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("certified range after later-block eviction: %v", err)
+	}
+	if w.Code != http.StatusPartialContent || w.Body.String() != "ABCDEFGHIJKLMNOP" {
+		t.Fatalf("later-block recovery = (%d, %q), want (206, full range)", w.Code, w.Body.String())
+	}
+	if got := mock.blockGets.Load() - beforeFetches; got != 1 {
+		t.Fatalf("later-block recovery upstream fetches = %d, want 1", got)
+	}
+}
+
+type blockRangeGateClient struct {
+	cacheclient.CacheClient
+	key     string
+	armed   atomic.Bool
+	entered chan struct{}
+	release <-chan struct{}
+}
+
+func (c *blockRangeGateClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if key == c.key && start == 0 && end > 1 && c.armed.CompareAndSwap(true, false) {
+		select {
+		case c.entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return c.CacheClient.GetRangeStream(ctx, key, start, end, w)
+}
+
+// An eviction between the start of parallel staging and one later block's read remains a
+// pre-commit miss: the response waits for the block, then recovers it before writing headers.
+func TestBlockCache_RangeCertificateEvictionDuringPrecommitRecoversBeforeHeaders(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJKLMNOP"), `"v1"`)
+	backing := cacheclient.NewMemoryCache()
+	release := make(chan struct{})
+	var released atomic.Bool
+	unblock := func() {
+		if released.CompareAndSwap(false, true) {
+			close(release)
+		}
+	}
+	defer unblock()
+	gate := &blockRangeGateClient{
+		CacheClient: backing,
+		entered:     make(chan struct{}, 1),
+		release:     release,
+	}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(gate, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	metaDeadline := time.NewTimer(2 * time.Second)
+	defer metaDeadline.Stop()
+	metaPoll := time.NewTicker(5 * time.Millisecond)
+	defer metaPoll.Stop()
+	var meta *cache.CachedObjectMeta
+	var metaErr error
+	for {
+		var found bool
+		meta, found, metaErr = c.GetMeta(context.Background(), wowBucket, wowKey)
+		if metaErr == nil && found && meta != nil && meta.RangeBlockSpan != nil {
+			break
+		}
+		select {
+		case <-metaPoll.C:
+		case <-metaDeadline.C:
+			t.Fatalf("range metadata = (found=%t, meta=%#v, err=%v), want certified entry", found, meta, metaErr)
+		}
+	}
+	gate.key = cache.MakeBlockKey(wowBucket, wowKey, meta.ETag, meta.BlockSize, 2)
+	gate.armed.Store(true)
+	beforeFetches := mock.blockGets.Load()
+	warm := httptest.NewRecorder()
+	done := make(chan error, 1)
+	go func() { done <- svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-15")) }()
+
+	select {
+	case <-gate.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("certified read did not reach the gated later block")
+	}
+	if warm.Body.Len() != 0 || warm.Header().Get("X-Cache") != "" {
+		t.Fatalf("response committed before later block read: status=%d cache=%q body=%q", warm.Code, warm.Header().Get("X-Cache"), warm.Body.String())
+	}
+	if err := backing.Delete(context.Background(), gate.key); err != nil {
+		t.Fatalf("evict later block during pre-commit read: %v", err)
+	}
+	unblock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("range after gated eviction: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("range did not finish after releasing the later-block read")
+	}
+	if warm.Code != http.StatusPartialContent || warm.Body.String() != "ABCDEFGHIJKLMNOP" || warm.Header().Get("X-Cache") != XCacheHit {
+		t.Fatalf("range after in-flight eviction = (%d, %q, cache=%q), want complete 206/HIT", warm.Code, warm.Body.String(), warm.Header().Get("X-Cache"))
+	}
+	if got := mock.blockGets.Load() - beforeFetches; got != 1 {
+		t.Fatalf("in-flight eviction recovery upstream fetches = %d, want 1", got)
+	}
+}
+
+// If a certified block was already evicted and upstream has moved on, the complete
+// range must fall through before writing old-version headers or a prefix. Cover the first
+// requested block and a later block because they take different speculative-read paths.
+func TestBlockCache_RangeCertificateStaleFallsThroughBeforeCommit(t *testing.T) {
+	tests := []struct {
+		name       string
+		evictBlock int64
+		configure  func(*blockMockForwarder)
+		wantStatus int
+		wantBody   string
+		wantETag   string
+	}{
+		{
+			name:       "first block version replacement",
+			evictBlock: 0,
+			configure: func(mock *blockMockForwarder) {
+				mock.etag = `"v2"`
+				mock.blockGetETag = `"v2"`
+				mock.object = []byte("QRSTUVWXYZabcdef")
+			},
+			wantStatus: http.StatusPartialContent,
+			wantBody:   "QRSTUVWXYZabcdef",
+			wantETag:   `"v2"`,
+		},
+		{
+			name:       "first block tombstone",
+			evictBlock: 0,
+			configure: func(mock *blockMockForwarder) {
+				mock.blockGet404 = true
+			},
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "later block version replacement",
+			evictBlock: 2,
+			configure: func(mock *blockMockForwarder) {
+				mock.etag = `"v2"`
+				mock.blockGetETag = `"v2"`
+				mock.object = []byte("QRSTUVWXYZabcdef")
+			},
+			wantStatus: http.StatusPartialContent,
+			wantBody:   "QRSTUVWXYZabcdef",
+			wantETag:   `"v2"`,
+		},
+		{
+			name:       "later block tombstone",
+			evictBlock: 2,
+			configure: func(mock *blockMockForwarder) {
+				mock.blockGet404 = true
+			},
+			wantStatus: http.StatusNotFound,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newBlockMock([]byte("ABCDEFGHIJKLMNOP"), `"v1"`)
+			svc, c, client := newCountingBlockService(t, mock, 4)
+			cold := httptest.NewRecorder()
+			if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+				t.Fatalf("cold range miss: %v", err)
+			}
+			if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+				t.Fatal("range-created metadata was not published")
+			}
+			meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+			key := cache.MakeBlockKey(wowBucket, wowKey, meta.ETag, meta.BlockSize, tc.evictBlock)
+			if err := client.CacheClient.Delete(context.Background(), key); err != nil {
+				t.Fatalf("evict block %d: %v", tc.evictBlock, err)
+			}
+			tc.configure(mock)
+
+			warm := httptest.NewRecorder()
+			if err := svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+				t.Fatalf("stale range fallback: %v", err)
+			}
+			if warm.Code != tc.wantStatus || warm.Body.String() != tc.wantBody {
+				t.Fatalf("stale response = (%d, %q), want (%d, %q)", warm.Code, warm.Body.String(), tc.wantStatus, tc.wantBody)
+			}
+			if tc.wantStatus == http.StatusPartialContent && warm.Header().Get("Content-Range") != "bytes 0-15/16" {
+				t.Fatalf("stale Content-Range = %q, want bytes 0-15/16", warm.Header().Get("Content-Range"))
+			}
+			if got := warm.Header().Get("X-Cache"); got != XCacheMiss {
+				t.Fatalf("stale X-Cache = %q, want %q", got, XCacheMiss)
+			}
+			if got := warm.Header().Get("ETag"); got != tc.wantETag {
+				t.Fatalf("stale ETag = %q, want %q", got, tc.wantETag)
+			}
+			if current, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found && current.ETag == `"v1"` {
+				t.Fatalf("stale v1 metadata survived fallback: %#v", current)
+			}
+		})
+	}
+}
+
+// A certified span may begin after block zero; full-range staging still returns its exact
+// requested object bytes without probing or shifting block-local offsets.
+func TestBlockCache_RangeCertificateInteriorSpanServesExactBytes(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJKLMNOPQRST"), `"v1"`)
+	svc, c, client := newCountingBlockService(t, mock, 4)
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=4-15")); err != nil {
+		t.Fatalf("cold interior range: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("range-created metadata was not published")
+	}
+	meta, _, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if meta == nil || meta.RangeBlockSpan == nil || meta.RangeBlockSpan.First != 1 || meta.RangeBlockSpan.Last != 3 {
+		t.Fatalf("interior metadata = %#v, want certificate blocks 1-3", meta)
+	}
+	client.presenceReads.Store(0)
+
+	warm := httptest.NewRecorder()
+	if err := svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=4-15")); err != nil {
+		t.Fatalf("warm interior range: %v", err)
+	}
+	if warm.Code != http.StatusPartialContent || warm.Body.String() != "EFGHIJKLMNOP" {
+		t.Fatalf("warm interior response = (%d, %q), want exact 206 body", warm.Code, warm.Body.String())
+	}
+	if got := client.presenceReads.Load(); got != 0 {
+		t.Fatalf("warm interior presence probes = %d, want 0", got)
 	}
 }
 
@@ -888,7 +1400,7 @@ func TestPutBlocksFromStream_ExactMultipleNoPhantomBlock(t *testing.T) {
 	meta := cache.MetaFromHTTPHeaders(wowBucket, wowKey, http.StatusOK, h)
 	meta.BlockSize = 4
 
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEFGH"), 60, cache.VersionAny); err != nil {
+	if _, err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEFGH"), 60, cache.VersionAny); err != nil {
 		t.Fatalf("putBlocksFromStream: %v", err)
 	}
 	for i := int64(0); i <= 1; i++ {
@@ -918,7 +1430,7 @@ func TestPutBlocksFromStream_MidStreamErrorLeavesMetaUnwritten(t *testing.T) {
 
 	// One full block, then a read error before the second.
 	r := &errAfterReader{data: []byte("ABCD")}
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, r, 60, cache.VersionAny); err == nil {
+	if _, err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, r, 60, cache.VersionAny); err == nil {
 		t.Fatal("expected an error from the mid-stream read failure")
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
@@ -941,7 +1453,7 @@ func TestPutBlocksFromStream_TruncatedStreamLeavesNoShortBlockOrMeta(t *testing.
 	meta.BlockSize = 4
 
 	// ...but the body carries only 6 bytes, ending cleanly (no read error).
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, cache.VersionAny); err == nil {
+	if _, err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, cache.VersionAny); err == nil {
 		t.Fatal("expected an error from the truncated body")
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
@@ -966,7 +1478,7 @@ func TestPutBlocksFromStream_OversizedStreamLeavesMetaUnwritten(t *testing.T) {
 	meta.BlockSize = 4
 
 	// ...but the body carries 6 bytes.
-	if err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, cache.VersionAny); err == nil {
+	if _, err := svc.putBlocksFromStream(context.Background(), wowBucket, wowKey, meta, strings.NewReader("ABCDEF"), 60, cache.VersionAny); err == nil {
 		t.Fatal("expected an error from the oversized body")
 	}
 	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
@@ -1170,6 +1682,324 @@ func (p *blockReadFaultClient) GetRangeStream(ctx context.Context, key string, s
 	return p.CacheClient.GetRangeStream(ctx, key, start, end, w)
 }
 
+// blockReadSelectiveFaultClient injects a transient failure for one block's payload read while
+// allowing its byte-zero presence probe to succeed, so the base reaches its post-commit remainder path.
+type blockReadSelectiveFaultClient struct {
+	cacheclient.CacheClient
+	fail atomic.Bool
+}
+
+func (p *blockReadSelectiveFaultClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if p.fail.Load() && strings.HasPrefix(key, "blk|") && strings.HasSuffix(key, "|2") && !(start == 0 && end == 1) {
+		return fmt.Errorf("simulated block 2 payload read blip")
+	}
+	return p.CacheClient.GetRangeStream(ctx, key, start, end, w)
+}
+
+type blockReadBlockOneFaultClient struct {
+	cacheclient.CacheClient
+	fail atomic.Bool
+}
+
+func (p *blockReadBlockOneFaultClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if p.fail.Load() && strings.HasPrefix(key, "blk|") && strings.HasSuffix(key, "|1") {
+		return fmt.Errorf("simulated block 1 read blip")
+	}
+	return p.CacheClient.GetRangeStream(ctx, key, start, end, w)
+}
+
+type blockFirstTransientLaterStallClient struct {
+	cacheclient.CacheClient
+	firstKey      string
+	laterKey      string
+	armed         atomic.Bool
+	laterSignaled atomic.Bool
+	laterStarted  chan struct{}
+}
+
+func (c *blockFirstTransientLaterStallClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if c.armed.Load() {
+		switch key {
+		case c.firstKey:
+			// Hold the first transient until a later cache read has entered its wait, making the
+			// cancellation schedule deterministic instead of depending on goroutine scheduling.
+			select {
+			case <-c.laterStarted:
+				return fmt.Errorf("simulated first-block cache read failure")
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		case c.laterKey:
+			if c.laterSignaled.CompareAndSwap(false, true) {
+				close(c.laterStarted)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	}
+	return c.CacheClient.GetRangeStream(ctx, key, start, end, w)
+}
+
+// A transient failure in the commitment block must cancel unrelated outstanding payload reads
+// before the request deadline, so the handler can perform the clean upstream fallback.
+func TestBlockCache_CertifiedFirstTransientCancelsLaterReadBeforeDeadline(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGH"), `"v1"`)
+	faulty := &blockFirstTransientLaterStallClient{
+		CacheClient:  cacheclient.NewMemoryCache(),
+		laterStarted: make(chan struct{}),
+	}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	store := cache.NewCacheWithClient(faulty, &cfg.Cache)
+	svc := NewService(mock, store, cfg)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(store, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("range-created metadata was not published")
+	}
+	meta, found, err := store.GetMeta(context.Background(), wowBucket, wowKey)
+	if err != nil || !found || meta == nil || meta.RangeBlockSpan == nil || meta.BlocksComplete {
+		t.Fatalf("range metadata = (found=%t, meta=%#v, err=%v), want non-BlocksComplete certificate", found, meta, err)
+	}
+	faulty.firstKey = cache.MakeBlockKey(wowBucket, wowKey, meta.ETag, meta.BlockSize, 0)
+	faulty.laterKey = cache.MakeBlockKey(wowBucket, wowKey, meta.ETag, meta.BlockSize, 1)
+	faulty.armed.Store(true)
+
+	originalForward := mock.mockForwarder.doRequestFunc
+	var fallbackSawLiveContext atomic.Bool
+	mock.mockForwarder.doRequestFunc = func(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		fallbackSawLiveContext.Store(true)
+		return originalForward(ctx, r, accessKey, secretKey)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	warm := httptest.NewRecorder()
+	requestDone := make(chan error, 1)
+	go func() {
+		requestDone <- svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-7").WithContext(ctx))
+	}()
+	select {
+	case <-faulty.laterStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("later cache read did not start")
+	}
+	select {
+	case err := <-requestDone:
+		if err != nil {
+			t.Fatalf("certified range fallback: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("certified range waited for the later read instead of cancelling it")
+	}
+	if ctx.Err() != nil || !fallbackSawLiveContext.Load() {
+		t.Fatalf("upstream fallback used expired request context: ctxErr=%v", ctx.Err())
+	}
+	if warm.Code != http.StatusPartialContent || warm.Body.String() != "ABCDEFGH" || warm.Header().Get("X-Cache") != XCacheMiss {
+		t.Fatalf("first-block transient response = (%d, %q, cache=%q), want exact 206/MISS", warm.Code, warm.Body.String(), warm.Header().Get("X-Cache"))
+	}
+}
+
+type certifiedRangeStallLaterTransientClient struct {
+	cacheclient.CacheClient
+	stallSuffix string
+	failSuffix  string
+	armed       atomic.Bool
+	started     chan struct{}
+	stopped     chan struct{}
+	startOnce   atomic.Bool
+	stopOnce    atomic.Bool
+}
+
+func (c *certifiedRangeStallLaterTransientClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	if c.armed.Load() && strings.HasPrefix(key, "blk|") {
+		if c.failSuffix != "" && strings.HasSuffix(key, c.failSuffix) {
+			return errors.New("simulated later block transient")
+		}
+		if strings.HasSuffix(key, c.stallSuffix) && end-start+1 > 2 {
+			if c.startOnce.CompareAndSwap(false, true) {
+				close(c.started)
+			}
+			<-ctx.Done()
+			if c.stopOnce.CompareAndSwap(false, true) {
+				close(c.stopped)
+			}
+			return ctx.Err()
+		}
+	}
+	return c.CacheClient.GetRangeStream(ctx, key, start, end, w)
+}
+
+// A later transient must cancel any earlier payload read that is still waiting. Otherwise the
+// certified path can wait for a request deadline and lose the upstream fallback the old probe gate
+// reached immediately. Cover both the commitment slice and an earlier tail slice.
+func TestBlockCache_CertifiedLaterTransientCancelsEarlierStalledRead(t *testing.T) {
+	for _, stallSuffix := range []string{"|0", "|1"} {
+		t.Run(strings.TrimPrefix(stallSuffix, "|"), func(t *testing.T) {
+			mock := newBlockMock([]byte("ABCDEFGHIJKL"), `"v1"`)
+			faulty := &certifiedRangeStallLaterTransientClient{
+				CacheClient: cacheclient.NewMemoryCache(),
+				stallSuffix: stallSuffix,
+				failSuffix:  "|2",
+				started:     make(chan struct{}),
+				stopped:     make(chan struct{}),
+			}
+			cfg := config.NewDefault()
+			cfg.Cache.SetBlockCachingEnabled(true)
+			cfg.Cache.BlockSize = 4
+			cfg.Cache.SizeThreshold = 1 << 20
+			store := cache.NewCacheWithClient(faulty, &cfg.Cache)
+			svc := NewService(mock, store, cfg)
+
+			cold := httptest.NewRecorder()
+			if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-11")); err != nil {
+				t.Fatalf("cold range miss: %v", err)
+			}
+			if !metaCached(store, wowBucket, wowKey, 2*time.Second) {
+				t.Fatal("range-created metadata was not published")
+			}
+			meta, found, err := store.GetMeta(context.Background(), wowBucket, wowKey)
+			if err != nil || !found || meta == nil || meta.RangeBlockSpan == nil || meta.BlocksComplete {
+				t.Fatalf("range metadata = (found=%t, meta=%#v, err=%v), want non-BlocksComplete certificate", found, meta, err)
+			}
+			if meta.RangeBlockSpan.First != 0 || meta.RangeBlockSpan.Last != 2 {
+				t.Fatalf("range span = %#v, want [0,2]", meta.RangeBlockSpan)
+			}
+
+			originalForward := mock.mockForwarder.doRequestFunc
+			var fallbackSawLiveContext atomic.Bool
+			mock.mockForwarder.doRequestFunc = func(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				fallbackSawLiveContext.Store(true)
+				return originalForward(ctx, r, accessKey, secretKey)
+			}
+			faulty.armed.Store(true)
+			beforeForwards := mock.forwards.Load()
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			warm := httptest.NewRecorder()
+			requestDone := make(chan error, 1)
+			go func() {
+				requestDone <- svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-11").WithContext(ctx))
+			}()
+			select {
+			case <-faulty.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("certified payload read did not enter the stall")
+			}
+			select {
+			case err := <-requestDone:
+				if err != nil {
+					t.Fatalf("fallback after later transient: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("later transient waited for the earlier read until the request deadline")
+			}
+			select {
+			case <-faulty.stopped:
+			default:
+				t.Fatal("fallback completed before the stalled cache read was canceled and joined")
+			}
+			if ctx.Err() != nil || !fallbackSawLiveContext.Load() {
+				t.Fatalf("upstream fallback did not retain a live request context: ctxErr=%v", ctx.Err())
+			}
+			if warm.Code != http.StatusPartialContent || warm.Body.String() != "ABCDEFGHIJKL" || warm.Header().Get("X-Cache") != XCacheMiss {
+				t.Fatalf("fallback response = (%d, %q, cache=%q), want exact 206/MISS", warm.Code, warm.Body.String(), warm.Header().Get("X-Cache"))
+			}
+			if got := mock.forwards.Load() - beforeForwards; got != 1 {
+				t.Fatalf("upstream fallbacks = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// A slow certified payload read has its own request-derived bound. It must fall back to the
+// original Range while the client request still has time remaining, not wait for the client deadline.
+func TestBlockCache_CertifiedRangeReadTimeoutFallsBackBeforeRequestDeadline(t *testing.T) {
+	body := []byte("ABCDEFGH")
+	mock := newBlockMock(body, `"v1"`)
+	faulty := &certifiedRangeStallLaterTransientClient{
+		CacheClient: cacheclient.NewMemoryCache(),
+		stallSuffix: "|0",
+		started:     make(chan struct{}),
+		stopped:     make(chan struct{}),
+	}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = int64(len(body))
+	store := cache.NewCacheWithClient(faulty, &cfg.Cache)
+	svc := NewService(mock, store, cfg)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(store, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("range-created metadata was not published")
+	}
+	meta, found, err := store.GetMeta(context.Background(), wowBucket, wowKey)
+	if err != nil || !found || meta == nil || meta.RangeBlockSpan == nil || meta.BlocksComplete {
+		t.Fatalf("range metadata = (found=%t, meta=%#v, err=%v), want non-BlocksComplete certificate", found, meta, err)
+	}
+	initialRemaining := svc.populateBudget.remaining
+
+	originalForward := mock.mockForwarder.doRequestFunc
+	var fallbackSawLiveContext atomic.Bool
+	mock.mockForwarder.doRequestFunc = func(ctx context.Context, r *http.Request, accessKey, secretKey string) (*http.Response, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		fallbackSawLiveContext.Store(true)
+		return originalForward(ctx, r, accessKey, secretKey)
+	}
+	faulty.armed.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*certifiedRangeReadTimeout)
+	defer cancel()
+	warm := httptest.NewRecorder()
+	requestDone := make(chan error, 1)
+	go func() {
+		requestDone <- svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-7").WithContext(ctx))
+	}()
+	select {
+	case <-faulty.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("certified payload read did not reach the stalled owner")
+	}
+	select {
+	case err := <-requestDone:
+		if err != nil {
+			t.Fatalf("bounded certified fallback: %v", err)
+		}
+	case <-time.After(certifiedRangeReadTimeout + time.Second):
+		t.Fatal("certified range read exceeded its shorter recovery deadline")
+	}
+	select {
+	case <-faulty.stopped:
+	default:
+		t.Fatal("fallback completed before the stalled cache read was canceled and joined")
+	}
+	if ctx.Err() != nil || !fallbackSawLiveContext.Load() {
+		t.Fatalf("upstream fallback did not retain a live request context: ctxErr=%v", ctx.Err())
+	}
+	if warm.Code != http.StatusPartialContent || warm.Body.String() != string(body) || warm.Header().Get("X-Cache") != XCacheMiss {
+		t.Fatalf("timed-out certified response = (%d,%q,cache=%q), want exact 206/MISS", warm.Code, warm.Body.String(), warm.Header().Get("X-Cache"))
+	}
+	if remaining, inUse := svc.populateBudget.remaining, svc.populateBudget.stagingInUse; remaining != initialRemaining || inUse != 0 {
+		t.Fatalf("staging budget after timeout fallback = (remaining=%d,in_use=%d), want (%d,0)", remaining, inUse, initialRemaining)
+	}
+}
+
 // A warm range that spans a block boundary is assembled byte-exact from both blocks with no
 // upstream fetch (the probe-free assembled path).
 func TestBlockCache_AssembledRangeSpansBlockBoundary(t *testing.T) {
@@ -1274,6 +2104,172 @@ func TestBlockCache_AssemblyCacheReadFailureFallsThroughWithoutInvalidating(t *t
 	faulty.fail.Store(false)
 	if m, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || m.BlockSize != 4 {
 		t.Fatalf("entry lost after transient cache read failure: found=%v", found)
+	}
+}
+
+// A certified multi-block read whose first block cannot be read keeps the response uncommitted,
+// so a transient failure falls through as an upstream MISS rather than being relabeled a HIT.
+func TestBlockCache_CertifiedRangeCacheReadFailureFallsThroughWithoutInvalidating(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJKLMNOP"), `"v1"`)
+	faulty := &blockReadFaultClient{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(faulty, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("range-created metadata not populated")
+	}
+	if meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || meta.RangeBlockSpan == nil {
+		t.Fatalf("range certificate missing: found=%v meta=%#v", found, meta)
+	}
+
+	faulty.fail.Store(true)
+	warm := httptest.NewRecorder()
+	if err := svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("certified range with transient cache reads: %v", err)
+	}
+	if warm.Code != http.StatusPartialContent || warm.Body.String() != "ABCDEFGHIJKLMNOP" {
+		t.Fatalf("certified fallback = (%d, %q), want upstream 206 body", warm.Code, warm.Body.String())
+	}
+	if got := warm.Header().Get("X-Cache"); got != XCacheMiss {
+		t.Fatalf("certified fallback X-Cache = %q, want %q", got, XCacheMiss)
+	}
+	faulty.fail.Store(false)
+	if meta, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); !found || meta.BlockSize != 4 || meta.RangeBlockSpan == nil {
+		t.Fatalf("entry after certified transient failure = (found=%v meta=%#v), want unchanged certificate", found, meta)
+	}
+}
+
+// A later transient payload failure returns to the probe/fetch gate and ordered stream, preserving
+// the existing inline recovery, validated remainder, and complete HIT behavior.
+func TestBlockCache_CertifiedRangeLaterTransientRecoversRemainder(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJKLMNOP"), `"v1"`)
+	faulty := &blockReadSelectiveFaultClient{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(faulty, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("range-created metadata not populated")
+	}
+
+	faulty.fail.Store(true)
+	beforeBlockGets := mock.blockGets.Load()
+	warm := httptest.NewRecorder()
+	if err := svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("certified later transient: %v", err)
+	}
+	if warm.Code != http.StatusPartialContent || warm.Body.String() != "ABCDEFGHIJKLMNOP" {
+		t.Fatalf("later transient response = (%d, %q), want cache-hit 206 body", warm.Code, warm.Body.String())
+	}
+	if got := warm.Header().Get("X-Cache"); got != XCacheHit {
+		t.Fatalf("later transient X-Cache = %q, want %q", got, XCacheHit)
+	}
+	if got := mock.blockGets.Load() - beforeBlockGets; got != 1 {
+		t.Fatalf("later transient remainder fetches = %d, want 1", got)
+	}
+}
+
+// A later payload transient must rerun the probe/fetch gate before commitment so an earlier
+// eviction plus a tombstone still invalidates the stale span.
+func TestBlockCache_CertifiedLaterTransientStillFindsTombstone(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJKLMNOP"), `"v1"`)
+	faulty := &blockReadSelectiveFaultClient{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(faulty, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("range-created metadata was not populated")
+	}
+	meta, found, err := c.GetMeta(context.Background(), wowBucket, wowKey)
+	if err != nil || !found || meta == nil || meta.RangeBlockSpan == nil {
+		t.Fatalf("range metadata = (found=%t, meta=%#v, err=%v), want certificate", found, meta, err)
+	}
+	if err := faulty.CacheClient.Delete(context.Background(), cache.MakeBlockKey(wowBucket, wowKey, meta.ETag, meta.BlockSize, 0)); err != nil {
+		t.Fatalf("evict first block: %v", err)
+	}
+	faulty.fail.Store(true) // block 2 payload fails; byte-zero presence probes still succeed
+	mock.blockGet404 = true
+	beforeForwards := mock.forwards.Load()
+
+	warm := httptest.NewRecorder()
+	if err := svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("later transient with tombstone: %v", err)
+	}
+	if warm.Code != http.StatusNotFound || warm.Body.Len() != 0 || warm.Header().Get("X-Cache") != XCacheMiss {
+		t.Fatalf("later transient tombstone = (%d, %q, cache=%q), want empty 404/MISS", warm.Code, warm.Body.String(), warm.Header().Get("X-Cache"))
+	}
+	if got := mock.forwards.Load() - beforeForwards; got != 1 {
+		t.Fatalf("tombstone range forwards = %d, want 1", got)
+	}
+	if _, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey); found {
+		t.Fatal("stale range metadata survived transient plus tombstone")
+	}
+}
+
+// A persistent transient on a later block read must be surfaced by the restored probe gate. The
+// handler then forwards while the request context is live instead of starting a suffix request.
+func TestBlockCache_CertifiedLaterProbeTransientFallsBackBeforeRemainder(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJKLMNOP"), `"v1"`)
+	faulty := &blockReadBlockOneFaultClient{CacheClient: cacheclient.NewMemoryCache()}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(faulty, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	cold := httptest.NewRecorder()
+	if err := svc.HandleGetObject(cold, blockGet(wowBucket, wowKey, "bytes=0-15")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("range-created metadata was not populated")
+	}
+	faulty.fail.Store(true)
+	mock.blockGetTransient = true
+	beforeForwards := mock.forwards.Load()
+	beforeBlockGets := mock.blockGets.Load()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	warm := httptest.NewRecorder()
+	if err := svc.HandleGetObject(warm, blockGet(wowBucket, wowKey, "bytes=0-15").WithContext(ctx)); err != nil {
+		t.Fatalf("later probe failure fallback: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("upstream fallback waited for the request deadline: %v", ctx.Err())
+	}
+	if warm.Code != http.StatusPartialContent || warm.Body.String() != "ABCDEFGHIJKLMNOP" || warm.Header().Get("X-Cache") != XCacheMiss {
+		t.Fatalf("later probe failure = (%d, %q, cache=%q), want full 206/MISS", warm.Code, warm.Body.String(), warm.Header().Get("X-Cache"))
+	}
+	if got := mock.forwards.Load() - beforeForwards; got != 1 {
+		t.Fatalf("later probe failure forwards = %d, want 1", got)
+	}
+	if got := mock.blockGets.Load() - beforeBlockGets; got != 0 {
+		t.Fatalf("later probe failure suffix requests = %d, want 0", got)
 	}
 }
 
@@ -1831,3 +2827,223 @@ func TestBlockCache_SequentialClientWriteFailureDoesNotFetchRemainder(t *testing
 
 // clientForwards reports how many client-range forwards have hit upstream.
 func (m *blockMockForwarder) clientForwards() int32 { return m.forwards.Load() }
+
+// blockPutHookClient fires hook once, synchronously, on the first PutStream of hookKey —
+// letting a test interleave an invalidation with a block assembly in progress.
+type blockPutHookClient struct {
+	cacheclient.CacheClient
+	hookKey string
+	fired   atomic.Bool
+	hook    func()
+}
+
+func (h *blockPutHookClient) PutStream(ctx context.Context, key string, r io.Reader, ttl int64) error {
+	if key == h.hookKey && h.fired.CompareAndSwap(false, true) {
+		h.hook()
+	}
+	return h.CacheClient.PutStream(ctx, key, r, ttl)
+}
+
+type blockMetaTokenErrorClient struct {
+	cacheclient.CacheClient
+	metaKey string
+	failed  atomic.Bool
+}
+
+func (c *blockMetaTokenErrorClient) failMetaTokenRead(key string) bool {
+	return key == c.metaKey && c.failed.CompareAndSwap(false, true)
+}
+
+func (c *blockMetaTokenErrorClient) Get(ctx context.Context, key string) ([]byte, error) {
+	if c.failMetaTokenRead(key) {
+		return nil, errors.New("simulated metadata token read failure")
+	}
+	return c.CacheClient.Get(ctx, key)
+}
+
+func (c *blockMetaTokenErrorClient) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	if c.failMetaTokenRead(key) {
+		return nil, 0, false, errors.New("simulated metadata token read failure")
+	}
+	return c.CacheClient.GetWithVersion(ctx, key)
+}
+
+// A failed decision-time token read must stop range population before fetching blocks or
+// publishing a range certificate, under both supported metadata coordinators.
+func TestBlockCache_RangePopulateSkipsWhenTokenReadFails(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		legacy bool
+	}{
+		{name: "legacy", legacy: true},
+		{name: "cas", legacy: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newBlockMock([]byte("ABCDEFGHIJKLMNOP"), `"v1"`)
+			cfg := config.NewDefault()
+			cfg.Cache.SetBlockCachingEnabled(true)
+			cfg.Cache.SetLegacyCoordination(tc.legacy)
+			cfg.Cache.BlockSize = 4
+			cfg.Cache.SizeThreshold = 1 << 20
+			client := &blockMetaTokenErrorClient{
+				CacheClient: cacheclient.NewMemoryCache(),
+				metaKey:     cache.MakeMetaKey(wowBucket, wowKey),
+			}
+			c := cache.NewCacheWithClient(client, &cfg.Cache)
+			svc := NewService(mock, c, cfg)
+			meta := &cache.CachedObjectMeta{
+				Bucket:        wowBucket,
+				Key:           wowKey,
+				ETag:          `"v1"`,
+				ContentLength: 16,
+				StatusCode:    http.StatusOK,
+				BlockSize:     4,
+			}
+
+			svc.populateBlockMode(context.Background(), wowBucket, wowKey, "ak", "sk", meta, []int64{0, 1})
+			if !client.failed.Load() {
+				t.Fatal("metadata token read was not attempted")
+			}
+			if got := mock.blockGets.Load(); got != 0 {
+				t.Fatalf("block fetches after token read failure = %d, want 0", got)
+			}
+			if _, found, err := c.GetMeta(context.Background(), wowBucket, wowKey); err != nil || found {
+				t.Fatalf("metadata after token read failure = (found=%t, err=%v), want absent", found, err)
+			}
+		})
+	}
+}
+
+// An invalidation after the decision-time token but during the block fetch must reject the
+// metadata commit, so no range certificate can resurrect a deleted entry.
+func TestBlockCache_RangePopulateFenceRejectsMidFetchInvalidation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		legacy bool
+	}{
+		{name: "legacy", legacy: true},
+		{name: "cas", legacy: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newBlockMock([]byte("ABCDEFGHIJKLMNOP"), `"v1"`)
+			cfg := config.NewDefault()
+			cfg.Cache.SetBlockCachingEnabled(true)
+			cfg.Cache.SetLegacyCoordination(tc.legacy)
+			cfg.Cache.BlockSize = 4
+			cfg.Cache.SizeThreshold = 1 << 20
+			hooked := &blockPutHookClient{
+				CacheClient: cacheclient.NewMemoryCache(),
+				hookKey:     cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 0),
+			}
+			c := cache.NewCacheWithClient(hooked, &cfg.Cache)
+			svc := NewService(mock, c, cfg)
+			hooked.hook = func() {
+				if err := c.DeleteWithMeta(context.Background(), wowBucket, wowKey); err != nil {
+					t.Errorf("mid-fetch invalidation: %v", err)
+				}
+			}
+			meta := &cache.CachedObjectMeta{
+				Bucket:        wowBucket,
+				Key:           wowKey,
+				ETag:          `"v1"`,
+				ContentLength: 16,
+				StatusCode:    http.StatusOK,
+				BlockSize:     4,
+			}
+			svc.populateBlockMode(context.Background(), wowBucket, wowKey, "ak", "sk", meta, []int64{0, 1})
+			if !hooked.fired.Load() {
+				t.Fatal("invalidation hook did not run during block fetch")
+			}
+			if got := mock.blockGets.Load(); got != 2 {
+				t.Fatalf("blocks fetched before range metadata commit = %d, want 2", got)
+			}
+			if _, found, err := c.GetMeta(context.Background(), wowBucket, wowKey); err != nil || found {
+				t.Fatalf("metadata after mid-fetch invalidation = (found=%t, err=%v), want absent", found, err)
+			}
+		})
+	}
+}
+
+// An invalidation landing DURING the full-GET assembly must refuse the
+// blocks-complete promotion: the promotion's token is read before assembly, so
+// the mid-assembly delete + same-ETag re-establishment (whose blocks the
+// promotion knows nothing about) stays !BlocksComplete. Regression test for
+// the post-assembly token read, under the default legacy coordination.
+func TestBlockCache_PromotionRefusedWhenInvalidationRacesAssembly(t *testing.T) {
+	mock := newBlockMock([]byte("ABCDEFGHIJ"), `"v1"`)
+	hooked := &blockPutHookClient{
+		CacheClient: cacheclient.NewMemoryCache(),
+		hookKey:     cache.MakeBlockKey(wowBucket, wowKey, `"v1"`, 4, 2),
+	}
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(true)
+	cfg.Cache.BlockSize = 4
+	cfg.Cache.SizeThreshold = 1 << 20
+	c := cache.NewCacheWithClient(hooked, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// The moment assembly writes the missing block: invalidate, then
+	// re-establish the same-ETag entry (as a fresh partial populate would).
+	hooked.hook = func() {
+		ctx := context.Background()
+		prior, found, _ := c.GetMeta(ctx, wowBucket, wowKey)
+		if !found {
+			t.Error("hook: no meta to displace")
+			return
+		}
+		if err := c.DeleteWithMeta(ctx, wowBucket, wowKey); err != nil {
+			t.Errorf("hook: invalidation: %v", err)
+			return
+		}
+		_, tok, _, _ := c.GetMetaWithVersion(ctx, wowBucket, wowKey)
+		fresh := *prior
+		fresh.BlocksComplete = false
+		if wrote, err := c.PutMetaIfVersion(ctx, wowBucket, wowKey, &fresh, 60, tok); err != nil || !wrote {
+			t.Errorf("hook: re-establish: wrote=%v err=%v", wrote, err)
+		}
+	}
+
+	// Partial entry via a cold range miss (blocks 0,1 of 3).
+	w := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w, blockGet(wowBucket, wowKey, "bytes=0-7")); err != nil {
+		t.Fatalf("cold range miss: %v", err)
+	}
+	if !metaCached(c, wowBucket, wowKey, 2*time.Second) {
+		t.Fatal("meta not populated")
+	}
+
+	// The refused promotion is observable as a precondition_lost meta_put — the
+	// only such refusal in this flow (the hook's own re-establishment is checked
+	// to succeed), so waiting on it synchronizes with the fire-and-forget
+	// promotion goroutine instead of racing it with a fixed sleep.
+	lostBefore := testutil.ToFloat64(metrics.CacheOperations.WithLabelValues("meta_put", "precondition_lost"))
+
+	// Full GET assembles block 2 (firing the hook mid-assembly) and serves.
+	w2 := httptest.NewRecorder()
+	if err := svc.HandleGetObject(w2, fullGet(wowBucket, wowKey)); err != nil {
+		t.Fatalf("full GET: %v", err)
+	}
+	if w2.Code != http.StatusOK || w2.Body.String() != "ABCDEFGHIJ" {
+		t.Fatalf("full GET: code=%d body=%q", w2.Code, w2.Body.String())
+	}
+	if !hooked.fired.Load() {
+		t.Fatal("hook never fired: assembly did not write the missing block")
+	}
+
+	// The displaced assembly's promotion must be attempted AND refused; the
+	// re-established entry stays !BlocksComplete throughout.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m, found, _ := c.GetMeta(context.Background(), wowBucket, wowKey)
+		if found && m.BlocksComplete {
+			t.Fatal("promotion committed over a mid-assembly invalidation")
+		}
+		if testutil.ToFloat64(metrics.CacheOperations.WithLabelValues("meta_put", "precondition_lost")) > lostBefore {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("promotion refusal never observed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

@@ -162,15 +162,34 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 	return nil
 }
 
+// ErrBodyLengthMismatch is returned by PutWithMetaStreamIfVersion when the
+// number of body bytes the store consumed differs from meta.ContentLength. The
+// metadata is not written in that case, so the entry never becomes visible.
+var ErrBodyLengthMismatch = errors.New("cache body length mismatch")
+
+// countingReader counts the bytes read through it.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
 // PutWithMetaStreamIfVersion is like PutWithMetaStream but commits the
 // metadata under the caller's decision-time version precondition (see
 // putMetaVersioned): body first, then the meta write that makes the entry
 // visible — refused atomically if the entry changed (including a fenced
 // delete) since the caller's token was read.
 //
-// The expected version is the meta write's precondition: 0 for legacy
-// unordered put-if-absent, a decision-time token (live version or absence
-// token) for an ordered populate, VersionAny for last-write-wins.
+// The expected version is the meta write's precondition: a decision-time
+// token (live version or absence token) for an ordered populate, VersionAny
+// for last-write-wins. 0 is unordered put-if-absent under the CAS
+// coordinator but is REFUSED by the legacy coordinator (nothing to order
+// against) — production callers always carry a nonzero token.
 //
 // Returns wrote=true only when the metadata was actually written (the entry
 // is now visible). It is false when the write was skipped without error — the
@@ -213,9 +232,28 @@ func (c *Cache) PutWithMetaStreamIfVersion(
 		return false, err
 	}
 
-	// Stream body to cache
-	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
+	// Stream body to cache, counting the bytes the store actually consumed so
+	// the meta commit below can be refused for a body that does not match the
+	// declared length.
+	counted := &countingReader{r: body}
+	if err := c.client.PutStream(ctx, bodyKey, counted, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
+		return false, err
+	}
+
+	// The body must be exactly ContentLength before the meta makes it visible.
+	// This mirrors putBlocksFromStream: a short body means the upstream stream
+	// ended (or was cut) before Content-Length, and a long one is a malformed
+	// upstream; either way a committed meta would claim a length the stored
+	// body does not have, and a later hit would serve truncated or overlong
+	// bytes under a full Content-Length. The producer side is responsible for
+	// failing the pipe on a cut stream; this guard is the last line of defense
+	// when that signal is lost (a store that accepts a short read as EOF, a
+	// listener that closed without an error chunk). The versioned body is left
+	// to age out via TTL, for the same reason as a lost precondition below.
+	if meta.ContentLength >= 0 && counted.n != meta.ContentLength {
+		err := fmt.Errorf("%w: wrote %d bytes, Content-Length %d", ErrBodyLengthMismatch, counted.n, meta.ContentLength)
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body length mismatch; meta not written")
 		return false, err
 	}
 
@@ -303,6 +341,34 @@ func (c *Cache) GetMeta(ctx context.Context, bucket, key string) (*CachedObjectM
 // Use this after GetMeta(), passing the meta's ETag so the body read resolves to
 // the exact version the metadata describes. Returns ErrNotFound if the body for
 // that version is not in cache.
+// PutBodyStream streams a whole-object body into the cache under the given
+// discriminator (an ETag for content-addressed entries, a NewBodyRef id for
+// the engine's streamed writes, where the ETag is unknown until EOF). Body
+// only — the entry becomes visible when its metadata commits; a body whose
+// meta never commits is an orphan that ages out by TTL, the same lifecycle
+// as a displaced version.
+func (c *Cache) PutBodyStream(ctx context.Context, bucket, key, discriminator string, r io.Reader, ttl int64) error {
+	if !c.IsEnabled() {
+		_, _ = io.Copy(io.Discard, r) // drain so a pipe producer never blocks
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = c.defaultTTL
+	}
+	return c.client.PutStream(ctx, MakeBodyKey(bucket, key, discriminator), r, ttl)
+}
+
+// DeleteBody removes one staged or orphaned body by its discriminator. Used
+// by the engine's PUT abort paths (overrun, digest mismatch, refused
+// conditional) to reclaim a body whose metadata will never commit; TTL is
+// the backstop when this best-effort delete fails.
+func (c *Cache) DeleteBody(ctx context.Context, bucket, key, discriminator string) error {
+	if !c.IsEnabled() {
+		return nil
+	}
+	return c.client.Delete(ctx, MakeBodyKey(bucket, key, discriminator))
+}
+
 func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w io.Writer) error {
 	if !c.IsEnabled() {
 		return ErrCacheDisabled
@@ -379,6 +445,19 @@ func (c *Cache) Delete(ctx context.Context, bucket, key string) error {
 	}
 
 	return c.DeleteWithMeta(ctx, bucket, key)
+}
+
+// DeleteMetaIfVersion invalidates the object's metadata only while it still
+// carries the observed version token (from GetMetaWithVersion): the guard is
+// the exact snapshot the caller examined, so an entry replaced in between —
+// even by identical content reusing the same MD5 ETag — refuses the delete.
+// Returns (false, nil) when replaced or absent. CAS-coordinator strength; the
+// legacy coordinator refuses (see coordinator.go).
+func (c *Cache) DeleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error) {
+	if !c.IsEnabled() {
+		return false, nil
+	}
+	return c.coord.deleteMetaIfVersion(ctx, bucket, key, version)
 }
 
 // DeleteIfETag invalidates the object's metadata only while it still carries
@@ -529,6 +608,23 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 		Int64("length", end-start+1).
 		Msg("Cache hit (range)")
 	return nil
+}
+
+// BodyExistsErr reports whether a whole-object body is present, with the same
+// error contract as BlockExistsErr: genuine absence is (false, nil), a transient
+// probe failure is (false, err). Same first-byte probe, on the body key.
+func (c *Cache) BodyExistsErr(ctx context.Context, bucket, key, etag string) (present bool, err error) {
+	if !c.IsEnabled() || etag == "" {
+		return false, nil
+	}
+	e := c.getRangeStreamByKey(ctx, MakeBodyKey(bucket, key, etag), bucket, key, 0, 0, io.Discard)
+	if e == nil {
+		return true, nil
+	}
+	if errors.Is(e, ErrNotFound) {
+		return false, nil // genuinely absent
+	}
+	return false, e // transient failure — not proof of absence
 }
 
 // BlockExists reports whether the given block of a block-mode object is present in cache.

@@ -888,8 +888,9 @@ func TestIsTigrisEndpoint(t *testing.T) {
 	}{
 		{"tigris.dev domain", "https://fly.storage.tigris.dev", true},
 		{"storage.dev domain", "https://t3.storage.dev", true},
-		{"localhost", "http://localhost:8080", true},
-		{"localhost no port", "http://localhost", true},
+		{"mixed-case tigris host", "https://T3.Storage.Dev", true},
+		{"localhost is not Tigris", "http://localhost:8080", false},
+		{"localhost no port is not Tigris", "http://localhost", false},
 		{"third-party s3", "https://s3.amazonaws.com", false},
 		{"minio", "http://minio.internal:9000", false},
 		{"not a suffix match", "https://nottrigris.dev", false},
@@ -902,6 +903,27 @@ func TestIsTigrisEndpoint(t *testing.T) {
 				t.Errorf("IsTigrisEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.want)
 			}
 		})
+	}
+}
+
+// The transparent-mode allowlist admits Tigris domains and localhost (any
+// case) for local testing, and nothing else.
+func TestIsTransparentEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     bool
+	}{
+		{"https://t3.storage.dev", true},
+		{"http://localhost:8080", true},
+		{"http://Localhost", true},
+		{"http://LOCALHOST:9000", true},
+		{"http://minio.internal:9000", false},
+		{"https://s3.amazonaws.com", false},
+	}
+	for _, tt := range tests {
+		if got := IsTransparentEndpoint(tt.endpoint); got != tt.want {
+			t.Errorf("IsTransparentEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.want)
+		}
 	}
 }
 

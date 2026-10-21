@@ -58,6 +58,13 @@ type metaCoordinator interface {
 	// deleteMetaIfETag invalidates only while the entry still carries
 	// staleETag. Returns (false, nil) when absent, different, or replaced.
 	deleteMetaIfETag(ctx context.Context, bucket, key, staleETag string) (bool, error)
+	// deleteMetaIfVersion invalidates only while the entry still carries the
+	// caller's observed version token — a check-then-delete whose guard is
+	// exactly the check's snapshot, unlike deleteMetaIfETag's content ETag
+	// (which identical bytes can reuse across entries and tiers). CAS-
+	// coordinator strength: legacy coordination stores no versions to compare
+	// and refuses with (false, nil).
+	deleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error)
 }
 
 // ============================================================================
@@ -194,6 +201,21 @@ func (c *casCoordinator) deleteMetaIfETag(ctx context.Context, bucket, key, stal
 	return true, nil
 }
 
+func (c *casCoordinator) deleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error) {
+	if derr := c.client.DeleteIfVersion(ctx, MakeMetaKey(bucket, key), version); derr != nil {
+		if _, mismatch := cacheclient.IsVersionMismatch(derr); mismatch {
+			// Replaced (or removed) since the caller's read: the newer state
+			// wins — exactly what the guard exists for.
+			return false, nil
+		}
+		if isNotFoundError(derr) {
+			return false, nil
+		}
+		return false, fmt.Errorf("version-guarded meta delete: %w", derr)
+	}
+	return true, nil
+}
+
 // ============================================================================
 // Legacy coordinator — timestamp tombstones, byte-faithful to v1.20
 // ============================================================================
@@ -256,6 +278,15 @@ func (c *legacyCoordinator) getMetaWithVersion(ctx context.Context, bucket, key 
 }
 
 func (c *legacyCoordinator) putMeta(ctx context.Context, bucket, key, metaKey string, metaBytes []byte, ttl int64, expected uint64) (bool, error) {
+	if expected == 0 {
+		// No decision-time token to order against. The CAS coordinator's
+		// expected==0 is unordered put-if-absent; that has no tombstone
+		// analogue, and writing here could resurrect an invalidated entry.
+		// Refuse — a skipped cache write is always safe. Production callers
+		// always carry a nonzero token (legacy stamps are wall-clock nanos).
+		metrics.RecordCacheOperation("meta_put", "precondition_lost")
+		return false, nil
+	}
 	if expected != VersionAny {
 		// Tombstone gate right before the visibility-granting meta write: an
 		// invalidation at or after the caller's decision-time stamp blocks the
@@ -335,4 +366,13 @@ func (c *legacyCoordinator) tombstoneTimestamp(ctx context.Context, bucket, key 
 		return 0
 	}
 	return int64(binary.BigEndian.Uint64(data))
+}
+
+// deleteMetaIfVersion is a CAS-strength identity delete: legacy coordination
+// stores no versions (its tokens are wall-clock stamps never persisted with
+// the row), so there is nothing to compare the caller's token against and the
+// only safe answer is to refuse. Its sole caller (the tiered cleanup repair)
+// runs under CAS coordination by construction — tiered mode rejects legacy.
+func (c *legacyCoordinator) deleteMetaIfVersion(ctx context.Context, bucket, key string, version uint64) (bool, error) {
+	return false, nil
 }

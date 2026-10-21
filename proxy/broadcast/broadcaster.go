@@ -62,6 +62,8 @@ const (
 // The client will see a truncated response and S3 SDKs will automatically retry.
 var ErrSlowConsumer = errors.New("slow consumer")
 
+var errCompletedBeforeHeaders = errors.New("broadcast completed before response headers")
+
 // Chunk represents a piece of streamed data.
 // Consumers should call Release() after processing Data to return the
 // underlying buffer to the pool. If Release() is not called, the buffer
@@ -90,24 +92,34 @@ type Listener struct {
 	ch           chan Chunk
 	headers      http.Header
 	status       int
-	headerCh     chan struct{} // Closed when headers are available
+	headerCh     chan struct{} // Closed when headers or a pre-header completion are available
+	headerErr    error         // Set when the broadcast completes before response headers
 	disconnected bool          // True if disconnected due to slow consumption
+	termErr      error         // Terminal error, written under Broadcaster.mu before ch is closed
 }
 
-// WaitForHeaders blocks until headers are available. If headers and context
-// cancellation become ready together, headers win. A cache listener can be
-// scheduled after its request handler returns, when both are already ready; it
+// WaitForHeaders blocks until headers are available, the broadcast completes
+// before headers, or the context is canceled. Successful headers still win over
+// concurrent cancellation; a pre-header error is returned only while the
+// request context remains live. A cache listener can be scheduled after its
+// request handler returns, when headers and cancellation are both ready; it
 // must still consume the completed response and publish the cache entry.
 func (l *Listener) WaitForHeaders(ctx context.Context) (int, http.Header, error) {
 	select {
 	case <-l.headerCh:
-		return l.status, l.headers, nil
+		if l.headerErr != nil && ctx.Err() != nil {
+			return 0, nil, ctx.Err()
+		}
+		return l.status, l.headers, l.headerErr
 	case <-ctx.Done():
 		// A select chooses randomly when both channels are ready. Re-check the
-		// headers so a completed response wins over concurrent cancellation, while
-		// still honoring cancellation when headers have not arrived.
+		// headers so a completed response wins over cancellation, but keep
+		// cancellation authoritative when the broadcast completed before headers.
 		select {
 		case <-l.headerCh:
+			if l.headerErr != nil {
+				return 0, nil, ctx.Err()
+			}
 			return l.status, l.headers, nil
 		default:
 			return 0, nil, ctx.Err()
@@ -116,8 +128,47 @@ func (l *Listener) WaitForHeaders(ctx context.Context) (int, http.Header, error)
 }
 
 // Chunks returns the channel to receive chunks.
+//
+// The channel delivers every data chunk the broadcaster managed to queue, in
+// order, followed by at most one Chunk{Err: ...}. When the listener's queue was
+// full at the moment it failed there is no room for that error chunk, so the
+// channel simply closes after the last data chunk. Consumers that see the
+// channel close without an error chunk must call Err() to learn whether the
+// stream ended cleanly or was cut short.
 func (l *Listener) Chunks() <-chan Chunk {
 	return l.ch
+}
+
+// Err returns the listener's terminal error: nil when the broadcast completed
+// successfully, otherwise the error that ended the stream (ErrSlowConsumer for
+// a slow-consumer disconnect, or the broadcaster's completion error).
+//
+// It is only meaningful once Chunks() has been closed, i.e. after a range loop
+// over Chunks() has ended. The field is written under Broadcaster.mu before the
+// channel is closed, and a receive that returns because the channel is closed
+// happens-after that close, so a consumer that has drained Chunks() reads it
+// without further synchronization. Calling it earlier is a data race.
+func (l *Listener) Err() error {
+	return l.termErr
+}
+
+// closeWithError records the terminal error and closes the listener. The caller
+// must hold Broadcaster.mu, which excludes other senders.
+//
+// The error is published two ways: it is stored in termErr (always), and a
+// Chunk{Err: err} is queued on a best-effort basis (only when the buffer has
+// room). A full buffer is never disturbed: channels are FIFO, so making room by
+// displacing a queued chunk would drop the OLDEST unread chunk and hand the
+// consumer the next one at the wrong offset, i.e. wrong bytes on the wire. No
+// data chunk is ever dropped or reordered; a consumer that drains to a close
+// without seeing an error chunk must consult Err().
+func (l *Listener) closeWithError(err error) {
+	l.termErr = err
+	select {
+	case l.ch <- Chunk{Err: err}:
+	default:
+	}
+	close(l.ch)
 }
 
 // DrainAndRelease drains remaining chunks from the listener channel,
@@ -182,10 +233,30 @@ func (b *Broadcaster) Subscribe() *Listener {
 		headerCh: make(chan struct{}),
 	}
 
-	// If headers already set, copy them and close headerCh
 	if b.headerSet {
 		l.headers = b.headers.Clone()
 		l.status = b.status
+	}
+
+	if b.done {
+		// A no-body success or a pre-header failure leaves streaming false. A
+		// subscriber arriving before Manager removes that completed broadcast
+		// must receive its terminal result rather than wait on an already-finished
+		// producer.
+		if !b.headerSet {
+			l.headerErr = b.err
+		}
+		close(l.headerCh)
+		l.termErr = b.err
+		if b.err != nil {
+			l.ch <- Chunk{Err: b.err}
+		}
+		close(l.ch)
+		return l
+	}
+
+	// If headers are already set, this listener is immediately ready.
+	if b.headerSet {
 		close(l.headerCh)
 	}
 
@@ -341,13 +412,14 @@ func (b *Broadcaster) broadcastOwnedLocked(data []byte) bool {
 	}
 }
 
+// disconnectSlowConsumer marks l as disconnected and closes it through
+// closeWithError so the terminal error is recorded in termErr and no queued data
+// chunk is displaced. Callers must hold Broadcaster.mu and must not have handed
+// the current chunk to l: on this path the chunk was never queued, so the
+// caller still owns (and is responsible for releasing or retaining) it.
 func disconnectSlowConsumer(l *Listener) {
 	l.disconnected = true
-	select {
-	case l.ch <- Chunk{Err: ErrSlowConsumer}:
-	default:
-	}
-	close(l.ch)
+	l.closeWithError(ErrSlowConsumer)
 	log.Warn().Msg("Disconnecting slow consumer from broadcast (buffer full)")
 }
 
@@ -362,19 +434,27 @@ func (b *Broadcaster) Complete(err error) {
 
 	b.done = true
 	b.err = err
+	if !b.headerSet {
+		if b.err == nil {
+			b.err = errCompletedBeforeHeaders
+		}
+		// A pre-header completion is the listener's terminal result. Publish it
+		// before waking header waiters so they can return the original error.
+		for _, l := range b.listeners {
+			l.headerErr = b.err
+			close(l.headerCh)
+		}
+	}
 	close(b.doneCh)
 
-	// Send final chunk and close all listener channels.
-	// Non-blocking send: if buffer is full, skip the error chunk.
-	// Correctness is guaranteed by the version preconditions on cache writes,
-	// which prevents stale data from being cached even if error delivery fails.
+	// Record the terminal result on every listener and close its channel. The
+	// error chunk is best-effort (skipped when the buffer is full); queued data
+	// chunks are always retained. A consumer that drains to the close without an
+	// error chunk learns the outcome from Listener.Err(), so a failed completion
+	// can never be mistaken for a clean EOF.
 	for _, l := range b.listeners {
 		if !l.disconnected {
-			select {
-			case l.ch <- Chunk{Err: err}:
-			default:
-			}
-			close(l.ch)
+			l.closeWithError(b.err)
 		}
 	}
 }

@@ -38,6 +38,10 @@ Send `Cache-Control: no-store` to skip the cache entirely. TAG forwards the requ
 curl -H "Cache-Control: no-store" http://localhost:8080/my-bucket/my-key
 ```
 
+For CopyObject requests, `Cache-Control: no-store` or `private` also skips TAG's
+post-copy cache warming. The copy still uses the normal destination invalidation
+path.
+
 ## Automatic Cache Invalidation
 
 TAG automatically invalidates cached objects when they are modified through TAG:
@@ -46,6 +50,8 @@ TAG automatically invalidates cached objects when they are modified through TAG:
 - **DeleteObject** — Cache entry deleted before forwarding the delete
 - **DeleteObjects** (bulk) — Cache entries deleted for all keys in the request
 - **CopyObject** — Cache entry deleted for the destination key
+
+For a cacheable whole-object GET miss, metadata becomes visible only after its cache write consumes the broadcast stream successfully. If the cache listener is dropped or the upstream body read fails, the partial body is not published as a new entry.
 
 Objects modified directly on Tigris (bypassing TAG) remain in cache until they expire (default TTL: 24 hours, configurable via `TAG_CACHE_TTL`) or are revalidated via `Cache-Control: no-cache`.
 

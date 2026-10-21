@@ -10,7 +10,7 @@ import (
 
 const (
 	// CompletionCacheTTL is the TTL for completion cache entries in seconds.
-	// tigris-os uses 1 second; we use 5 seconds for safety margin.
+	// Chosen with margin over the upstream implementation-observed window.
 	CompletionCacheTTL = 5
 
 	// completionKeyPrefix is the prefix for completion cache keys.
