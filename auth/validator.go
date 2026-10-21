@@ -24,11 +24,21 @@ var (
 
 	// ErrMissingContentHash is returned when X-Amz-Content-Sha256 header is required but missing.
 	ErrMissingContentHash = errors.New("missing X-Amz-Content-Sha256 header")
+
+	// ErrInvalidExpires is returned when a presigned URL's X-Amz-Expires is
+	// missing, repeated, not an integer, or outside [1, maxPresignedExpires].
+	ErrInvalidExpires = errors.New("invalid X-Amz-Expires")
 )
 
 const (
 	// maxRequestAge is the maximum age of a request before it's considered expired.
+	// It is also the tolerated clock skew: a request dated further than this in
+	// the future is rejected.
 	maxRequestAge = 15 * time.Minute
+
+	// maxPresignedExpires is the largest X-Amz-Expires a presigned URL may carry,
+	// in seconds (seven days, matching AWS).
+	maxPresignedExpires int64 = 604800
 )
 
 // RequestValidator validates incoming AWS SigV4 signed requests.
@@ -67,8 +77,9 @@ func (vr *ValidatedRequest) ChunkVerifier() *ChunkVerifier {
 }
 
 // ValidateRequest validates the AWS SigV4 signature of an incoming request.
-// This requires the X-Amz-Content-Sha256 header to be present (all AWS SDKs set this).
-// This enables zero-copy streaming of the request body.
+// Header-authenticated requests and non-GET requests require X-Amz-Content-Sha256.
+// Presigned GETs use UNSIGNED-PAYLOAD and may omit the header.
+// The header lets uploads be validated without buffering the request body.
 // Returns the access key if validation succeeds, or an error if it fails.
 func (v *RequestValidator) ValidateRequest(r *http.Request) (string, error) {
 	vr, err := v.Validate(r)
@@ -81,16 +92,19 @@ func (v *RequestValidator) ValidateRequest(r *http.Request) (string, error) {
 // Validate is ValidateRequest returning the full validation outcome, for
 // callers that must go on to verify a signed streaming body.
 func (v *RequestValidator) Validate(r *http.Request) (*ValidatedRequest, error) {
-	// Require X-Amz-Content-Sha256 header - all AWS SDKs set this
 	bodyHash := r.Header.Get("X-Amz-Content-Sha256")
-	if bodyHash == "" {
-		return nil, ErrMissingContentHash
-	}
 
-	// Parse auth info
+	// Classify the authentication form before enforcing the hash requirement:
+	// a presigned GET uses UNSIGNED-PAYLOAD and does not need this header.
 	authInfo, err := ParseAuthInfo(r)
 	if err != nil {
+		if bodyHash == "" {
+			return nil, ErrMissingContentHash
+		}
 		return nil, fmt.Errorf("failed to parse auth: %w", err)
+	}
+	if bodyHash == "" && (!authInfo.IsPresigned || r.Method != http.MethodGet) {
+		return nil, ErrMissingContentHash
 	}
 
 	// Get the date string for signing key lookup
@@ -173,6 +187,12 @@ func (v *RequestValidator) validateSigned(r *http.Request, authInfo *AuthInfo, s
 
 // validatePresigned validates a presigned URL request and returns the signing
 // time the signature was verified under.
+//
+// Beyond the signature, a presigned URL must satisfy the AWS rules for its
+// lifetime: X-Amz-Expires is mandatory, appears exactly once, is an integer in
+// [1, maxPresignedExpires], the URL is rejected once that many seconds have
+// passed since X-Amz-Date, and X-Amz-Date may not sit more than maxRequestAge
+// in the future (the same clock-skew tolerance header-signed requests get).
 func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo, signingKey []byte) (time.Time, error) {
 	query := r.URL.Query()
 
@@ -187,13 +207,22 @@ func (v *RequestValidator) validatePresigned(r *http.Request, authInfo *AuthInfo
 		return time.Time{}, ErrInvalidDate
 	}
 
-	// Check expires
-	expiresStr := query.Get("X-Amz-Expires")
-	if expiresStr != "" {
-		expires, err := strconv.Atoi(expiresStr)
-		if err == nil && time.Since(requestTime) > time.Duration(expires)*time.Second {
-			return time.Time{}, ErrExpiredRequest
-		}
+	// Check expires. The range check runs before the Duration conversion so
+	// the multiplication below can never overflow.
+	expiresValues := query["X-Amz-Expires"]
+	if len(expiresValues) != 1 {
+		return time.Time{}, ErrInvalidExpires
+	}
+	expires, err := strconv.ParseInt(expiresValues[0], 10, 64)
+	if err != nil || expires < 1 || expires > maxPresignedExpires {
+		return time.Time{}, ErrInvalidExpires
+	}
+	age := time.Since(requestTime)
+	if age < -maxRequestAge {
+		return time.Time{}, ErrExpiredRequest
+	}
+	if age > time.Duration(expires)*time.Second {
+		return time.Time{}, ErrExpiredRequest
 	}
 
 	// For presigned URLs, body hash is typically UNSIGNED-PAYLOAD

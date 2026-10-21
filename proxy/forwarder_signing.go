@@ -21,12 +21,22 @@ type signingForwarder struct {
 	validator *auth.RequestValidator
 }
 
+// validateRequest keeps signing mode's historical payload-hash requirement.
+// URL-only presigned GETs are enabled for transparent local authentication, not
+// for this forwarder's credential-translating request path.
+func (f *signingForwarder) validateRequest(r *http.Request) (*auth.ValidatedRequest, error) {
+	if r.Header.Get("X-Amz-Content-Sha256") == "" {
+		return nil, auth.ErrMissingContentHash
+	}
+	return f.validator.Validate(r)
+}
+
 // validate validates the incoming request signature and looks up the secret key
 // to re-sign with. The validation outcome carries the signing material a signed
 // streaming body's chunk chain is verified against, so it must come BEFORE the
 // body is decoded.
 func (f *signingForwarder) validate(r *http.Request) (*auth.ValidatedRequest, string, error) {
-	vr, err := f.validator.Validate(r)
+	vr, err := f.validateRequest(r)
 	if err != nil {
 		log.Warn().Err(err).Str("path", r.URL.Path).Msg("Request signature validation failed")
 		return nil, "", mapAuthError(err)

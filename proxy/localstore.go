@@ -205,6 +205,8 @@ func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *c
 	if meta.ContentLength == 0 {
 		return true, nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, cacheReadTimeoutForSize(0))
+	defer cancel()
 	return s.cache.BodyExistsErr(ctx, bucket, key, meta.BodyDiscriminator())
 }
 

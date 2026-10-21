@@ -59,7 +59,50 @@ const (
 	// Used to compute dynamic timeouts for large objects.
 	// 5 MB/s is conservative for local disk writes.
 	minCacheWriteThroughput = 5 * 1024 * 1024 // 5 MB/s
+
+	// cacheReadTimeout is the floor for a single cache read (a presence probe or
+	// the first bytes of a body). Cache reads go to remote peer pods over gRPC,
+	// so it must absorb a cluster-wide hiccup without failing healthy reads.
+	cacheReadTimeout = 30 * time.Second
+
+	// minCacheReadThroughput is the per-byte allowance added to cacheReadTimeout.
+	// Only buffered reads use it (the client never paces those), so it is a
+	// generous lower bound on peer-to-pod gRPC throughput.
+	minCacheReadThroughput = 1024 * 1024 // 1 MiB/s
+
+	// maxCacheReadTimeout caps the read deadline at the server's WriteTimeout
+	// (handlers/server.go): a read that outlives the response cannot help it.
+	maxCacheReadTimeout = 5 * time.Minute
 )
+
+// cacheStreamReadTimeout bounds a cache read whose destination is the client: the
+// response writer is the read's sink, so the client paces the read and a
+// size-scaled bound would cut off a slow-but-progressing client earlier than
+// the server itself does. The flat cap only restates the bound the server's
+// WriteTimeout already enforces, so it can never truncate a response that would
+// otherwise have completed. It is a variable so tests can inject a short deadline.
+var cacheStreamReadTimeout = maxCacheReadTimeout
+
+// cacheReadTimeoutForSize bounds one cache read of n bytes INTO A BUFFER (or a
+// presence probe) with a size-scaled deadline, mirroring cacheWriteTimeoutForSize:
+// cacheReadTimeout plus one second per minCacheReadThroughput, capped at
+// maxCacheReadTimeout. n <= 0 (a presence probe) gets the floor. Without it a
+// stalled peer read holds the request until the client disconnects or the
+// server's WriteTimeout fires. The deadline never extends the caller's own: a
+// shorter parent deadline still wins. Reads that stream straight to the client
+// use cacheStreamReadTimeout instead.
+//
+// A timeout is an ordinary transient read error on every path: bodyGone and the
+// block-stream salvage already classify context.DeadlineExceeded as "not
+// evidence the body is gone", so a slow peer never evicts a still-valid entry.
+// It is a variable so tests can inject a short deadline.
+var cacheReadTimeoutForSize = func(n int64) time.Duration {
+	timeout := cacheReadTimeout
+	if n > 0 {
+		timeout += time.Duration(n/minCacheReadThroughput) * time.Second
+	}
+	return min(timeout, maxCacheReadTimeout)
+}
 
 // errCachePopulateDeclined signals that a background cache populate was
 // deliberately skipped because the concurrent-cache-write limit was saturated.
@@ -133,6 +176,17 @@ func (r *contextBoundReader) Read(p []byte) (int, error) {
 		return n, ctxErr
 	}
 	return n, err
+}
+
+// cachePipeReadError keeps EOF-shaped terminal failures distinguishable from a
+// clean short value. The embedded cache's inline size probe accepts io.EOF and
+// io.ErrUnexpectedEOF as normal short-value terminators, so a failed broadcast
+// carrying either sentinel must be wrapped before it reaches that reader.
+func cachePipeReadError(err error) error {
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return fmt.Errorf("cache stream failed: %w", err)
+	}
+	return err
 }
 
 // waitForCacheWrite waits for a detached cache writer while retaining the
@@ -347,6 +401,13 @@ func (s *Service) setupCacheListener(
 			for chunk := range listener.Chunks() {
 				chunk.Release()
 			}
+		} else if err := listener.Err(); err != nil {
+			// The channel closed without room for an error chunk (a slow-consumer
+			// disconnect or a failed completion against a full queue). Every queued
+			// data chunk was delivered above; the terminal error is only recorded
+			// on the listener. Treat it exactly like an error chunk so the pipe
+			// fails and no metadata is committed for the truncated body.
+			chunkErr = err
 		}
 
 		// Close queue to signal pipe writer to finish
@@ -357,14 +418,14 @@ func (s *Service) setupCacheListener(
 
 		// Close the pipe to signal EOF to the reader
 		if chunkErr != nil {
-			pipeWriter.CloseWithError(chunkErr)
+			pipeWriter.CloseWithError(cachePipeReadError(chunkErr))
 		} else if pipeWriteErr != nil {
-			pipeWriter.CloseWithError(pipeWriteErr)
+			pipeWriter.CloseWithError(cachePipeReadError(pipeWriteErr))
 		} else if relayErr != nil {
 			// A relay deadline can stop forwarding after the cache queue fills.
 			// Do not turn that incomplete stream into a clean EOF that can publish
 			// metadata for a truncated whole-body cache entry.
-			pipeWriter.CloseWithError(relayErr)
+			pipeWriter.CloseWithError(cachePipeReadError(relayErr))
 		} else {
 			pipeWriter.Close()
 		}

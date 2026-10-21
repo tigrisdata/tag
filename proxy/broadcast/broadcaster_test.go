@@ -1,6 +1,7 @@
 package broadcast
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -166,6 +167,7 @@ func TestBroadcasterSlowConsumerDisconnect(t *testing.T) {
 				return
 			}
 			fastReceived = append(fastReceived, chunk.Data...)
+			chunk.Release()
 		}
 	}()
 
@@ -190,12 +192,16 @@ func TestBroadcasterSlowConsumerDisconnect(t *testing.T) {
 				return
 			}
 			received += len(chunk.Data)
+			chunk.Release()
 		}
-		// Channel closed without error chunk (buffer was full)
+		// The queue was full when the broadcaster disconnected this listener, so
+		// there was no room for an error chunk: the terminal error is only
+		// recorded on the listener. A nil Err() here is the failure this test
+		// is meant to catch.
 		slowResult <- struct {
 			err          error
 			receivedData int
-		}{nil, received}
+		}{slowListener.Err(), received}
 	}()
 
 	// Broadcast many chunks quickly to overflow slow consumer's buffer
@@ -210,16 +216,12 @@ func TestBroadcasterSlowConsumerDisconnect(t *testing.T) {
 
 	<-fastDone
 
-	// Slow consumer should either:
-	// 1. Get ErrSlowConsumer if error chunk was sent before buffer filled
-	// 2. Get channel closed with partial data (buffer was completely full when disconnected)
+	// A slow consumer must receive the terminal error even when its queue was full.
 	select {
 	case result := <-slowResult:
-		if result.err != nil && result.err != ErrSlowConsumer {
-			t.Errorf("Slow consumer got unexpected error: %v", result.err)
+		if result.err != ErrSlowConsumer {
+			t.Errorf("Slow consumer error = %v, want %v", result.err, ErrSlowConsumer)
 		}
-		// Either ErrSlowConsumer or nil (channel closed) is acceptable
-		// The important thing is that slow consumer was disconnected (received less data than fast)
 		t.Logf("Slow consumer received %d bytes, err=%v", result.receivedData, result.err)
 	case <-time.After(2 * time.Second):
 		t.Error("Timeout waiting for slow consumer to finish")
@@ -592,4 +594,145 @@ func TestConcurrentRequestsCoalescing(t *testing.T) {
 	}
 
 	t.Logf("Coalesced %d requests into %d fetches (%d subscribed)", numRequests, fetchCount, subscribedCount)
+}
+
+// A slow-consumer disconnect against a full queue must never cost the consumer
+// a data chunk: every chunk that was queued is delivered, in order, and the
+// disconnect is then surfaced via Err(). The old behaviour displaced the OLDEST
+// queued chunk to make room for the error chunk, which handed the consumer
+// chunk k+1 at chunk k's offset (a hole in the body) before it learned anything
+// was wrong.
+func TestBroadcasterSlowConsumerDeliversQueuedChunksInOrder(t *testing.T) {
+	const buf = 4
+	b := NewBroadcaster(buf)
+	l := b.Subscribe()
+	if l == nil {
+		t.Fatal("Subscribe failed")
+	}
+	b.SetHeaders(http.StatusOK, http.Header{})
+
+	// Fill the queue exactly, then overflow it by one: the listener is now
+	// disconnected with a full buffer and no room for an error chunk.
+	for i := 0; i < buf+1; i++ {
+		b.Broadcast([]byte{byte(i)})
+	}
+	if n := b.ListenerCount(); n != 0 {
+		t.Fatalf("ListenerCount = %d after overflow, want 0 (listener disconnected)", n)
+	}
+
+	var got []byte
+	var errChunk error
+	for chunk := range l.Chunks() {
+		if chunk.Err != nil {
+			errChunk = chunk.Err
+			continue
+		}
+		got = append(got, chunk.Data...)
+		chunk.Release()
+	}
+
+	want := []byte{0, 1, 2, 3}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("queued chunks delivered = %v, want %v (no hole, no reorder)", got, want)
+	}
+	if errChunk != nil {
+		t.Fatalf("unexpected error chunk %v: the queue was full, so none could be sent", errChunk)
+	}
+	if err := l.Err(); err != ErrSlowConsumer {
+		t.Fatalf("Err() = %v, want %v", err, ErrSlowConsumer)
+	}
+
+	// Completing afterwards must not resurrect or re-close the disconnected listener.
+	b.Complete(nil)
+	if err := l.Err(); err != ErrSlowConsumer {
+		t.Fatalf("Err() after Complete = %v, want %v", err, ErrSlowConsumer)
+	}
+}
+
+// A failed completion against a full queue keeps every queued chunk and
+// surfaces the completion error via Err(); when the queue has room the error
+// also arrives as a chunk. A clean completion leaves Err() nil either way.
+func TestBroadcasterCompleteErrorSurvivesFullQueue(t *testing.T) {
+	upstreamErr := errors.New("upstream cut")
+
+	t.Run("full queue", func(t *testing.T) {
+		b := NewBroadcaster(2)
+		l := b.Subscribe()
+		b.SetHeaders(http.StatusOK, http.Header{})
+		b.Broadcast([]byte("a"))
+		b.Broadcast([]byte("b"))
+		b.Complete(upstreamErr)
+
+		var got []byte
+		var errChunk error
+		for chunk := range l.Chunks() {
+			if chunk.Err != nil {
+				errChunk = chunk.Err
+				continue
+			}
+			got = append(got, chunk.Data...)
+			chunk.Release()
+		}
+		if string(got) != "ab" {
+			t.Fatalf("data = %q, want %q", got, "ab")
+		}
+		if errChunk != nil {
+			t.Fatalf("unexpected error chunk %v on a full queue", errChunk)
+		}
+		if err := l.Err(); err != upstreamErr {
+			t.Fatalf("Err() = %v, want %v", err, upstreamErr)
+		}
+	})
+
+	t.Run("queue has room", func(t *testing.T) {
+		b := NewBroadcaster(4)
+		l := b.Subscribe()
+		b.SetHeaders(http.StatusOK, http.Header{})
+		b.Broadcast([]byte("a"))
+		b.Complete(upstreamErr)
+
+		var got []byte
+		var errChunk error
+		for chunk := range l.Chunks() {
+			if chunk.Err != nil {
+				errChunk = chunk.Err
+				continue
+			}
+			got = append(got, chunk.Data...)
+			chunk.Release()
+		}
+		if string(got) != "a" {
+			t.Fatalf("data = %q, want %q", got, "a")
+		}
+		if errChunk != upstreamErr {
+			t.Fatalf("error chunk = %v, want %v", errChunk, upstreamErr)
+		}
+		if err := l.Err(); err != upstreamErr {
+			t.Fatalf("Err() = %v, want %v", err, upstreamErr)
+		}
+	})
+
+	t.Run("clean completion", func(t *testing.T) {
+		b := NewBroadcaster(2)
+		l := b.Subscribe()
+		b.SetHeaders(http.StatusOK, http.Header{})
+		b.Broadcast([]byte("a"))
+		b.Broadcast([]byte("b"))
+		b.Complete(nil)
+
+		var got []byte
+		for chunk := range l.Chunks() {
+			if chunk.Err != nil {
+				t.Fatalf("unexpected error chunk %v", chunk.Err)
+			}
+			got = append(got, chunk.Data...)
+			chunk.Release()
+		}
+		if string(got) != "ab" {
+			t.Fatalf("data = %q, want %q", got, "ab")
+		}
+		if err := l.Err(); err != nil {
+			t.Fatalf("Err() = %v, want nil", err)
+		}
+	})
 }

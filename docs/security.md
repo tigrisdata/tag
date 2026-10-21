@@ -105,6 +105,8 @@ Client                     TAG                          Tigris
 
 **RequestValidator** performs cryptographic SigV4 validation using stored signing keys. Uses constant-time comparison (HMAC-Equal) to prevent timing attacks. Enforces a 15-minute clock skew tolerance.
 
+A valid SigV4 presigned GET can omit `X-Amz-Content-Sha256`; its signature uses `UNSIGNED-PAYLOAD`. Header-authenticated requests and other methods still require the header. A presigned URL must carry exactly one integer `X-Amz-Expires` in `[1, 604800]` (seven days, as on AWS); it is rejected once that many seconds have passed since `X-Amz-Date`, or if `X-Amz-Date` is more than 15 minutes in the future. Cache serving still requires a learned signing key and an authorization grant for the requested bucket.
+
 ## Access Control Flow
 
 ```text

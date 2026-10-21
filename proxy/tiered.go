@@ -217,10 +217,12 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// that makes this object exist in TAG's authoritative view.
 	//
 	// No pre-forward invalidation, unlike HandlePutObject: for a local-tier
-	// prior the cache holds the ONLY copy, and a failed forward must leave it
-	// intact — S3 semantics say a rejected PUT changes nothing. Reads racing
-	// the in-flight PUT serve the prior version, which is the atomic-replace
-	// behavior clients expect. The one read-triggered populate in this mode —
+	// prior the cache holds the ONLY copy, and an upstream-rejected PUT must
+	// leave it intact — S3 semantics say a rejected PUT changes nothing. The
+	// status recorder separates that rejection from a response-delivery error
+	// after the upstream has confirmed the write. Reads racing the in-flight PUT
+	// serve the prior version, which is the atomic-replace behavior clients expect.
+	// The one read-triggered populate in this mode —
 	// the re-tier — cannot be ordered against this path's writes here (it
 	// performs none pre-forward). Its claim cancels registered work and its
 	// triggering GET's version token rejects any stale worker mutation (see
@@ -253,7 +255,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	rec := &statusRecorder{ResponseWriter: w}
 	err = s.forwarder.Forward(ctx, rec, r)
 
-	if err == nil && rec.wroteSuccess() && markerOwning && s.cache.IsEnabled() {
+	if rec.wroteSuccess() && markerOwning && s.cache.IsEnabled() {
 		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, prior, priorVersion, priorKnown)
 	}
 
