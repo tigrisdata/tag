@@ -38,6 +38,10 @@ Send `Cache-Control: no-store` to skip the cache entirely. TAG forwards the requ
 curl -H "Cache-Control: no-store" http://localhost:8080/my-bucket/my-key
 ```
 
+For CopyObject requests, `Cache-Control: no-store` or `private` also skips TAG's
+post-copy cache warming. The copy still uses the normal destination invalidation
+path.
+
 ## Automatic Cache Invalidation
 
 TAG automatically invalidates cached objects when they are modified through TAG:

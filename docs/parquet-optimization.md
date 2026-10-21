@@ -36,6 +36,9 @@ When `cache.parquet_optimization` is on, TAG fills that gap from two directions:
 | `parquet_footer` | a read reaches an object's trailer | the **second and later** opens of a file |
 | `write_warm` | a parquet object is written through TAG | the **first** open, before any read happens |
 
+A CopyObject request with `Cache-Control: no-store` or `private` skips both
+post-copy warmers, including `write_warm`; the destination is still invalidated.
+
 Both compute the metadata region from the length the file itself declares — never a guess — and fetch only the blocks it provably spans.
 
 ### Why the second trigger exists
@@ -58,7 +61,7 @@ The comparison is *not* footer size against `block_size`. It is footer size agai
 tail_bytes = ContentLength - floor((ContentLength - 1) / block_size) * block_size
 ```
 
-That is `ContentLength mod block_size` for most objects — anywhere from 1 byte to a full block — and exactly `block_size` for an object whose length happens to be a multiple of it. The prefetch does work whenever:
+That is `ContentLength mod block_size` for most objects — anywhere from 1 byte to a full block — and exactly `block_size` for an object whose length happens to be a multiple of it. An admitted prefetch needs blocks beyond the cached tail whenever:
 
 ```
 footer_bytes + 8  >  tail_bytes
@@ -73,9 +76,9 @@ For arbitrarily sized objects the tail averages half a block, so a footer of a f
 histogram_quantile(0.5, sum(rate(tag_cache_parquet_footer_bytes_bucket[1h])) by (le))
 ```
 
-`tag_cache_parquet_footer_bytes` is recorded for **every** parquet object whose trailer is read — including ones that are not prefetched — so it describes the whole population, not just the part that was acted on.
+`tag_cache_parquet_footer_bytes` records valid footer sizes from admitted read scans and write warms, including scans that find no blocks to fetch. A read trigger shed by the service-wide scan limit skips trailer inspection and is not recorded, so saturation can make this sample incomplete. Use `rate(tag_cache_parquet_footer_prefetch_shed_total[5m])` to see eligible read-trigger attempts refused by that limit. It counts declined attempts, not distinct footer samples omitted: because admission precedes per-version coalescing, a denied trigger may be for a version another scan is already handling. Treat it as a pressure signal, not a correction factor for the histogram.
 
-Compare that figure against the **tail block, not `block_size`**. Since the tail averages half a block across arbitrarily sized objects, `block_size / 2` is the practical yardstick: a median footer near or above it means the prefetch fires on a large share of your objects, and a median well below it means this optimization has little to do and should stay off. Comparing against the full `block_size` understates how often it fires and will talk you out of a change worth making.
+Compare that figure against the **tail block, not `block_size`**. Since the tail averages half a block across arbitrarily sized objects, `block_size / 2` is the practical yardstick: a median footer near or above it means footer geometry requires extra blocks for a large share of the observed population; a median well below it means the optimization has little to do. Read triggers can also be shed under saturation, as noted above. Comparing against the full `block_size` understates how often the metadata spans past the cached tail.
 
 ---
 
@@ -101,7 +104,9 @@ Applies to keys ending in `.parquet` (case-insensitive). The suffix is a hint, n
 ### Related settings
 
 - **`cache.block_size`** — the single most important tuning knob. Size it to your reader's granularity; an oversized block over-fetches on every miss. It also sets what counts as "metadata too large to fit", as above.
-- **`cache.meta_on_write`** — complementary, not an alternative. It caches an object's *metadata entry* on write so the first read does not spend a round trip discovering the object exists. Measured across a reader's opening sequence, it removes the discovery round trips while footer caching removes the block fetches; enabling both takes a cold first open to zero upstream requests.
+- **`cache.meta_on_write`** — complementary, not an alternative. It caches an object's *metadata entry* on write so the first read does not spend a round trip discovering the object exists. It removes the discovery round trips while footer caching removes the block fetches.
+
+On a successful multipart completion with both options enabled, the metadata HEAD and footer warm run independently after the write response. The footer warm validates the suffix-range ETag against the completed write and fills missing footer blocks even if the metadata HEAD publishes first. If the ETag-matched metadata HEAD has published an entry but the suffix response cannot be trusted, TAG keeps the metadata-only entry; later range reads fetch missing blocks normally. A first open that arrives before the footer warm finishes can still fetch missing blocks from upstream.
 
 ---
 
@@ -137,8 +142,9 @@ path, and the hit ratio answers the real question more directly.
 
 Also worth watching:
 
-- `tag_cache_parquet_footer_bytes` — the footer distribution. A shift here means a
-  schema change, and it is worth re-checking that the optimization still applies.
+- `tag_cache_parquet_footer_bytes` — the observed footer distribution. A shift can
+  reflect a schema change or, under saturation, a change in which read scans are
+  admitted; re-check the sample before deciding the optimization still applies.
 
 ## What it costs, and what bounds it
 
@@ -146,7 +152,8 @@ Fetching metadata is roughly 1% of the bytes that caching whole objects would mo
 
 - **Bounded by the object.** The block range comes from the declared metadata length, validated against the object size. A corrupt or impossible length prefetches nothing.
 - **Capped.** At most 32 blocks per object, so a pathological file cannot evict a working set.
-- **Shed, not queued.** Fetches take the populate budget non-blocking, so under load prefetching is dropped rather than competing with reads that clients are waiting on.
+- **Read scans are globally capped.** A service admits at most 32 read-triggered scans at once. Extra tail reads are shed before a background marker or goroutine is created and can retry on a later read. Write warms keep their existing path.
+- **Shed, not queued.** Block fetches take the populate budget non-blocking, so under load prefetching is dropped rather than competing with reads that clients are waiting on.
 - **Skips what is cached.** Blocks already present are never re-fetched.
 - **Coalesced.** One scan per object version at a time, with a short cooldown afterwards, so a hot object is not re-examined on every read.
 - **Off the request path.** Both triggers fire after the response is committed, so neither adds latency to the request that fired it.

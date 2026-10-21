@@ -451,6 +451,10 @@ func TestCachedObjectMeta_EncodeDecodeMeta(t *testing.T) {
 			"X-Amz-Meta-Custom": "value",
 		},
 		StatusCode: http.StatusOK,
+		RangeBlockSpan: &BlockSpan{
+			First: 3,
+			Last:  7,
+		},
 	}
 
 	// Encode
@@ -483,6 +487,9 @@ func TestCachedObjectMeta_EncodeDecodeMeta(t *testing.T) {
 	}
 	if decoded.StatusCode != original.StatusCode {
 		t.Errorf("StatusCode = %d, want %d", decoded.StatusCode, original.StatusCode)
+	}
+	if decoded.RangeBlockSpan == nil || *decoded.RangeBlockSpan != *original.RangeBlockSpan {
+		t.Errorf("RangeBlockSpan = %#v, want %#v", decoded.RangeBlockSpan, original.RangeBlockSpan)
 	}
 }
 
