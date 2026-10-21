@@ -278,24 +278,17 @@ func (v *RequestValidator) buildCanonicalHeadersFromList(r *http.Request, signed
 	var builder strings.Builder
 
 	for _, name := range signedHeaders {
-		var value string
+		builder.WriteString(name)
+		builder.WriteString(":")
 		if name == "host" {
-			value = r.Host
+			value := r.Host
 			if value == "" {
 				value = r.URL.Host
 			}
+			builder.WriteString(canonicalHeaderValue(value))
 		} else {
-			values := r.Header.Values(name)
-			// Trim and join values
-			for i, val := range values {
-				values[i] = strings.TrimSpace(val)
-			}
-			value = strings.Join(values, ",")
+			writeCanonicalHeaderValues(&builder, r.Header.Values(name))
 		}
-
-		builder.WriteString(name)
-		builder.WriteString(":")
-		builder.WriteString(value)
 		builder.WriteString("\n")
 	}
 

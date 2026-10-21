@@ -21,6 +21,14 @@ const (
 	tombKeyPrefix  = "tomb|"
 )
 
+// BlockSpan records an inclusive range of block indexes.
+// It is embedded in metadata only as a bounded, write-once hint for the range
+// that created the entry; it is never a distributed presence bitmap.
+type BlockSpan struct {
+	First int64 `json:"first"`
+	Last  int64 `json:"last"`
+}
+
 // CachedObjectMeta represents cached S3 object metadata.
 // This is stored separately from the body to support:
 // - HEAD requests from cache (metadata only)
@@ -61,6 +69,14 @@ type CachedObjectMeta struct {
 	// hint, not an invariant: false (including on entries written before the field existed)
 	// only means the probe-first path is used.
 	BlocksComplete bool `json:"blocks_complete,omitempty"`
+	// RangeBlockSpan records the contiguous blocks fetched by the range that created
+	// this entry. It is written only after every block in the span is durable and is
+	// advisory: blocks can evict independently of metadata. The span is valid only
+	// with this row's ETag and BlockSize, and is never extended by later reads. A nil
+	// span disables only the certified multi-block fast path: short ranges keep their
+	// assembled path and other ranges use probe-first, including legacy and
+	// metadata-only-on-write entries.
+	RangeBlockSpan *BlockSpan `json:"range_block_span,omitempty"`
 	// BodyRef, when set, is the body key discriminator for this entry —
 	// a per-write unique id minted by the LOCAL-STORE ENGINE, which streams
 	// the body into the cache before its MD5 (the ETag) is known and so
