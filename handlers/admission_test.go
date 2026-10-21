@@ -1,11 +1,13 @@
 package handlers
 
 import (
+	"encoding/xml"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gorilla/mux"
+	"github.com/tigrisdata/tag/s3err"
 )
 
 // buildAdmissionTestRouter builds a router mirroring a representative subset of
@@ -100,6 +102,36 @@ func TestAdmission_ListBucketsSubjectToAdmission(t *testing.T) {
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 for ListBuckets when admission full, got %d", rec.Code)
+	}
+}
+
+// TestServerSetupAppliesAdmissionMiddleware verifies built-in routes retain
+// their admission policy when the server builds route middleware at startup.
+func TestServerSetupAppliesAdmissionMiddleware(t *testing.T) {
+	server := NewServer(nil, "127.0.0.1", 0, false, 1)
+	server.admissionSem <- struct{}{}
+	handler := server.Router()
+	if server.httpServer != nil {
+		handler = server.httpServer.Handler
+	}
+
+	health := httptest.NewRecorder()
+	handler.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if health.Code != http.StatusOK {
+		t.Fatalf("health status = %d, want %d while S3 admission is full", health.Code, http.StatusOK)
+	}
+
+	object := httptest.NewRecorder()
+	handler.ServeHTTP(object, httptest.NewRequest(http.MethodGet, "/bucket/key", nil))
+	if object.Code != http.StatusServiceUnavailable {
+		t.Fatalf("S3 status = %d, want %d while admission is full", object.Code, http.StatusServiceUnavailable)
+	}
+	var errorResponse s3err.ErrorResponse
+	if err := xml.Unmarshal(object.Body.Bytes(), &errorResponse); err != nil {
+		t.Fatalf("decode SlowDown response: %v", err)
+	}
+	if errorResponse.Code != s3err.ErrSlowDown {
+		t.Fatalf("S3 error code = %q, want %q", errorResponse.Code, s3err.ErrSlowDown)
 	}
 }
 
