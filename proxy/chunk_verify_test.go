@@ -42,24 +42,39 @@ func (u upstreamRecord) complete() bool {
 	return u.bodyErr == nil && int64(len(u.body)) == u.contentLen
 }
 
-// newChunkVerifyUpstream fakes Tigris for the signing forwarder: it validates
+// chunkVerifyUpstream fakes Tigris for the signing forwarder: it validates
 // the re-signed request with the same credentials TAG re-signs with, reads the
-// body, and answers 200 only to a validly signed, complete request.
-func newChunkVerifyUpstream(t *testing.T) (*httptest.Server, func(path string) []upstreamRecord) {
+// body, and answers 200 only to a validly signed, complete request. Every
+// handler run is recorded, attributed by request path (unique per subtest),
+// and announced on changed, so a test can wait for the handler of a request
+// whose client side already returned: a forward that aborts mid-body comes
+// back before upstream has finished reading — or even started — and a record
+// inspected before then is simply absent, which would let the central
+// promise (upstream never holds a complete unauthenticated body) go
+// unchecked.
+type chunkVerifyUpstream struct {
+	*httptest.Server
+	mu      sync.Mutex
+	records []upstreamRecord
+	changed chan struct{} // closed and replaced on every new record
+}
+
+func newChunkVerifyUpstream(t *testing.T) *chunkVerifyUpstream {
 	t.Helper()
 	store := auth.NewCredentialStore()
 	store.AddCredential(chunkVerifyAccessKey, chunkVerifySecretKey)
 	validator := auth.NewRequestValidator(store)
 
-	var mu sync.Mutex
-	var records []upstreamRecord
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	u := &chunkVerifyUpstream{changed: make(chan struct{})}
+	u.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec := upstreamRecord{path: r.URL.Path, contentLen: r.ContentLength, header: r.Header.Clone()}
 		_, rec.validateErr = validator.ValidateRequest(r)
 		rec.body, rec.bodyErr = io.ReadAll(r.Body)
-		mu.Lock()
-		records = append(records, rec)
-		mu.Unlock()
+		u.mu.Lock()
+		u.records = append(u.records, rec)
+		close(u.changed)
+		u.changed = make(chan struct{})
+		u.mu.Unlock()
 		switch {
 		case rec.validateErr != nil:
 			http.Error(w, rec.validateErr.Error(), http.StatusForbidden)
@@ -70,20 +85,48 @@ func newChunkVerifyUpstream(t *testing.T) (*httptest.Server, func(path string) [
 			w.WriteHeader(http.StatusOK)
 		}
 	}))
-	t.Cleanup(srv.Close)
-	// Records are attributed by request path: a handler whose client aborted
-	// mid-body finishes (and records) only after the connection closes, which
-	// may be after the next subtest has started.
-	return srv, func(path string) []upstreamRecord {
-		mu.Lock()
-		defer mu.Unlock()
-		var out []upstreamRecord
-		for _, rec := range records {
-			if rec.path == path {
-				out = append(out, rec)
-			}
+	t.Cleanup(u.Close)
+	return u
+}
+
+// recorded returns the handler runs recorded so far for path, without waiting.
+func (u *chunkVerifyUpstream) recorded(path string) []upstreamRecord {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.recordedLocked(path)
+}
+
+func (u *chunkVerifyUpstream) recordedLocked(path string) []upstreamRecord {
+	var out []upstreamRecord
+	for _, rec := range u.records {
+		if rec.path == path {
+			out = append(out, rec)
 		}
-		return out
+	}
+	return out
+}
+
+// await blocks until at least n handler runs have been recorded for path and
+// returns them. A forwarded request always reaches the handler — the
+// transport flushes the headers before it reads the body, so even a body
+// that fails on its first byte has been announced upstream — but the handler
+// may finish well after the client side returned.
+func (u *chunkVerifyUpstream) await(t *testing.T, path string, n int) []upstreamRecord {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		u.mu.Lock()
+		recs := u.recordedLocked(path)
+		changed := u.changed
+		u.mu.Unlock()
+		if len(recs) >= n {
+			return recs
+		}
+		select {
+		case <-changed:
+		case <-deadline:
+			t.Fatalf("upstream recorded %d requests for %s, want %d", len(recs), path, n)
+		}
 	}
 }
 
@@ -260,7 +303,7 @@ func chunkVerifyChunks(t *testing.T) [][]byte {
 // X-Amz-Decoded-Content-Length and the aws-chunked token are left out of the
 // signed header set, not deleted after signing.
 func TestSigningForwarderVerifiedStreamForwardsDecodedBody(t *testing.T) {
-	upstream, records := newChunkVerifyUpstream(t)
+	upstream := newChunkVerifyUpstream(t)
 	fwd := newChunkVerifyForwarder(upstream.URL)
 	chunks := chunkVerifyChunks(t)
 	want := concat(chunks)
@@ -274,7 +317,7 @@ func TestSigningForwarderVerifiedStreamForwardsDecodedBody(t *testing.T) {
 			if err != nil || status != http.StatusOK {
 				t.Fatalf("status = %d, err = %v, want 200", status, err)
 			}
-			recs := records(path)
+			recs := upstream.await(t, path, 1)
 			if len(recs) != 1 {
 				t.Fatalf("upstream requests = %d, want 1", len(recs))
 			}
@@ -304,18 +347,40 @@ func TestSigningForwarderVerifiedStreamForwardsDecodedBody(t *testing.T) {
 	}
 }
 
+// oversizedFrame frames data as ONE chunk claiming two bytes more than it
+// carries, under an arbitrary signature, and no terminal frame: the replay
+// that needs no signing at all. A decoder bounding frames only by their own
+// claimed size would hand every byte of data to a consumer satisfied by
+// exactly len(data) — upstream under an exact Content-Length — before the
+// frame's signature was ever checked.
+func oversizedFrame(data []byte) []byte {
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "%x;chunk-signature=%s\r\n", len(data)+2, strings.Repeat("0", 64))
+	b.Write(data)
+	b.WriteString("\r\n")
+	return b.Bytes()
+}
+
 // Every way a captured header can be replayed with a body it did not sign is
 // refused before the body completes: upstream never receives all the declared
 // bytes (so cannot commit), nothing answers 2xx, and the client gets a
 // signature error.
 func TestSigningForwarderRejectsUnverifiedStream(t *testing.T) {
-	upstream, records := newChunkVerifyUpstream(t)
+	upstream := newChunkVerifyUpstream(t)
 	fwd := newChunkVerifyForwarder(upstream.URL)
 	chunks := chunkVerifyChunks(t)
 	want := concat(chunks)
 	attacker := aws.Credentials{AccessKeyID: chunkVerifyAccessKey, SecretAccessKey: "not-the-secret"}
 
 	cases := map[string]func(f *streamFixture) []byte{
+		"replayed header, one frame claiming more than the declared length": func(f *streamFixture) []byte {
+			return oversizedFrame(want)
+		},
+		"frames stop short of the declared length": func(f *streamFixture) []byte {
+			// Honestly signed, but the signed header declared len(want):
+			// the chain verified some other body.
+			return f.wire(chunks[:len(chunks)-1], f.chain(f.creds))
+		},
 		"tampered middle chunk body": func(f *streamFixture) []byte {
 			return flipByte(t, f.wire(chunks, f.chain(f.creds)), []byte("second chunk"))
 		},
@@ -358,7 +423,9 @@ func TestSigningForwarderRejectsUnverifiedStream(t *testing.T) {
 				if authErr, ok := IsAuthError(err); !ok || authErr.Code != ErrCodeSignatureMismatch {
 					t.Fatalf("err = %v, want AuthError with ErrCodeSignatureMismatch", err)
 				}
-				for _, rec := range records(path) {
+				// The forward aborted the upstream request mid-body; wait for
+				// upstream's view of it rather than inspecting an empty record set.
+				for _, rec := range upstream.await(t, path, 1) {
 					if rec.complete() {
 						t.Fatalf("upstream received a complete %d-byte body", len(rec.body))
 					}
@@ -371,10 +438,59 @@ func TestSigningForwarderRejectsUnverifiedStream(t *testing.T) {
 	}
 }
 
+// An empty signed stream is the one body the forwarder never streams: a zero
+// decoded length goes upstream as http.NoBody. Its terminal frame — the only
+// thing binding the empty body to the request — is verified anyway, on every
+// entry point: a correct one forwards as an empty PUT that validates
+// upstream; a tampered one is refused before any request is made upstream.
+func TestSigningForwarderVerifiesEmptyStream(t *testing.T) {
+	upstream := newChunkVerifyUpstream(t)
+	fwd := newChunkVerifyForwarder(upstream.URL)
+
+	for name, call := range forwardCalls {
+		t.Run(name+"/verified", func(t *testing.T) {
+			path := "/bucket/empty-" + name
+			f := newStreamFixture(t, upstream.URL, path, StreamingPayloadHash, 0)
+			var tee bytes.Buffer
+			status, err := call(fwd, f.request(f.wire(nil, f.chain(f.creds))), &tee)
+			if err != nil || status != http.StatusOK {
+				t.Fatalf("status = %d, err = %v, want 200", status, err)
+			}
+			recs := upstream.await(t, path, 1)
+			if len(recs) != 1 || recs[0].validateErr != nil || !recs[0].complete() || recs[0].contentLen != 0 {
+				t.Fatalf("upstream records = %+v, want one validly signed, complete, empty PUT", recs)
+			}
+			if tee.Len() != 0 {
+				t.Fatalf("tee holds %d bytes for an empty body", tee.Len())
+			}
+		})
+		t.Run(name+"/tampered terminal signature", func(t *testing.T) {
+			path := "/bucket/empty-bad-" + name
+			f := newStreamFixture(t, upstream.URL, path, StreamingPayloadHash, 0)
+			var tee bytes.Buffer
+			status, err := call(fwd, f.request(flipSignature(t, f.wire(nil, f.chain(f.creds)), 0)), &tee)
+			if err == nil || status == http.StatusOK {
+				t.Fatalf("status = %d, err = %v, want a signature error", status, err)
+			}
+			if !errors.Is(err, auth.ErrChunkSignatureMismatch) {
+				t.Fatalf("err = %v, want ErrChunkSignatureMismatch", err)
+			}
+			if authErr, ok := IsAuthError(err); !ok || authErr.Code != ErrCodeSignatureMismatch {
+				t.Fatalf("err = %v, want AuthError with ErrCodeSignatureMismatch", err)
+			}
+			// Refused before forwarding: the path was never requested
+			// upstream, so there is no late handler to wait for.
+			if recs := upstream.recorded(path); len(recs) != 0 {
+				t.Fatalf("upstream received %d requests for an unverified empty stream", len(recs))
+			}
+		})
+	}
+}
+
 // STREAMING-UNSIGNED-PAYLOAD-TRAILER carries no chunk signatures; it keeps
 // decoding exactly as before, with nothing to verify.
 func TestSigningForwarderUnsignedTrailerStreamUntouched(t *testing.T) {
-	upstream, records := newChunkVerifyUpstream(t)
+	upstream := newChunkVerifyUpstream(t)
 	fwd := newChunkVerifyForwarder(upstream.URL)
 	f := newStreamFixture(t, upstream.URL, "/bucket/unsigned", StreamingUnsignedTrailerHash, 4)
 	wire := []byte("4\r\ntest\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n")
@@ -383,7 +499,7 @@ func TestSigningForwarderUnsignedTrailerStreamUntouched(t *testing.T) {
 	if err := fwd.Forward(t.Context(), w, f.request(wire)); err != nil || w.Code != http.StatusOK {
 		t.Fatalf("status = %d, err = %v, want 200", w.Code, err)
 	}
-	recs := records("/bucket/unsigned")
+	recs := upstream.await(t, "/bucket/unsigned", 1)
 	if len(recs) != 1 || !recs[0].complete() || string(recs[0].body) != "test" {
 		t.Fatalf("upstream records = %+v, want one complete %q body", recs, "test")
 	}
@@ -393,7 +509,8 @@ func TestSigningForwarderUnsignedTrailerStreamUntouched(t *testing.T) {
 // the decoded object, an unverified one answers SignatureDoesNotMatch and
 // commits nothing — no metadata, no staged body.
 func TestTieredLocalPutVerifiesStreamChunks(t *testing.T) {
-	upstream, _ := newChunkVerifyUpstream(t)
+	upstream := newChunkVerifyUpstream(t)
+
 	fwd := newChunkVerifyForwarder(upstream.URL)
 	svc, c := newTieredTestService(fwd, 1<<20)
 	chunks := [][]byte{[]byte("hello, "), []byte("local tier")}
@@ -422,6 +539,42 @@ func TestTieredLocalPutVerifiesStreamChunks(t *testing.T) {
 	}
 }
 
+// The local tier verifies an empty signed stream too: the store reads the
+// decoder to EOF even for a zero declared size, and that EOF exists only
+// after the terminal frame verified. A correct terminal frame commits an
+// empty object; a tampered one answers SignatureDoesNotMatch and commits
+// nothing.
+func TestTieredLocalPutVerifiesEmptyStream(t *testing.T) {
+	upstream := newChunkVerifyUpstream(t)
+	fwd := newChunkVerifyForwarder(upstream.URL)
+	svc, c := newTieredTestService(fwd, 1<<20)
+
+	f := newStreamFixture(t, upstream.URL, "/bucket/empty", StreamingPayloadHash, 0)
+	w := httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, f.request(f.wire(nil, f.chain(f.creds)))); err != nil || w.Code != http.StatusOK {
+		t.Fatalf("verified empty PUT: status = %d, err = %v, want 200", w.Code, err)
+	}
+	meta, found, err := c.GetMeta(context.Background(), "bucket", "empty")
+	if err != nil || !found || meta.ContentLength != 0 {
+		t.Fatalf("verified empty PUT meta = (%+v, %v, %v), want committed with length 0", meta, found, err)
+	}
+
+	bad := newStreamFixture(t, upstream.URL, "/bucket/empty-bad", StreamingPayloadHash, 0)
+	w = httptest.NewRecorder()
+	if err := svc.HandlePutObject(w, bad.request(flipSignature(t, bad.wire(nil, bad.chain(bad.creds)), 0))); err != nil {
+		t.Fatalf("tampered empty PUT: %v", err)
+	}
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "SignatureDoesNotMatch") {
+		t.Fatalf("tampered empty PUT = %d %q, want 403 SignatureDoesNotMatch", w.Code, w.Body.String())
+	}
+	if _, found, _ := c.GetMeta(context.Background(), "bucket", "empty-bad"); found {
+		t.Fatal("tampered empty PUT committed metadata")
+	}
+	if recs := upstream.recorded("/bucket/empty-bad"); len(recs) != 0 {
+		t.Fatalf("local-tier PUT reached upstream %d times", len(recs))
+	}
+}
+
 // Reader-level contract: a chunk-signature failure (or absence) is sticky and
 // the failed chunk's last byte is never delivered.
 func TestVerifyingChunkedReaderWithholdsUnverifiedChunk(t *testing.T) {
@@ -437,12 +590,12 @@ func TestVerifyingChunkedReaderWithholdsUnverifiedChunk(t *testing.T) {
 	}
 	chunks := [][]byte{[]byte("hello"), []byte("wrld")}
 
-	got, err := io.ReadAll(newVerifyingAWSChunkedReader(bytes.NewReader(f.wire(chunks, f.chain(f.creds))), verify()))
+	got, err := io.ReadAll(newVerifyingAWSChunkedReader(bytes.NewReader(f.wire(chunks, f.chain(f.creds))), verify(), 9))
 	if err != nil || string(got) != "hellowrld" {
 		t.Fatalf("verified stream = %q, %v", got, err)
 	}
 
-	r := newVerifyingAWSChunkedReader(bytes.NewReader(flipByte(t, f.wire(chunks, f.chain(f.creds)), []byte("wrld"))), verify())
+	r := newVerifyingAWSChunkedReader(bytes.NewReader(flipByte(t, f.wire(chunks, f.chain(f.creds)), []byte("wrld"))), verify(), 9)
 	got, err = io.ReadAll(r)
 	if !errors.Is(err, auth.ErrChunkSignatureMismatch) || len(got) != len("hellowrld")-1 {
 		t.Fatalf("tampered stream = %d bytes, %v; want 8 bytes and ErrChunkSignatureMismatch", len(got), err)
@@ -451,9 +604,65 @@ func TestVerifyingChunkedReaderWithholdsUnverifiedChunk(t *testing.T) {
 		t.Fatalf("read after failure = %d, %v; want sticky failure", n, err2)
 	}
 
-	got, err = io.ReadAll(newVerifyingAWSChunkedReader(strings.NewReader("5\r\nhello\r\n0\r\n\r\n"), verify()))
+	got, err = io.ReadAll(newVerifyingAWSChunkedReader(strings.NewReader("5\r\nhello\r\n0\r\n\r\n"), verify(), 9))
 	if !errors.Is(err, auth.ErrChunkSignatureMismatch) || len(got) != 0 {
 		t.Fatalf("unsigned chunk under verifier = %q, %v; want nothing and ErrChunkSignatureMismatch", got, err)
+	}
+}
+
+// Reader-level contract: with a declared decoded length, the frames are bound
+// to it. A frame claiming more than the declaration has left is refused
+// before any of its bytes are delivered; a frame claiming exactly what is
+// left is fine; frames that stop short fail at the terminal frame, the last
+// delivered chunk's final byte still withheld. Without a declaration the
+// per-chunk rules alone apply.
+func TestVerifyingChunkedReaderBoundsDecodedLength(t *testing.T) {
+	const declared = 9
+	f := newStreamFixture(t, "http://s3.example.com", "/bucket/key", StreamingPayloadHash, declared)
+	store := auth.NewCredentialStore()
+	store.AddCredential(chunkVerifyAccessKey, chunkVerifySecretKey)
+	verify := func() *auth.ChunkVerifier {
+		vr, err := auth.NewRequestValidator(store).Validate(f.request(nil))
+		if err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+		return vr.ChunkVerifier()
+	}
+	body := []byte("hellowrld")
+
+	// One frame claiming declared+2 with declared bytes behind it: nothing
+	// is delivered, so no consumer can hold the declared body.
+	got, err := io.ReadAll(newVerifyingAWSChunkedReader(bytes.NewReader(oversizedFrame(body)), verify(), declared))
+	if !errors.Is(err, auth.ErrChunkSignatureMismatch) || len(got) != 0 {
+		t.Fatalf("oversized frame = %d bytes, %v; want 0 bytes and ErrChunkSignatureMismatch", len(got), err)
+	}
+
+	// A later frame overrunning what is left is refused the same way; the
+	// previous chunk's withheld byte stays withheld.
+	over := f.wire([][]byte{[]byte("hello"), []byte("wrld!")}, f.chain(f.creds))
+	got, err = io.ReadAll(newVerifyingAWSChunkedReader(bytes.NewReader(over), verify(), declared))
+	if !errors.Is(err, auth.ErrChunkSignatureMismatch) || string(got) != "hell" {
+		t.Fatalf("overrunning second frame = %q, %v; want %q and ErrChunkSignatureMismatch", got, err, "hell")
+	}
+
+	// A frame claiming exactly what is left completes normally.
+	got, err = io.ReadAll(newVerifyingAWSChunkedReader(bytes.NewReader(f.wire([][]byte{body}, f.chain(f.creds))), verify(), declared))
+	if err != nil || string(got) != string(body) {
+		t.Fatalf("exact frame = %q, %v; want %q", got, err, body)
+	}
+
+	// Frames summing below the declaration, honestly signed: refused at the
+	// terminal frame, with the last chunk's final byte never delivered.
+	short := f.wire([][]byte{[]byte("hello")}, f.chain(f.creds))
+	got, err = io.ReadAll(newVerifyingAWSChunkedReader(bytes.NewReader(short), verify(), declared))
+	if !errors.Is(err, auth.ErrChunkSignatureMismatch) || string(got) != "hell" {
+		t.Fatalf("short stream = %q, %v; want %q and ErrChunkSignatureMismatch", got, err, "hell")
+	}
+
+	// No declaration: the same short stream is a verified 5-byte body.
+	got, err = io.ReadAll(newVerifyingAWSChunkedReader(bytes.NewReader(short), verify(), -1))
+	if err != nil || string(got) != "hello" {
+		t.Fatalf("undeclared length = %q, %v; want %q", got, err, "hello")
 	}
 }
 

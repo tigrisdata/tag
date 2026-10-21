@@ -67,15 +67,32 @@ func IsStreamingPayload(bodyHash string) bool {
 // terminal frame being verified too, before it is accepted as end of body. A
 // mismatch (or a missing chunk-signature) is a sticky, wrapped
 // auth.ErrChunkSignatureMismatch from Read. So a chunk that fails
-// verification is never completely delivered, the body's final byte is
-// delivered only once the whole chain — terminal frame included — verified,
-// and a clean io.EOF exists only after that: a consumer counting bytes
-// against the declared decoded length (the exact upstream Content-Length, the
-// engine's staged body) can never hold a complete body that was not
-// authenticated end to end. Withholding one byte rather than buffering the
-// chunk keeps memory at the fixed bufio buffer whatever chunk size the client
-// chose. Without a verifier the framing is decoded and signatures are
-// ignored; trailing checksums are never validated.
+// verification is never completely delivered, and a clean io.EOF exists only
+// after the whole chain — terminal frame included — verified.
+//
+// The frames are also bound to the DECLARED decoded length (the request's
+// X-Amz-Decoded-Content-Length, a signed header, which the forwarder sends
+// upstream as the exact Content-Length and the engine stages the body
+// against): a frame claiming more bytes than the declaration has left is
+// refused before a single byte of it is delivered, and a terminal frame that
+// arrives with declared bytes still unsent is refused too. Both are sticky
+// auth.ErrChunkSignatureMismatch failures: the chain cannot authenticate the
+// declared body when the framing is not that body. Withholding the last byte
+// of a chunk alone would not do: a consumer taking exactly the declared N
+// bytes would be satisfied by the first N bytes of a frame CLAIMING more,
+// before that frame's signature was ever checked. With the bound, the
+// declared body's final byte is always the last byte of a frame whose
+// successor can only be the terminal frame, so it is delivered only after
+// the terminal signature verified — a consumer counting bytes against the
+// declared length can never hold a complete body that was not authenticated
+// end to end. A verifier with no declared length (-1) keeps the per-chunk
+// rules only; its consumer has no exact length to be satisfied by and must
+// read to the verified EOF.
+//
+// Withholding one byte rather than buffering the chunk keeps memory at the
+// fixed bufio buffer whatever chunk size the client chose. Without a verifier
+// the framing is decoded and signatures are ignored; trailing checksums are
+// never validated.
 type awsChunkedReader struct {
 	reader    *bufio.Reader
 	remaining int
@@ -85,6 +102,10 @@ type awsChunkedReader struct {
 	chunkSig  string              // signature claimed by the current chunk
 	chunkHash hash.Hash           // SHA-256 of the current chunk's data
 	err       error               // sticky verification failure
+	// undeclared is how many bytes of the declared decoded length no frame
+	// has claimed yet; -1 when the request declared no decoded length.
+	// Verifying readers only.
+	undeclared int64
 }
 
 // awsChunkedReaderBufSize is the decoder's internal bufio buffer. Named so
@@ -94,17 +115,23 @@ const awsChunkedReaderBufSize = 64 * 1024
 
 func newAWSChunkedReader(r io.Reader) *awsChunkedReader {
 	return &awsChunkedReader{
-		reader: bufio.NewReaderSize(r, awsChunkedReaderBufSize),
+		reader:     bufio.NewReaderSize(r, awsChunkedReaderBufSize),
+		undeclared: -1,
 	}
 }
 
 // newVerifyingAWSChunkedReader decodes an aws-chunked body and verifies each
-// chunk's signature against verifier; a nil verifier decodes framing only.
-func newVerifyingAWSChunkedReader(r io.Reader, verifier *auth.ChunkVerifier) *awsChunkedReader {
+// chunk's signature against verifier, binding the frames to decodedLength —
+// the request's declared decoded length, or -1 when it declared none. A nil
+// verifier decodes framing only, unbounded.
+func newVerifyingAWSChunkedReader(r io.Reader, verifier *auth.ChunkVerifier, decodedLength int64) *awsChunkedReader {
 	cr := newAWSChunkedReader(r)
 	if verifier != nil {
 		cr.verifier = verifier
 		cr.chunkHash = sha256.New()
+		if decodedLength >= 0 {
+			cr.undeclared = decodedLength
+		}
 	}
 	return cr
 }
@@ -225,6 +252,9 @@ const maxChunkHeaderLen = 256
 
 // readChunkHeader reads a line like "<hex-size>;chunk-signature=<sig>\r\n"
 // and sets r.remaining to the chunk data size. Sets r.done if size is 0.
+// With a verifier it also binds the frame to the declared decoded length and
+// verifies a terminal frame's signature, so no byte of an over-claiming frame
+// and no EOF of a short or unverified stream ever reaches the consumer.
 func (r *awsChunkedReader) readChunkHeader() error {
 	line, err := r.readLine()
 	if err != nil {
@@ -245,7 +275,8 @@ func (r *awsChunkedReader) readChunkHeader() error {
 			r.err = fmt.Errorf("chunk header carries no chunk-signature: %w", auth.ErrChunkSignatureMismatch)
 			return r.err
 		}
-		if size <= 0 {
+		switch {
+		case size <= 0:
 			// The terminal chunk is signed over empty data; verify it before
 			// accepting it as end of body.
 			emptySum := sha256.Sum256(nil)
@@ -253,6 +284,23 @@ func (r *awsChunkedReader) readChunkHeader() error {
 				r.err = fmt.Errorf("verifying final chunk signature: %w", err)
 				return r.err
 			}
+			if r.undeclared > 0 {
+				// The frames stopped short of the declared body: a
+				// verified chain over some OTHER body is no authentication
+				// of the declared one, and a clean EOF here would let a
+				// consumer treat the shortfall as the client's transfer
+				// fault rather than a body that never verified.
+				r.err = fmt.Errorf("terminal chunk arrived with %d bytes of the declared decoded length unsent: %w", r.undeclared, auth.ErrChunkSignatureMismatch)
+				return r.err
+			}
+		case r.undeclared >= 0 && size > r.undeclared:
+			// Refused BEFORE any of the frame's bytes are read: a consumer
+			// taking the declared length would otherwise be satisfied by
+			// the frame's first bytes, ahead of its signature check.
+			r.err = fmt.Errorf("chunk claims %d bytes, more than the %d left of the declared decoded length: %w", size, r.undeclared, auth.ErrChunkSignatureMismatch)
+			return r.err
+		case r.undeclared >= 0:
+			r.undeclared -= size
 		}
 		r.chunkSig = sig
 		r.chunkHash.Reset()
@@ -329,12 +377,21 @@ func decodeChunkedIfNeeded(r *http.Request, vr *auth.ValidatedRequest) (body io.
 		}
 	}
 
-	var verifier *auth.ChunkVerifier
-	if bodyHash == StreamingPayloadHash && vr != nil {
-		verifier = vr.ChunkVerifier()
-	}
-	decoded := newVerifyingAWSChunkedReader(r.Body, verifier)
+	decoded := newVerifyingAWSChunkedReader(r.Body, streamChunkVerifier(r, vr), contentLength)
 	return io.NopCloser(decoded), "UNSIGNED-PAYLOAD", contentLength, true
+}
+
+// streamChunkVerifier returns the chunk-chain verifier a body decoded from r
+// is checked against: one seeded by vr for the signed-chunk marker, nil for
+// the framing-only markers or when the request was not validated. The single
+// place that decides whether a stream is verified, so a caller that must act
+// on the decoder's existence (the empty-stream drain) cannot disagree with
+// decodeChunkedIfNeeded.
+func streamChunkVerifier(r *http.Request, vr *auth.ValidatedRequest) *auth.ChunkVerifier {
+	if vr == nil || r.Header.Get("X-Amz-Content-Sha256") != StreamingPayloadHash {
+		return nil
+	}
+	return vr.ChunkVerifier()
 }
 
 // stripAWSChunkedToken removes the aws-chunked token from a Content-Encoding

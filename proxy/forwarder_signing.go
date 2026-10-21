@@ -74,6 +74,25 @@ func forwardError(err error) error {
 	return err
 }
 
+// decodeBody is decodeChunkedIfNeeded for a validated request, with one
+// addition: an EMPTY verified stream is verified right here. A zero decoded
+// length is forwarded as http.NoBody (prepareForwardedRequest, so upstream
+// sees Content-Length: 0 rather than a chunked transfer), which means nothing
+// downstream ever reads the decoder — and the terminal frame's signature,
+// the only thing binding an empty body to the request, would go unchecked.
+// Draining the decoder reads exactly that frame and verifies it before the
+// body is replaced; a failure is the same SignatureDoesNotMatch a non-empty
+// stream earns, and the request never reaches upstream.
+func decodeBody(r *http.Request, vr *auth.ValidatedRequest) (body io.ReadCloser, bodyHash string, contentLength int64, chunked bool, err error) {
+	body, bodyHash, contentLength, chunked = decodeChunkedIfNeeded(r, vr)
+	if chunked && contentLength == 0 && streamChunkVerifier(r, vr) != nil {
+		if _, err := io.Copy(io.Discard, body); err != nil {
+			return nil, "", 0, false, forwardError(err)
+		}
+	}
+	return body, bodyHash, contentLength, chunked, nil
+}
+
 // Forward forwards a request to Tigris and writes the response to the client.
 // Validates the incoming request signature, re-signs with upstream credentials,
 // and streams the response back. If the request uses AWS chunked transfer encoding
@@ -84,7 +103,10 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 	if err != nil {
 		return err
 	}
-	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r, vr)
+	body, bodyHash, contentLength, chunked, err := decodeBody(r, vr)
+	if err != nil {
+		return err
+	}
 
 	fwdReq, err := f.signForward(ctx, r, body, bodyHash, contentLength, chunked, vr.AccessKey, secretKey)
 	if err != nil {
@@ -111,7 +133,10 @@ func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.Respons
 	if err != nil {
 		return 0, nil, "", "", err
 	}
-	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r, vr)
+	body, bodyHash, contentLength, chunked, err := decodeBody(r, vr)
+	if err != nil {
+		return 0, nil, "", "", err
+	}
 
 	// Tee the decoded body into the caller's buffer as it is streamed upstream.
 	fwdReq, err := f.signForward(ctx, r, io.TeeReader(body, tee), bodyHash, contentLength, chunked, vr.AccessKey, secretKey)
@@ -132,7 +157,10 @@ func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.Respon
 	if err != nil {
 		return nil, err
 	}
-	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r, vr)
+	body, bodyHash, contentLength, chunked, err := decodeBody(r, vr)
+	if err != nil {
+		return nil, err
+	}
 
 	fwdReq, err := f.signForward(ctx, r, body, bodyHash, contentLength, chunked, vr.AccessKey, secretKey)
 	if err != nil {
@@ -166,7 +194,10 @@ func (f *signingForwarder) DoRequestWithCreds(ctx context.Context, r *http.Reque
 			return nil, err
 		}
 	}
-	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r, vr)
+	body, bodyHash, contentLength, chunked, err := decodeBody(r, vr)
+	if err != nil {
+		return nil, err
+	}
 
 	fwdReq, err := f.signForward(ctx, r, body, bodyHash, contentLength, chunked, accessKey, secretKey)
 	if err != nil {
@@ -174,4 +205,5 @@ func (f *signingForwarder) DoRequestWithCreds(ctx context.Context, r *http.Reque
 	}
 	resp, err := f.executeRequest(fwdReq, contentLength, nil)
 	return resp, forwardError(err)
+
 }

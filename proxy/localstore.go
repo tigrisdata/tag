@@ -509,11 +509,14 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 	// them — are the object, not the wire encoding. Storing the framing serves
 	// corrupt bytes with a 200, which the caller cannot detect as a miss. With a
 	// chunk verifier, a chunk whose signature does not continue the request's
-	// chain errors the stream, which takes the reader-error path below: no
-	// commit, staged body reclaimed.
+	// chain — or a frame that does not fit the declared size this store is
+	// sized by — errors the stream, which takes the reader-error path below:
+	// no commit, staged body reclaimed. An EMPTY declared body is verified
+	// the same way: the store below reads the decoder to EOF, and the
+	// decoder's EOF exists only after the terminal frame verified.
 	reader := r.Body
 	if streaming {
-		reader = io.NopCloser(newVerifyingAWSChunkedReader(r.Body, chunkVerifier))
+		reader = io.NopCloser(newVerifyingAWSChunkedReader(r.Body, chunkVerifier, declaredSize))
 	}
 
 	// The stream is limited to declared+1 bytes (the extra byte detects a
