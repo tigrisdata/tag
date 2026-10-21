@@ -2,12 +2,16 @@ package proxy
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/tigrisdata/tag/auth"
 )
 
 // StreamingPayloadHash is the X-Amz-Content-Sha256 value used by AWS SDKs
@@ -55,12 +59,32 @@ func IsStreamingPayload(bodyHash string) bool {
 //	0[;chunk-signature=<signature>]\r\n
 //
 // The reader strips the framing and returns only the raw chunk data.
-// Chunk signatures and trailing checksums are not validated (the
-// request-level signature was already verified by the auth validator).
+//
+// With a verifier, every chunk's signature is checked against the request's
+// SigV4 chunk chain as the chunk is consumed. The data is hashed as it streams
+// through, and the chunk's LAST byte is withheld until the trailing CRLF has
+// been read, the signature verified, and the NEXT frame header read — a
+// terminal frame being verified too, before it is accepted as end of body. A
+// mismatch (or a missing chunk-signature) is a sticky, wrapped
+// auth.ErrChunkSignatureMismatch from Read. So a chunk that fails
+// verification is never completely delivered, the body's final byte is
+// delivered only once the whole chain — terminal frame included — verified,
+// and a clean io.EOF exists only after that: a consumer counting bytes
+// against the declared decoded length (the exact upstream Content-Length, the
+// engine's staged body) can never hold a complete body that was not
+// authenticated end to end. Withholding one byte rather than buffering the
+// chunk keeps memory at the fixed bufio buffer whatever chunk size the client
+// chose. Without a verifier the framing is decoded and signatures are
+// ignored; trailing checksums are never validated.
 type awsChunkedReader struct {
 	reader    *bufio.Reader
 	remaining int
 	done      bool
+
+	verifier  *auth.ChunkVerifier // nil: decode framing only
+	chunkSig  string              // signature claimed by the current chunk
+	chunkHash hash.Hash           // SHA-256 of the current chunk's data
+	err       error               // sticky verification failure
 }
 
 // awsChunkedReaderBufSize is the decoder's internal bufio buffer. Named so
@@ -74,7 +98,21 @@ func newAWSChunkedReader(r io.Reader) *awsChunkedReader {
 	}
 }
 
+// newVerifyingAWSChunkedReader decodes an aws-chunked body and verifies each
+// chunk's signature against verifier; a nil verifier decodes framing only.
+func newVerifyingAWSChunkedReader(r io.Reader, verifier *auth.ChunkVerifier) *awsChunkedReader {
+	cr := newAWSChunkedReader(r)
+	if verifier != nil {
+		cr.verifier = verifier
+		cr.chunkHash = sha256.New()
+	}
+	return cr
+}
+
 func (r *awsChunkedReader) Read(p []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
 	if r.done {
 		return 0, io.EOF
 	}
@@ -89,14 +127,28 @@ func (r *awsChunkedReader) Read(p []byte) (int, error) {
 		}
 	}
 
-	// Read up to remaining bytes from current chunk.
+	// With a verifier, the chunk's last byte is delivered only once the
+	// chunk has verified.
+	if r.verifier != nil && r.remaining == 1 {
+		return r.readVerifiedLastByte(p)
+	}
+
+	// Read up to remaining bytes from current chunk — all but the withheld
+	// last byte when verifying (remaining >= 2 here, so toRead stays >= 1
+	// for a non-empty p).
 	toRead := len(p)
 	if toRead > r.remaining {
 		toRead = r.remaining
 	}
+	if r.verifier != nil && toRead == r.remaining {
+		toRead--
+	}
 
 	n, err := r.reader.Read(p[:toRead])
 	r.remaining -= n
+	if r.chunkHash != nil {
+		r.chunkHash.Write(p[:n])
+	}
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			// The body ended INSIDE a chunk's data. A bare io.EOF here would
@@ -120,6 +172,51 @@ func (r *awsChunkedReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// readVerifiedLastByte consumes the current chunk's withheld last byte and
+// trailing CRLF, verifies the chunk's signature, reads the next frame header
+// (verifying it when terminal), and only then delivers the byte. A mismatch
+// anywhere is sticky: the chunk — and so the body — stays incomplete.
+func (r *awsChunkedReader) readVerifiedLastByte(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	var last [1]byte
+	if _, err := io.ReadFull(r.reader, last[:]); err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, fmt.Errorf("aws-chunked body truncated mid-chunk: %w", io.ErrUnexpectedEOF)
+		}
+		return 0, err
+	}
+	r.chunkHash.Write(last[:])
+	if err := r.readTrailingCRLF(); err != nil {
+		return 0, err
+	}
+	if err := r.verifier.VerifyChunk(r.chunkSig, r.chunkHash.Sum(nil)); err != nil {
+		r.err = fmt.Errorf("verifying chunk signature: %w", err)
+		return 0, r.err
+	}
+	r.remaining = 0
+	// Look ahead to the next frame: it sets up the next chunk, or verifies
+	// the terminal frame and marks the body done. Either way the withheld
+	// byte goes out only with a verified continuation.
+	if err := r.readChunkHeader(); err != nil {
+		return 0, err
+	}
+	p[0] = last[0]
+	return 1, nil
+}
+
+// chunkSignatureExtension extracts the chunk-signature value from a chunk
+// header's extensions ("chunk-signature=<sig>[;...]").
+func chunkSignatureExtension(ext string) (string, bool) {
+	for _, part := range strings.Split(ext, ";") {
+		if sig, ok := strings.CutPrefix(strings.TrimSpace(part), "chunk-signature="); ok {
+			return sig, true
+		}
+	}
+	return "", false
+}
+
 // maxChunkHeaderLen is the maximum allowed length of a chunk header line.
 // AWS chunk headers contain a hex size and a signature (~88 chars for the
 // signature), so 256 bytes is generous. This prevents memory exhaustion
@@ -135,14 +232,30 @@ func (r *awsChunkedReader) readChunkHeader() error {
 	}
 
 	// Extract hex size before the semicolon
-	sizeStr := line
-	if idx := strings.IndexByte(line, ';'); idx != -1 {
-		sizeStr = line[:idx]
-	}
+	sizeStr, ext, _ := strings.Cut(line, ";")
 
 	size, err := strconv.ParseInt(strings.TrimSpace(sizeStr), 16, 64)
 	if err != nil {
 		return fmt.Errorf("parsing chunk size %q: %w", sizeStr, err)
+	}
+
+	if r.verifier != nil {
+		sig, ok := chunkSignatureExtension(ext)
+		if !ok {
+			r.err = fmt.Errorf("chunk header carries no chunk-signature: %w", auth.ErrChunkSignatureMismatch)
+			return r.err
+		}
+		if size <= 0 {
+			// The terminal chunk is signed over empty data; verify it before
+			// accepting it as end of body.
+			emptySum := sha256.Sum256(nil)
+			if err := r.verifier.VerifyChunk(sig, emptySum[:]); err != nil {
+				r.err = fmt.Errorf("verifying final chunk signature: %w", err)
+				return r.err
+			}
+		}
+		r.chunkSig = sig
+		r.chunkHash.Reset()
 	}
 
 	if size <= 0 {
@@ -191,9 +304,17 @@ func (r *awsChunkedReader) readTrailingCRLF() error {
 // decoded content length, and chunked=true. Otherwise returns the original values
 // unchanged with chunked=false.
 //
-// Supports both signed (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) and unsigned
-// (STREAMING-UNSIGNED-PAYLOAD-TRAILER) chunked formats.
-func decodeChunkedIfNeeded(r *http.Request) (body io.ReadCloser, bodyHash string, contentLength int64, chunked bool) {
+// Chunk-signature verification covers exactly the STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+// marker, using the chain seeded by the validated request (vr): without it the
+// request-level signature only authenticates the headers, and a captured
+// header-signed PUT could be replayed with an arbitrary body (TAG re-signs
+// upstream as UNSIGNED-PAYLOAD, so nothing downstream would catch it). The
+// other markers keep framing-only decoding, as before: the -TRAILER variant
+// (signed chunks plus a signed trailer) and the ECDSA (SigV4A) variants would
+// need their own chain and key handling, and STREAMING-UNSIGNED-PAYLOAD-TRAILER
+// carries no chunk signatures at all. A nil vr for the signed marker decodes
+// without verification; callers in signing mode always validate first.
+func decodeChunkedIfNeeded(r *http.Request, vr *auth.ValidatedRequest) (body io.ReadCloser, bodyHash string, contentLength int64, chunked bool) {
 	bodyHash = r.Header.Get("X-Amz-Content-Sha256")
 
 	if !IsStreamingPayload(bodyHash) {
@@ -208,7 +329,11 @@ func decodeChunkedIfNeeded(r *http.Request) (body io.ReadCloser, bodyHash string
 		}
 	}
 
-	decoded := newAWSChunkedReader(r.Body)
+	var verifier *auth.ChunkVerifier
+	if bodyHash == StreamingPayloadHash && vr != nil {
+		verifier = vr.ChunkVerifier()
+	}
+	decoded := newVerifyingAWSChunkedReader(r.Body, verifier)
 	return io.NopCloser(decoded), "UNSIGNED-PAYLOAD", contentLength, true
 }
 

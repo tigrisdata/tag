@@ -120,7 +120,7 @@ func mapAuthError(err error) *AuthError {
 	var code AuthErrorCode
 
 	// Check for specific auth errors
-	if errors.Is(err, auth.ErrSignatureMismatch) {
+	if errors.Is(err, auth.ErrSignatureMismatch) || errors.Is(err, auth.ErrChunkSignatureMismatch) {
 		reason = "signature_mismatch"
 		code = ErrCodeSignatureMismatch
 	} else if errors.Is(err, auth.ErrUnknownAccessKey) {
@@ -500,13 +500,35 @@ func NewForwarder(credStore *auth.CredentialStore, tigrisEndpoint, region string
 	}
 }
 
-// prepareForwardedRequest sets Content-Length on the forwarded request and strips
-// AWS chunked-encoding headers when the request body was decoded from chunked format.
+// headersForForwardedSigning returns the client headers as they will be sent
+// upstream. When the body was decoded from aws-chunked framing, the framing
+// headers go: X-Amz-Decoded-Content-Length (the signer signs every x-amz-*
+// header, and a signed header that is absent on arrival is a
+// SignatureDoesNotMatch at Tigris, so it must be removed BEFORE signing, not
+// after) and the aws-chunked Content-Encoding token (the forwarded body is the
+// decoded object). The client's header map is never mutated.
+func headersForForwardedSigning(headers http.Header, chunked bool) http.Header {
+	if !chunked {
+		return headers
+	}
+	forwarded := headers.Clone()
+	forwarded.Del("X-Amz-Decoded-Content-Length")
+	if ce := forwarded.Get("Content-Encoding"); ce != "" {
+		if stripped := stripAWSChunkedToken(ce); stripped == "" {
+			forwarded.Del("Content-Encoding")
+		} else {
+			forwarded.Set("Content-Encoding", stripped)
+		}
+	}
+	return forwarded
+}
+
+// prepareForwardedRequest sets Content-Length on the forwarded request. The
+// chunked-encoding headers were already left out of the signed header set by
+// headersForForwardedSigning.
 func prepareForwardedRequest(fwdReq *http.Request, contentLength int64, chunked bool) {
 	if chunked {
 		fwdReq.ContentLength = contentLength
-		fwdReq.Header.Del("X-Amz-Decoded-Content-Length")
-		stripAWSChunkedEncoding(fwdReq)
 		// When decoded content length is 0, set Body to http.NoBody so Go's
 		// HTTP transport sends "Content-Length: 0" instead of using
 		// "Transfer-Encoding: chunked" (which happens when ContentLength == 0
@@ -516,29 +538,6 @@ func prepareForwardedRequest(fwdReq *http.Request, contentLength int64, chunked 
 		}
 	} else if contentLength > 0 {
 		fwdReq.ContentLength = contentLength
-	}
-}
-
-// stripAWSChunkedEncoding removes "aws-chunked" from the Content-Encoding header.
-// AWS S3 allows combined values like "aws-chunked,gzip". After decoding the chunked
-// layer, we strip only the aws-chunked token and preserve any remaining encodings.
-func stripAWSChunkedEncoding(req *http.Request) {
-	ce := req.Header.Get("Content-Encoding")
-	if ce == "" {
-		return
-	}
-
-	var remaining []string
-	for _, part := range strings.Split(ce, ",") {
-		if strings.TrimSpace(part) != "aws-chunked" {
-			remaining = append(remaining, strings.TrimSpace(part))
-		}
-	}
-
-	if len(remaining) == 0 {
-		req.Header.Del("Content-Encoding")
-	} else {
-		req.Header.Set("Content-Encoding", strings.Join(remaining, ","))
 	}
 }
 

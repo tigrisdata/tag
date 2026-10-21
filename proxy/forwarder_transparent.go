@@ -202,6 +202,21 @@ func (f *transparentForwarder) ValidateAndGetCredentials(r *http.Request) (AuthR
 	return result, f.proxySigner.AccessKey(), f.proxySigner.SecretKey(), nil
 }
 
+// chunkVerifier implements chunkVerifierProvider for the tiered local-tier PUT,
+// which the engine decodes itself. Without local auth there is no signing
+// material (and validateLocally reports every request validated), so the
+// body decodes unverified exactly as before.
+func (f *transparentForwarder) chunkVerifier(r *http.Request) (*auth.ChunkVerifier, error) {
+	if f.validator == nil {
+		return nil, nil
+	}
+	vr, err := f.validator.Validate(r)
+	if err != nil {
+		return nil, mapAuthError(err)
+	}
+	return vr.ChunkVerifier(), nil
+}
+
 // validateLocally performs local SigV4 validation of the client's request.
 func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, error) {
 	// If local auth is not configured, always treat as validated (legacy behavior)

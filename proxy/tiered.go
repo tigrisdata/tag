@@ -193,7 +193,15 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 			// above and the engine's precondition/token now share one read,
 			// so a marker committing in between cannot make them disagree.
 			expectedSHA256 := concretePayloadSHA256(r)
-			err := s.handleOriginlessPut(rec, r, &putPrior{meta: priorMeta, version: priorVersion, found: found}, expectedSHA256)
+			// The engine decodes a signed streaming body itself, so it needs
+			// the request's chunk chain: the request signature validated above
+			// covers only the headers.
+			chunkVerifier, verr := s.streamingChunkVerifier(r)
+			if verr != nil {
+				metrics.RecordRequest("PutObject", "auth_error", metrics.SourceLocal, time.Since(start).Seconds())
+				return verr
+			}
+			err := s.handleOriginlessPut(rec, r, &putPrior{meta: priorMeta, version: priorVersion, found: found}, expectedSHA256, chunkVerifier)
 			if err == nil && rec.wroteSuccess() && prior != nil && prior.BodyUpstream {
 				// Small write displaced an upstream-tier version: remove the
 				// upstream copy so it doesn't linger as an orphan. Bound to the
