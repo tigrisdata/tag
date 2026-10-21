@@ -17,6 +17,11 @@ import (
 // DeleteObjects (Multi-Object Delete) Support
 // ============================================================================
 
+// bulkDeleteFenceTimeout bounds the post-success cache fence a cache-enabled
+// bulk delete waits on before committing its staged upstream response, so a
+// stalled cache peer delays the client's 2xx by at most this long.
+const bulkDeleteFenceTimeout = 10 * time.Second
+
 // deleteObjectsRequest represents the S3 DeleteObjects request body.
 type deleteObjectsRequest struct {
 	XMLName xml.Name            `xml:"Delete"`
@@ -222,6 +227,13 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	// A key whose entries ALL errored keeps its refill (it's still upstream).
 	// Routed through invalidateObject so a failed re-invalidation is recorded/logged.
 	if err == nil && capture != nil && capture.StatusCode >= 200 && capture.StatusCode < 300 && s.cache.IsEnabled() {
+		// Upstream has committed the deletes, so a client disconnect must not
+		// abandon the fence (WithoutCancel); the timeout keeps a stalled cache
+		// peer from holding the staged response indefinitely. On expiry the
+		// remaining per-key attempts fail fast, the captured 2xx is still
+		// committed below, and the stale metadata ages out via TTL.
+		fenceCtx, cancelFence := context.WithTimeout(context.WithoutCancel(r.Context()), bulkDeleteFenceTimeout)
+		fencedKeys := 0
 		erroredCounts, parsed := erroredDeleteKeyCounts(capture.Body)
 		for key, reqN := range requestedCounts {
 			// On a parse failure, over-invalidate every requested key (safe).
@@ -233,8 +245,17 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 				s.convergeTieredDelete(bucket, key, p.version, p.known)
 				continue
 			}
-			s.convergeInvalidation(context.Background(), bucket, key)
+			fencedKeys++
+			s.convergeInvalidation(fenceCtx, bucket, key)
 		}
+		if fenceCtx.Err() != nil {
+			log.Warn().
+				Str("bucket", bucket).
+				Int("keys", fencedKeys).
+				Dur("timeout", bulkDeleteFenceTimeout).
+				Msg("Bulk-delete cache fence did not converge within the timeout; responding with the upstream result, stale metadata may serve until TTL")
+		}
+		cancelFence()
 	}
 
 	if responseStager != nil {

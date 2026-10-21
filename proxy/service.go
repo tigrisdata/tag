@@ -1041,7 +1041,7 @@ func s3WriteSucceeded(capture *ResponseCapture) bool {
 // convergeInvalidation is the synchronous post-success invalidation used by
 // proxy-mode mutation handlers. Most callers stream the upstream response before
 // calling it; bulk DeleteObjects stages its captured response until this helper
-// returns. One immediate retry absorbs a transient backend failure. Returning
+// returns, under a context bounded by bulkDeleteFenceTimeout. One immediate retry absorbs a transient backend failure. Returning
 // means the attempts finished, not that the backend fence succeeded; if both
 // attempts fail, stale metadata may remain until TTL and the failure stays visible
 // as tag_cache_operations_total{operation="delete",result="error"} (the dashboard's

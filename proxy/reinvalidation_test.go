@@ -1,13 +1,22 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
+	"github.com/tigrisdata/tag/config"
 )
 
 // A GET that races an in-flight PUT can fetch the pre-PUT object and begin
@@ -399,4 +408,118 @@ func TestHandleDeleteObjects_IncompleteCapturePreservesPrefixAndInvalidatesKey(t
 	if _, found, err := c.GetMeta(context.Background(), bucket, key); err != nil || found {
 		t.Fatalf("incomplete response fallback left key cached: found=%t err=%v", found, err)
 	}
+}
+
+// stalledMetaDeleteClient answers the pre-forward meta delete normally and
+// then stalls every later meta delete for the target key until the caller's
+// context ends, like a cache peer that stops answering mid-request.
+type stalledMetaDeleteClient struct {
+	cacheclient.CacheClient
+	metaKey string
+	deletes atomic.Int32
+	stalled chan struct{}
+	once    sync.Once
+}
+
+func (c *stalledMetaDeleteClient) Delete(ctx context.Context, key string) error {
+	if key == c.metaKey && c.deletes.Add(1) > 1 {
+		c.once.Do(func() { close(c.stalled) })
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return c.CacheClient.Delete(ctx, key)
+}
+
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// A cache peer that never answers the post-success fence must not hold the
+// staged DeleteObjects response past bulkDeleteFenceTimeout; the client still
+// gets the upstream 2xx byte-exact, and the expiry is logged with the bucket
+// and the fenced key count rather than surfacing as an error.
+func TestHandleDeleteObjects_StalledFenceReleasesResponseAtTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const bucket = "bulk-bucket"
+		const key = "stalled-key"
+		const responseBody = `<DeleteResult><Deleted><Key>stalled-key</Key></Deleted></DeleteResult>`
+		headers := make(http.Header)
+		headers.Set("Content-Type", "application/xml")
+		headers.Set("X-Upstream-Delete-Result", "deleted")
+
+		cfg := config.NewDefault()
+		cacheClient := &stalledMetaDeleteClient{
+			CacheClient: cacheclient.NewMemoryCache(),
+			metaKey:     cache.MakeMetaKey(bucket, key),
+			stalled:     make(chan struct{}),
+		}
+		c := cache.NewCacheWithClient(cacheClient, &cfg.Cache)
+
+		deleteUpstream := func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+			for header, values := range headers {
+				w.Header()[header] = append([]string(nil), values...)
+			}
+			body := []byte(responseBody)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			return &ResponseCapture{StatusCode: http.StatusOK, Headers: headers.Clone(), Body: body, Complete: true}, nil
+		}
+		svc := NewService(&mockForwarder{captureFunc: deleteUpstream}, c, cfg)
+
+		logs := &lockedLogBuffer{}
+		previousLogger := log.Logger
+		log.Logger = zerolog.New(logs).Level(zerolog.WarnLevel)
+		defer func() { log.Logger = previousLogger }()
+
+		r := httptest.NewRequest(http.MethodPost, "/"+bucket+"?delete", strings.NewReader(`<Delete><Object><Key>stalled-key</Key></Object></Delete>`))
+		w := httptest.NewRecorder()
+		start := time.Now()
+		if err := svc.HandleDeleteObjects(w, r); err != nil {
+			t.Fatalf("HandleDeleteObjects: %v", err)
+		}
+		elapsed := time.Since(start)
+
+		select {
+		case <-cacheClient.stalled:
+		default:
+			t.Fatal("post-success fence never reached the stalled cache peer")
+		}
+		// synctest's fake clock advances only while every goroutine is blocked,
+		// so the handler returned exactly when the fence deadline fired: no
+		// earlier (the fence was awaited) and no later (the stall was bounded).
+		if elapsed != bulkDeleteFenceTimeout {
+			t.Fatalf("DeleteObjects responded after %v, want release at the %v fence timeout", elapsed, bulkDeleteFenceTimeout)
+		}
+		if w.Code != http.StatusOK {
+			t.Fatalf("DeleteObjects status = %d, want %d", w.Code, http.StatusOK)
+		}
+		if got := w.Header().Get("X-Upstream-Delete-Result"); got != "deleted" {
+			t.Fatalf("DeleteObjects response header = %q, want deleted", got)
+		}
+		if got := w.Body.String(); got != responseBody {
+			t.Fatalf("DeleteObjects response body = %q, want byte-exact upstream body %q", got, responseBody)
+		}
+		logged := logs.String()
+		if !strings.Contains(logged, "Bulk-delete cache fence did not converge") {
+			t.Fatalf("fence timeout was not logged; logs: %q", logged)
+		}
+		for _, want := range []string{`"level":"warn"`, `"bucket":"` + bucket + `"`, `"keys":1`} {
+			if !strings.Contains(logged, want) {
+				t.Errorf("fence timeout log lacks %s; logs: %q", want, logged)
+			}
+		}
+	})
 }
