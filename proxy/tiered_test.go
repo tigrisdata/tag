@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,12 @@ import (
 // newTieredTestService builds a Service in tiered mode with an in-memory cache
 // and the given small/large tier boundary.
 func newTieredTestService(forwarder RequestForwarder, threshold int64) (*Service, *cache.Cache) {
+	return newTieredTestServiceWithClient(forwarder, threshold, cacheclient.NewMemoryCache())
+}
+
+// newTieredTestServiceWithClient keeps the production tiered configuration and
+// CAS coordinator while allowing tests to gate versioned cache reads.
+func newTieredTestServiceWithClient(forwarder RequestForwarder, threshold int64, client cacheclient.CacheClient) (*Service, *cache.Cache) {
 	cfg := config.NewDefault()
 	cfg.Mode = config.ModeTiered
 	cfg.Cache.SetBlockCachingEnabled(false)
@@ -36,8 +43,7 @@ func newTieredTestService(forwarder RequestForwarder, threshold int64) (*Service
 		panic(err)
 	}
 
-	memCache := cacheclient.NewMemoryCache()
-	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	c := cache.NewCacheWithClient(client, &cfg.Cache)
 	svc := NewService(forwarder, c, cfg)
 	return svc, c
 }
@@ -457,6 +463,349 @@ func waitRetierDone(t *testing.T, svc *Service, bucket, key string) {
 			t.Fatal("re-tier still in flight after 2s")
 		case <-time.After(5 * time.Millisecond):
 		}
+	}
+}
+
+type tieredMetaReadObservation struct {
+	data    []byte
+	version uint64
+	found   bool
+	err     error
+}
+
+// tieredMetaReadGateClient pauses a versioned metadata result after the cache
+// read returns, so a test can deterministically place a write before GET-side
+// re-tier registration.
+type tieredMetaReadGateClient struct {
+	cacheclient.CacheClient
+	mu sync.Mutex
+
+	key       string
+	blockNext bool
+	observed  chan tieredMetaReadObservation
+	release   <-chan struct{}
+	watchNext bool
+	watched   chan tieredMetaReadObservation
+}
+
+func (g *tieredMetaReadGateClient) gateNextMetaRead(key string) (<-chan tieredMetaReadObservation, chan struct{}) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.key = key
+	g.blockNext = true
+	g.observed = make(chan tieredMetaReadObservation, 1)
+	release := make(chan struct{})
+	g.release = release
+	return g.observed, release
+}
+
+func (g *tieredMetaReadGateClient) watchNextMetaRead() <-chan tieredMetaReadObservation {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.watchNext = true
+	g.watched = make(chan tieredMetaReadObservation, 1)
+	return g.watched
+}
+
+func (g *tieredMetaReadGateClient) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	data, version, found, err := g.CacheClient.GetWithVersion(ctx, key)
+	observation := tieredMetaReadObservation{data: data, version: version, found: found, err: err}
+
+	g.mu.Lock()
+	if key != g.key {
+		g.mu.Unlock()
+		return data, version, found, err
+	}
+	if g.blockNext {
+		g.blockNext = false
+		observed, release := g.observed, g.release
+		g.mu.Unlock()
+		observed <- observation
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, 0, false, ctx.Err()
+		}
+		return data, version, found, err
+	}
+	var watched chan tieredMetaReadObservation
+	if g.watchNext {
+		g.watchNext = false
+		watched = g.watched
+	}
+	g.mu.Unlock()
+	if watched != nil {
+		watched <- observation
+	}
+	return data, version, found, err
+}
+
+type tieredRetierDelayedScenario struct {
+	name        string
+	localBody   string
+	markerETag  string
+	fetchStatus int
+	fetchETag   string
+	fetchBody   string
+}
+
+func tieredETag(body string) string {
+	sum := md5.Sum([]byte(body))
+	return `"` + hex.EncodeToString(sum[:]) + `"`
+}
+
+func TestTieredRetierDelayedRegistrationPreservesLocalPut(t *testing.T) {
+	scenarios := []tieredRetierDelayedScenario{
+		{
+			name:        "upstream 404 cannot remove local successor",
+			localBody:   "local-after-404",
+			markerETag:  `"upstream-a"`,
+			fetchStatus: http.StatusNotFound,
+		},
+		{
+			name:        "changed response cannot relabel same-content local successor",
+			localBody:   "same-content",
+			markerETag:  tieredETag("same-content"),
+			fetchStatus: http.StatusOK,
+			fetchETag:   `"upstream-b"`,
+			fetchBody:   "replacement-body",
+		},
+	}
+
+	var violations []string
+	setupComplete := true
+	for _, scenario := range scenarios {
+		scenario := scenario
+		var violation string
+		if !t.Run(scenario.name, func(t *testing.T) {
+			violation = runTieredRetierDelayedRegistrationScenario(t, scenario)
+		}) {
+			setupComplete = false
+		}
+		if violation != "" {
+			violations = append(violations, scenario.name+": "+violation)
+		}
+	}
+	if !setupComplete {
+		return
+	}
+	if len(violations) != 0 {
+		t.Errorf("stale re-tier changed the authoritative metadata of a completed local PUT: %s", strings.Join(violations, "; "))
+	}
+}
+
+func runTieredRetierDelayedRegistrationScenario(t *testing.T, scenario tieredRetierDelayedScenario) string {
+	t.Helper()
+	const bucket, key = "b", "obj"
+	ctx := context.Background()
+
+	mock, _, _ := tieredMock()
+	cleanupFinished := make(chan struct{})
+	mock.doObjectDeleteFunc = func(context.Context, string, string, string, string, string) (*http.Response, error) {
+		defer close(cleanupFinished)
+		// The local PUT's upstream cleanup is unrelated to this invariant. A
+		// lost If-Match takes the normal early-return path before its own
+		// versioned metadata repair read can be mistaken for the re-tier read.
+		return &http.Response{StatusCode: http.StatusPreconditionFailed, Body: http.NoBody}, nil
+	}
+	var fetches atomic.Int32
+	mock.doFullObjectFunc = func(context.Context, string, string, string, string) (*http.Response, error) {
+		if fetches.Add(1) > 1 {
+			return nil, errors.New("unexpected repeated re-tier fetch")
+		}
+		header := make(http.Header)
+		if scenario.fetchETag != "" {
+			header.Set("ETag", scenario.fetchETag)
+			header.Set("Content-Length", strconv.Itoa(len(scenario.fetchBody)))
+		}
+		return &http.Response{
+			StatusCode:    scenario.fetchStatus,
+			Header:        header,
+			ContentLength: int64(len(scenario.fetchBody)),
+			Body:          io.NopCloser(strings.NewReader(scenario.fetchBody)),
+		}, nil
+	}
+
+	gate := &tieredMetaReadGateClient{CacheClient: cacheclient.NewMemoryCache()}
+	svc, c := newTieredTestServiceWithClient(mock, 1024, gate)
+	marker := &cache.CachedObjectMeta{
+		Bucket: bucket, Key: key, ETag: scenario.markerETag,
+		BodyUpstream: true, ContentLength: int64(len(scenario.localBody)), StatusCode: http.StatusOK,
+	}
+	_, absentVersion, found, err := c.GetMetaWithVersion(ctx, bucket, key)
+	if err != nil || found {
+		t.Fatalf("initial metadata state: found=%v err=%v, want absence", found, err)
+	}
+	if wrote, err := c.PutMetaIfVersion(ctx, bucket, key, marker, 60, absentVersion); err != nil || !wrote {
+		t.Fatalf("seed upstream marker: wrote=%v err=%v", wrote, err)
+	}
+	seeded, markerVersion, found, err := c.GetMetaWithVersion(ctx, bucket, key)
+	if err != nil || !found || seeded == nil || !seeded.BodyUpstream || seeded.ETag != marker.ETag {
+		t.Fatalf("seeded marker snapshot: meta=%+v found=%v err=%v", seeded, found, err)
+	}
+
+	observed, release := gate.gateNextMetaRead(cache.MakeMetaKey(bucket, key))
+	var releaseOnce sync.Once
+	resumeGET := func() { releaseOnce.Do(func() { close(release) }) }
+	getRecorder := httptest.NewRecorder()
+	getRequest := httptest.NewRequest(http.MethodGet, "/b/obj", nil)
+	getFinished := make(chan struct{})
+	var getErr error
+	go func() {
+		getErr = svc.HandleGetObject(getRecorder, getRequest)
+		close(getFinished)
+	}()
+	defer func() {
+		resumeGET()
+		select {
+		case <-getFinished:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
+	var firstRead tieredMetaReadObservation
+	select {
+	case firstRead = <-observed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GET did not reach the gated versioned metadata read")
+	}
+	firstMeta, decodeErr := cache.DecodeMeta(firstRead.data)
+	if firstRead.err != nil || decodeErr != nil || !firstRead.found || firstRead.version != markerVersion || firstMeta == nil || !firstMeta.BodyUpstream || firstMeta.ETag != marker.ETag {
+		t.Fatalf("gated GET did not observe marker A: meta=%+v version=%d found=%v readErr=%v decodeErr=%v", firstMeta, firstRead.version, firstRead.found, firstRead.err, decodeErr)
+	}
+	if svc.retierRunning(bucket, key) {
+		t.Fatal("re-tier registered before the gated GET resumed")
+	}
+
+	putRecorder := httptest.NewRecorder()
+	putRequest := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader(scenario.localBody))
+	if err := svc.HandlePutObject(putRecorder, putRequest); err != nil {
+		t.Fatalf("local successor PUT: %v", err)
+	}
+	if putRecorder.Code != http.StatusOK {
+		t.Fatalf("local successor PUT status = %d, want %d", putRecorder.Code, http.StatusOK)
+	}
+	svc.retierMu.Lock()
+	claims := svc.retierClaims[bucket+"|"+key]
+	svc.retierMu.Unlock()
+	if claims != 0 {
+		t.Fatalf("PUT returned while holding %d re-tier write claims", claims)
+	}
+	before, beforeVersion, found, err := c.GetMetaWithVersion(ctx, bucket, key)
+	if err != nil || !found || before == nil || before.BodyUpstream || before.BodyRef == "" {
+		t.Fatalf("completed PUT metadata: meta=%+v found=%v err=%v", before, found, err)
+	}
+	if beforeVersion == markerVersion {
+		t.Fatalf("successor metadata version %d did not advance from marker version", beforeVersion)
+	}
+	if scenario.localBody == "same-content" && before.ETag != marker.ETag {
+		t.Fatalf("same-content successor ETag = %q, want marker ETag %q", before.ETag, marker.ETag)
+	}
+	select {
+	case <-cleanupFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("local PUT's cross-tier cleanup did not finish")
+	}
+
+	workerRead := gate.watchNextMetaRead()
+	resumeGET()
+	select {
+	case <-getFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GET did not finish after its metadata snapshot was released")
+	}
+	if getErr != nil {
+		t.Fatalf("validated GET: %v", getErr)
+	}
+	var workerSnapshot tieredMetaReadObservation
+	select {
+	case workerSnapshot = <-workerRead:
+	case <-time.After(2 * time.Second):
+		t.Fatal("delayed GET did not start the re-tier worker's pre-fetch metadata read")
+	}
+	workerMeta, workerDecodeErr := cache.DecodeMeta(workerSnapshot.data)
+	if workerSnapshot.err != nil || workerDecodeErr != nil || !workerSnapshot.found || workerSnapshot.version != beforeVersion || workerMeta == nil || workerMeta.BodyUpstream || workerMeta.BodyRef != before.BodyRef {
+		t.Fatalf("re-tier worker did not observe completed local PUT: meta=%+v version=%d found=%v readErr=%v decodeErr=%v", workerMeta, workerSnapshot.version, workerSnapshot.found, workerSnapshot.err, workerDecodeErr)
+	}
+	waitRetierDone(t, svc, bucket, key)
+
+	issues := make([]string, 0, 5)
+	after, afterVersion, found, err := c.GetMetaWithVersion(ctx, bucket, key)
+	if err != nil {
+		t.Fatalf("metadata after re-tier: %v", err)
+	}
+	if !found || after == nil {
+		issues = append(issues, "successor metadata was removed")
+	} else {
+		if afterVersion != beforeVersion {
+			issues = append(issues, "metadata version changed")
+		}
+		if after.BodyRef != before.BodyRef {
+			issues = append(issues, "BodyRef changed")
+		}
+		if after.ETag != before.ETag {
+			issues = append(issues, "ETag changed")
+		}
+		if after.BodyUpstream {
+			issues = append(issues, "metadata no longer identifies the local tier")
+		}
+	}
+
+	getAfter := httptest.NewRecorder()
+	if err := svc.HandleGetObject(getAfter, httptest.NewRequest(http.MethodGet, "/b/obj", nil)); err != nil {
+		t.Fatalf("GET after re-tier: %v", err)
+	}
+	waitRetierDone(t, svc, bucket, key)
+	if getAfter.Code != http.StatusOK || getAfter.Body.String() != scenario.localBody || getAfter.Header().Get("ETag") != before.ETag {
+		issues = append(issues, "subsequent validated GET did not expose the local PUT")
+	}
+	headAfter := httptest.NewRecorder()
+	if err := svc.HandleHeadObject(headAfter, httptest.NewRequest(http.MethodHead, "/b/obj", nil)); err != nil {
+		t.Fatalf("HEAD after re-tier: %v", err)
+	}
+	if headAfter.Code != http.StatusOK || headAfter.Header().Get("ETag") != before.ETag || headAfter.Header().Get("Content-Length") != strconv.Itoa(len(scenario.localBody)) {
+		issues = append(issues, "subsequent validated HEAD did not expose the local PUT")
+	}
+	return strings.Join(issues, ", ")
+}
+
+// A 404 for an unchanged marker still removes that marker from the
+// authoritative view; the stale-GET guard must not disable this convergence.
+func TestTieredRetier404ConvergesUnchangedMarker(t *testing.T) {
+	mock, _, _ := tieredMock()
+	var fetches atomic.Int32
+	mock.doFullObjectFunc = func(context.Context, string, string, string, string) (*http.Response, error) {
+		fetches.Add(1)
+		return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: http.NoBody}, nil
+	}
+	svc, c := newTieredTestService(mock, 1024)
+	marker := &cache.CachedObjectMeta{
+		Bucket: "b", Key: "obj", ETag: `"gone"`, BodyUpstream: true,
+		ContentLength: 4, StatusCode: http.StatusOK,
+	}
+	_, version, found, err := c.GetMetaWithVersion(context.Background(), "b", "obj")
+	if err != nil || found {
+		t.Fatalf("initial metadata state: found=%v err=%v, want absence", found, err)
+	}
+	if wrote, err := c.PutMetaIfVersion(context.Background(), "b", "obj", marker, 60, version); err != nil || !wrote {
+		t.Fatalf("seed upstream marker: wrote=%v err=%v", wrote, err)
+	}
+	if w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want forwarded 200", w.Code)
+	}
+	waitRetierDone(t, svc, "b", "obj")
+	if n := fetches.Load(); n != 1 {
+		t.Fatalf("background fetches = %d, want 1", n)
+	}
+	if _, found, err := c.GetMeta(context.Background(), "b", "obj"); err != nil || found {
+		t.Fatalf("unchanged 404 marker survived convergence: found=%v err=%v", found, err)
+	}
+	head := httptest.NewRecorder()
+	if err := svc.HandleHeadObject(head, httptest.NewRequest(http.MethodHead, "/b/obj", nil)); err != nil {
+		t.Fatalf("HEAD after 404 convergence: %v", err)
+	}
+	if head.Code != http.StatusNotFound {
+		t.Fatalf("HEAD after 404 convergence = %d, want %d", head.Code, http.StatusNotFound)
 	}
 }
 
@@ -1504,5 +1853,180 @@ func TestTieredForwardedDeleteCancelsInflightRetier(t *testing.T) {
 			t.Fatal("deleted object still present after DELETE + canceled re-tier")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A tiered CopyObject must converge the destination under its PRE-FORWARD
+// version — the same rule as a forwarded DELETE. A small PUT acked while the
+// copy is in flight is the local tier's only copy and must survive; the old
+// unconditional converge out-deleted it behind the copy's 200.
+func TestTieredCopyConvergeSparesRacingPut(t *testing.T) {
+	mock, _, _ := tieredMock()
+	var svc *Service
+	raced := make(chan struct{})
+	mock.captureFunc = func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+		// Mid-copy: a small client PUT commits a new local-tier object.
+		put := httptest.NewRequest(http.MethodPut, "/b/dst", strings.NewReader("racer-wins"))
+		if err := svc.HandlePutObject(httptest.NewRecorder(), put); err != nil {
+			t.Errorf("racing PUT: %v", err)
+		}
+		close(raced)
+		body := `<CopyObjectResult><ETag>"copied"</ETag></CopyObjectResult>`
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+		return &ResponseCapture{StatusCode: http.StatusOK, Body: []byte(body), Complete: true, Headers: http.Header{}}, nil
+	}
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 1024
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	svc = NewService(mock, c, cfg)
+
+	// Seed a prior local-tier destination so the copy has state to displace.
+	if w := tieredDo(t, svc, http.MethodPut, "/b/dst", "old", nil); w.Code != http.StatusOK {
+		t.Fatalf("seed PUT: %d", w.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/b/dst", nil)
+	req.Header.Set("X-Amz-Copy-Source", "/b/src")
+	if err := svc.HandleCopyObject(httptest.NewRecorder(), req); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	<-raced
+
+	// The racing PUT's object must survive the converge.
+	cur, found, _ := c.GetMeta(context.Background(), "b", "dst")
+	if !found || cur == nil || cur.BodyUpstream {
+		t.Fatalf("racing PUT's local object was out-deleted by the copy converge: %+v", cur)
+	}
+	if g := tieredDo(t, svc, http.MethodGet, "/b/dst", "", nil); g.Code != http.StatusOK || g.Body.String() != "racer-wins" {
+		t.Fatalf("GET = %d %q, want the racing PUT's bytes", g.Code, g.Body.String())
+	}
+}
+
+// deleteIfVersionFlakeClient fails the first N meta-key DeleteIfVersion calls
+// with a transient error (after recording each attempt's version) and lets
+// later ones through — the transient-converge shape.
+type deleteIfVersionFlakeClient struct {
+	cacheclient.CacheClient
+	mu       sync.Mutex
+	failN    int
+	versions []uint64
+}
+
+func (d *deleteIfVersionFlakeClient) DeleteIfVersion(ctx context.Context, key string, version uint64) error {
+	if !strings.HasPrefix(key, "meta|") {
+		return d.CacheClient.DeleteIfVersion(ctx, key, version)
+	}
+	d.mu.Lock()
+	d.versions = append(d.versions, version)
+	n := len(d.versions)
+	d.mu.Unlock()
+	if n <= d.failN {
+		return errors.New("transient converge failure")
+	}
+	return d.CacheClient.DeleteIfVersion(ctx, key, version)
+}
+
+// The tiered converge retries ONCE on a transient error, under the SAME
+// version token (the guard must not weaken across the retry), and attempts
+// exactly twice on persistent failure — a client holds its 2xx, so a
+// converge that never lands leaves deleted metadata authoritative until TTL.
+func TestTieredConvergeRetriesOnceUnderSameVersion(t *testing.T) {
+	newSvc := func(failN int) (*Service, *cache.Cache, *deleteIfVersionFlakeClient) {
+		mock, _, _ := tieredMock()
+		flake := &deleteIfVersionFlakeClient{CacheClient: cacheclient.NewMemoryCache(), failN: failN}
+		cfg := config.NewDefault()
+		cfg.Mode = config.ModeTiered
+		cfg.Cache.SetBlockCachingEnabled(false)
+		cfg.Cache.SizeThreshold = 1024
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		c := cache.NewCacheWithClient(flake, &cfg.Cache)
+		return NewService(mock, c, cfg), c, flake
+	}
+	seedMarker := func(c *cache.Cache) uint64 {
+		marker := &cache.CachedObjectMeta{Bucket: "b", Key: "obj", ETag: `"up-1"`, BodyUpstream: true, ContentLength: 5000, StatusCode: 200}
+		_, tok, _, _ := c.GetMetaWithVersion(context.Background(), "b", "obj")
+		if wrote, err := c.PutMetaIfVersion(context.Background(), "b", "obj", marker, 60, tok); err != nil || !wrote {
+			t.Fatalf("seed marker: %v", err)
+		}
+		_, v, _, _ := c.GetMetaWithVersion(context.Background(), "b", "obj")
+		return v
+	}
+
+	// Transient: first attempt fails, retry succeeds under the same version.
+	svc, c, flake := newSvc(1)
+	v := seedMarker(c)
+	svc.convergeTieredDelete("b", "obj", v, true)
+	if len(flake.versions) != 2 {
+		t.Fatalf("attempts = %d, want 2 (one retry)", len(flake.versions))
+	}
+	if flake.versions[0] != v || flake.versions[1] != v {
+		t.Fatalf("retry changed the version guard: %v, want both == %d", flake.versions, v)
+	}
+	if _, found, _ := c.GetMeta(context.Background(), "b", "obj"); found {
+		t.Fatal("converge did not land on the retry")
+	}
+
+	// Persistent: exactly two attempts, then give up (metadata stays until TTL).
+	svc2, c2, flake2 := newSvc(99)
+	v2 := seedMarker(c2)
+	svc2.convergeTieredDelete("b", "obj", v2, true)
+	if len(flake2.versions) != 2 {
+		t.Fatalf("persistent-failure attempts = %d, want exactly 2", len(flake2.versions))
+	}
+	if _, found, _ := c2.GetMeta(context.Background(), "b", "obj"); !found {
+		t.Fatal("metadata vanished despite every converge attempt failing")
+	}
+}
+
+// On a non-Tigris endpoint the cross-tier cleanup DELETE is disabled by
+// construction: If-Match enforcement on DELETE is verified on Tigris only, and
+// a backend that ignored it could delete a racing replacement. The displaced
+// upstream copy is left for bucket expiry. (The gate returns synchronously
+// before any goroutine is spawned, so a delete that was going to happen would
+// already be in flight by the time the PUT returns.)
+func TestTieredCleanupDisabledOnNonTigrisEndpoint(t *testing.T) {
+	mock, _, _ := tieredMock()
+	var deletes atomic.Int32
+	mock.doObjectDeleteFunc = func(ctx context.Context, bucket, key, etag, accessKey, secretKey string) (*http.Response, error) {
+		deletes.Add(1)
+		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+	}
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Upstream.Endpoint = "https://ns.compat.objectstorage.us-ashburn-1.oraclecloud.com"
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 8
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("tiered on a non-Tigris endpoint must validate: %v", err)
+	}
+	if cfg.ForwardsTransparently() {
+		t.Fatal("fixture: expected signing flavor")
+	}
+	c := cache.NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	// Large PUT stamps an upstream-tier marker; the small overwrite displaces it —
+	// the exact trigger for cross-tier cleanup on Tigris.
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "way past threshold", nil); w.Code != http.StatusOK {
+		t.Fatalf("large PUT status = %d", w.Code)
+	}
+	if w := tieredDo(t, svc, http.MethodPut, "/b/obj", "tiny", nil); w.Code != http.StatusOK {
+		t.Fatalf("small PUT status = %d", w.Code)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := deletes.Load(); n != 0 {
+		t.Fatalf("cleanup DELETE issued %d time(s) on a non-Tigris endpoint, want 0", n)
+	}
+	// The small object is the live, servable local-tier entry regardless.
+	if g := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); g.Code != http.StatusOK || g.Body.String() != "tiny" {
+		t.Fatalf("GET = %d %q, want the local-tier object", g.Code, g.Body.String())
 	}
 }

@@ -123,6 +123,66 @@ func TestWriteChunksToResponse_ZeroByteResponse(t *testing.T) {
 	}
 }
 
+func TestWriteChunksToResponse_CompletedEmptyBroadcastWithLateListener(t *testing.T) {
+	b := broadcast.NewBroadcaster(16)
+	headers := http.Header{
+		"Content-Length": []string{"0"},
+		"Content-Type":   []string{"application/octet-stream"},
+	}
+	b.SetHeaders(http.StatusOK, headers)
+	b.Complete(nil)
+
+	listener := b.Subscribe()
+	if listener == nil {
+		t.Fatal("Subscribe returned nil after an empty response completed")
+	}
+	w := httptest.NewRecorder()
+	if err := (&Service{}).writeChunksToResponse(context.Background(), w, listener, "MISS"); err != nil {
+		t.Fatalf("writeChunksToResponse: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("body length = %d, want 0", w.Body.Len())
+	}
+	if got := w.Header().Get("Content-Type"); got != "application/octet-stream" {
+		t.Errorf("Content-Type = %q, want application/octet-stream", got)
+	}
+	if got := w.Header().Get("X-Cache"); got != "MISS" {
+		t.Errorf("X-Cache = %q, want MISS", got)
+	}
+}
+
+func TestWriteChunksToResponse_CompletedHeaderErrorWithLateListener(t *testing.T) {
+	upstreamErr := errors.New("upstream body read failed")
+	b := broadcast.NewBroadcaster(16)
+	b.SetHeaders(http.StatusOK, http.Header{
+		"Content-Length": []string{"6"},
+		"Content-Type":   []string{"text/plain"},
+	})
+	b.Complete(upstreamErr)
+
+	listener := b.Subscribe()
+	if listener == nil {
+		t.Fatal("Subscribe returned nil after a completed response")
+	}
+	w := httptest.NewRecorder()
+	err := (&Service{}).writeChunksToResponse(context.Background(), w, listener, "MISS")
+	if err != upstreamErr {
+		t.Fatalf("writeChunksToResponse error = %v, want original upstream error %v", err, upstreamErr)
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("body length = %d, want 0 before any body data", w.Body.Len())
+	}
+	if got := w.Header().Get("Content-Type"); got != "" {
+		t.Errorf("Content-Type = %q, want uncommitted headers", got)
+	}
+	if got := w.Header().Get("X-Cache"); got != "" {
+		t.Errorf("X-Cache = %q, want no cache status before error response mapping", got)
+	}
+}
+
 func TestWriteChunksToResponse_ErrorAfterPartialData(t *testing.T) {
 	// Error after partial data: headers are committed (can't undo), error returned.
 	b := broadcast.NewBroadcaster(16)

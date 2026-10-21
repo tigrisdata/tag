@@ -8,9 +8,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"strconv"
@@ -235,6 +237,21 @@ func writePreconditionFailed(w http.ResponseWriter, r *http.Request, meta *cache
 	return false
 }
 
+// concretePayloadSHA256 returns a decoded, concrete SigV4 payload digest. Sentinel
+// values and malformed hashes are not body digests and retain their existing handling.
+func concretePayloadSHA256(r *http.Request) []byte {
+	payloadHash := r.Header.Get("X-Amz-Content-Sha256")
+	if payloadHash == "" || payloadHash == "UNSIGNED-PAYLOAD" ||
+		IsStreamingPayload(payloadHash) || len(payloadHash) != sha256.Size*2 {
+		return nil
+	}
+	digest, err := hex.DecodeString(payloadHash)
+	if err != nil {
+		return nil
+	}
+	return digest
+}
+
 // originlessPutSize returns the number of body bytes a PUT declares. For a
 // streaming (aws-chunked) payload that is X-Amz-Decoded-Content-Length —
 // REQUIRED, and zero is valid (the SDK's empty-body default); sizing a framed
@@ -292,7 +309,7 @@ func originlessPlainObject(r *http.Request) bool {
 // mode's semantics: new meta points at the new ETag-keyed body; the old body
 // ages out by TTL.
 func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) error {
-	return s.handleOriginlessPut(w, r, nil)
+	return s.handleOriginlessPut(w, r, nil, nil)
 }
 
 // putPrior is a metadata snapshot the caller already read, threaded into the
@@ -305,7 +322,7 @@ type putPrior struct {
 	found   bool
 }
 
-func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, prior *putPrior) error {
+func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, prior *putPrior, expectedSHA256 []byte) error {
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
@@ -479,7 +496,13 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 	// whose meta never commits is an orphan, and TTL is the backstop when
 	// the delete itself fails.
 	hasher := md5.New()
-	src := &captureReader{r: io.TeeReader(io.LimitReader(reader, declaredSize+1), hasher)}
+	var payloadHasher hash.Hash
+	var digestWriter io.Writer = hasher
+	if expectedSHA256 != nil {
+		payloadHasher = sha256.New()
+		digestWriter = io.MultiWriter(hasher, payloadHasher)
+	}
+	src := &captureReader{r: io.TeeReader(io.LimitReader(reader, declaredSize+1), digestWriter)}
 	ref := cache.NewBodyRef()
 	ttl := int(s.config.Cache.TTL.Seconds())
 	// ONE deferred, panic-safe reclamation for the staged body, in place of a
@@ -525,9 +548,6 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 			return nil
 		}
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
-		if src.err != nil {
-			return src.err
-		}
 		return putErr
 	}
 	switch {
@@ -548,6 +568,11 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 	etag := `"` + hex.EncodeToString(sum) + `"`
 	if wantMD5 != nil && !bytes.Equal(wantMD5, sum) {
 		s3err.WriteError(w, r, s3err.ErrBadDigest)
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
+	}
+	if payloadHasher != nil && !bytes.Equal(payloadHasher.Sum(nil), expectedSHA256) {
+		s3err.WriteError(w, r, s3err.ErrContentSHA256Mismatch)
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	}

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
@@ -95,6 +96,7 @@ type Service struct {
 	perPopulateCap              int64              // Max bytes a foreground broadcast populate can buffer
 	backgroundPopulateWriterCap int64              // Bytes reserved for direct writer buffers before response inspection
 	broadcastManager            *broadcast.Manager // For streaming request coalescing
+	activeIndependentBroadcasts atomic.Int64       // Late GET broadcasts not keyed in the coalescing manager
 	activeBackgroundFetches     sync.Map           // Dedup for background full-object fetches (range caching)
 	// retier coordinates tiered-mode re-tier-on-read populates with writes:
 	// claims[key] counts PUTs in flight (a claim cancels and excludes re-tiers
@@ -123,6 +125,14 @@ type Service struct {
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
 	recentFooterWork *expirable.LRU[string, struct{}]
+	// parquetFooterPrefetchSlots bounds read-triggered scans before they create a
+	// goroutine or marker. Write-triggered warms retain their separate admission path.
+	parquetFooterPrefetchSlots chan struct{}
+}
+
+// setActiveBroadcasts includes private late-GET broadcasts alongside the manager's keyed broadcasts.
+func (s *Service) setActiveBroadcasts() {
+	metrics.SetActiveBroadcasts(s.broadcastManager.ActiveCount() + int(s.activeIndependentBroadcasts.Load()))
 }
 
 // NewService creates a new proxy service.
@@ -214,6 +224,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		blockFetches:                make(map[string]*blockFetchState),
 		retierClaims:                make(map[string]int),
 		retierInflight:              make(map[string]context.CancelFunc),
+		parquetFooterPrefetchSlots:  make(chan struct{}, maxConcurrentParquetFooterPrefetches),
 	}
 	// Allocated only when the feature that uses it is on.
 	if cfg.Cache.ParquetOptimization {
@@ -921,6 +932,16 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error {
 	bucket, key := ParseBucketKey(r)
 
+	// CopyObject warming uses request Cache-Control as an admission policy just like
+	// the PUT cache path. Decide before forwarding so a rejected copy can still take
+	// both invalidation fences without starting either warmer.
+	requestRejectsCache := false
+	if !s.config.IsTiered() && s.cache.IsEnabled() && (s.config.Cache.WarmOnWrite || s.config.Cache.ParquetOptimization) {
+		if cacheControls := r.Header["Cache-Control"]; len(cacheControls) > 0 {
+			requestRejectsCache = hasNoCacheDirectives(cacheControls)
+		}
+	}
+
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleCopyObject")
 
 	// Invalidate cache for destination object BEFORE forwarding to ensure
@@ -930,6 +951,22 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// local-tier only-copy that a failed copy must leave intact.
 	if s.cache.IsEnabled() {
 		s.preForwardInvalidate(context.Background(), bucket, key)
+	}
+
+	// Tiered: the post-success converge must be ORDERED, exactly as for a
+	// forwarded DELETE. The unconditional converge out-deletes racing
+	// writers — a small PUT acked while the copy is in flight is the local
+	// tier's only copy, and out-deleting it is data loss. Claim the key
+	// (cancels/excludes re-tiers) and capture the pre-forward token; the
+	// converge removes only the state this copy displaced.
+	var (
+		cpPriorVer   uint64
+		cpPriorKnown bool
+	)
+	if s.config.IsTiered() {
+		s.claimRetierWrite(bucket, key)
+		defer s.releaseRetierWrite(bucket, key)
+		_, cpPriorVer, cpPriorKnown = s.captureMarkerPrior(r.Context(), bucket, key)
 	}
 
 	// Forward to upstream, capturing the response so we can confirm the copy
@@ -945,9 +982,18 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 	// Gated on a confirmed-successful copy: a rejected copy leaves the destination
 	// unchanged, so re-invalidating would only discard a valid racing refill.
 	if err == nil && s3WriteSucceeded(capture) && s.cache.IsEnabled() {
-		s.convergeInvalidation(context.Background(), bucket, key)
-		s.warmOnWrite(r, bucket, key)
-		s.warmParquetFooterOnWrite(r, bucket, key)
+		if s.config.IsTiered() {
+			// The copied object lives upstream and reads as a miss until
+			// re-put (documented v1 limitation); converge the displaced
+			// destination state under its pre-forward token only.
+			s.convergeTieredDelete(bucket, key, cpPriorVer, cpPriorKnown)
+		} else {
+			s.convergeInvalidation(context.Background(), bucket, key)
+			if !requestRejectsCache {
+				s.warmOnWrite(r, bucket, key)
+				s.warmParquetFooterOnWrite(r, bucket, key)
+			}
+		}
 	}
 
 	return err
@@ -1024,9 +1070,20 @@ func (s *Service) convergeTieredDelete(bucket, key string, priorVersion uint64, 
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Tiered DELETE converge skipped - prior unknown; possibly-stale metadata serves until TTL")
 		return
 	}
-	if _, err := s.cache.DeleteMetaIfVersion(ctx, bucket, key, priorVersion); err != nil {
+	// One immediate retry absorbs the transient class (the discipline
+	// convergeInvalidation already applies): the client holds its 2xx, and
+	// a converge that never lands leaves the old metadata AUTHORITATIVE —
+	// a marker makes HEAD report the deleted object present, a surviving
+	// local-tier entry keeps serving the deleted body — until TTL. The
+	// version guard is kept on the retry; a repeat failure stays visible on
+	// the invalidation-errors metric.
+	_, err := s.cache.DeleteMetaIfVersion(ctx, bucket, key, priorVersion)
+	if err != nil {
+		_, err = s.cache.DeleteMetaIfVersion(ctx, bucket, key, priorVersion)
+	}
+	if err != nil {
 		metrics.RecordCacheOperation("delete", "error")
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Tiered DELETE converge failed; stale metadata may serve until TTL")
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Tiered DELETE converge failed after retry; stale metadata may serve until TTL")
 		return
 	}
 	metrics.RecordCacheOperation("delete", "success")
@@ -1229,11 +1286,16 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 			s.warmOnWrite(r, bucket, key)
 			// The path that matters for parquet: ingestors write via multipart, so this
 			// is where a freshly written file's metadata gets warmed (RFC 0002).
-			s.warmParquetFooterOnWrite(r, bucket, key)
+			writtenETag := completedMultipartETag(capture)
+			footerETag := ""
+			if s.config.Cache.MetaOnWrite && s.config.Cache.ParquetOptimization && isParquetKey(key) {
+				footerETag = writtenETag
+			}
+			s.warmParquetFooterOnWriteWithETag(r, bucket, key, footerETag)
 			// Prototype: establish the metadata entry so the first read does not pay an
 			// upstream round trip to discover it. Multipart is the gap — write-through
 			// cannot tee a body TAG never sees.
-			s.cacheBlockMetaOnWrite(r, bucket, key, completedMultipartETag(capture))
+			s.cacheBlockMetaOnWrite(r, bucket, key, writtenETag)
 		}
 	}
 

@@ -78,7 +78,7 @@ TAG adds a caching layer for read operations. The `X-Cache` response header indi
 
 Key caching behaviors:
 
-- **Request coalescing** — Multiple concurrent GETs for the same object are coalesced into a single upstream fetch using a broadcast/subscriber pattern.
+- **Request coalescing** — Multiple concurrent GETs for the same object are coalesced into a single upstream fetch using a broadcast/subscriber pattern. For live requests, a fetch failure before response commitment returns TAG's existing S3 error response to waiting GETs; errors after commitment terminate the stream.
 - **Range requests** — If the full object is cached, range requests are served from cache. On a range cache miss, the range is served directly from Tigris while a background fetch populates the cache with the full object.
 - **Conditional requests** — `If-None-Match` and `If-Modified-Since` are evaluated against cached metadata and can return 304 without hitting Tigris.
 - **Write-through invalidation** — PUT, DELETE, CopyObject, and DeleteObjects invalidate the cache _before_ forwarding to Tigris to prevent stale reads.
@@ -94,7 +94,7 @@ All requests must be signed with AWS Signature Version 4 (header-based).
 
 In **transparent proxy mode** (default), TAG forwards the client's original Authorization header as-is and adds proxy headers (`X-Tigris-Forwarded-Host`, etc.) so Tigris validates the signature against the original host. No local credential store is needed.
 
-In **signing mode**, TAG validates the incoming signature against its credential store, then re-signs the request with the same credentials for the Tigris upstream endpoint.
+In **signing mode**, TAG validates the incoming signature against its credential store, then re-signs the request with the same credentials for the Tigris upstream endpoint. During SigV4 signing, TAG trims surrounding whitespace and collapses runs of ASCII spaces in each signed header value. This normalization affects signature calculation only; forwarded metadata retains its interior spacing and tabs.
 
 Presigned URL authentication (`X-Amz-Algorithm` query parameter) is supported for request validation.
 

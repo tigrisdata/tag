@@ -17,9 +17,15 @@ memory, so the threshold can be sized to the workload without a per-request
 memory cost. The MD5 ETag is computed over the decoded bytes as they stream;
 because the ETag cannot exist before the last byte, the body is keyed by a
 per-write id carried in the metadata (`BodyRef`), and the metadata commit is
-what makes the entry visible. `If-Match`/`If-None-Match` are honored; GET,
-HEAD, and DELETE are served entirely locally. Reads and writes of small
-objects generate zero upstream traffic.
+what makes the entry visible. After admission and any local precondition pass
+and the full body passes its declared-length and any Content-MD5 checks, a PUT
+routed to the local tier checks a concrete SigV4 payload hash against the
+streamed bytes before that commit.
+Conditional writes against an upstream-tier marker stay on the forwarding
+path. `UNSIGNED-PAYLOAD` and aws-chunked streaming markers retain their
+existing handling. `If-Match`/`If-None-Match` are honored; GET, HEAD, and
+DELETE are served entirely locally. Reads and writes of small objects
+generate zero upstream traffic.
 
 **Large objects are the upstream tier.** The PUT passes through to upstream and
 TAG stores a metadata marker locally. HEAD answers from the marker; GET
@@ -41,8 +47,10 @@ the body into the local tier — streamed like the engine's PUT, so a heal
 costs fixed memory regardless of object size and the threshold is never
 budget-capped. This heals objects mis-placed by the cold-start
 window below, capping the damage at one extra upstream fetch per object
-instead of one body forward per read until TTL. The displaced upstream copy
-is left for the upstream bucket's own expiry.
+instead of one body forward per read until TTL. Each background move is bound
+to the marker version that triggered it; if a later write replaces that
+metadata, the stale move cannot change the newer entry. The displaced
+upstream copy is left for the upstream bucket's own expiry.
 
 ## Authentication
 
@@ -55,13 +63,41 @@ marker, so they stay readable) — the first such write's 2xx is itself what
 teaches the keys, and re-tier-on-read moves those objects into the local tier
 on their first validated read.
 
-**Credential requirement**: unlike proxy mode's read-only guidance (which
-targets customer buckets), tiered mode's upstream is the operator's own cache
-bucket, and TAG's `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` must have
-**delete** permission there — the cross-tier cleanup DELETE and the re-tier
-fetch are signed with TAG's own credentials. With read-only credentials every
-cleanup is rejected (visible as `tag_tiered_cleanup_total{outcome="rejected"}`)
-and displaced upstream copies accumulate until bucket expiry.
+**Forwarding flavor is decided by the endpoint.** Tiering is a caching
+topology, not a forwarding flavor: a tiered deployment fronting a Tigris
+domain (`*.tigris.dev`, `*.storage.dev`) forwards the transparent way (client
+signature preserved, `X-Tigris-Proxy-*` identity headers, keys learned from
+Tigris); one fronting any other endpoint — including `localhost`, which
+transparent mode allows for local testing but which earns no trust claim
+about the backend behind it — forwards the signing way (TAG validates the
+caller against its credential store and re-signs). The startup log states
+which flavor was selected.
+
+**Credential requirement** (Tigris-backed tiered deployments): unlike proxy
+mode's read-only guidance (which targets customer buckets), tiered mode's
+upstream is the operator's own cache bucket, and the validated caller's key
+must have **delete** permission there — the cross-tier cleanup DELETE is
+signed with it. With read-only credentials every cleanup is rejected (visible
+as `tag_tiered_cleanup_total{outcome="rejected"}`) and displaced upstream
+copies accumulate until bucket expiry. On any other endpoint the cleanup is
+never issued (next paragraph), so TAG's *background* operations need only
+**read** on the key (the re-tier fetch is a GET) and `rejected` cannot occur.
+That is not the key's overall requirement: on the signing flavor the same
+credential-store key re-signs every forwarded client operation — large-object
+PUTs, upstream-tier DELETEs, multipart, copies — so it must carry whatever
+those operations need.
+
+**Non-Tigris endpoints: cross-tier cleanup is disabled.** The cleanup DELETE
+carries `If-Match` so a racing replacement is never deleted, and that safety
+rests on the backend *enforcing* the precondition — verified on Tigris only.
+A backend that accepts but ignores `If-Match` would let the delete remove a
+replacement that landed after the pre-check, a durable loss no metadata repair
+can undo. So on any other endpoint TAG does not issue the delete at all: the
+displaced upstream copy ages out by bucket expiry (the same outcome as
+read-only credentials), counted as
+`tag_tiered_cleanup_total{outcome="unverified_backend"}`, and the startup log
+says so. Deployments whose keys are never overwritten (content- or
+version-addressed) never trigger cleanup in the first place.
 
 ## Configuration
 
