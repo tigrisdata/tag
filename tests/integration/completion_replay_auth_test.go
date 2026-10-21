@@ -116,10 +116,10 @@ func testCompleteMultipartUploadReplayAuthorization(t *testing.T, transparent bo
 	bucket := completionReplayBucket(t)
 	otherBucket := bucket + "-other"
 	upstream := newCompletionReplayUpstream(t, bucket, transparent)
-	defer upstream.releaseSlow()
 	completionCalls := &upstream.completionCalls
 	env := newCompletionReplayEnvironment(t, transparent, upstream.handler)
 	defer env.Close()
+	defer upstream.releaseSlow()
 
 	if transparent {
 		// Replay binds to a principal TAG can validate locally: learned signing keys
@@ -250,9 +250,9 @@ func testColdCompletionReplay(t *testing.T) {
 	t.Helper()
 	bucket := completionReplayBucket(t)
 	upstream := newCompletionReplayUpstream(t, bucket, true)
-	defer upstream.releaseSlow()
 	env := NewTestEnvironmentWithTransparentAuth(t, upstream.handler)
 	defer env.Close()
+	defer upstream.releaseSlow()
 	if env.DerivedKeyStore.HasKey(completionReplayAccessA) || env.AuthzCache.IsAuthorized(completionReplayAccessA, bucket) {
 		t.Fatal("test did not begin with cold transparent authentication state")
 	}
@@ -286,7 +286,6 @@ func testCompletionReplayGrantRevocationDuringRead(t *testing.T) {
 	t.Helper()
 	bucket := completionReplayBucket(t)
 	upstream := newCompletionReplayUpstream(t, bucket, true)
-	defer upstream.releaseSlow()
 
 	gate := &completionReplayReadGate{
 		CacheClient: sharedEmbeddedCache,
@@ -296,6 +295,7 @@ func testCompletionReplayGrantRevocationDuringRead(t *testing.T) {
 	}
 	env := newTestEnvironmentWithTransparentAuthCacheClient(t, upstream.handler, gate)
 	defer env.Close()
+	defer upstream.releaseSlow()
 	defer gate.releaseRead()
 	seedTransparentPrincipal(t, env, completionReplayAccessA, completionReplaySecretA, bucket)
 
