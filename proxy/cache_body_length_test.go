@@ -363,6 +363,165 @@ func TestHandleGetObject_LargeLongCachedBodyAbortsAfterCommit(t *testing.T) {
 	}
 }
 
+// When the cache stream's chunks align with Content-Length, refusing only the
+// excess chunk is not enough: the client would already hold every promised
+// byte and see a clean, complete response from an entry detected as corrupt.
+// The last promised byte is held back until the stream ends cleanly, so the
+// client receives Content-Length-1 bytes (an aborted body), the entry is
+// invalidated and the mismatch is counted.
+func TestHandleGetObject_LargeLongCachedBodyAlignedChunksAbortsAfterCommit(t *testing.T) {
+	const chunk = 32 * 1024
+	stored := bytes.Repeat([]byte("x"), 4*chunk)
+	claimed := int64(3 * chunk)
+	svc, store, client, meta := newBodyLengthServiceWithClient(t,
+		&chunkedCacheClient{CacheClient: cacheclient.NewMemoryCache(), chunk: chunk}, stored, claimed)
+	beforeErrors := requestCount(t, "error")
+	beforeSuccesses := requestCount(t, "success")
+	beforeMismatches := lengthMismatchCount(t)
+
+	var upstreamCalls atomic.Int32
+	svc.forwarder = &mockForwarder{
+		doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			return nil, errors.New("upstream unavailable")
+		},
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject() error = %v", err)
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("upstream calls = %d, want 0 after committed cache response", got)
+	}
+	if got := w.Header().Get(XCacheHeader); got != XCacheHit {
+		t.Fatalf("%s = %q, want %q", XCacheHeader, got, XCacheHit)
+	}
+	if got := w.Header().Get("Content-Length"); got != strconv.FormatInt(claimed, 10) {
+		t.Fatalf("Content-Length = %q, want %d", got, claimed)
+	}
+	// Three chunks land exactly on Content-Length and the fourth is refused;
+	// the held last byte is never released, so the body stays one short.
+	if int64(w.Body.Len()) != claimed-1 {
+		t.Fatalf("body = %d bytes, want %d (Content-Length minus the held last byte)", w.Body.Len(), claimed-1)
+	}
+	if got := requestCount(t, "error"); got != beforeErrors+1 {
+		t.Fatalf("error request count = %v, want %v", got, beforeErrors+1)
+	}
+	if got := requestCount(t, "success"); got != beforeSuccesses {
+		t.Fatalf("success request count = %v, want %v", got, beforeSuccesses)
+	}
+	if got := lengthMismatchCount(t) - beforeMismatches; got != 1 {
+		t.Fatalf("length_mismatch count delta = %v, want 1", got)
+	}
+	if got := client.deletes.Load(); got != 1 {
+		t.Fatalf("guarded deletes = %d, want 1", got)
+	}
+	if _, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key); err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	} else if found {
+		t.Fatal("long-body entry still cached after a committed length mismatch")
+	}
+}
+
+// The boundary the holdback must not disturb: a body of exactly Content-Length
+// delivered in aligned chunks is a complete hit. The held last byte is released
+// when the stream ends cleanly, the entry stays, and nothing is counted as a
+// mismatch.
+func TestHandleGetObject_LargeExactCachedBodyAlignedChunksIsHit(t *testing.T) {
+	const chunk = 32 * 1024
+	stored := bytes.Repeat([]byte("x"), 3*chunk)
+	stored[len(stored)-1] = 'z' // the held byte must come back verbatim
+	svc, store, client, meta := newBodyLengthServiceWithClient(t,
+		&chunkedCacheClient{CacheClient: cacheclient.NewMemoryCache(), chunk: chunk}, stored, int64(len(stored)))
+	client.deletes.Store(0)
+	beforeErrors := requestCount(t, "error")
+	beforeSuccesses := requestCount(t, "success")
+	beforeMismatches := lengthMismatchCount(t)
+
+	var upstreamCalls atomic.Int32
+	svc.forwarder = &mockForwarder{
+		doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			return nil, errors.New("unexpected upstream request")
+		},
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	if err := svc.HandleGetObject(w, r); err != nil {
+		t.Fatalf("HandleGetObject() error = %v", err)
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("upstream calls = %d, want 0", got)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := w.Header().Get(XCacheHeader); got != XCacheHit {
+		t.Fatalf("%s = %q, want %q", XCacheHeader, got, XCacheHit)
+	}
+	if !bytes.Equal(w.Body.Bytes(), stored) {
+		t.Fatalf("body = %d bytes, want the full %d stored bytes", w.Body.Len(), len(stored))
+	}
+	if got := requestCount(t, "success"); got != beforeSuccesses+1 {
+		t.Fatalf("success request count = %v, want %v", got, beforeSuccesses+1)
+	}
+	if got := requestCount(t, "error"); got != beforeErrors {
+		t.Fatalf("error request count = %v, want %v", got, beforeErrors)
+	}
+	if got := lengthMismatchCount(t) - beforeMismatches; got != 0 {
+		t.Fatalf("length_mismatch count delta = %v, want 0", got)
+	}
+	if got := client.deletes.Load(); got != 0 {
+		t.Fatalf("guarded deletes = %d, want 0", got)
+	}
+	if cur, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key); err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	} else if !found {
+		t.Fatal("entry missing after a correct hit, want it to survive")
+	} else if cur.ETag != meta.ETag {
+		t.Fatalf("entry ETag = %q, want %q (the original entry must survive a correct hit)", cur.ETag, meta.ETag)
+	}
+}
+
+// Writer-level contract of the holdback at its smallest: with Content-Length
+// 1 the only byte is held, so nothing commits before release; release then
+// writes exactly that byte; and any byte after the held one is a mismatch.
+func TestLengthBoundedWriter_HoldsLastByteUntilRelease(t *testing.T) {
+	meta := &cache.CachedObjectMeta{ContentLength: 1, StatusCode: http.StatusOK}
+	rec := httptest.NewRecorder()
+	cw := &lazyCommitWriter{w: rec, meta: meta}
+	bw := &lengthBoundedWriter{w: cw, bucket: "bucket", key: "key", meta: meta}
+
+	if n, err := bw.Write([]byte("a")); err != nil || n != 1 {
+		t.Fatalf("Write(1 byte) = %d, %v; want 1, nil", n, err)
+	}
+	if cw.committed || rec.Body.Len() != 0 {
+		t.Fatalf("committed=%v body=%d after the held byte, want nothing committed", cw.committed, rec.Body.Len())
+	}
+	if got := bw.seen(); got != 1 {
+		t.Fatalf("seen() = %d, want 1", got)
+	}
+	if _, err := bw.Write([]byte("b")); !errors.Is(err, errCacheBodyLengthMismatch) {
+		t.Fatalf("Write past the held byte: err = %v, want %v", err, errCacheBodyLengthMismatch)
+	}
+	if err := bw.release(); err != nil {
+		t.Fatalf("release() error = %v", err)
+	}
+	if !cw.committed || rec.Body.String() != "a" {
+		t.Fatalf("committed=%v body=%q after release, want committed and %q", cw.committed, rec.Body.String(), "a")
+	}
+	if bw.written != 1 || bw.seen() != 1 {
+		t.Fatalf("written=%d seen=%d after release, want 1 and 1", bw.written, bw.seen())
+	}
+	// Releasing again is a no-op.
+	if err := bw.release(); err != nil || rec.Body.Len() != 1 {
+		t.Fatalf("second release: err=%v body=%d, want nil and 1", err, rec.Body.Len())
+	}
+}
+
 // contentLengthEnforcingWriter mimics net/http's own check: a write that would
 // carry the body past limit fails with http.ErrContentLength.
 type contentLengthEnforcingWriter struct {

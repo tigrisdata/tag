@@ -333,31 +333,96 @@ func checkCachedBodyLength(bucket, key string, meta *cache.CachedObjectMeta, got
 }
 
 // lengthBoundedWriter sits in front of the streamed path's committing writer
-// and refuses the chunk that would carry the body past meta.ContentLength. The
-// excess never reaches net/http: its own Content-Length enforcement would
-// reject it with http.ErrContentLength, which serveFromCache could not tell
-// from a transient stream failure, so the over-long entry would stay cached
-// and fail every later request the same way until its TTL. Refusing here
-// classifies the excess as errCacheBodyLengthMismatch instead, exactly like a
-// short body. Nothing of the offending chunk is written, so the client sees at
-// most ContentLength bytes; if the very first chunk is already too long the
-// response is still uncommitted and the caller falls through to upstream.
+// and keeps the response from ever satisfying meta.ContentLength unless the
+// cache stream ends cleanly with exactly that many bytes.
+//
+// Two mechanisms combine for that:
+//
+//   - A chunk that would carry the body past ContentLength is refused in full,
+//     classified as errCacheBodyLengthMismatch. The excess never reaches
+//     net/http, whose own Content-Length enforcement would reject it with
+//     http.ErrContentLength, which serveFromCache could not tell from a
+//     transient stream failure, so the over-long entry would stay cached and
+//     fail every later request the same way until its TTL.
+//   - The last promised byte (the one that would land at offset
+//     ContentLength-1) is withheld, not forwarded. Refusing the excess chunk
+//     alone is not enough: when chunks align with ContentLength the client has
+//     already received every promised byte by the time the excess arrives, and
+//     sees a clean, complete response from an entry detected as corrupt. Only
+//     release, called after the stream has ended cleanly with exactly
+//     ContentLength bytes, forwards the held byte and completes the response.
+//     An over-run, short, or failed stream never releases it, so the declared
+//     Content-Length is never met and the client sees an aborted body.
+//
+// If the very first chunk is already too long, or the whole body fits in the
+// single held byte, nothing has committed and the caller falls through to
+// upstream. A negative ContentLength (unknown upstream length) is passed
+// through unbounded.
 type lengthBoundedWriter struct {
-	w       io.Writer
-	bucket  string
-	key     string
-	meta    *cache.CachedObjectMeta
+	w      io.Writer
+	bucket string
+	key    string
+	meta   *cache.CachedObjectMeta
+	// written counts the bytes forwarded to w; the held byte is excluded
+	// until release.
 	written int64
+	held    [1]byte
+	holding bool
+}
+
+// seen is the number of body bytes the cache stream has delivered so far,
+// forwarded or held.
+func (bw *lengthBoundedWriter) seen() int64 {
+	if bw.holding {
+		return bw.written + 1
+	}
+	return bw.written
 }
 
 func (bw *lengthBoundedWriter) Write(p []byte) (int, error) {
-	next := bw.written + int64(len(p))
-	if bw.meta.ContentLength >= 0 && next > bw.meta.ContentLength {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	limit := bw.meta.ContentLength
+	if limit < 0 {
+		n, err := bw.w.Write(p)
+		bw.written += int64(n)
+		return n, err
+	}
+	next := bw.seen() + int64(len(p))
+	if next > limit {
 		return 0, checkCachedBodyLength(bw.bucket, bw.key, bw.meta, next)
 	}
-	n, err := bw.w.Write(p)
+	forward := p
+	if next == limit {
+		// This chunk carries the last promised byte: keep it back. p may be
+		// reused by the cache client once Write returns, so copy the byte.
+		forward = p[:len(p)-1]
+		bw.held[0] = p[len(p)-1]
+		bw.holding = true
+	}
+	if len(forward) == 0 {
+		return len(p), nil
+	}
+	n, err := bw.w.Write(forward)
 	bw.written += int64(n)
-	return n, err
+	if err != nil {
+		return n, err
+	}
+	return len(p), nil
+}
+
+// release forwards the held last byte, completing the response. It is only
+// correct to call once the cache stream has ended cleanly with exactly
+// meta.ContentLength bytes; serveFromCache checks that first.
+func (bw *lengthBoundedWriter) release() error {
+	if !bw.holding {
+		return nil
+	}
+	bw.holding = false
+	n, err := bw.w.Write(bw.held[:])
+	bw.written += int64(n)
+	return err
 }
 
 // serveFromCache serves an object from the cache body.
@@ -419,7 +484,9 @@ func (s *Service) serveFromCache(
 	// fallback for an absent or empty body without staging the stream through a
 	// pipe and a second copy.
 	// An over-long body is caught chunk by chunk, before the excess reaches
-	// the response writer; a short one only once the stream ends cleanly.
+	// the response writer; a short one only once the stream ends cleanly. In
+	// both cases the last promised byte, held back by lengthBoundedWriter, is
+	// never released, so the client cannot mistake the body for complete.
 	// The client paces this read (the response writer is its sink), so a size-scaled
 	// bound would punish slow clients; the flat cap matches the server's WriteTimeout.
 	ctx, cancel := context.WithTimeout(ctx, cacheStreamReadTimeout)
@@ -427,18 +494,25 @@ func (s *Service) serveFromCache(
 	cw := &lazyCommitWriter{w: w, meta: meta}
 	bw := &lengthBoundedWriter{w: cw, bucket: bucket, key: key, meta: meta}
 	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), bw)
+	if bodyErr == nil {
+		// The stream ended cleanly: only now is the delivered count meaningful.
+		// A failed stream is already incomplete and may be transient, so it is
+		// not treated as a corrupt entry.
+		bodyErr = checkCachedBodyLength(bucket, key, meta, bw.seen())
+	}
+	if bodyErr == nil {
+		// Exactly the promised bytes arrived: let the held last byte through,
+		// which completes the response (and commits it, if the whole body was
+		// that one byte).
+		bodyErr = bw.release()
+	}
 	if !cw.committed {
 		if bodyErr != nil {
 			return fmt.Errorf("cache body unavailable: %w", bodyErr)
 		}
 		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
 	}
-	if bodyErr == nil {
-		// The stream ended cleanly: only now is the delivered count meaningful.
-		// A failed stream is already incomplete and may be transient, so it is
-		// not treated as a corrupt entry.
-		bodyErr = checkCachedBodyLength(bucket, key, meta, cw.written)
-	} else if errors.Is(bodyErr, http.ErrContentLength) {
+	if errors.Is(bodyErr, http.ErrContentLength) {
 		// Belt and braces: lengthBoundedWriter should have refused the excess
 		// first, but a writer that enforces Content-Length ahead of it reports
 		// the same over-long body this way.
