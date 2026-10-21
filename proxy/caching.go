@@ -275,6 +275,11 @@ func (s *Service) setupCacheListener(
 			}
 			if cacheErr != nil {
 				log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")
+				// A failed cache write may stop reading before EOF. Close the read
+				// end to interrupt a blocked pipe write, then cancel the relay context
+				// to wake a writer waiting for its first read and stop queueing chunks.
+				_ = pipeReader.CloseWithError(cacheErr)
+				cacheCancel()
 			}
 			cacheErrCh <- cacheErr
 		}()
@@ -287,11 +292,13 @@ func (s *Service) setupCacheListener(
 			case <-sigReader.Ready():
 				// Reader is ready, safe to write
 			case <-cacheCtx.Done():
-				pipeErrCh <- cacheCtx.Err()
-				// Drain queue to unblock producer, returning pooled buffers
+				writeErr := cacheCtx.Err()
+				// Drain queue before reporting relay completion so the populate
+				// owner does not release its reservation while buffers remain held.
 				for chunk := range chunkQueue {
 					broadcast.PutChunkBuf(chunk)
 				}
+				pipeErrCh <- writeErr
 				return
 			}
 
@@ -317,6 +324,7 @@ func (s *Service) setupCacheListener(
 		// This runs in parallel with cache writer initialization,
 		// with the intermediate buffer absorbing chunks during the startup window.
 		var chunkErr error
+		var relayErr error
 		var earlyExit bool
 	chunkLoop:
 		for chunk := range listener.Chunks() {
@@ -334,7 +342,7 @@ func (s *Service) setupCacheListener(
 					// Ownership transferred - don't Release()
 				case <-cacheCtx.Done():
 					broadcast.PutChunkBuf(chunk.Data) // Return unused buffer
-					chunkErr = cacheCtx.Err()
+					relayErr = cacheCtx.Err()
 					earlyExit = true
 					break chunkLoop
 				}
@@ -343,10 +351,13 @@ func (s *Service) setupCacheListener(
 			}
 		}
 
-		// Drain remaining listener chunks to return pooled buffers on early exit.
-		// Runs async since the broadcaster may still be streaming (channel not closed yet).
+		// The populate reservation covers the listener's buffers too. Keep this
+		// owner until every remaining chunk has been returned, even when the
+		// cache deadline or upstream stream error stops relaying to the cache.
 		if earlyExit {
-			listener.DrainAndRelease()
+			for chunk := range listener.Chunks() {
+				chunk.Release()
+			}
 		}
 
 		// Close queue to signal pipe writer to finish
@@ -360,6 +371,11 @@ func (s *Service) setupCacheListener(
 			pipeWriter.CloseWithError(cachePipeReadError(chunkErr))
 		} else if pipeWriteErr != nil {
 			pipeWriter.CloseWithError(cachePipeReadError(pipeWriteErr))
+		} else if relayErr != nil {
+			// A relay deadline can stop forwarding after the cache queue fills.
+			// Do not turn that incomplete stream into a clean EOF that can publish
+			// metadata for a truncated whole-body cache entry.
+			pipeWriter.CloseWithError(relayErr)
 		} else {
 			pipeWriter.Close()
 		}
@@ -368,10 +384,12 @@ func (s *Service) setupCacheListener(
 		cacheErr := <-cacheErrCh
 		if chunkErr != nil {
 			errCh <- chunkErr
+		} else if cacheErr != nil {
+			errCh <- cacheErr
 		} else if pipeWriteErr != nil {
 			errCh <- pipeWriteErr
 		} else {
-			errCh <- cacheErr
+			errCh <- relayErr
 		}
 	}()
 

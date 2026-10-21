@@ -2,6 +2,7 @@ package broadcast
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -275,6 +276,147 @@ func TestBroadcasterHeadersWinOverConcurrentCancellation(t *testing.T) {
 	}
 	if got := gotHeaders.Get("ETag"); got != `"ready"` {
 		t.Errorf("ETag = %q, want %q", got, `"ready"`)
+	}
+}
+
+type observedHeaderWaitContext struct {
+	done        chan struct{}
+	entered     chan struct{}
+	cancelOnce  sync.Once
+	enteredOnce sync.Once
+}
+
+func newObservedHeaderWaitContext() *observedHeaderWaitContext {
+	return &observedHeaderWaitContext{done: make(chan struct{}), entered: make(chan struct{})}
+}
+
+func (c *observedHeaderWaitContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (c *observedHeaderWaitContext) Done() <-chan struct{} {
+	c.enteredOnce.Do(func() { close(c.entered) })
+	return c.done
+}
+
+func (c *observedHeaderWaitContext) Err() error {
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+
+func (c *observedHeaderWaitContext) Value(any) any { return nil }
+
+func (c *observedHeaderWaitContext) cancel() { c.cancelOnce.Do(func() { close(c.done) }) }
+
+func TestBroadcasterCancellationBeforePreHeaderCompletion(t *testing.T) {
+	b := NewBroadcaster(DefaultChannelBuffer)
+	listener := b.Subscribe()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	b.Complete(errors.New("upstream transport failed"))
+
+	_, _, err := listener.WaitForHeaders(ctx)
+	if err != context.Canceled {
+		t.Errorf("WaitForHeaders error = %v, want context.Canceled after cancellation before completion", err)
+	}
+}
+
+func TestBroadcasterCompletionBeforeHeadersWakesExistingAndLateListeners(t *testing.T) {
+	b := NewBroadcaster(DefaultChannelBuffer)
+	first := b.Subscribe()
+	second := b.Subscribe()
+	if first == nil || second == nil {
+		t.Fatal("Subscribe returned nil before streaming")
+	}
+
+	upstreamErr := errors.New("upstream transport failed")
+	type headerWait struct {
+		name   string
+		ctx    *observedHeaderWaitContext
+		result chan error
+	}
+	startHeaderWait := func(name string, listener *Listener) headerWait {
+		ctx := newObservedHeaderWaitContext()
+		t.Cleanup(ctx.cancel)
+		result := make(chan error, 1)
+		go func() {
+			_, _, err := listener.WaitForHeaders(ctx)
+			result <- err
+		}()
+		return headerWait{name: name, ctx: ctx, result: result}
+	}
+	waitUntilWaiting := func(wait headerWait) {
+		t.Helper()
+		select {
+		case <-wait.ctx.entered:
+		case <-time.After(time.Second):
+			wait.ctx.cancel()
+			t.Fatalf("%s WaitForHeaders did not start", wait.name)
+		}
+	}
+	waitForPreHeaderError := func(wait headerWait) {
+		t.Helper()
+		select {
+		case err := <-wait.result:
+			if err != upstreamErr {
+				t.Errorf("%s WaitForHeaders error = %v, want original error %v", wait.name, err, upstreamErr)
+			}
+			if wait.ctx.Err() != nil {
+				t.Errorf("%s context was canceled before WaitForHeaders returned", wait.name)
+			}
+		case <-time.After(time.Second):
+			if wait.ctx.Err() != nil {
+				t.Errorf("%s context was canceled before the bounded wait completed", wait.name)
+			}
+			wait.ctx.cancel()
+			if err := <-wait.result; !errors.Is(err, context.Canceled) {
+				t.Errorf("%s cleanup WaitForHeaders error = %v, want context.Canceled", wait.name, err)
+			}
+			t.Errorf("%s WaitForHeaders did not return the upstream error while its context remained live", wait.name)
+		}
+		wait.ctx.cancel()
+	}
+
+	firstWait := startHeaderWait("first", first)
+	secondWait := startHeaderWait("second", second)
+	waitUntilWaiting(firstWait)
+	waitUntilWaiting(secondWait)
+	b.Complete(upstreamErr)
+
+	for i, listener := range []*Listener{first, second} {
+		chunk, ok := <-listener.Chunks()
+		if !ok {
+			t.Fatalf("listener %d chunk channel closed without the completion error", i)
+		}
+		if chunk.Err != upstreamErr {
+			t.Errorf("listener %d chunk error = %v, want original error %v", i, chunk.Err, upstreamErr)
+		}
+		if _, ok := <-listener.Chunks(); ok {
+			t.Errorf("listener %d chunk channel remained open after completion", i)
+		}
+	}
+
+	waitForPreHeaderError(firstWait)
+	waitForPreHeaderError(secondWait)
+
+	late := b.Subscribe()
+	if late == nil {
+		t.Fatal("Subscribe returned nil after an unstreamed completion")
+	}
+	lateWait := startHeaderWait("late", late)
+	waitForPreHeaderError(lateWait)
+	select {
+	case chunk, ok := <-late.Chunks():
+		if !ok || chunk.Err != upstreamErr {
+			t.Errorf("late listener chunk = %#v, open=%v, want the original completion error", chunk, ok)
+		}
+		if _, ok := <-late.Chunks(); ok {
+			t.Error("late listener chunk channel remained open after completion")
+		}
+	case <-time.After(time.Second):
+		t.Error("late listener did not receive the completed broadcast's terminal chunk")
 	}
 }
 

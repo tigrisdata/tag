@@ -62,6 +62,8 @@ const (
 // The client will see a truncated response and S3 SDKs will automatically retry.
 var ErrSlowConsumer = errors.New("slow consumer")
 
+var errCompletedBeforeHeaders = errors.New("broadcast completed before response headers")
+
 // Chunk represents a piece of streamed data.
 // Consumers should call Release() after processing Data to return the
 // underlying buffer to the pool. If Release() is not called, the buffer
@@ -90,24 +92,33 @@ type Listener struct {
 	ch           chan Chunk
 	headers      http.Header
 	status       int
-	headerCh     chan struct{} // Closed when headers are available
+	headerCh     chan struct{} // Closed when headers or a pre-header completion are available
+	headerErr    error         // Set when the broadcast completes before response headers
 	disconnected bool          // True if disconnected due to slow consumption
 }
 
-// WaitForHeaders blocks until headers are available. If headers and context
-// cancellation become ready together, headers win. A cache listener can be
-// scheduled after its request handler returns, when both are already ready; it
+// WaitForHeaders blocks until headers are available, the broadcast completes
+// before headers, or the context is canceled. Successful headers still win over
+// concurrent cancellation; a pre-header error is returned only while the
+// request context remains live. A cache listener can be scheduled after its
+// request handler returns, when headers and cancellation are both ready; it
 // must still consume the completed response and publish the cache entry.
 func (l *Listener) WaitForHeaders(ctx context.Context) (int, http.Header, error) {
 	select {
 	case <-l.headerCh:
-		return l.status, l.headers, nil
+		if l.headerErr != nil && ctx.Err() != nil {
+			return 0, nil, ctx.Err()
+		}
+		return l.status, l.headers, l.headerErr
 	case <-ctx.Done():
 		// A select chooses randomly when both channels are ready. Re-check the
-		// headers so a completed response wins over concurrent cancellation, while
-		// still honoring cancellation when headers have not arrived.
+		// headers so a completed response wins over cancellation, but keep
+		// cancellation authoritative when the broadcast completed before headers.
 		select {
 		case <-l.headerCh:
+			if l.headerErr != nil {
+				return 0, nil, ctx.Err()
+			}
 			return l.status, l.headers, nil
 		default:
 			return 0, nil, ctx.Err()
@@ -205,10 +216,29 @@ func (b *Broadcaster) Subscribe() *Listener {
 		headerCh: make(chan struct{}),
 	}
 
-	// If headers already set, copy them and close headerCh
 	if b.headerSet {
 		l.headers = b.headers.Clone()
 		l.status = b.status
+	}
+
+	if b.done {
+		// A no-body success or a pre-header failure leaves streaming false. A
+		// subscriber arriving before Manager removes that completed broadcast
+		// must receive its terminal result rather than wait on an already-finished
+		// producer.
+		if !b.headerSet {
+			l.headerErr = b.err
+		}
+		close(l.headerCh)
+		if b.err != nil {
+			l.ch <- Chunk{Err: b.err}
+		}
+		close(l.ch)
+		return l
+	}
+
+	// If headers are already set, this listener is immediately ready.
+	if b.headerSet {
 		close(l.headerCh)
 	}
 
@@ -290,6 +320,17 @@ func (b *Broadcaster) Complete(err error) {
 
 	b.done = true
 	b.err = err
+	if !b.headerSet {
+		if b.err == nil {
+			b.err = errCompletedBeforeHeaders
+		}
+		// A pre-header completion is the listener's terminal result. Publish it
+		// before waking header waiters so they can return the original error.
+		for _, l := range b.listeners {
+			l.headerErr = b.err
+			close(l.headerCh)
+		}
+	}
 	close(b.doneCh)
 
 	// Send the final chunk and close all listener channels. Non-nil errors
@@ -297,7 +338,7 @@ func (b *Broadcaster) Complete(err error) {
 	// a nil completion retains every queued data chunk.
 	for _, l := range b.listeners {
 		if !l.disconnected {
-			l.closeWithError(err)
+			l.closeWithError(b.err)
 		}
 	}
 }

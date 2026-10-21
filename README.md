@@ -11,7 +11,7 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 - **Range Request Caching**: Background fetch of full objects on range cache miss for optimal ML training workloads
 - **Block-Aligned Caching** *(default)*: Caches large objects as fixed-size blocks (RFC 0001) so a small range read fetches and caches only the covering blocks instead of the whole object — ideal for sparse reads of large files (Parquet footers/row-groups, SST blocks). Enabled by default at 1 MiB blocks; size `block_size` to your read granularity, or set `block_caching_enabled: false` to cache whole objects.
 - **Conditional Requests**: Supports If-None-Match and If-Modified-Since for efficient cache validation
-- **AWS SigV4 Authentication**: Full AWS Signature Version 4 validation and re-signing
+- **AWS SigV4 Authentication**: Full AWS Signature Version 4 validation and re-signing; repeated ASCII spaces are normalized only for signature calculation, not in forwarded metadata
 - **Prometheus Metrics**: Comprehensive metrics for monitoring cache efficiency and performance
 - **Kubernetes Ready**: Includes deployment manifests for production use
 
@@ -101,9 +101,12 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 - Objects with `Cache-Control: no-store` or `private` are not cached
 - CopyObject requests with `Cache-Control: no-store` or `private` still invalidate the destination but skip post-copy cache warming
 - Among cacheable objects (within `size_threshold`), those at or above `block_size` are cached as fixed-size blocks (block caching, on by default), so a range read fetches only the covering blocks; smaller objects are whole-cached
+- A later multi-block Range within a range-created entry's recorded span stages its payload blocks before `206`, skipping probes only on a complete hit. The ETag/layout-bound hint is advisory; misses keep existing recovery, and speculative reads fall back upstream after five seconds while the request is live.
 - Set `block_caching_enabled: false` to cache whole objects instead — a range request then triggers a background fetch of the full object (if within threshold)
 - A dropped whole-object cache listener or upstream body-read error does not publish the partial body as a new cache entry
+- In tiered mode, a PUT routed to the local tier checks a concrete SigV4 `X-Amz-Content-Sha256` digest after admission and any local precondition pass and the full body passes its declared-length and any Content-MD5 checks; conditional writes against upstream-tier markers, `UNSIGNED-PAYLOAD`, and aws-chunked uploads keep their existing paths
 - PUT/DELETE operations invalidate the cache entry
+- If a whole-object cache write returns an error during a successful GET, the upstream response is unchanged and the cache-populate slot becomes available after relay cleanup, so a later eligible GET can retry. A store call that never returns has no completion guarantee.
 
 See [docs/cache-control.md](docs/cache-control.md) for detailed cache control and revalidation documentation. For tuning and sizing block caching in production, see [docs/deploy.md](docs/deploy.md#block-aligned-caching).
 
@@ -125,7 +128,7 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 - **Kubernetes** — StatefulSet, HPA, and services in [`deploy/kubernetes/`](deploy/kubernetes/); high availability, scaling, and probes in [docs/deploy.md](docs/deploy.md).
 - **Docker** — single-node and cluster Compose in [`deploy/docker/`](deploy/docker/); see [docs/docker.md](docs/docker.md).
 - **TLS/HTTPS** — see [docs/tls.md](docs/tls.md).
-- **Parquet workloads** — caching parquet metadata ahead of the reader that needs it; see [docs/parquet-optimization.md](docs/parquet-optimization.md).
+- **Parquet workloads** — `cache.parquet_optimization` warms footer blocks and `cache.meta_on_write` caches object metadata before readers need them; see [docs/parquet-optimization.md](docs/parquet-optimization.md).
 - **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Architecture
@@ -148,14 +151,21 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 
 ### Request Coalescing
 
-When multiple concurrent requests arrive for the same uncached object:
+Concurrent full-object GETs for the same uncached object share one upstream fetch only when callers
+subscribe before the first upstream body chunk starts:
 
 1. First request becomes the "fetcher" and streams from upstream
-2. Subsequent requests join as "listeners" to the same broadcast
-3. All listeners receive data simultaneously as it streams from upstream
-4. Only one upstream request is made, regardless of concurrent client count
+2. Other requests that subscribe before streaming starts join as "listeners" to the same broadcast
+3. Those listeners receive the same upstream response as it streams
+4. A GET arriving after streaming starts cannot join that broadcast and starts its own upstream fetch
+
+If an upstream fetch fails before TAG commits the client response while requests are still live, each GET waiting on that broadcast can return TAG's normal S3 error response. After commitment, the stream cannot be replaced by an error document.
 
 See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
+
+### Tiered Store Mode
+
+In tiered mode, validated plain-object PUTs no larger than `cache.size_threshold` are stored locally, and their metadata is authoritative. A background re-tier started by a GET is bound to the marker version seen by that GET, so it cannot replace metadata committed by a later write. See [docs/tiered-mode.md](docs/tiered-mode.md) for the full behavior.
 
 ## Performance
 

@@ -101,9 +101,9 @@ func TestReadParquetFooterLength(t *testing.T) {
 		s := newParquetTestService(t, content, blockSize)
 		meta := &cache.CachedObjectMeta{ETag: `"v1"`, BlockSize: blockSize, ContentLength: contentLength}
 
-		got, ok := s.readParquetFooterLength(context.Background(), "b", "a.parquet", meta)
-		if !ok || got != 300 {
-			t.Fatalf("footer length = %d (ok=%v), want 300", got, ok)
+		got, ok, complete := s.readParquetFooterLength(context.Background(), "b", "a.parquet", meta)
+		if !ok || !complete || got != 300 {
+			t.Fatalf("footer length = %d (ok=%v, complete=%v), want 300", got, ok, complete)
 		}
 	})
 
@@ -113,8 +113,8 @@ func TestReadParquetFooterLength(t *testing.T) {
 		s := newParquetTestService(t, content, blockSize)
 		meta := &cache.CachedObjectMeta{ETag: `"v1"`, BlockSize: blockSize, ContentLength: contentLength}
 
-		if _, ok := s.readParquetFooterLength(context.Background(), "b", "a.parquet", meta); ok {
-			t.Fatal("accepted an object whose trailer is not a parquet trailer")
+		if _, ok, complete := s.readParquetFooterLength(context.Background(), "b", "a.parquet", meta); ok || !complete {
+			t.Fatalf("missing-magic result = (ok=%v, complete=%v), want stable negative", ok, complete)
 		}
 	})
 
@@ -124,8 +124,8 @@ func TestReadParquetFooterLength(t *testing.T) {
 		s := newParquetTestService(t, content, blockSize)
 		meta := &cache.CachedObjectMeta{ETag: `"v1"`, BlockSize: blockSize, ContentLength: contentLength}
 
-		if _, ok := s.readParquetFooterLength(context.Background(), "b", "a.parquet", meta); ok {
-			t.Fatal("accepted a metadata length that cannot fit in the object")
+		if _, ok, complete := s.readParquetFooterLength(context.Background(), "b", "a.parquet", meta); ok || !complete {
+			t.Fatalf("oversize-footer result = (ok=%v, complete=%v), want stable negative", ok, complete)
 		}
 	})
 }
@@ -391,7 +391,9 @@ func TestPrefetchParquetFooterBlocks_SkipsWhenTrailerUnavailable(t *testing.T) {
 	s := NewService(fwd, store, cfg)
 
 	meta := &cache.CachedObjectMeta{ETag: `"v1"`, BlockSize: blockSize, ContentLength: contentLength}
-	s.prefetchParquetFooterBlocks("b", "a.parquet", "access", "secret", meta, nil)
+	if completed := s.prefetchParquetFooterBlocks("b", "a.parquet", "access", "secret", meta, nil); completed {
+		t.Fatal("unreadable trailer was treated as a completed stable negative")
+	}
 
 	if got := fwd.requestedRanges(); len(got) != 0 {
 		t.Fatalf("prefetched %v with no readable trailer", got)
