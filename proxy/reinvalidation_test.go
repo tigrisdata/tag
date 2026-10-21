@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -540,23 +539,6 @@ func (c *stalledMetaDeleteClient) Delete(ctx context.Context, key string) error 
 		return ctx.Err()
 	}
 	return c.CacheClient.Delete(ctx, key)
-}
-
-type lockedLogBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *lockedLogBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedLogBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
 }
 
 // A cache peer that never answers the post-success fence must not hold the
