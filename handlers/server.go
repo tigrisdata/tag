@@ -62,6 +62,8 @@ func NewServer(service *proxy.Service, bindIP string, port int, pprofEnabled boo
 	}
 
 	s.router = s.setupRouter()
+	// Initialize before Start can run in another goroutine so Stop always sees
+	// this same server, even when shutdown wins the race to start serving.
 	s.httpServer = &http.Server{
 		Addr:         s.bindAddr,
 		Handler:      s.foregroundHandlerMiddleware(s.router),
@@ -384,11 +386,15 @@ func (s *Server) Stop(ctx context.Context) error {
 	var closeErr error
 	var stopDeadline func() bool
 	var deadlineCloseErr <-chan error
+	// joinStart is set when the drain deadline passes while handlers are still
+	// running, marking the start of the unbounded handler join below.
+	var joinStart time.Time
 	if err != nil {
 		if s.cancelRequests != nil {
 			s.cancelRequests()
 		}
 		closeErr = server.Close()
+		joinStart = s.warnHandlerJoinPastDeadline(err)
 	} else {
 		closeResult := make(chan error, 1)
 		deadlineCloseErr = closeResult
@@ -396,13 +402,19 @@ func (s *Server) Stop(ctx context.Context) error {
 			if s.cancelRequests != nil {
 				s.cancelRequests()
 			}
-			closeResult <- server.Close()
+			closeResultErr := server.Close()
+			// Written before the send so the receive below publishes it.
+			joinStart = s.warnHandlerJoinPastDeadline(ctx.Err())
+			closeResult <- closeResultErr
 		})
 	}
 
 	<-s.handlersDone
 	if stopDeadline != nil && !stopDeadline() {
 		closeErr = <-deadlineCloseErr
+	}
+	if !joinStart.IsZero() {
+		log.Info().Dur("waited", time.Since(joinStart)).Msg("In-flight HTTP handlers finished after the drain deadline")
 	}
 	if s.cancelRequests != nil {
 		s.cancelRequests()
@@ -414,6 +426,22 @@ func (s *Server) Stop(ctx context.Context) error {
 		err = errors.Join(err, closeErr)
 	}
 	return err
+}
+
+// warnHandlerJoinPastDeadline logs once when the drain context ends while
+// admitted handlers are still running, since Stop then waits for them without a
+// bound. It returns when the wait began, or the zero time if nothing is running.
+func (s *Server) warnHandlerJoinPastDeadline(cause error) time.Time {
+	select {
+	case <-s.handlersDone:
+		return time.Time{}
+	default:
+	}
+	log.Warn().
+		Err(cause).
+		Uint64("inflight_handlers", s.handlerState.Load()&handlerCountMask).
+		Msg("HTTP drain deadline passed; shutdown is waiting past the drain deadline for in-flight handlers to finish")
+	return time.Now()
 }
 
 // responseTracker wraps http.ResponseWriter to track whether headers have been

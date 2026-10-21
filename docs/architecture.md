@@ -229,6 +229,8 @@ Client                 TAG                    Embedded Cache         Tigris
   │  X-Cache: MISS      │                       │                    │
 ```
 
+Cache population is best-effort. If the cache writer returns an error after a successful upstream response, TAG keeps that response and releases the populate reservation after the cache relay and its buffer holders finish. A cache writer that never returns has no completion guarantee.
+
 ### GET Object (Cluster Mode - Remote Key)
 
 ```text
@@ -250,7 +252,10 @@ Client                 TAG-1                   TAG-2 (owns key)       Tigris
 
 ### Request Coalescing (Multiple Concurrent Requests)
 
-When multiple clients request the same uncached object simultaneously:
+Concurrent full-object GETs for the same uncached object share one upstream fetch only when callers
+subscribe before the first upstream body chunk begins. The diagram shows callers that join during that
+window. A GET arriving after streaming starts cannot join that broadcast and starts its own upstream
+fetch.
 
 ```text
 Client1                TAG                              Tigris
@@ -284,11 +289,12 @@ Client3                 │                                  │
 
 **Key Points:**
 
-- First request becomes the "fetcher" and initiates upstream request
-- Subsequent requests before streaming starts join as "listeners"
-- All clients receive data simultaneously as chunks arrive
-- Only ONE upstream request regardless of concurrent client count
+- First request becomes the "fetcher" and initiates the upstream request
+- Requests that subscribe before streaming starts join as "listeners"
+- All listeners of a broadcast receive the same upstream response as chunks arrive
+- Once streaming starts, later requests cannot join that broadcast and start their own upstream fetch
 - Memory usage scales with listeners, not object size
+- For live requests, an upstream failure before response commitment is returned through the existing S3 error mapping for each waiting GET; after commitment, the stream cannot be replaced by an error document
 
 ### Range Request Caching
 
@@ -410,10 +416,10 @@ TAG returns S3-compatible XML error responses:
 
 ### Error Mapping
 
-| Internal Error     | S3 Error Code         | HTTP Status |
-| ------------------ | --------------------- | ----------- |
-| Invalid signature  | SignatureDoesNotMatch | 403         |
-| Unknown access key | InvalidAccessKeyId    | 403         |
-| Request expired    | RequestTimeTooSkewed  | 403         |
-| Slow consumer      | InternalError         | 500         |
-| Upstream error     | InternalError         | 502         |
+| Internal Error                         | S3 Error Code         | HTTP Status |
+| -------------------------------------- | --------------------- | ----------- |
+| Invalid signature                     | SignatureDoesNotMatch | 403         |
+| Unknown access key                    | InvalidAccessKeyId    | 403         |
+| Request expired                       | RequestTimeTooSkewed  | 403         |
+| Slow consumer                         | InternalError         | 500         |
+| Uncommitted upstream error            | InternalError         | 500         |
