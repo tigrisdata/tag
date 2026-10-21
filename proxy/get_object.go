@@ -576,6 +576,19 @@ func (s *Service) writeChunksToResponse(
 		}
 	}
 
+	// The channel closed without an error chunk. That is a clean completion
+	// unless the listener's queue was full when it failed (slow-consumer
+	// disconnect or a failed completion), in which case the broadcaster could
+	// not queue the error chunk and only recorded it on the listener. Every
+	// queued data chunk has already been written above, in order; surface the
+	// error now exactly as if it had arrived as a chunk.
+	if err := listener.Err(); err != nil {
+		if err == broadcast.ErrSlowConsumer {
+			metrics.RecordBroadcastSlowConsumer()
+		}
+		return err
+	}
+
 	// Zero-byte response or all-empty chunks: commit headers now
 	if !headersWritten {
 		copyHeaders(w.Header(), headers)

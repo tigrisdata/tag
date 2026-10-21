@@ -162,6 +162,23 @@ func (c *Cache) PutWithMeta(ctx context.Context, bucket, key string, meta *Cache
 	return nil
 }
 
+// ErrBodyLengthMismatch is returned by PutWithMetaStreamIfVersion when the
+// number of body bytes the store consumed differs from meta.ContentLength. The
+// metadata is not written in that case, so the entry never becomes visible.
+var ErrBodyLengthMismatch = errors.New("cache body length mismatch")
+
+// countingReader counts the bytes read through it.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
 // PutWithMetaStreamIfVersion is like PutWithMetaStream but commits the
 // metadata under the caller's decision-time version precondition (see
 // putMetaVersioned): body first, then the meta write that makes the entry
@@ -215,9 +232,28 @@ func (c *Cache) PutWithMetaStreamIfVersion(
 		return false, err
 	}
 
-	// Stream body to cache
-	if err := c.client.PutStream(ctx, bodyKey, body, int64(ttl)); err != nil {
+	// Stream body to cache, counting the bytes the store actually consumed so
+	// the meta commit below can be refused for a body that does not match the
+	// declared length.
+	counted := &countingReader{r: body}
+	if err := c.client.PutStream(ctx, bodyKey, counted, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
+		return false, err
+	}
+
+	// The body must be exactly ContentLength before the meta makes it visible.
+	// This mirrors putBlocksFromStream: a short body means the upstream stream
+	// ended (or was cut) before Content-Length, and a long one is a malformed
+	// upstream; either way a committed meta would claim a length the stored
+	// body does not have, and a later hit would serve truncated or overlong
+	// bytes under a full Content-Length. The producer side is responsible for
+	// failing the pipe on a cut stream; this guard is the last line of defense
+	// when that signal is lost (a store that accepts a short read as EOF, a
+	// listener that closed without an error chunk). The versioned body is left
+	// to age out via TTL, for the same reason as a lost precondition below.
+	if meta.ContentLength >= 0 && counted.n != meta.ContentLength {
+		err := fmt.Errorf("%w: wrote %d bytes, Content-Length %d", ErrBodyLengthMismatch, counted.n, meta.ContentLength)
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body length mismatch; meta not written")
 		return false, err
 	}
 
