@@ -121,9 +121,7 @@ func (s *Service) forwardAfterCacheMiss(ctx context.Context, w http.ResponseWrit
 	}
 	writeCacheStatus(w, XCacheMiss)
 	forwardErr := s.forwarder.Forward(ctx, w, r)
-	status := "success"
 	if forwardErr != nil {
-		status = "error"
 	}
 	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return forwardErr
@@ -245,9 +243,7 @@ func (s *Service) handleRevalidation200(
 		// Not cacheable — just stream to client
 		n, copyErr := io.Copy(w, resp.Body)
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-		status := "success"
 		if copyErr != nil {
-			status = "error"
 		}
 		metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 		return copyErr
@@ -304,9 +300,7 @@ func (s *Service) handleRevalidation200(
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Cache write timeout after revalidation")
 	}
 
-	status := "success"
 	if copyErr != nil {
-		status = "error"
 	}
 	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return copyErr
@@ -437,7 +431,6 @@ func (s *Service) serveFromCache(
 		metrics.RecordCacheOperation("get", "length_mismatch")
 		bodyErr = fmt.Errorf("%w for %s/%s: %w", errCacheBodyLengthMismatch, bucket, key, bodyErr)
 	}
-	status := "success"
 	if bodyErr != nil {
 		// The response is already committed. Do not return the error to the
 		// caller: HandleGetObject would otherwise try to append an upstream
@@ -447,7 +440,6 @@ func (s *Service) serveFromCache(
 		// body cleanly for the client.
 		log.Warn().Err(bodyErr).Str("bucket", bucket).Str("key", key).
 			Msg("Failed to stream cache body after headers committed")
-		status = "error"
 		if errors.Is(bodyErr, errCacheBodyLengthMismatch) {
 			// The entry itself is bad, not transiently unreadable, and no caller
 			// sees a committed failure, so drop it here. ETag/version-guarded:
@@ -458,7 +450,7 @@ func (s *Service) serveFromCache(
 	}
 
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
-	metrics.RecordRequest("GetObject", status, metrics.SourceLocal, time.Since(start).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, bodyErr, time.Since(start).Seconds())
 	return nil
 }
 
@@ -492,9 +484,7 @@ func (s *Service) handleRevalidation206Range(
 	n, copyErr := io.Copy(w, resp.Body)
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 
-	status := "success"
 	if copyErr != nil {
-		status = "error"
 	}
 	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 

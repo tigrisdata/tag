@@ -276,10 +276,11 @@ func (s *Service) serveRangeFromBlockCache(
 	w.WriteHeader(http.StatusPartialContent)
 
 	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng.start, rng.end); berr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
 	}
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -1139,9 +1140,10 @@ func (s *Service) serveFullObjectFromBlockCache(
 	w.WriteHeader(meta.StatusCode)
 
 	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, 0, meta.ContentLength-1); berr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
 	}
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -1229,9 +1231,10 @@ func (s *Service) serveCompleteFromBlocks(
 		}
 	}
 	if berr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
 	}
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -1722,7 +1725,8 @@ func (s *Service) invalidateStaleMeta(bucket, key, staleETag string) {
 // serve path) bails when a MAJORITY of covering blocks are absent (assemble only a mostly-cached
 // object, else stream it once); maxFetchFanout>0 (the range serve path) bails on an ABSOLUTE count
 // of absent blocks, so a footer/row-group read still assembles its few blocks but a pathologically
-// large client range doesn't fan out into hundreds of aligned GETs.
+// large client range doesn't fan out into hundreds of aligned GETs. A positive cap stops the scan
+// on the cap-plus-one confirmed miss; a zero cap leaves the full-object majority scan exhaustive.
 //
 // Probing uses BlockExistsErr so a transient probe failure (canceled ctx, cluster gRPC blip) is
 // NOT counted as a missing block: it returns that error immediately instead, so a network hiccup
@@ -1737,6 +1741,9 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 		}
 		if !present {
 			missing = append(missing, i)
+			if maxFetchFanout > 0 && int64(len(missing)) > maxFetchFanout {
+				return errBlockAssemblyWouldAmplify
+			}
 		}
 	}
 	total := bK - b0 + 1
@@ -1744,8 +1751,7 @@ func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey
 	// recorded ONLY on a committed block-cache serve below, so a bail or a failed fetch (both fall
 	// through to upstream, not a block serve) records none — matching CacheBlockRangeServed and
 	// avoiding a hit-ratio skew (failed fetches correlate with more-missing requests).
-	if (bailIfMostlyMissing && int64(len(missing))*2 > total) ||
-		(maxFetchFanout > 0 && int64(len(missing)) > maxFetchFanout) {
+	if bailIfMostlyMissing && int64(len(missing))*2 > total {
 		return errBlockAssemblyWouldAmplify
 	}
 	if len(missing) == 0 {
