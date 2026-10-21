@@ -233,25 +233,34 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		// remaining per-key attempts fail fast, the captured 2xx is still
 		// committed below, and the stale metadata ages out via TTL.
 		fenceCtx, cancelFence := context.WithTimeout(context.WithoutCancel(r.Context()), bulkDeleteFenceTimeout)
-		fencedKeys := 0
+		fencedKeys, skippedKeys := 0, 0
 		erroredCounts, parsed := erroredDeleteKeyCounts(capture.Body)
 		for key, reqN := range requestedCounts {
 			// On a parse failure, over-invalidate every requested key (safe).
 			if parsed && reqN <= erroredCounts[key] {
 				continue // every requested entry for this key errored — object still present
 			}
+			// Once the shared deadline has passed, stop starting per-key fences in
+			// either mode: the tiered helper runs under its own per-key timeout, so
+			// without this check a large tiered batch could hold the 2xx for N times
+			// that timeout. Skipped keys age out via TTL and are counted below.
+			if fenceCtx.Err() != nil {
+				skippedKeys++
+				continue
+			}
+			fencedKeys++
 			if tieredPriors != nil {
 				p := tieredPriors[key]
 				s.convergeTieredDelete(bucket, key, p.version, p.known)
 				continue
 			}
-			fencedKeys++
 			s.convergeInvalidation(fenceCtx, bucket, key)
 		}
 		if fenceCtx.Err() != nil {
 			log.Warn().
 				Str("bucket", bucket).
 				Int("keys", fencedKeys).
+				Int("skipped_keys", skippedKeys).
 				Dur("timeout", bulkDeleteFenceTimeout).
 				Msg("Bulk-delete cache fence did not converge within the timeout; responding with the upstream result, stale metadata may serve until TTL")
 		}
