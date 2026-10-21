@@ -35,6 +35,32 @@ const maxRangeBlockFanout = 32
 // while the original request context can still perform its upstream fallback.
 const certifiedRangeReadTimeout = 5 * time.Second
 
+// getBlockRangeStream is the one cache-read seam for block payload slices. Each read
+// carries its own deadline so a stalled peer surfaces as a transient read error —
+// errBlockStreamDegraded on a committed stream, an untouched response pre-commit —
+// rather than holding the request open. A read into a staging buffer is bounded by
+// the size-scaled cacheReadTimeoutForSize; a read whose sink is the client
+// (toClient) is paced by that client, so it gets the flat cacheStreamReadTimeout
+// that only restates the server's WriteTimeout.
+func (s *Service) getBlockRangeStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, idx, localStart, localEnd int64, w io.Writer, toClient bool) error {
+	timeout := cacheReadTimeoutForSize(localEnd - localStart + 1)
+	if toClient {
+		timeout = cacheStreamReadTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, idx, localStart, localEnd, w)
+}
+
+// probeBlock is BlockExistsErr under the cache-read floor: a stalled peer answers with
+// a transient error after cacheReadTimeout, which callers already treat as "unknown",
+// never as absent — see ensureBlocksCached.
+func (s *Service) probeBlock(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, idx int64) (present bool, err error) {
+	ctx, cancel := context.WithTimeout(ctx, cacheReadTimeoutForSize(0))
+	defer cancel()
+	return s.cache.BlockExistsErr(ctx, bucket, key, meta.ETag, meta.BlockSize, idx)
+}
+
 // errBlockETagMismatch means a block fetched from upstream belongs to a different object
 // version than the meta we hold (a concurrent overwrite), so it must not be cached.
 var errBlockETagMismatch = errors.New("block etag mismatch")
@@ -579,7 +605,7 @@ func (s *Service) serveAssembledRange(
 		localStart, localEnd := blockLocalRange(i, rng.start, rng.end, meta.BlockSize, meta.ContentLength)
 		n := localEnd - localStart + 1
 		sw := &sliceWriter{dst: buf[off : off+n]}
-		rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, sw)
+		rerr := s.getBlockRangeStream(ctx, bucket, key, meta, i, localStart, localEnd, sw, false)
 		switch {
 		case errors.Is(rerr, cache.ErrNotFound):
 			missing = append(missing, i)
@@ -621,7 +647,7 @@ func (s *Service) serveAssembledRange(
 				continue
 			}
 			sw := &sliceWriter{dst: buf[goff : goff+n]}
-			rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, sw)
+			rerr := s.getBlockRangeStream(ctx, bucket, key, meta, i, localStart, localEnd, sw, false)
 			if rerr != nil || sw.off != n {
 				return false, fmt.Errorf("block %d assembly: fetched block unreadable (err=%v, %d of %d bytes)", i, rerr, sw.off, n)
 			}
@@ -863,7 +889,7 @@ func (s *Service) readBlockSlice(ctx context.Context, bucket, key, accessKey, se
 // so it cannot race the shared inline-fetch cap or report a later failure before an earlier block.
 func (s *Service) readCachedBlockSlice(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, idx, localStart, localEnd int64, dst []byte) error {
 	sw := &sliceWriter{dst: dst}
-	rerr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, idx, localStart, localEnd, sw)
+	rerr := s.getBlockRangeStream(ctx, bucket, key, meta, idx, localStart, localEnd, sw, false)
 	if rerr == nil && sw.off != int64(len(dst)) {
 		return fmt.Errorf("block %d stream: short read %d of %d bytes", idx, sw.off, len(dst))
 	}
@@ -940,7 +966,7 @@ func (s *Service) streamBlockRangeSequential(ctx context.Context, cw *countingWr
 		localStart, localEnd := blockLocalRange(i, start, end, meta.BlockSize, meta.ContentLength)
 		before := cw.written
 		wasFetched := false
-		berr := s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, tw)
+		berr := s.getBlockRangeStream(ctx, bucket, key, meta, i, localStart, localEnd, tw, true)
 		if errors.Is(berr, cache.ErrNotFound) && cw.written == before {
 			if fetchesLeft <= 0 {
 				return out, errBlocksMostlyAbsent
@@ -954,7 +980,7 @@ func (s *Service) streamBlockRangeSequential(ctx context.Context, cw *countingWr
 			}
 			out.fetched++
 			wasFetched = true
-			berr = s.cache.GetBlockRangeStream(ctx, bucket, key, meta.ETag, meta.BlockSize, i, localStart, localEnd, tw)
+			berr = s.getBlockRangeStream(ctx, bucket, key, meta, i, localStart, localEnd, tw, true)
 		}
 		if berr != nil {
 			// A write-side failure is the client's, not the cache's: return it raw so the
@@ -1578,7 +1604,11 @@ func (s *Service) runBlockFetch(state *blockFetchState, blockKey, bucket, key, a
 	// adds a serial RPC without making the staged bytes safer. A writer that
 	// races after that observed miss can at most receive an idempotent put of the
 	// same ETag-versioned block.
-	if !knownMissing && s.cache.BlockExists(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx) {
+	present := false
+	if !knownMissing {
+		present, _ = s.probeBlock(fetchCtx, bucket, key, meta, blockIdx)
+	}
+	if present {
 		state.completeServe(nil, nil, nil)
 		cancel()
 		s.finishBlockFetch(blockKey, state, nil)
@@ -1735,7 +1765,7 @@ func (s *Service) invalidateStaleMeta(bucket, key, staleETag string) {
 func (s *Service) ensureBlocksCached(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, b0, bK int64, bailIfMostlyMissing bool, maxFetchFanout int64) error {
 	var missing []int64
 	for i := b0; i <= bK; i++ {
-		present, perr := s.cache.BlockExistsErr(ctx, bucket, key, meta.ETag, meta.BlockSize, i)
+		present, perr := s.probeBlock(ctx, bucket, key, meta, i)
 		if perr != nil {
 			return perr // transient probe failure — abort without bailing or invalidating
 		}
