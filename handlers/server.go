@@ -471,15 +471,20 @@ func (rt *responseTracker) Flush() {
 
 // handleWithError calls a handler function and handles any returned error.
 // If headers have already been committed (e.g., the handler started streaming
-// a response before encountering an error), the error is logged but no error
-// response is written to avoid corrupting the HTTP stream.
+// a response before encountering an error), the response is aborted so the
+// server does not complete framing for a partial body or append error XML.
 func handleWithError(w http.ResponseWriter, r *http.Request, handler func(http.ResponseWriter, *http.Request) error) {
 	rt := &responseTracker{ResponseWriter: w}
 	err := handler(rt, r)
 	if err != nil {
 		if rt.committed {
 			log.Warn().Err(err).Str("path", r.URL.Path).
-				Msg("Error after response headers committed, cannot send error response")
+				Msg("Error after response headers committed, aborting response")
+			// Go closes the connection without completing the response framing;
+			// an HTTP/1.0 client, which reads an unknown-length body to EOF, cannot
+			// tell that truncation from completion, an accepted limitation since
+			// no real client speaks HTTP/1.0 to TAG.
+			panic(http.ErrAbortHandler)
 		} else {
 			handleError(rt, r, err)
 		}

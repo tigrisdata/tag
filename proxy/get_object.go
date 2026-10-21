@@ -579,6 +579,19 @@ func (s *Service) writeChunksToResponse(
 		}
 	}
 
+	// The channel closed without an error chunk. That is a clean completion
+	// unless the listener's queue was full when it failed (slow-consumer
+	// disconnect or a failed completion), in which case the broadcaster could
+	// not queue the error chunk and only recorded it on the listener. Every
+	// queued data chunk has already been written above, in order; surface the
+	// error now exactly as if it had arrived as a chunk.
+	if err := listener.Err(); err != nil {
+		if err == broadcast.ErrSlowConsumer {
+			metrics.RecordBroadcastSlowConsumer()
+		}
+		return err
+	}
+
 	// Zero-byte response or all-empty chunks: commit headers now
 	if !headersWritten {
 		copyHeaders(w.Header(), headers)
@@ -749,6 +762,7 @@ func (s *Service) serveRangeFromCache(
 			Msg("Failed to stream range from cache")
 		// Headers already sent, can't return an upstream response after the partial
 		// cache body.
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, streamErr, time.Since(startTime).Seconds())
 		return true, streamErr
 	}
 
@@ -762,7 +776,7 @@ func (s *Service) serveRangeFromCache(
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
 	}
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 

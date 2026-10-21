@@ -135,6 +135,17 @@ func (r *contextBoundReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// cachePipeReadError keeps EOF-shaped terminal failures distinguishable from a
+// clean short value. The embedded cache's inline size probe accepts io.EOF and
+// io.ErrUnexpectedEOF as normal short-value terminators, so a failed broadcast
+// carrying either sentinel must be wrapped before it reaches that reader.
+func cachePipeReadError(err error) error {
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return fmt.Errorf("cache stream failed: %w", err)
+	}
+	return err
+}
+
 // waitForCacheWrite waits for a detached cache writer while retaining the
 // deadline that bounds the background fetch. The result channel is buffered by
 // the caller so a writer that ignores cancellation can still finish later.
@@ -367,6 +378,13 @@ func (s *Service) setupCacheListener(
 			for chunk := range listener.Chunks() {
 				chunk.Release()
 			}
+		} else if err := listener.Err(); err != nil {
+			// The channel closed without room for an error chunk (a slow-consumer
+			// disconnect or a failed completion against a full queue). Every queued
+			// data chunk was delivered above; the terminal error is only recorded
+			// on the listener. Treat it exactly like an error chunk so the pipe
+			// fails and no metadata is committed for the truncated body.
+			chunkErr = err
 		}
 
 		// Close queue to signal pipe writer to finish
@@ -377,14 +395,14 @@ func (s *Service) setupCacheListener(
 
 		// Close the pipe to signal EOF to the reader
 		if chunkErr != nil {
-			pipeWriter.CloseWithError(chunkErr)
+			pipeWriter.CloseWithError(cachePipeReadError(chunkErr))
 		} else if pipeWriteErr != nil {
-			pipeWriter.CloseWithError(pipeWriteErr)
+			pipeWriter.CloseWithError(cachePipeReadError(pipeWriteErr))
 		} else if relayErr != nil {
 			// A relay deadline can stop forwarding after the cache queue fills.
 			// Do not turn that incomplete stream into a clean EOF that can publish
 			// metadata for a truncated whole-body cache entry.
-			pipeWriter.CloseWithError(relayErr)
+			pipeWriter.CloseWithError(cachePipeReadError(relayErr))
 		} else {
 			pipeWriter.Close()
 		}

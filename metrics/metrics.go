@@ -493,6 +493,15 @@ func RecordRequest(operation, status, source string, durationSeconds float64) {
 	RequestDuration.WithLabelValues(operation, processMode, source).Observe(durationSeconds)
 }
 
+// RecordRequestResult records a request with a status derived from its result.
+func RecordRequestResult(operation, source string, err error, durationSeconds float64) {
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	RecordRequest(operation, status, source, durationSeconds)
+}
+
 // RecordCacheHit records a cache hit.
 func RecordCacheHit() {
 	CacheHits.Inc()

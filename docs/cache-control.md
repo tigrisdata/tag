@@ -6,11 +6,13 @@ TAG supports RFC 7234-compliant cache revalidation. Clients can control caching 
 
 | Value         | Meaning                                                                          |
 | ------------- | -------------------------------------------------------------------------------- |
-| `HIT`         | Served from cache (includes revalidation that confirmed the object is unchanged) |
+| `HIT`         | A cache entry was selected to serve the response (including revalidation that confirmed the object is unchanged) |
 | `MISS`        | Not in cache, fetched from upstream and now cached                               |
 | `REVALIDATED` | Revalidated with upstream, object changed, new content returned                  |
 | `BYPASS`      | Cache bypassed entirely (client requested `no-store`)                            |
 | `DISABLED`    | Caching is disabled server-side (`TAG_CACHE_DISABLED=true`)                      |
+
+In block mode, a committed stream can recover missing bytes from an upstream range only after validating the cached ETag and exact range. Because `HIT` is committed before the body streams, it describes the cache-backed request, not each byte's source or whether the transfer completed. See [S3 compatibility](s3-compatibility.md#caching-behavior) for incomplete cache-range behavior.
 
 ## Force Revalidation
 
@@ -50,6 +52,8 @@ TAG automatically invalidates cached objects when they are modified through TAG:
 - **DeleteObject** — Cache entry deleted before forwarding the delete
 - **DeleteObjects** (bulk) — Cache entries deleted for all keys in the request
 - **CopyObject** — Cache entry deleted for the destination key
+
+For a cacheable whole-object GET miss, metadata becomes visible only after its cache write consumes the broadcast stream successfully. If the cache listener is dropped or the upstream body read fails, the partial body is not published as a new entry.
 
 Objects modified directly on Tigris (bypassing TAG) remain in cache until they expire (default TTL: 24 hours, configurable via `TAG_CACHE_TTL`) or are revalidated via `Cache-Control: no-cache`.
 

@@ -28,7 +28,7 @@ Total number of requests processed by TAG.
 | `operation` | S3 operation: `GetObject`, `PutObject`, `DeleteObject`, `HeadObject` |
 | `status`    | Result: `success`, `error`, `auth_error`, `range_not_satisfiable`    |
 | `mode`      | The process's operating mode (`transparent`, `signing`, `tiered`) — one constant value per instance, for fleet-wide splits |
-| `source`    | Where the response was produced: `local` (TAG's own store or knowledge — cache hits, revalidated-304 serves, authoritative misses, auth errors) or `upstream` (proxied) |
+| `source`    | Request-handling path: `local` (TAG's own store or knowledge — cache hits, revalidated-304 serves, authoritative misses, auth errors) or `upstream` (proxied); a degraded block response may also use an upstream suffix |
 
 **Example queries:**
 
@@ -39,7 +39,7 @@ rate(tag_requests_total[5m])
 # Error rate
 sum(rate(tag_requests_total{status="error"}[5m])) / sum(rate(tag_requests_total[5m]))
 
-# Share of traffic answered without touching upstream (per mode)
+# Share of requests handled by the local TAG path (per mode; not per-byte upstream avoidance)
 sum(rate(tag_requests_total{source="local"}[5m])) by (mode) / sum(rate(tag_requests_total[5m])) by (mode)
 
 # GetObject success rate
@@ -80,9 +80,12 @@ rate(tag_request_duration_seconds_sum[5m]) / rate(tag_request_duration_seconds_c
 
 **Type:** Counter
 
-Total number of cache hits — every request served from cache, including
-range-from-cache hits and conditional 304 (Not Modified) responses. It is
-recorded in lockstep with the `X-Cache: HIT` response header.
+Total number of requests whose cache status was committed as `X-Cache: HIT`,
+including range-from-cache hits and conditional 304 (Not Modified) responses. It is
+recorded in lockstep with that header. This is a request-level cache decision, not a
+per-byte source or successful-transfer count: a block response may append a verified
+upstream suffix or later finish with an error; request status is recorded separately
+in `tag_requests_total`.
 
 `tag_cache_hits_total` and `tag_cache_misses_total` count only `HIT` and `MISS`.
 `REVALIDATED` responses (object changed on upstream) are neither — they are tracked
@@ -112,10 +115,16 @@ Total number of cache misses.
 
 Total number of cache operations.
 
-| Label       | Description                               |
-| ----------- | ----------------------------------------- |
-| `operation` | Operation type: `get`, `put`, `delete`    |
-| `result`    | Result: `hit`, `miss`, `success`, `error` |
+| Label       | Description                                                              |
+| ----------- | ------------------------------------------------------------------------ |
+| `operation` | Operation type: `get`, `put`, `meta_put`, `delete`                       |
+| `result`    | Result: `hit`, `miss`, `success`, `error`, `precondition_lost`           |
+
+`meta_put` denotes metadata publication outcomes. `precondition_lost` means an
+ordered metadata write was refused: in legacy coordination, no decision token was
+supplied (`expected == 0`) or a newer tombstone was observed; in CAS coordination,
+a `PutIfVersion` version mismatch occurred. With legacy coordination, an unreadable
+or malformed tombstone is recorded as `error` and the write is refused.
 
 **Example queries:**
 

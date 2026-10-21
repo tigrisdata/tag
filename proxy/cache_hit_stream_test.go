@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -109,6 +110,38 @@ func TestServeFromCache_LargeObject(t *testing.T) {
 	}
 	if !bytes.Equal(w.Body.Bytes(), body) {
 		t.Fatalf("body mismatch: got %d bytes, want %d", w.Body.Len(), len(body))
+	}
+}
+
+func TestServeFromCache_PostCommitErrorIsRecordedAsError(t *testing.T) {
+	body := bytes.Repeat([]byte("cached body"), 8192)
+	firstChunk := body[:1024]
+	wantErr := errors.New("cache body stream failed after first chunk")
+	stream := func(_ context.Context, _ string, w io.Writer) error {
+		if _, err := w.Write(firstChunk); err != nil {
+			return err
+		}
+		return wantErr
+	}
+	svc, _, meta := newLargeStreamCacheService(t, body, stream)
+
+	beforeSuccesses := requestCount(t, "success")
+	beforeErrors := requestCount(t, "error")
+	w := httptest.NewRecorder()
+	if err := svc.serveFromCache(context.Background(), w, meta.Bucket, meta.Key, meta, time.Now()); err != nil {
+		t.Fatalf("serveFromCache() error = %v, want committed response to remain served", err)
+	}
+	if w.Code != http.StatusOK || w.Header().Get(XCacheHeader) != XCacheHit || !bytes.Equal(w.Body.Bytes(), firstChunk) {
+		t.Errorf("response = (status=%d, cache=%q, body=%d bytes), want committed 200/HIT prefix", w.Code, w.Header().Get(XCacheHeader), w.Body.Len())
+	}
+	if got := w.Header().Get("Content-Length"); got != strconv.Itoa(len(body)) {
+		t.Errorf("Content-Length = %q, want %d", got, len(body))
+	}
+	if got := requestCount(t, "success"); got != beforeSuccesses {
+		t.Errorf("success requests = %v, want unchanged %v", got, beforeSuccesses)
+	}
+	if got := requestCount(t, "error"); got != beforeErrors+1 {
+		t.Errorf("error requests = %v, want %v", got, beforeErrors+1)
 	}
 }
 
