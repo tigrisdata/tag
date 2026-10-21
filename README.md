@@ -68,7 +68,8 @@ Deploy as a StatefulSet with an embedded distributed cache using the Kustomize m
 kubectl apply -k deploy/kubernetes/base/
 ```
 
-See [docs/deploy.md](docs/deploy.md) for the full guide.
+See [docs/deploy.md](docs/deploy.md) for the full guide. On SIGTERM, TAG gives HTTP requests a 30-second drain window and keeps the embedded cache open until admitted handlers finish their synchronous cleanup.
+Kubernetes may enforce a separate termination grace period (see [graceful shutdown](docs/deploy.md#graceful-shutdown)).
 
 ### Build from source
 
@@ -148,6 +149,10 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 1. **Cache Check**: TAG first checks if the object exists in its embedded cache
 2. **Cache Hit**: Returns cached object with `X-Cache: HIT` header
 3. **Cache Miss**: Forwards request to upstream Tigris, caches response, returns with `X-Cache: MISS`
+
+For directly streamed upstream responses, TAG aborts the downstream response if copying the body fails. It does not complete a truncated prefix as a successful response. Clients may see a transport or body-read error.
+
+For streamed PUT and DELETE operations, an upstream 2xx still triggers cache invalidation or a tiered marker when caching is enabled. A delivery error alone does not prove the mutation failed.
 
 ### Request Coalescing
 
