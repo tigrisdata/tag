@@ -725,7 +725,11 @@ func (s *Service) serveRangeFromCache(
 		rangeEnd:      rng.end,
 		rangeTotal:    meta.ContentLength,
 	}
-	streamErr := s.cache.GetRangeStream(ctx, bucket, key, meta.BodyDiscriminator(), rng.start, rng.end, cw)
+	// The client paces this read (the response writer is its sink), so a size-scaled
+	// bound would punish slow clients; the flat cap matches the server's WriteTimeout.
+	readCtx, cancel := context.WithTimeout(ctx, cacheStreamReadTimeout)
+	defer cancel()
+	streamErr := s.cache.GetRangeStream(readCtx, bucket, key, meta.BodyDiscriminator(), rng.start, rng.end, cw)
 
 	if streamErr != nil {
 		if !cw.committed {

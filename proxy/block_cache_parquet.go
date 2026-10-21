@@ -198,7 +198,7 @@ func (s *Service) ensureParquetFooterBlocks(ctx context.Context, bucket, key, ac
 	// already cached costs nothing beyond the probes.
 	absent := make([]int64, 0, len(blocks))
 	for _, idx := range blocks {
-		if !s.cache.BlockExists(ctx, bucket, key, meta.ETag, meta.BlockSize, idx) {
+		if present, _ := s.probeBlock(ctx, bucket, key, meta, idx); !present {
 			absent = append(absent, idx)
 		}
 	}

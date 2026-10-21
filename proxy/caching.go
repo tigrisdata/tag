@@ -59,7 +59,50 @@ const (
 	// Used to compute dynamic timeouts for large objects.
 	// 5 MB/s is conservative for local disk writes.
 	minCacheWriteThroughput = 5 * 1024 * 1024 // 5 MB/s
+
+	// cacheReadTimeout is the floor for a single cache read (a presence probe or
+	// the first bytes of a body). Cache reads go to remote peer pods over gRPC,
+	// so it must absorb a cluster-wide hiccup without failing healthy reads.
+	cacheReadTimeout = 30 * time.Second
+
+	// minCacheReadThroughput is the per-byte allowance added to cacheReadTimeout.
+	// Only buffered reads use it (the client never paces those), so it is a
+	// generous lower bound on peer-to-pod gRPC throughput.
+	minCacheReadThroughput = 1024 * 1024 // 1 MiB/s
+
+	// maxCacheReadTimeout caps the read deadline at the server's WriteTimeout
+	// (handlers/server.go): a read that outlives the response cannot help it.
+	maxCacheReadTimeout = 5 * time.Minute
 )
+
+// cacheStreamReadTimeout bounds a cache read whose destination is the client: the
+// response writer is the read's sink, so the client paces the read and a
+// size-scaled bound would cut off a slow-but-progressing client earlier than
+// the server itself does. The flat cap only restates the bound the server's
+// WriteTimeout already enforces, so it can never truncate a response that would
+// otherwise have completed. It is a variable so tests can inject a short deadline.
+var cacheStreamReadTimeout = maxCacheReadTimeout
+
+// cacheReadTimeoutForSize bounds one cache read of n bytes INTO A BUFFER (or a
+// presence probe) with a size-scaled deadline, mirroring cacheWriteTimeoutForSize:
+// cacheReadTimeout plus one second per minCacheReadThroughput, capped at
+// maxCacheReadTimeout. n <= 0 (a presence probe) gets the floor. Without it a
+// stalled peer read holds the request until the client disconnects or the
+// server's WriteTimeout fires. The deadline never extends the caller's own: a
+// shorter parent deadline still wins. Reads that stream straight to the client
+// use cacheStreamReadTimeout instead.
+//
+// A timeout is an ordinary transient read error on every path: bodyGone and the
+// block-stream salvage already classify context.DeadlineExceeded as "not
+// evidence the body is gone", so a slow peer never evicts a still-valid entry.
+// It is a variable so tests can inject a short deadline.
+var cacheReadTimeoutForSize = func(n int64) time.Duration {
+	timeout := cacheReadTimeout
+	if n > 0 {
+		timeout += time.Duration(n/minCacheReadThroughput) * time.Second
+	}
+	return min(timeout, maxCacheReadTimeout)
+}
 
 // errCachePopulateDeclined signals that a background cache populate was
 // deliberately skipped because the concurrent-cache-write limit was saturated.

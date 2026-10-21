@@ -326,8 +326,12 @@ func (s *Service) serveFromCache(
 		return nil
 	}
 
-	// Small objects: buffer and serve
+	// Small objects: buffer and serve. The read lands in a buffer, so it is bounded
+	// by the size-scaled deadline: a stalled peer fails the serve pre-commit and the
+	// caller falls through upstream.
 	if meta.ContentLength <= smallObjectThreshold {
+		ctx, cancel := context.WithTimeout(ctx, cacheReadTimeoutForSize(meta.ContentLength))
+		defer cancel()
 		bodyBuf := bufferPool.Get().(*bytes.Buffer)
 		bodyBuf.Reset()
 
@@ -354,6 +358,10 @@ func (s *Service) serveFromCache(
 	// cache produces its first nonempty chunk. This preserves the pre-commit
 	// fallback for an absent or empty body without staging the stream through a
 	// pipe and a second copy.
+	// The client paces this read (the response writer is its sink), so a size-scaled
+	// bound would punish slow clients; the flat cap matches the server's WriteTimeout.
+	ctx, cancel := context.WithTimeout(ctx, cacheStreamReadTimeout)
+	defer cancel()
 	cw := &lazyCommitWriter{w: w, meta: meta}
 	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), cw)
 	status := "success"
