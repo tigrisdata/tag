@@ -471,7 +471,8 @@ func (c *Cache) IsBlockLocal(bucket, key, etag string, blockSize, blockIdx int64
 // Uses ocache's GetRangeStream for efficient partial reads from disk.
 // start and end are inclusive byte positions (HTTP Range semantics).
 // Pass the meta's ETag so the range resolves to the exact cached version.
-// Returns ErrNotFound if the object is not in cache.
+// Returns ErrNotFound if the object is not in cache. A positive short backend read returns an
+// error after writing its available bytes to w.
 func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, start, end int64, w io.Writer) error {
 	if !c.IsEnabled() {
 		return ErrCacheDisabled
@@ -483,7 +484,8 @@ func (c *Cache) GetRangeStream(ctx context.Context, bucket, key, etag string, st
 // block of a block-mode object to w. blockIdx identifies the block; start and end are
 // offsets WITHIN the block (0 = first byte of the block), not within the object. Pass the
 // meta's ETag so the block resolves to the exact cached version. Returns ErrNotFound if the
-// block is not in cache. See RFC 0001.
+// block is not in cache. A positive short backend read returns an error after writing its
+// available bytes to w. See RFC 0001.
 func (c *Cache) GetBlockRangeStream(ctx context.Context, bucket, key, etag string, blockSize, blockIdx, start, end int64, w io.Writer) error {
 	if !c.IsEnabled() {
 		return ErrCacheDisabled
@@ -505,8 +507,9 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 }
 
 // getRangeStreamByKey streams an inclusive byte range [start,end] of the blob at cacheKey to
-// w, mapping ocache's not-found to ErrNotFound and handling ocache's read-byte-0 quirk.
-// bucket/key are used for logging only.
+// w, mapping ocache's not-found to ErrNotFound, handling ocache's read-byte-0 quirk, and
+// rejecting successful reads that do not deliver the requested range in full. bucket/key are
+// used for logging only.
 func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key string, start, end int64, w io.Writer) error {
 	// Handle ocache quirk: reading byte 0 alone requires reading 2 bytes
 	// and discarding the last byte
@@ -561,6 +564,21 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 	if cw.written == 0 {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
 		return ErrNotFound
+	}
+
+	// The byte-zero probe above is intentionally handled separately: it asks the backend
+	// for two bytes but only needs the first. For ordinary valid ranges, a positive read is
+	// a hit only when the backend delivered the complete inclusive span.
+	if start >= 0 && end >= start {
+		want := end - start + 1
+		if want > 0 {
+			if cw.written < want {
+				return fmt.Errorf("cache range short read: got %d of %d bytes: %w", cw.written, want, io.ErrUnexpectedEOF)
+			}
+			if cw.written > want {
+				return fmt.Errorf("cache range over-read: got %d bytes, want %d", cw.written, want)
+			}
+		}
 	}
 
 	c.recordServeLocality(cacheKey)

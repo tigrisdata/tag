@@ -71,7 +71,7 @@ TAG adds a caching layer for read operations. The `X-Cache` response header indi
 
 | Value      | Meaning                                                  |
 | ---------- | -------------------------------------------------------- |
-| `HIT`      | Served entirely from cache                               |
+| `HIT`      | A cache entry was selected to serve the request; block streams may also recover a verified upstream remainder |
 | `MISS`     | Fetched from Tigris and cached                           |
 | `BYPASS`   | Caching skipped (e.g., conditional request returned 304) |
 | `DISABLED` | Caching is turned off                                    |
@@ -80,6 +80,7 @@ Key caching behaviors:
 
 - **Request coalescing** — Multiple concurrent GETs for the same object are coalesced into a single upstream fetch using a broadcast/subscriber pattern. For live requests, a fetch failure before response commitment returns TAG's existing S3 error response to waiting GETs; errors after commitment terminate the stream.
 - **Range requests** — If the full object is cached, range requests are served from cache. On a range cache miss, the range is served directly from Tigris while a background fetch populates the cache with the full object.
+- **Incomplete cached ranges** — TAG checks that a cached range supplies the requested byte count. A committed block GET can recover an unwritten suffix only when the upstream ETag and exact range match. `X-Cache: HIT` is committed before the body streams, so it describes the cache-backed request, not per-byte provenance or successful completion. If the ETag changes, TAG rejects the suffix without appending it; the already-sent 200 status and Content-Length remain, so the client may receive only the cached prefix while the handler reports an error. A whole-object cached Range response commits its 206 when the first nonempty cache chunk arrives and cannot restart upstream; a later positive short read returns a handler error while its 206 and Content-Length remain. Client write failures are not retried upstream.
 - **Conditional requests** — `If-None-Match` and `If-Modified-Since` are evaluated against cached metadata and can return 304 without hitting Tigris.
 - **Write-through invalidation** — PUT, DELETE, CopyObject, and DeleteObjects invalidate the cache _before_ forwarding to Tigris to prevent stale reads.
 - **Tombstone protection** — A short-lived tombstone is written on DELETE to prevent in-flight background cache writes from resurrecting deleted objects.
