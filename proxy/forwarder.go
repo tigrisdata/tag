@@ -130,7 +130,8 @@ func mapAuthError(err error) *AuthError {
 		reason = "expired_request"
 		code = ErrCodeExpiredRequest
 	} else if errors.Is(err, auth.ErrMissingAuth) || errors.Is(err, auth.ErrInvalidAuthFormat) ||
-		errors.Is(err, auth.ErrUnsupportedAuthScheme) || errors.Is(err, auth.ErrMissingContentHash) {
+		errors.Is(err, auth.ErrUnsupportedAuthScheme) || errors.Is(err, auth.ErrMissingContentHash) ||
+		errors.Is(err, auth.ErrInvalidExpires) {
 		reason = "malformed_auth"
 		code = ErrCodeMalformedAuth
 	} else {

@@ -22,13 +22,23 @@ const (
 
 func newSDKPresignedRequestForValidatorTest(t *testing.T, method string, signingTime time.Time, expiry time.Duration) *http.Request {
 	t.Helper()
+	return newSDKPresignedRequestWithRawExpires(t, method, signingTime, []string{strconv.FormatInt(int64(expiry/time.Second), 10)})
+}
+
+// newSDKPresignedRequestWithRawExpires presigns with the SDK over whatever
+// X-Amz-Expires values are given (nil omits the parameter), so malformed
+// lifetimes reach the validator inside an otherwise well-formed URL.
+func newSDKPresignedRequestWithRawExpires(t *testing.T, method string, signingTime time.Time, expires []string) *http.Request {
+	t.Helper()
 
 	req, err := http.NewRequest(method, "http://s3.example.com/test-bucket/object", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	query := req.URL.Query()
-	query.Set("X-Amz-Expires", strconv.FormatInt(int64(expiry/time.Second), 10))
+	for _, value := range expires {
+		query.Add("X-Amz-Expires", value)
+	}
 	req.URL.RawQuery = query.Encode()
 
 	signedURI, signedHeaders, err := v4.NewSigner().PresignHTTP(
@@ -161,4 +171,59 @@ func TestRequestValidator_SDKPresignedGETWithoutContentHash(t *testing.T) {
 			t.Fatalf("header-auth GET ValidateRequest() error = %v, want %v", err, ErrMissingContentHash)
 		}
 	})
+}
+
+func TestRequestValidator_PresignedLifetime(t *testing.T) {
+	credentials := NewCredentialStore()
+	credentials.AddCredential(presignedValidatorTestAccessKey, presignedValidatorTestSecretKey)
+	validator := NewRequestValidator(credentials)
+
+	// Dates are offsets from the time the table is built. The validator's own
+	// clock only moves forward from here, so every case is deterministic: a
+	// case meant to pass sits well inside its window, and a case meant to fail
+	// sits well outside it. The exactly-15-minutes-ahead case is accepted
+	// because the skew the validator measures is at most 15m minus the test's
+	// own elapsed time, never more.
+	now := time.Now().UTC().Truncate(time.Second)
+
+	tests := []struct {
+		name    string
+		date    time.Duration // X-Amz-Date relative to now
+		expires []string      // X-Amz-Expires values; nil omits the parameter
+		wantErr error         // nil means the request validates
+	}{
+		{name: "missing expires", date: 0, expires: nil, wantErr: ErrInvalidExpires},
+		{name: "duplicate expires", date: 0, expires: []string{"300", "300"}, wantErr: ErrInvalidExpires},
+		{name: "non-integer expires", date: 0, expires: []string{"5m"}, wantErr: ErrInvalidExpires},
+		{name: "empty expires", date: 0, expires: []string{""}, wantErr: ErrInvalidExpires},
+		{name: "zero expires", date: 0, expires: []string{"0"}, wantErr: ErrInvalidExpires},
+		{name: "negative expires", date: 0, expires: []string{"-1"}, wantErr: ErrInvalidExpires},
+		{name: "expires one past the cap", date: 0, expires: []string{"604801"}, wantErr: ErrInvalidExpires},
+		{name: "expires at int64 max", date: 0, expires: []string{"9223372036854775807"}, wantErr: ErrInvalidExpires},
+		{name: "expires beyond int64", date: 0, expires: []string{"9223372036854775808"}, wantErr: ErrInvalidExpires},
+		{name: "expired", date: -2 * time.Minute, expires: []string{"1"}, wantErr: ErrExpiredRequest},
+		{name: "expired long-lived url", date: -8 * 24 * time.Hour, expires: []string{"604800"}, wantErr: ErrExpiredRequest},
+		{name: "dated beyond future skew", date: 16 * time.Minute, expires: []string{"300"}, wantErr: ErrExpiredRequest},
+		{name: "dated far in the future with maximum expires", date: 24 * time.Hour, expires: []string{"604800"}, wantErr: ErrExpiredRequest},
+		{name: "minimum expires", date: time.Minute, expires: []string{"1"}, wantErr: nil},
+		{name: "maximum expires", date: 0, expires: []string{"604800"}, wantErr: nil},
+		{name: "dated exactly at the future skew limit", date: maxRequestAge, expires: []string{"300"}, wantErr: nil},
+		{name: "typical sdk url", date: 0, expires: []string{"300"}, wantErr: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := newSDKPresignedRequestWithRawExpires(t, http.MethodGet, now.Add(tt.date), tt.expires)
+			accessKey, err := validator.ValidateRequest(request)
+			if tt.wantErr == nil {
+				if err != nil || accessKey != presignedValidatorTestAccessKey {
+					t.Fatalf("ValidateRequest() = (%q, %v), want (%q, nil)", accessKey, err, presignedValidatorTestAccessKey)
+				}
+				return
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("ValidateRequest() error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
 }

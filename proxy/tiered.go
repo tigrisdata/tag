@@ -53,7 +53,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
 )
@@ -84,12 +83,6 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 	if err != nil {
 		metrics.RecordRequest(operation, "auth_error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
-	}
-	if result == AuthValidated && tieredPresignedGETNeedsFallback(s.forwarder, r) {
-		// Tiered mode treats a metadata miss as authoritative NoSuchKey. Keep
-		// URL-only presigned GETs on the existing origin path here; their local
-		// validation exemption is for ordinary transparent cache-proxy mode.
-		result = AuthNotValidated
 	}
 	if result != AuthValidated {
 		// Unvalidated requests forward to upstream (the auth authority) — an
@@ -148,16 +141,6 @@ func (s *Service) handleTieredObject(w http.ResponseWriter, r *http.Request) err
 		meta = nil
 	}
 	return s.serveOriginlessObject(w, r, operation, start, meta, metaVersion)
-}
-
-// tieredPresignedGETNeedsFallback keeps the proxy-mode URL-only presigned-GET
-// exemption from changing tiered mode's authoritative metadata-miss behavior.
-func tieredPresignedGETNeedsFallback(forwarder RequestForwarder, r *http.Request) bool {
-	if r.Method != http.MethodGet || r.Header.Get("X-Amz-Content-Sha256") != "" || !auth.IsPresignedRequest(r) {
-		return false
-	}
-	transparent, ok := forwarder.(*transparentForwarder)
-	return ok && transparent.validator != nil
 }
 
 // handleTieredPut routes a PUT to its tier by declared size.
