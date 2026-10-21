@@ -40,6 +40,8 @@ import (
 	"github.com/rs/zerolog/log"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/metrics"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // metaCoordinator is the ordering seam for the mutable meta key.
@@ -290,8 +292,15 @@ func (c *legacyCoordinator) putMeta(ctx context.Context, bucket, key, metaKey st
 	if expected != VersionAny {
 		// Tombstone gate right before the visibility-granting meta write: an
 		// invalidation at or after the caller's decision-time stamp blocks the
-		// commit, so a populate cannot resurrect deleted metadata.
-		if ts := c.tombstoneTimestamp(ctx, bucket, key); ts >= int64(expected) {
+		// commit, so a populate cannot resurrect deleted metadata. If the marker
+		// cannot be read or decoded, its state is unknown, not absent: refuse the
+		// visibility write and let the caller handle this as a cache-write error.
+		ts, err := c.tombstoneTimestamp(ctx, bucket, key)
+		if err != nil {
+			metrics.RecordCacheOperation("meta_put", "error")
+			return false, err
+		}
+		if ts >= int64(expected) {
 			metrics.RecordCacheOperation("meta_put", "precondition_lost")
 			log.Debug().Str("bucket", bucket).Str("key", key).
 				Int64("tombstone_ts", ts).Uint64("write_start", expected).
@@ -360,12 +369,25 @@ func (c *legacyCoordinator) writeTombstone(ctx context.Context, bucket, key stri
 	return c.client.Put(ctx, MakeTombstoneKey(bucket, key), data, c.tombstoneTTL)
 }
 
-func (c *legacyCoordinator) tombstoneTimestamp(ctx context.Context, bucket, key string) int64 {
+func (c *legacyCoordinator) tombstoneTimestamp(ctx context.Context, bucket, key string) (int64, error) {
 	data, err := c.client.Get(ctx, MakeTombstoneKey(bucket, key))
-	if err != nil || len(data) != 8 {
-		return 0
+	if err != nil {
+		// The production embedded client represents absence as nil, nil; the
+		// gRPC and in-memory clients return a typed NotFound status. Other errors
+		// (including routing errors whose text contains "not found") leave the
+		// marker state unknown and must not authorize a metadata write.
+		if data == nil && status.Code(err) == codes.NotFound {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read tombstone for %s/%s: %w", bucket, key, err)
 	}
-	return int64(binary.BigEndian.Uint64(data))
+	if data == nil {
+		return 0, nil
+	}
+	if len(data) != 8 {
+		return 0, fmt.Errorf("malformed tombstone for %s/%s: got %d bytes, want 8", bucket, key, len(data))
+	}
+	return int64(binary.BigEndian.Uint64(data)), nil
 }
 
 // deleteMetaIfVersion is a CAS-strength identity delete: legacy coordination

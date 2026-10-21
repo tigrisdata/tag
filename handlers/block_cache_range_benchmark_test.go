@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net"
 	"net/http"
@@ -100,9 +101,9 @@ func (w *rangeServeBenchmarkResponseWriter) Write(p []byte) (int, error) {
 	if w.status == 0 {
 		w.WriteHeader(http.StatusOK)
 	}
-	for _, b := range p {
-		w.checksum += uint64(b)
-	}
+	// Order-sensitive running CRC: a reordered or swapped block must not
+	// validate just because the byte multiset is unchanged.
+	w.checksum = uint64(crc32.Update(uint32(w.checksum), crc32.IEEETable, p))
 	w.written += int64(len(p))
 	return len(p), nil
 }
@@ -112,11 +113,7 @@ func (w *rangeServeBenchmarkResponseWriter) valid() bool {
 }
 
 func benchmarkRangeSum(body []byte, start, end int) uint64 {
-	var sum uint64
-	for _, b := range body[start : end+1] {
-		sum += uint64(b)
-	}
-	return sum
+	return uint64(crc32.ChecksumIEEE(body[start : end+1]))
 }
 
 func BenchmarkServeBlocksCompleteRangeRemote(b *testing.B) {

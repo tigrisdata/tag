@@ -297,10 +297,11 @@ func (s *Service) serveRangeFromBlockCache(
 	w.WriteHeader(http.StatusPartialContent)
 
 	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng.start, rng.end); berr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
 	}
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -1169,9 +1170,10 @@ func (s *Service) serveFullObjectFromBlockCache(
 	w.WriteHeader(meta.StatusCode)
 
 	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, 0, meta.ContentLength-1); berr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
 	}
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -1279,12 +1281,13 @@ func (s *Service) serveCompleteFromBlocks(
 		}
 	}
 	if berr != nil {
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, berr, time.Since(startTime).Seconds())
 		return true, berr
 	}
 	if partial {
 		metrics.RecordRangeFromCacheHit()
 	}
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 

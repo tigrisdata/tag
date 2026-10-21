@@ -33,11 +33,13 @@ const (
 // lockstep. Call it once per response, where the status is committed — never pair
 // it with a separate RecordCacheHit/RecordCacheMiss for the same response.
 //
-// HIT increments hits; MISS increments misses. REVALIDATED, BYPASS, and DISABLED
-// set the header but are neither hits nor misses: REVALIDATED (object changed on
-// upstream) is tracked by the tag_revalidations_* metrics, and a bypassed/disabled
-// request made no cache decision. Range-from-cache hits additionally call
-// RecordRangeFromCacheHit for the specialized counter.
+// HIT identifies a response committed using a cache entry, not per-byte provenance
+// or transfer completion: a block stream can recover a suffix from upstream after
+// commitment or later return an error. HIT increments hits; MISS increments misses.
+// REVALIDATED, BYPASS, and DISABLED set the header but are neither hits nor misses:
+// REVALIDATED (object changed on upstream) is tracked by the tag_revalidations_* metrics,
+// and a bypassed/disabled request made no cache decision. Range-from-cache hits additionally
+// call RecordRangeFromCacheHit for the specialized counter.
 func writeCacheStatus(w http.ResponseWriter, status string) {
 	w.Header().Set(XCacheHeader, status)
 	switch status {

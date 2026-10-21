@@ -759,6 +759,7 @@ func (s *Service) serveRangeFromCache(
 			Msg("Failed to stream range from cache")
 		// Headers already sent, can't return an upstream response after the partial
 		// cache body.
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, streamErr, time.Since(startTime).Seconds())
 		return true, streamErr
 	}
 
@@ -772,7 +773,7 @@ func (s *Service) serveRangeFromCache(
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
 	}
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
