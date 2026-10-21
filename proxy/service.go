@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
@@ -95,6 +96,7 @@ type Service struct {
 	perPopulateCap              int64              // Max bytes a foreground broadcast populate can buffer
 	backgroundPopulateWriterCap int64              // Bytes reserved for direct writer buffers before response inspection
 	broadcastManager            *broadcast.Manager // For streaming request coalescing
+	activeIndependentBroadcasts atomic.Int64       // Late GET broadcasts not keyed in the coalescing manager
 	activeBackgroundFetches     sync.Map           // Dedup for background full-object fetches (range caching)
 	// retier coordinates tiered-mode re-tier-on-read populates with writes:
 	// claims[key] counts PUTs in flight (a claim cancels and excludes re-tiers
@@ -123,6 +125,11 @@ type Service struct {
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
 	recentFooterWork *expirable.LRU[string, struct{}]
+}
+
+// setActiveBroadcasts includes private late-GET broadcasts alongside the manager's keyed broadcasts.
+func (s *Service) setActiveBroadcasts() {
+	metrics.SetActiveBroadcasts(s.broadcastManager.ActiveCount() + int(s.activeIndependentBroadcasts.Load()))
 }
 
 // NewService creates a new proxy service.
@@ -921,6 +928,16 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error {
 	bucket, key := ParseBucketKey(r)
 
+	// CopyObject warming uses request Cache-Control as an admission policy just like
+	// the PUT cache path. Decide before forwarding so a rejected copy can still take
+	// both invalidation fences without starting either warmer.
+	requestRejectsCache := false
+	if !s.config.IsTiered() && s.cache.IsEnabled() && (s.config.Cache.WarmOnWrite || s.config.Cache.ParquetOptimization) {
+		if cacheControls := r.Header["Cache-Control"]; len(cacheControls) > 0 {
+			requestRejectsCache = hasNoCacheDirectives(cacheControls)
+		}
+	}
+
 	log.Debug().Str("bucket", bucket).Str("key", key).Msg("HandleCopyObject")
 
 	// Invalidate cache for destination object BEFORE forwarding to ensure
@@ -968,8 +985,10 @@ func (s *Service) HandleCopyObject(w http.ResponseWriter, r *http.Request) error
 			s.convergeTieredDelete(bucket, key, cpPriorVer, cpPriorKnown)
 		} else {
 			s.convergeInvalidation(context.Background(), bucket, key)
-			s.warmOnWrite(r, bucket, key)
-			s.warmParquetFooterOnWrite(r, bucket, key)
+			if !requestRejectsCache {
+				s.warmOnWrite(r, bucket, key)
+				s.warmParquetFooterOnWrite(r, bucket, key)
+			}
 		}
 	}
 

@@ -36,6 +36,9 @@ When `cache.parquet_optimization` is on, TAG fills that gap from two directions:
 | `parquet_footer` | a read reaches an object's trailer | the **second and later** opens of a file |
 | `write_warm` | a parquet object is written through TAG | the **first** open, before any read happens |
 
+A CopyObject request with `Cache-Control: no-store` or `private` skips both
+post-copy warmers, including `write_warm`; the destination is still invalidated.
+
 Both compute the metadata region from the length the file itself declares — never a guess — and fetch only the blocks it provably spans.
 
 ### Why the second trigger exists

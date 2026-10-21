@@ -17,9 +17,15 @@ memory, so the threshold can be sized to the workload without a per-request
 memory cost. The MD5 ETag is computed over the decoded bytes as they stream;
 because the ETag cannot exist before the last byte, the body is keyed by a
 per-write id carried in the metadata (`BodyRef`), and the metadata commit is
-what makes the entry visible. `If-Match`/`If-None-Match` are honored; GET,
-HEAD, and DELETE are served entirely locally. Reads and writes of small
-objects generate zero upstream traffic.
+what makes the entry visible. After admission and any local precondition pass
+and the full body passes its declared-length and any Content-MD5 checks, a PUT
+routed to the local tier checks a concrete SigV4 payload hash against the
+streamed bytes before that commit.
+Conditional writes against an upstream-tier marker stay on the forwarding
+path. `UNSIGNED-PAYLOAD` and aws-chunked streaming markers retain their
+existing handling. `If-Match`/`If-None-Match` are honored; GET, HEAD, and
+DELETE are served entirely locally. Reads and writes of small objects
+generate zero upstream traffic.
 
 **Large objects are the upstream tier.** The PUT passes through to upstream and
 TAG stores a metadata marker locally. HEAD answers from the marker; GET
@@ -41,8 +47,10 @@ the body into the local tier — streamed like the engine's PUT, so a heal
 costs fixed memory regardless of object size and the threshold is never
 budget-capped. This heals objects mis-placed by the cold-start
 window below, capping the damage at one extra upstream fetch per object
-instead of one body forward per read until TTL. The displaced upstream copy
-is left for the upstream bucket's own expiry.
+instead of one body forward per read until TTL. Each background move is bound
+to the marker version that triggered it; if a later write replaces that
+metadata, the stale move cannot change the newer entry. The displaced
+upstream copy is left for the upstream bucket's own expiry.
 
 ## Authentication
 
