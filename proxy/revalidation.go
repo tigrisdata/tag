@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -311,8 +312,32 @@ func (s *Service) handleRevalidation200(
 	return copyErr
 }
 
+// errCacheBodyLengthMismatch marks a cached whole body whose byte count differs
+// from the Content-Length its metadata advertises (a truncated populate, or a
+// body overwritten in place). bodyGone treats it as an unusable body, so the
+// pre-commit callers invalidate and refetch exactly as for a missing body.
+var errCacheBodyLengthMismatch = errors.New("cache body length mismatch")
+
+// checkCachedBodyLength compares the bytes a cache body produced with the
+// metadata's Content-Length. A negative ContentLength (unknown upstream
+// length) has nothing to compare against.
+func checkCachedBodyLength(bucket, key string, meta *cache.CachedObjectMeta, got int64) error {
+	if meta.ContentLength < 0 || got == meta.ContentLength {
+		return nil
+	}
+	metrics.RecordCacheOperation("get", "length_mismatch")
+	return fmt.Errorf("%w for %s/%s: body is %d bytes, metadata says %d",
+		errCacheBodyLengthMismatch, bucket, key, got, meta.ContentLength)
+}
+
 // serveFromCache serves an object from the cache body.
 // Used as fallback during revalidation (304 or error paths).
+// The body is checked against meta.ContentLength on the way out: a short or
+// long body is never served as a clean hit. Before headers commit the mismatch
+// is returned like any other unusable-body error (callers invalidate via
+// bodyGone and fall through to upstream); after commit the response is left
+// incomplete, as for any committed-then-failed stream, and the entry is
+// invalidated here.
 func (s *Service) serveFromCache(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -333,6 +358,11 @@ func (s *Service) serveFromCache(
 
 		bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), bodyBuf)
 		if bodyErr == nil && bodyBuf.Len() > 0 {
+			// Whole body is buffered, so the check runs before any header is written.
+			if lenErr := checkCachedBodyLength(bucket, key, meta, int64(bodyBuf.Len())); lenErr != nil {
+				putBuffer(bodyBuf)
+				return lenErr
+			}
 			meta.WriteHeaders(w)
 			writeCacheStatus(w, XCacheHit)
 			w.WriteHeader(meta.StatusCode)
@@ -356,21 +386,36 @@ func (s *Service) serveFromCache(
 	// pipe and a second copy.
 	cw := &lazyCommitWriter{w: w, meta: meta}
 	bodyErr := s.cache.GetBodyStream(ctx, bucket, key, meta.BodyDiscriminator(), cw)
-	status := "success"
-	if bodyErr != nil {
-		if !cw.committed {
+	if !cw.committed {
+		if bodyErr != nil {
 			return fmt.Errorf("cache body unavailable: %w", bodyErr)
 		}
+		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
+	}
+	if bodyErr == nil {
+		// The stream ended cleanly: only now is the delivered count meaningful.
+		// A failed stream is already incomplete and may be transient, so it is
+		// not treated as a corrupt entry.
+		bodyErr = checkCachedBodyLength(bucket, key, meta, cw.written)
+	}
+	status := "success"
+	if bodyErr != nil {
 		// The response is already committed. Do not return the error to the
 		// caller: HandleGetObject would otherwise try to append an upstream
 		// response to the partial cached body. The response is incomplete,
-		// however, so record the request as an error.
+		// however, so record the request as an error. The declared
+		// Content-Length is never satisfied, so net/http does not end the
+		// body cleanly for the client.
 		log.Warn().Err(bodyErr).Str("bucket", bucket).Str("key", key).
 			Msg("Failed to stream cache body after headers committed")
 		status = "error"
-	}
-	if !cw.committed {
-		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
+		if errors.Is(bodyErr, errCacheBodyLengthMismatch) {
+			// The entry itself is bad, not transiently unreadable, and no caller
+			// sees a committed failure, so drop it here. ETag/version-guarded:
+			// an entry a concurrent request re-established under a newer
+			// version is left alone.
+			s.invalidateStaleMeta(bucket, key, meta.ETag)
+		}
 	}
 
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
