@@ -305,6 +305,43 @@ func canonicalQueryString(query url.Values) string {
 	return result.String()
 }
 
+// canonicalHeaderValue applies the shared SigV4 header-value normalization.
+// It trims surrounding whitespace and collapses runs of ASCII spaces while
+// preserving other interior whitespace, such as tabs.
+func canonicalHeaderValue(value string) string {
+	value = strings.TrimSpace(value)
+	if !strings.Contains(value, "  ") {
+		return value
+	}
+
+	var normalized strings.Builder
+	normalized.Grow(len(value))
+	previousSpace := false
+	for i := 0; i < len(value); i++ {
+		if value[i] == ' ' {
+			if previousSpace {
+				continue
+			}
+			previousSpace = true
+		} else {
+			previousSpace = false
+		}
+		normalized.WriteByte(value[i])
+	}
+	return normalized.String()
+}
+
+// writeCanonicalHeaderValues normalizes header values in order and joins them
+// with commas without modifying the borrowed values slice.
+func writeCanonicalHeaderValues(builder *strings.Builder, values []string) {
+	for i, value := range values {
+		if i > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(canonicalHeaderValue(value))
+	}
+}
+
 // buildCanonicalHeaders builds canonical headers and signed headers string.
 func (s *RequestSigner) buildCanonicalHeaders(req *http.Request) (string, string) {
 	// Get headers to sign
@@ -332,14 +369,9 @@ func (s *RequestSigner) buildCanonicalHeaders(req *http.Request) (string, string
 	// Build canonical headers string
 	var canonicalHeaders strings.Builder
 	for _, name := range headerNames {
-		values := headers[name]
-		// Trim and collapse whitespace
-		for i, v := range values {
-			values[i] = strings.TrimSpace(v)
-		}
 		canonicalHeaders.WriteString(name)
 		canonicalHeaders.WriteString(":")
-		canonicalHeaders.WriteString(strings.Join(values, ","))
+		writeCanonicalHeaderValues(&canonicalHeaders, headers[name])
 		canonicalHeaders.WriteString("\n")
 	}
 

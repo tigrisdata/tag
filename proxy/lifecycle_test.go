@@ -1,16 +1,20 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
@@ -174,4 +178,122 @@ func runStopWaitsForWriterAfterFetchSupervisorTimesOut(t *testing.T) error {
 		t.Logf("both Stop calls returned after writer exit; cache slots=%d, populate bytes reserved=%d", len(svc.cacheSemaphore), cfg.Cache.MaxPopulateMemoryBytes-remaining)
 	})
 	return proofErr
+}
+
+// lockedLogBuffer collects zerolog output written from the Stop goroutine so the
+// test can read it after synctest.Wait without a data race.
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestServiceWorkersStopWarnsOnceWhenJoinOutlivesDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			warnMsg = "Service worker join deadline passed"
+			doneMsg = "Detached cache work finished after the join deadline"
+		)
+		logs := &lockedLogBuffer{}
+		previousLogger := log.Logger
+		log.Logger = zerolog.New(logs)
+		t.Cleanup(func() { log.Logger = previousLogger })
+
+		w := newServiceWorkers()
+		release := make(chan struct{})
+		for range 2 {
+			if !w.goTask(nil, func(ctx context.Context) {
+				<-ctx.Done()
+				<-release
+			}) {
+				t.Fatal("task was not admitted before stop")
+			}
+		}
+
+		// Two concurrent callers, as main and a signal handler might be: the
+		// join must still be logged exactly once.
+		stopped := make(chan struct{}, 2)
+		for range 2 {
+			go func() {
+				w.stop()
+				stopped <- struct{}{}
+			}()
+		}
+		synctest.Wait()
+		if w.goTask(nil, func(context.Context) {}) {
+			t.Fatal("task admitted after stop began")
+		}
+
+		time.Sleep(stopJoinWarnAfter - time.Second)
+		synctest.Wait()
+		if out := logs.String(); strings.Contains(out, warnMsg) {
+			t.Fatalf("warned before the join deadline:\n%s", out)
+		}
+
+		time.Sleep(time.Second)
+		synctest.Wait()
+		out := logs.String()
+		if got := strings.Count(out, warnMsg); got != 1 {
+			t.Fatalf("join-deadline warnings = %d, want 1:\n%s", got, out)
+		}
+		if !strings.Contains(out, `"active_tasks":2`) {
+			t.Fatalf("warning does not report the two outstanding tasks:\n%s", out)
+		}
+		if strings.Contains(out, doneMsg) {
+			t.Fatalf("completion logged while tasks are still held:\n%s", out)
+		}
+		select {
+		case <-stopped:
+			t.Fatal("stop returned while admitted tasks were still running")
+		default:
+		}
+
+		// The held tasks finish a minute past the warning; the completion log
+		// reports that wait, not the whole join.
+		time.Sleep(time.Minute)
+		close(release)
+		<-stopped
+		<-stopped
+		out = logs.String()
+		if got := strings.Count(out, warnMsg); got != 1 {
+			t.Fatalf("join-deadline warnings after completion = %d, want 1:\n%s", got, out)
+		}
+		if got := strings.Count(out, doneMsg); got != 1 {
+			t.Fatalf("completion logs = %d, want 1:\n%s", got, out)
+		}
+		if !strings.Contains(out, `"waited":60000`) {
+			t.Fatalf("completion log does not report the 1m wait past the deadline:\n%s", out)
+		}
+	})
+}
+
+func TestServiceWorkersStopIsSilentWhenJoinCompletesInTime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &lockedLogBuffer{}
+		previousLogger := log.Logger
+		log.Logger = zerolog.New(logs)
+		t.Cleanup(func() { log.Logger = previousLogger })
+
+		w := newServiceWorkers()
+		if !w.goTask(nil, func(ctx context.Context) { <-ctx.Done() }) {
+			t.Fatal("task was not admitted before stop")
+		}
+		w.stop()
+		time.Sleep(2 * stopJoinWarnAfter)
+		synctest.Wait()
+		if out := logs.String(); out != "" {
+			t.Fatalf("stop that joined in time logged:\n%s", out)
+		}
+	})
 }

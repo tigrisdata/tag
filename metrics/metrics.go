@@ -345,10 +345,21 @@ var (
 		[]string{"trigger"},
 	)
 
-	// CacheParquetFooterBytes records observed parquet metadata sizes. The
-	// distribution answers whether footer prefetching can help at all: metadata
-	// that fits inside the object's tail block is already cached by the read that
-	// triggered this measurement, so only the tail of this distribution matters.
+	// CacheParquetFooterPrefetchShed counts eligible read-triggered footer scans
+	// refused because the per-Service admission limit is full. It counts declined
+	// trigger attempts, not distinct object versions.
+	CacheParquetFooterPrefetchShed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "tag_cache_parquet_footer_prefetch_shed_total",
+			Help: "Eligible read-triggered Parquet footer prefetch attempts declined because the service-wide scan limit was full",
+		},
+	)
+
+	// CacheParquetFooterBytes records valid trailer sizes seen by admitted read
+	// scans and write warms. Read triggers shed before trailer inspection are not
+	// observed, so load shedding can make the sample incomplete. Metadata that fits
+	// inside the object's tail block is already cached by the read that triggered
+	// this measurement, so only the tail of this distribution matters.
 	CacheParquetFooterBytes = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "tag_cache_parquet_footer_bytes",

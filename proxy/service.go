@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
@@ -96,6 +97,7 @@ type Service struct {
 	perPopulateCap              int64              // Max bytes a foreground broadcast populate can buffer
 	backgroundPopulateWriterCap int64              // Bytes reserved for direct writer buffers before response inspection
 	broadcastManager            *broadcast.Manager // For streaming request coalescing
+	activeIndependentBroadcasts atomic.Int64       // Late GET broadcasts not keyed in the coalescing manager
 	activeBackgroundFetches     sync.Map           // Dedup for background full-object fetches (range caching)
 	// retier coordinates tiered-mode re-tier-on-read populates with writes:
 	// claims[key] counts PUTs in flight (a claim cancels and excludes re-tiers
@@ -124,6 +126,14 @@ type Service struct {
 	// already examined. Without it every tail read of a fully-warmed object re-probes
 	// its metadata blocks, which in cluster mode are mostly remote.
 	recentFooterWork *expirable.LRU[string, struct{}]
+	// parquetFooterPrefetchSlots bounds read-triggered scans before they create a
+	// goroutine or marker. Write-triggered warms retain their separate admission path.
+	parquetFooterPrefetchSlots chan struct{}
+}
+
+// setActiveBroadcasts includes private late-GET broadcasts alongside the manager's keyed broadcasts.
+func (s *Service) setActiveBroadcasts() {
+	metrics.SetActiveBroadcasts(s.broadcastManager.ActiveCount() + int(s.activeIndependentBroadcasts.Load()))
 }
 
 // NewService creates a new proxy service.
@@ -216,6 +226,7 @@ func NewService(forwarder RequestForwarder, cache *cache.Cache, cfg *config.Conf
 		blockFetches:                make(map[string]*blockFetchState),
 		retierClaims:                make(map[string]int),
 		retierInflight:              make(map[string]context.CancelFunc),
+		parquetFooterPrefetchSlots:  make(chan struct{}, maxConcurrentParquetFooterPrefetches),
 	}
 	// Allocated only when the feature that uses it is on.
 	if cfg.Cache.ParquetOptimization {
@@ -1277,11 +1288,16 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 			s.warmOnWrite(r, bucket, key)
 			// The path that matters for parquet: ingestors write via multipart, so this
 			// is where a freshly written file's metadata gets warmed (RFC 0002).
-			s.warmParquetFooterOnWrite(r, bucket, key)
+			writtenETag := completedMultipartETag(capture)
+			footerETag := ""
+			if s.config.Cache.MetaOnWrite && s.config.Cache.ParquetOptimization && isParquetKey(key) {
+				footerETag = writtenETag
+			}
+			s.warmParquetFooterOnWriteWithETag(r, bucket, key, footerETag)
 			// Prototype: establish the metadata entry so the first read does not pay an
 			// upstream round trip to discover it. Multipart is the gap — write-through
 			// cannot tee a body TAG never sees.
-			s.cacheBlockMetaOnWrite(r, bucket, key, completedMultipartETag(capture))
+			s.cacheBlockMetaOnWrite(r, bucket, key, writtenETag)
 		}
 	}
 

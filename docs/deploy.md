@@ -74,6 +74,12 @@ images:
 
 ## Production Considerations
 
+### Graceful shutdown
+
+On SIGINT or SIGTERM, TAG drains admitted HTTP handlers for up to 30 seconds. If the drain expires, it cancels active request contexts and closes their HTTP connections, then keeps the embedded cache open until each synchronous handler and its cache-consistency cleanup returns. A request that finishes inside the drain window retains its normal response; a longer request may be aborted. Cleanup that does not return can keep TAG running beyond the HTTP drain window.
+
+The base StatefulSet sets `terminationGracePeriodSeconds: 30`, which is a separate process-termination limit. Kubernetes may force-stop the pod when that grace expires even if TAG is still waiting for handler cleanup. Set the pod's termination grace to the longest cleanup interval you need to allow; no finite grace can guarantee completion for uncooperative storage.
+
 ### High Availability
 
 - The StatefulSet deploys 3 replicas by default with pod anti-affinity to distribute across nodes.

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,12 @@ import (
 // newTieredTestService builds a Service in tiered mode with an in-memory cache
 // and the given small/large tier boundary.
 func newTieredTestService(forwarder RequestForwarder, threshold int64) (*Service, *cache.Cache) {
+	return newTieredTestServiceWithClient(forwarder, threshold, cacheclient.NewMemoryCache())
+}
+
+// newTieredTestServiceWithClient keeps the production tiered configuration and
+// CAS coordinator while allowing tests to gate versioned cache reads.
+func newTieredTestServiceWithClient(forwarder RequestForwarder, threshold int64, client cacheclient.CacheClient) (*Service, *cache.Cache) {
 	cfg := config.NewDefault()
 	cfg.Mode = config.ModeTiered
 	cfg.Cache.SetBlockCachingEnabled(false)
@@ -37,8 +44,7 @@ func newTieredTestService(forwarder RequestForwarder, threshold int64) (*Service
 		panic(err)
 	}
 
-	memCache := cacheclient.NewMemoryCache()
-	c := cache.NewCacheWithClient(memCache, &cfg.Cache)
+	c := cache.NewCacheWithClient(client, &cfg.Cache)
 	svc := NewService(forwarder, c, cfg)
 	return svc, c
 }
@@ -458,6 +464,349 @@ func waitRetierDone(t *testing.T, svc *Service, bucket, key string) {
 			t.Fatal("re-tier still in flight after 2s")
 		case <-time.After(5 * time.Millisecond):
 		}
+	}
+}
+
+type tieredMetaReadObservation struct {
+	data    []byte
+	version uint64
+	found   bool
+	err     error
+}
+
+// tieredMetaReadGateClient pauses a versioned metadata result after the cache
+// read returns, so a test can deterministically place a write before GET-side
+// re-tier registration.
+type tieredMetaReadGateClient struct {
+	cacheclient.CacheClient
+	mu sync.Mutex
+
+	key       string
+	blockNext bool
+	observed  chan tieredMetaReadObservation
+	release   <-chan struct{}
+	watchNext bool
+	watched   chan tieredMetaReadObservation
+}
+
+func (g *tieredMetaReadGateClient) gateNextMetaRead(key string) (<-chan tieredMetaReadObservation, chan struct{}) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.key = key
+	g.blockNext = true
+	g.observed = make(chan tieredMetaReadObservation, 1)
+	release := make(chan struct{})
+	g.release = release
+	return g.observed, release
+}
+
+func (g *tieredMetaReadGateClient) watchNextMetaRead() <-chan tieredMetaReadObservation {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.watchNext = true
+	g.watched = make(chan tieredMetaReadObservation, 1)
+	return g.watched
+}
+
+func (g *tieredMetaReadGateClient) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	data, version, found, err := g.CacheClient.GetWithVersion(ctx, key)
+	observation := tieredMetaReadObservation{data: data, version: version, found: found, err: err}
+
+	g.mu.Lock()
+	if key != g.key {
+		g.mu.Unlock()
+		return data, version, found, err
+	}
+	if g.blockNext {
+		g.blockNext = false
+		observed, release := g.observed, g.release
+		g.mu.Unlock()
+		observed <- observation
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, 0, false, ctx.Err()
+		}
+		return data, version, found, err
+	}
+	var watched chan tieredMetaReadObservation
+	if g.watchNext {
+		g.watchNext = false
+		watched = g.watched
+	}
+	g.mu.Unlock()
+	if watched != nil {
+		watched <- observation
+	}
+	return data, version, found, err
+}
+
+type tieredRetierDelayedScenario struct {
+	name        string
+	localBody   string
+	markerETag  string
+	fetchStatus int
+	fetchETag   string
+	fetchBody   string
+}
+
+func tieredETag(body string) string {
+	sum := md5.Sum([]byte(body))
+	return `"` + hex.EncodeToString(sum[:]) + `"`
+}
+
+func TestTieredRetierDelayedRegistrationPreservesLocalPut(t *testing.T) {
+	scenarios := []tieredRetierDelayedScenario{
+		{
+			name:        "upstream 404 cannot remove local successor",
+			localBody:   "local-after-404",
+			markerETag:  `"upstream-a"`,
+			fetchStatus: http.StatusNotFound,
+		},
+		{
+			name:        "changed response cannot relabel same-content local successor",
+			localBody:   "same-content",
+			markerETag:  tieredETag("same-content"),
+			fetchStatus: http.StatusOK,
+			fetchETag:   `"upstream-b"`,
+			fetchBody:   "replacement-body",
+		},
+	}
+
+	var violations []string
+	setupComplete := true
+	for _, scenario := range scenarios {
+		scenario := scenario
+		var violation string
+		if !t.Run(scenario.name, func(t *testing.T) {
+			violation = runTieredRetierDelayedRegistrationScenario(t, scenario)
+		}) {
+			setupComplete = false
+		}
+		if violation != "" {
+			violations = append(violations, scenario.name+": "+violation)
+		}
+	}
+	if !setupComplete {
+		return
+	}
+	if len(violations) != 0 {
+		t.Errorf("stale re-tier changed the authoritative metadata of a completed local PUT: %s", strings.Join(violations, "; "))
+	}
+}
+
+func runTieredRetierDelayedRegistrationScenario(t *testing.T, scenario tieredRetierDelayedScenario) string {
+	t.Helper()
+	const bucket, key = "b", "obj"
+	ctx := context.Background()
+
+	mock, _, _ := tieredMock()
+	cleanupFinished := make(chan struct{})
+	mock.doObjectDeleteFunc = func(context.Context, string, string, string, string, string) (*http.Response, error) {
+		defer close(cleanupFinished)
+		// The local PUT's upstream cleanup is unrelated to this invariant. A
+		// lost If-Match takes the normal early-return path before its own
+		// versioned metadata repair read can be mistaken for the re-tier read.
+		return &http.Response{StatusCode: http.StatusPreconditionFailed, Body: http.NoBody}, nil
+	}
+	var fetches atomic.Int32
+	mock.doFullObjectFunc = func(context.Context, string, string, string, string) (*http.Response, error) {
+		if fetches.Add(1) > 1 {
+			return nil, errors.New("unexpected repeated re-tier fetch")
+		}
+		header := make(http.Header)
+		if scenario.fetchETag != "" {
+			header.Set("ETag", scenario.fetchETag)
+			header.Set("Content-Length", strconv.Itoa(len(scenario.fetchBody)))
+		}
+		return &http.Response{
+			StatusCode:    scenario.fetchStatus,
+			Header:        header,
+			ContentLength: int64(len(scenario.fetchBody)),
+			Body:          io.NopCloser(strings.NewReader(scenario.fetchBody)),
+		}, nil
+	}
+
+	gate := &tieredMetaReadGateClient{CacheClient: cacheclient.NewMemoryCache()}
+	svc, c := newTieredTestServiceWithClient(mock, 1024, gate)
+	marker := &cache.CachedObjectMeta{
+		Bucket: bucket, Key: key, ETag: scenario.markerETag,
+		BodyUpstream: true, ContentLength: int64(len(scenario.localBody)), StatusCode: http.StatusOK,
+	}
+	_, absentVersion, found, err := c.GetMetaWithVersion(ctx, bucket, key)
+	if err != nil || found {
+		t.Fatalf("initial metadata state: found=%v err=%v, want absence", found, err)
+	}
+	if wrote, err := c.PutMetaIfVersion(ctx, bucket, key, marker, 60, absentVersion); err != nil || !wrote {
+		t.Fatalf("seed upstream marker: wrote=%v err=%v", wrote, err)
+	}
+	seeded, markerVersion, found, err := c.GetMetaWithVersion(ctx, bucket, key)
+	if err != nil || !found || seeded == nil || !seeded.BodyUpstream || seeded.ETag != marker.ETag {
+		t.Fatalf("seeded marker snapshot: meta=%+v found=%v err=%v", seeded, found, err)
+	}
+
+	observed, release := gate.gateNextMetaRead(cache.MakeMetaKey(bucket, key))
+	var releaseOnce sync.Once
+	resumeGET := func() { releaseOnce.Do(func() { close(release) }) }
+	getRecorder := httptest.NewRecorder()
+	getRequest := httptest.NewRequest(http.MethodGet, "/b/obj", nil)
+	getFinished := make(chan struct{})
+	var getErr error
+	go func() {
+		getErr = svc.HandleGetObject(getRecorder, getRequest)
+		close(getFinished)
+	}()
+	defer func() {
+		resumeGET()
+		select {
+		case <-getFinished:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
+	var firstRead tieredMetaReadObservation
+	select {
+	case firstRead = <-observed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GET did not reach the gated versioned metadata read")
+	}
+	firstMeta, decodeErr := cache.DecodeMeta(firstRead.data)
+	if firstRead.err != nil || decodeErr != nil || !firstRead.found || firstRead.version != markerVersion || firstMeta == nil || !firstMeta.BodyUpstream || firstMeta.ETag != marker.ETag {
+		t.Fatalf("gated GET did not observe marker A: meta=%+v version=%d found=%v readErr=%v decodeErr=%v", firstMeta, firstRead.version, firstRead.found, firstRead.err, decodeErr)
+	}
+	if svc.retierRunning(bucket, key) {
+		t.Fatal("re-tier registered before the gated GET resumed")
+	}
+
+	putRecorder := httptest.NewRecorder()
+	putRequest := httptest.NewRequest(http.MethodPut, "/b/obj", strings.NewReader(scenario.localBody))
+	if err := svc.HandlePutObject(putRecorder, putRequest); err != nil {
+		t.Fatalf("local successor PUT: %v", err)
+	}
+	if putRecorder.Code != http.StatusOK {
+		t.Fatalf("local successor PUT status = %d, want %d", putRecorder.Code, http.StatusOK)
+	}
+	svc.retierMu.Lock()
+	claims := svc.retierClaims[bucket+"|"+key]
+	svc.retierMu.Unlock()
+	if claims != 0 {
+		t.Fatalf("PUT returned while holding %d re-tier write claims", claims)
+	}
+	before, beforeVersion, found, err := c.GetMetaWithVersion(ctx, bucket, key)
+	if err != nil || !found || before == nil || before.BodyUpstream || before.BodyRef == "" {
+		t.Fatalf("completed PUT metadata: meta=%+v found=%v err=%v", before, found, err)
+	}
+	if beforeVersion == markerVersion {
+		t.Fatalf("successor metadata version %d did not advance from marker version", beforeVersion)
+	}
+	if scenario.localBody == "same-content" && before.ETag != marker.ETag {
+		t.Fatalf("same-content successor ETag = %q, want marker ETag %q", before.ETag, marker.ETag)
+	}
+	select {
+	case <-cleanupFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("local PUT's cross-tier cleanup did not finish")
+	}
+
+	workerRead := gate.watchNextMetaRead()
+	resumeGET()
+	select {
+	case <-getFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GET did not finish after its metadata snapshot was released")
+	}
+	if getErr != nil {
+		t.Fatalf("validated GET: %v", getErr)
+	}
+	var workerSnapshot tieredMetaReadObservation
+	select {
+	case workerSnapshot = <-workerRead:
+	case <-time.After(2 * time.Second):
+		t.Fatal("delayed GET did not start the re-tier worker's pre-fetch metadata read")
+	}
+	workerMeta, workerDecodeErr := cache.DecodeMeta(workerSnapshot.data)
+	if workerSnapshot.err != nil || workerDecodeErr != nil || !workerSnapshot.found || workerSnapshot.version != beforeVersion || workerMeta == nil || workerMeta.BodyUpstream || workerMeta.BodyRef != before.BodyRef {
+		t.Fatalf("re-tier worker did not observe completed local PUT: meta=%+v version=%d found=%v readErr=%v decodeErr=%v", workerMeta, workerSnapshot.version, workerSnapshot.found, workerSnapshot.err, workerDecodeErr)
+	}
+	waitRetierDone(t, svc, bucket, key)
+
+	issues := make([]string, 0, 5)
+	after, afterVersion, found, err := c.GetMetaWithVersion(ctx, bucket, key)
+	if err != nil {
+		t.Fatalf("metadata after re-tier: %v", err)
+	}
+	if !found || after == nil {
+		issues = append(issues, "successor metadata was removed")
+	} else {
+		if afterVersion != beforeVersion {
+			issues = append(issues, "metadata version changed")
+		}
+		if after.BodyRef != before.BodyRef {
+			issues = append(issues, "BodyRef changed")
+		}
+		if after.ETag != before.ETag {
+			issues = append(issues, "ETag changed")
+		}
+		if after.BodyUpstream {
+			issues = append(issues, "metadata no longer identifies the local tier")
+		}
+	}
+
+	getAfter := httptest.NewRecorder()
+	if err := svc.HandleGetObject(getAfter, httptest.NewRequest(http.MethodGet, "/b/obj", nil)); err != nil {
+		t.Fatalf("GET after re-tier: %v", err)
+	}
+	waitRetierDone(t, svc, bucket, key)
+	if getAfter.Code != http.StatusOK || getAfter.Body.String() != scenario.localBody || getAfter.Header().Get("ETag") != before.ETag {
+		issues = append(issues, "subsequent validated GET did not expose the local PUT")
+	}
+	headAfter := httptest.NewRecorder()
+	if err := svc.HandleHeadObject(headAfter, httptest.NewRequest(http.MethodHead, "/b/obj", nil)); err != nil {
+		t.Fatalf("HEAD after re-tier: %v", err)
+	}
+	if headAfter.Code != http.StatusOK || headAfter.Header().Get("ETag") != before.ETag || headAfter.Header().Get("Content-Length") != strconv.Itoa(len(scenario.localBody)) {
+		issues = append(issues, "subsequent validated HEAD did not expose the local PUT")
+	}
+	return strings.Join(issues, ", ")
+}
+
+// A 404 for an unchanged marker still removes that marker from the
+// authoritative view; the stale-GET guard must not disable this convergence.
+func TestTieredRetier404ConvergesUnchangedMarker(t *testing.T) {
+	mock, _, _ := tieredMock()
+	var fetches atomic.Int32
+	mock.doFullObjectFunc = func(context.Context, string, string, string, string) (*http.Response, error) {
+		fetches.Add(1)
+		return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: http.NoBody}, nil
+	}
+	svc, c := newTieredTestService(mock, 1024)
+	marker := &cache.CachedObjectMeta{
+		Bucket: "b", Key: "obj", ETag: `"gone"`, BodyUpstream: true,
+		ContentLength: 4, StatusCode: http.StatusOK,
+	}
+	_, version, found, err := c.GetMetaWithVersion(context.Background(), "b", "obj")
+	if err != nil || found {
+		t.Fatalf("initial metadata state: found=%v err=%v, want absence", found, err)
+	}
+	if wrote, err := c.PutMetaIfVersion(context.Background(), "b", "obj", marker, 60, version); err != nil || !wrote {
+		t.Fatalf("seed upstream marker: wrote=%v err=%v", wrote, err)
+	}
+	if w := tieredDo(t, svc, http.MethodGet, "/b/obj", "", nil); w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want forwarded 200", w.Code)
+	}
+	waitRetierDone(t, svc, "b", "obj")
+	if n := fetches.Load(); n != 1 {
+		t.Fatalf("background fetches = %d, want 1", n)
+	}
+	if _, found, err := c.GetMeta(context.Background(), "b", "obj"); err != nil || found {
+		t.Fatalf("unchanged 404 marker survived convergence: found=%v err=%v", found, err)
+	}
+	head := httptest.NewRecorder()
+	if err := svc.HandleHeadObject(head, httptest.NewRequest(http.MethodHead, "/b/obj", nil)); err != nil {
+		t.Fatalf("HEAD after 404 convergence: %v", err)
+	}
+	if head.Code != http.StatusNotFound {
+		t.Fatalf("HEAD after 404 convergence = %d, want %d", head.Code, http.StatusNotFound)
 	}
 }
 
