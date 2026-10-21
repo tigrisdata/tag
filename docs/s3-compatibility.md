@@ -53,7 +53,7 @@ All bucket operations support both `/{bucket}` and `/{bucket}/` path forms for c
 | InitiateMultipartUpload | POST   | `/{bucket}/{key}?uploads`               |                                            |
 | UploadPart              | PUT    | `/{bucket}/{key}?uploadId=&partNumber=` |                                            |
 | UploadPartCopy          | PUT    | `/{bucket}/{key}?uploadId=&partNumber=` | Detected via `X-Amz-Copy-Source` header    |
-| CompleteMultipartUpload | POST   | `/{bucket}/{key}?uploadId=`             | Idempotent — successful completions cached |
+| CompleteMultipartUpload | POST   | `/{bucket}/{key}?uploadId=`             |                                            |
 | AbortMultipartUpload    | DELETE | `/{bucket}/{key}?uploadId=`             |                                            |
 | ListParts               | GET    | `/{bucket}/{key}?uploadId=`             |                                            |
 
@@ -92,6 +92,7 @@ Key caching behaviors:
 - **Conditional requests** — `If-None-Match` and `If-Modified-Since` are evaluated against cached metadata and can return 304 without hitting Tigris.
 - **Write-through invalidation** — In proxy mode, PUT, DELETE, CopyObject, and DeleteObjects invalidate affected cache entries before forwarding. For cache-enabled DeleteObjects requests with a nonempty parsed key list, TAG completes an upstream 2xx only after the post-success invalidation attempts return, bounded by a 10-second fence timeout; a fence that does not converge in time is logged as a warning and the 2xx is still returned.
 - **Tombstone protection** — A short-lived tombstone is written on DELETE to prevent in-flight background cache writes from resurrecting deleted objects.
+- **Multipart completion replay** — A fully captured successful response is cached for five seconds when TAG can identify a caller. A replay must match the exact bucket, object key, and upload ID and pass local validation for the saved access key; transparent mode also checks the caller's current bucket authorization. Entries without a saved caller identity are treated as misses; other requests follow normal forwarding and authorization.
 
 ## Addressing Style
 

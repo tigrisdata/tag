@@ -16,8 +16,19 @@ const (
 	mpUpload = "upload-123"
 )
 
+// completeMultipartRequest builds a completion signed as the mock-validated
+// principal "access": the Authorization header identifies the caller and the
+// content hash lets the request be validated locally (the mock accepts any).
 func completeMultipartRequest() *http.Request {
-	return httptest.NewRequest(http.MethodPost, "/"+mpBucket+"/"+mpKey+"?uploadId="+mpUpload, nil)
+	return completeMultipartRequestAs("access")
+}
+
+func completeMultipartRequestAs(accessKey string) *http.Request {
+	r := httptest.NewRequest(http.MethodPost, "/"+mpBucket+"/"+mpKey+"?uploadId="+mpUpload, nil)
+	r.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential="+accessKey+"/20260101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=deadbeef")
+	r.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	r.Header.Set("X-Amz-Date", "20260101T000000Z")
+	return r
 }
 
 // completion result body (a genuine success — not an <Error> document).
@@ -89,7 +100,7 @@ func TestHandleCompleteMultipartUpload_200ErrorBodyKeepsRacingRefill(t *testing.
 	}
 
 	// A failed completion must not be cached as a successful idempotent replay.
-	if _, found, _ := c.GetCompletion(context.Background(), mpBucket, mpKey, mpUpload); found {
+	if _, found, _ := c.GetCompletion(context.Background(), mpBucket, mpKey, mpUpload, "access"); found {
 		t.Error("200-with-error-body completion was cached as a successful completion — an idempotent replay would return the error as success")
 	}
 }
@@ -119,7 +130,9 @@ func TestHandleCompleteMultipartUpload_InvalidatesBeforeForward(t *testing.T) {
 }
 
 // A successful completion is cached for idempotent replay: a second call with the
-// same uploadId must return the stored response without forwarding upstream again.
+// same uploadId by the same validated principal must return the stored response
+// without forwarding upstream again. The entry is bound to that principal, so a
+// different caller for the same uploadId is forwarded upstream instead.
 func TestHandleCompleteMultipartUpload_SuccessCachedForIdempotentReplay(t *testing.T) {
 	var forwards int
 	succeed := func(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
@@ -142,5 +155,13 @@ func TestHandleCompleteMultipartUpload_SuccessCachedForIdempotentReplay(t *testi
 	}
 	if forwards != 1 {
 		t.Errorf("upstream forwarded %d times; the second identical completion must be served from the idempotency cache", forwards)
+	}
+
+	w := httptest.NewRecorder()
+	if err := svc.HandleCompleteMultipartUpload(w, completeMultipartRequestAs("other")); err != nil {
+		t.Fatalf("HandleCompleteMultipartUpload as another principal: %v", err)
+	}
+	if forwards != 2 {
+		t.Errorf("upstream forwarded %d times; a completion by another principal must not be served from a caller-bound cache entry", forwards)
 	}
 }

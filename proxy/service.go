@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/rs/zerolog/log"
+	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
@@ -1209,8 +1210,10 @@ func (s *Service) HandlePassthrough(w http.ResponseWriter, r *http.Request) erro
 }
 
 // HandleCompleteMultipartUpload handles CompleteMultipartUpload with idempotency caching.
-// This caches successful completion responses in ocache to support idempotent calls,
-// matching tigris-os behavior where a second CompleteMultipartUpload call returns success.
+// A fully captured successful response is cached for five seconds, bound to the
+// locally validated caller, and replayed only to that same principal for the exact
+// bucket, key, and upload ID. Any other caller is forwarded upstream, which gives
+// the authoritative answer and never leaks the completed object's ETag or existence.
 func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request) error {
 	bucket, key := ParseBucketKey(r)
 	uploadId := r.URL.Query().Get("uploadId")
@@ -1218,13 +1221,24 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 
 	log.Debug().Str("bucket", bucket).Str("key", key).Str("uploadId", uploadId).Msg("HandleCompleteMultipartUpload")
 
+	// Identify the caller before forwarding. Only a locally validated principal can
+	// replay a cached completion or have one saved for it, and the identity must be
+	// taken now: a long completion can outlive the SigV4 age window before its
+	// response is captured, so it could not be validated afterwards.
+	var principal string
+	if s.cache.IsEnabled() {
+		principal = s.completionPrincipal(r)
+	}
+
 	// Check ocache first for idempotent completion (works across TAG pods).
 	// A replay returns the already-completed response without touching upstream and
 	// without changing the object, so it needs no read-cache invalidation — the first
 	// completion (below) already invalidated it.
-	if s.cache.IsEnabled() {
-		entry, found, err := s.cache.GetCompletion(ctx, bucket, key, uploadId)
-		if err == nil && found {
+	if principal != "" {
+		entry, found, err := s.cache.GetCompletion(ctx, bucket, key, uploadId, principal)
+		// The cache read may have waited on a remote peer, during which an upstream
+		// 403 can revoke the caller's grant; re-validate at the replay decision point.
+		if err == nil && found && s.completionPrincipal(r) == principal {
 			log.Debug().Str("uploadId", uploadId).Msg("CompleteMultipartUpload cache hit - returning cached response")
 			for k, v := range entry.Headers {
 				w.Header().Set(k, v)
@@ -1306,17 +1320,70 @@ func (s *Service) HandleCompleteMultipartUpload(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	// Cache successful completions in ocache for idempotent replays. Only cache a
-	// genuine success (not a 200-with-<Error> body) that was fully captured, so we
-	// never replay a corrupted or error response as a successful completion.
-	if completed && capture.Complete {
-		if cacheErr := s.cache.PutCompletion(ctx, bucket, key, uploadId, capture.StatusCode, capture.Headers, capture.Body); cacheErr != nil {
+	// Cache a genuine, fully captured success (not a 200-with-<Error> body) for
+	// idempotent replays, bound to the caller validated at request start. A
+	// completion whose caller could not be identified locally is not cached, so
+	// it can never be replayed to anyone.
+	if completed && capture.Complete && principal != "" {
+		if cacheErr := s.cache.PutCompletion(ctx, bucket, key, uploadId, principal, capture.StatusCode, capture.Headers, capture.Body); cacheErr != nil {
 			log.Debug().Err(cacheErr).Msg("Failed to cache completion response")
 			// Don't fail the request if caching fails
 		}
 	}
 
 	return nil
+}
+
+// completionPrincipal returns the access key of a caller the forwarder validates
+// locally, or "" when the caller cannot be identified. In signing mode that is a
+// signature check against the credential store; in transparent mode it is the
+// signature check against learned keys plus the caller's current bucket grant —
+// the same validation that gates serving cached objects. The access key comes
+// from the client's own auth info in both modes (transparent mode's
+// ValidateAndGetCredentials returns the proxy's upstream credentials).
+func (s *Service) completionPrincipal(r *http.Request) string {
+	validationRequest, ok := completionRequestForLocalValidation(r)
+	if !ok {
+		return ""
+	}
+	result, _, _, err := s.forwarder.ValidateAndGetCredentials(validationRequest)
+	if err != nil || result != AuthValidated {
+		return ""
+	}
+	authInfo, err := auth.ParseAuthInfo(r)
+	if err != nil {
+		return ""
+	}
+	return authInfo.AccessKey
+}
+
+// completionRequestForLocalValidation returns the request to validate locally.
+// The validator requires X-Amz-Content-Sha256 on non-GET requests, but a presigned
+// POST completion legitimately omits it and is signed over UNSIGNED-PAYLOAD; supply
+// that marker on a clone so validation can run without changing the request that
+// is forwarded upstream. A request that neither carries the hash nor is presigned
+// cannot be validated locally.
+func completionRequestForLocalValidation(r *http.Request) (*http.Request, bool) {
+	if r.Header.Get("X-Amz-Content-Sha256") != "" {
+		return r, true
+	}
+	if !auth.IsPresignedRequest(r) {
+		return r, false
+	}
+	authInfo, err := auth.ParseAuthInfo(r)
+	if err != nil || !authInfo.IsPresigned {
+		return r, false
+	}
+	for _, header := range authInfo.SignedHeaders {
+		if strings.EqualFold(header, "x-amz-content-sha256") {
+			return r, false
+		}
+	}
+
+	validationRequest := r.Clone(r.Context())
+	validationRequest.Header = r.Header.Clone()
+	validationRequest.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	return validationRequest, true
 }
 
 // ParseBucketKey extracts bucket and key from request path.
