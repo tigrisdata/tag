@@ -234,8 +234,16 @@ func serveBroadcastErrorGET(router http.Handler) (*httptest.ResponseRecorder, <-
 	done := make(chan struct{})
 	request := httptest.NewRequest(http.MethodGet, "/"+broadcastErrorBucket+"/"+broadcastErrorKey, nil)
 	go func() {
+		defer close(done)
+		// A committed response whose stream fails is aborted with
+		// http.ErrAbortHandler, which a real http.Server recovers; this helper
+		// drives the router directly, so recover it here the same way.
+		defer func() {
+			if r := recover(); r != nil && r != http.ErrAbortHandler {
+				panic(r)
+			}
+		}()
 		router.ServeHTTP(response, request)
-		close(done)
 	}()
 	return response, done
 }
