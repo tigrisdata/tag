@@ -121,7 +121,9 @@ func (s *Service) forwardAfterCacheMiss(ctx context.Context, w http.ResponseWrit
 	}
 	writeCacheStatus(w, XCacheMiss)
 	forwardErr := s.forwarder.Forward(ctx, w, r)
+	status := "success"
 	if forwardErr != nil {
+		status = "error"
 	}
 	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return forwardErr
@@ -243,7 +245,9 @@ func (s *Service) handleRevalidation200(
 		// Not cacheable — just stream to client
 		n, copyErr := io.Copy(w, resp.Body)
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+		status := "success"
 		if copyErr != nil {
+			status = "error"
 		}
 		metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 		return copyErr
@@ -300,7 +304,9 @@ func (s *Service) handleRevalidation200(
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Cache write timeout after revalidation")
 	}
 
+	status := "success"
 	if copyErr != nil {
+		status = "error"
 	}
 	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 	return copyErr
@@ -484,7 +490,9 @@ func (s *Service) handleRevalidation206Range(
 	n, copyErr := io.Copy(w, resp.Body)
 	metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
 
+	status := "success"
 	if copyErr != nil {
+		status = "error"
 	}
 	metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
 
