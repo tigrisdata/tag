@@ -100,9 +100,8 @@ func (f *signingForwarder) ForwardTeeingBody(ctx context.Context, w http.Respons
 	return status, headers, accessKey, secretKey, err
 }
 
-// ForwardWithCapture forwards request and captures response for caching.
-// Validates and re-signs like Forward, but also captures the response body
-// for caching while streaming to the client.
+// ForwardWithCapture forwards the request and captures the response for caching.
+// It validates and re-signs like Forward, but also retains the response body.
 func (f *signingForwarder) ForwardWithCapture(ctx context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
 	// Decode AWS chunked encoding if present, otherwise pass through unchanged
 	body, bodyHash, contentLength, chunked := decodeChunkedIfNeeded(r)

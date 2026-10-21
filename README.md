@@ -104,7 +104,7 @@ When configuring S3 clients, ensure path-style addressing is enabled. See [docs/
 - A later multi-block Range within a range-created entry's recorded span stages its payload blocks before `206`, skipping probes only on a complete hit. The ETag/layout-bound hint is advisory; misses keep existing recovery, and speculative reads fall back upstream after five seconds while the request is live.
 - Set `block_caching_enabled: false` to cache whole objects instead — a range request then triggers a background fetch of the full object (if within threshold)
 - In tiered mode, a PUT routed to the local tier checks a concrete SigV4 `X-Amz-Content-Sha256` digest after admission and any local precondition pass and the full body passes its declared-length and any Content-MD5 checks; conditional writes against upstream-tier markers, `UNSIGNED-PAYLOAD`, and aws-chunked uploads keep their existing paths
-- PUT/DELETE operations invalidate the cache entry
+- PUT/DELETE operations invalidate affected cache entries. For cache-enabled bulk DeleteObjects requests with a nonempty parsed key list, TAG completes an upstream 2xx response only after the post-success invalidation attempts return.
 - If a whole-object cache write returns an error during a successful GET, the upstream response is unchanged and the cache-populate slot becomes available after relay cleanup, so a later eligible GET can retry. A store call that never returns has no completion guarantee.
 
 See [docs/cache-control.md](docs/cache-control.md) for detailed cache control and revalidation documentation. For tuning and sizing block caching in production, see [docs/deploy.md](docs/deploy.md#block-aligned-caching).
