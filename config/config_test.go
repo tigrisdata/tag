@@ -888,8 +888,9 @@ func TestIsTigrisEndpoint(t *testing.T) {
 	}{
 		{"tigris.dev domain", "https://fly.storage.tigris.dev", true},
 		{"storage.dev domain", "https://t3.storage.dev", true},
-		{"localhost", "http://localhost:8080", true},
-		{"localhost no port", "http://localhost", true},
+		{"mixed-case tigris host", "https://T3.Storage.Dev", true},
+		{"localhost is not Tigris", "http://localhost:8080", false},
+		{"localhost no port is not Tigris", "http://localhost", false},
 		{"third-party s3", "https://s3.amazonaws.com", false},
 		{"minio", "http://minio.internal:9000", false},
 		{"not a suffix match", "https://nottrigris.dev", false},
@@ -902,6 +903,27 @@ func TestIsTigrisEndpoint(t *testing.T) {
 				t.Errorf("IsTigrisEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.want)
 			}
 		})
+	}
+}
+
+// The transparent-mode allowlist admits Tigris domains and localhost (any
+// case) for local testing, and nothing else.
+func TestIsTransparentEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     bool
+	}{
+		{"https://t3.storage.dev", true},
+		{"http://localhost:8080", true},
+		{"http://Localhost", true},
+		{"http://LOCALHOST:9000", true},
+		{"http://minio.internal:9000", false},
+		{"https://s3.amazonaws.com", false},
+	}
+	for _, tt := range tests {
+		if got := IsTransparentEndpoint(tt.endpoint); got != tt.want {
+			t.Errorf("IsTransparentEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.want)
+		}
 	}
 }
 
@@ -1352,5 +1374,43 @@ func TestLoad_NegativeEnvDisablesLimits(t *testing.T) {
 	}
 	if cfg.Cache.MaxConcurrentWrites != -1 {
 		t.Errorf("MaxConcurrentWrites = %d, want -1 (disabled)", cfg.Cache.MaxConcurrentWrites)
+	}
+}
+
+func TestLoad_LegacyCoordinationOverrideByEnv(t *testing.T) {
+	cases := []struct {
+		name       string
+		yaml       string
+		env        string
+		wantLegacy bool
+	}{
+		// Legacy coordination is the default: unset yaml + unset env = legacy.
+		{"default legacy", "cache:\n  enabled: true\n", "", true},
+		{"yaml selects cas", "cache:\n  enabled: true\n  legacy_coordination: false\n", "", false},
+		{"env selects cas", "cache:\n  enabled: true\n", "false", false},
+		{"env 0 selects cas", "cache:\n  enabled: true\n", "0", false},
+		{"env re-enables legacy over yaml", "cache:\n  enabled: true\n  legacy_coordination: false\n", "true", true},
+		// Fail-safe: anything but an explicit "false"/"0" keeps legacy —
+		// a typo must never flip a fleet onto the CAS coordinator.
+		{"unrecognized env keeps legacy", "cache:\n  enabled: true\n", "no", true},
+		{"unrecognized env overrides cas yaml", "cache:\n  enabled: true\n  legacy_coordination: false\n", "False ", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(tmpFile, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			if tc.env != "" {
+				t.Setenv("TAG_CACHE_LEGACY_COORDINATION", tc.env)
+			}
+			cfg, err := Load(tmpFile)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Cache.IsLegacyCoordination() != tc.wantLegacy {
+				t.Errorf("IsLegacyCoordination = %v, want %v", cfg.Cache.IsLegacyCoordination(), tc.wantLegacy)
+			}
+		})
 	}
 }

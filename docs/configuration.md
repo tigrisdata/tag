@@ -24,6 +24,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_SIZE_THRESHOLD`         | Max object size to cache (bytes); larger bodies pass through uncached                                                                                                                          | `1073741824` (1 GiB)     |
 | `TAG_CACHE_META_ON_WRITE`          | Cache an object's metadata (not its body) when TAG proxies its write, so the first read resolves it from cache instead of a round trip. Closes the multipart gap, where write-through cannot tee a body TAG never sees (`true`/`1`; any other value leaves it off). **Requires block caching**; silently does nothing when `block_caching_enabled` is false or `block_size` is not positive | `false`                  |
 | `TAG_CACHE_PARQUET_OPTIMIZATION`   | Cache a parquet object's metadata blocks ahead of the reader that needs them, so opening the file does not discover them as serial misses. Two triggers: a read reaching the object's tail (helps second and later opens) and a write through TAG (helps the first). Only fires when the metadata spans more than the tail block (`true`/`1`; any other value leaves it off). **Requires block caching**; silently does nothing when `block_caching_enabled` is false or `block_size` is not positive | `false`                  |
+| `TAG_CACHE_LEGACY_COORDINATION`    | Meta invalidation/populate coordination mechanism. `true` (default) = legacy tombstones, compatible with any cluster mix including nodes upgrading straight from ≤v1.20. Fail-safe parsing: only an explicit `false`/`0` selects the fenced-CAS coordinator; any other value keeps legacy. Flip only once every node in the cluster is CAS-capable, then rolling-restart briskly | `true`                   |
 | `TAG_CACHE_NODE_ID`               | Unique node identifier for cluster mode                                         | (none)                   |
 | `TAG_CACHE_CLUSTER_ADDR`          | Address for memberlist gossip                                                   | `:7000`                  |
 | `TAG_CACHE_GRPC_ADDR`             | Address for gRPC server                                                         | `:9000`                  |
@@ -38,7 +39,8 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_HTTP_PORT`                   | Port for the S3 API                                                             | `8080`                   |
 | `TAG_LOG_LEVEL`                   | Log level: `debug`, `info`, `warn`, `error`                                     | `info`                   |
 | `TAG_LOG_FORMAT`                  | Log format: `json` or `console`                                                 | `json`                   |
-| `TAG_TRANSPARENT_PROXY`           | Disable transparent proxy mode (`false` or `0`)                                 | `true`                   |
+| `TAG_MODE`                        | Operating mode: `transparent`, `signing`, or `tiered` (see [tiered-mode.md](tiered-mode.md)) | `transparent`            |
+| `TAG_TRANSPARENT_PROXY`           | **Deprecated** — use `TAG_MODE`. Disable transparent proxy mode (`false` or `0`); conflicts with an explicit `TAG_MODE` are startup-fatal | `true`                   |
 | `TAG_TLS_CERT_FILE`               | Path to TLS certificate file (PEM format)                                       | (none)                   |
 | `TAG_TLS_KEY_FILE`                | Path to TLS private key file (PEM format)                                       | (none)                   |
 | `TAG_PPROF_ENABLED`               | Enable pprof endpoints (`true` or `1`)                                          | `false`                  |
@@ -54,6 +56,13 @@ The configuration file uses YAML format. Specify the path with the `--config` fl
 ### Full Configuration Reference
 
 ```yaml
+# Operating mode: transparent (default), signing, or tiered.
+# transparent forwards client signatures as-is with proxy headers; signing
+# validates client signatures and re-signs for upstream; tiered serves small
+# objects entirely from the local cache with authoritative misses (see
+# tiered-mode.md). Supersedes upstream.transparent_proxy.
+mode: transparent
+
 # Server configuration
 server:
   # HTTP port for the S3 API
@@ -100,9 +109,10 @@ upstream:
   # Default: 100
   max_idle_conns_per_host: 100
 
-  # Enable transparent proxy mode
+  # Deprecated: use the top-level `mode` instead.
   # When true (default), client requests are forwarded as-is with proxy headers.
   # When false, TAG validates and re-signs requests (signing mode).
+  # Setting both this and `mode` inconsistently is a startup-fatal error.
   # Default: true
   transparent_proxy: true
 
@@ -177,6 +187,14 @@ cache:
   # warm-on-write), so a range read populates and serves only the blocks it touches. On by
   # default; set false to cache whole objects instead.
   block_caching_enabled: true
+
+  # Meta invalidation/populate coordination. true (default) = legacy tombstone mechanism,
+  # compatible with any cluster mix — including nodes upgrading directly from <=v1.20. false =
+  # fenced-CAS coordination (stronger ordering; requires every node in the cluster to be
+  # CAS-capable BEFORE flipping, then a brisk rolling restart). Standalone deployments may flip
+  # immediately. Override with TAG_CACHE_LEGACY_COORDINATION (fail-safe: only an explicit
+  # "false"/"0" selects CAS).
+  legacy_coordination: true
 
   # Block granularity AND the whole-vs-block boundary for every populate path: an object
   # smaller than one block is whole-cached, one this size or larger is block-cached. Size it to
@@ -312,7 +330,7 @@ Configures the connection to upstream Tigris storage.
 | `endpoint`                | string | `"https://t3.storage.dev"` | Tigris S3 endpoint URL                           |
 | `region`                  | string | `"auto"`                   | AWS region for request signing                   |
 | `max_idle_conns_per_host` | int    | `100`                      | HTTP connection pool size per host               |
-| `transparent_proxy`       | bool   | `true`                     | Forward client requests as-is with proxy headers |
+| `transparent_proxy`       | bool   | `true`                     | **Deprecated** — use top-level `mode`. Forward client requests as-is with proxy headers |
 
 **Endpoint Validation:**
 
@@ -386,6 +404,7 @@ Controls the embedded cache behavior. TAG uses an embedded OCache instance with 
 | `ttl`                   | duration | `24h`            | Default TTL for cached objects                                                      |
 | `size_threshold`        | int64    | `1073741824`     | Max object size to cache (bytes)                                                    |
 | `block_caching_enabled` | bool     | `true`           | Enable block-aligned caching for large objects (RFC 0001)                           |
+| `legacy_coordination`   | bool     | `true`           | Meta coordination mechanism: `true` = legacy tombstones (safe for any cluster mix, incl. direct ≤v1.20 upgrades); `false` = fenced CAS (all nodes must be CAS-capable before flipping) |
 | `block_size`            | int64    | `1048576`        | Block granularity **and** the read-side whole-vs-block boundary (must stay below ocache's 64 MB compaction threshold) |
 | `parquet_optimization`  | bool     | `false`          | Prefetch a parquet object's metadata blocks on a tail read (only when the metadata spans more than the tail block) |
 | `disk_path`             | string   | `/var/cache/tag` | Path to cache data directory                                                        |

@@ -161,7 +161,7 @@ func newGatedAssembledRangeService(t *testing.T, local bool) (*Service, *cache.C
 		StatusCode:    http.StatusOK,
 		BlockSize:     4,
 	}
-	if wrote, err := store.PutMetaTombstoneAware(context.Background(), bucket, key, meta, 60, time.Now().UnixNano()); err != nil || !wrote {
+	if wrote, err := store.PutMetaIfVersion(context.Background(), bucket, key, meta, 60, cache.VersionAny); err != nil || !wrote {
 		t.Fatalf("seed block meta = (wrote=%t, err=%v)", wrote, err)
 	}
 	return svc, store, client, mock, meta, trace
@@ -368,10 +368,17 @@ func TestServeAssembledRange_RemoteWriteRespectsTombstoneVisibility(t *testing.T
 	waitBlockSignal(t, client.putFinished, "remote cache put finish")
 
 	if _, found, err := store.GetMeta(context.Background(), meta.Bucket, meta.Key); err != nil || found {
-		t.Fatalf("metadata after tombstoned detached write = (found=%t, err=%v), want absent", found, err)
+		t.Fatalf("metadata after fenced detached write = (found=%t, err=%v), want absent", found, err)
 	}
-	if tombstone := store.GetTombstoneTimestamp(context.Background(), meta.Bucket, meta.Key); tombstone == 0 {
-		t.Fatal("delete tombstone disappeared while detached block write completed")
+	// The invalidation left a fence: a writer holding pre-delete state cannot
+	// recreate the entry (the ordering the tombstone timestamp used to assert).
+	preDeleteToken := meta // any stale identity; commit with expected=0-era token must lose
+	_ = preDeleteToken
+	staleMeta := *meta
+	if wrote, err := store.PutMetaIfVersion(context.Background(), meta.Bucket, meta.Key, &staleMeta, 60, 1); err != nil {
+		t.Fatalf("PutMetaIfVersion: %v", err)
+	} else if wrote {
+		t.Fatal("stale pre-delete write recreated the entry over the fence")
 	}
 }
 

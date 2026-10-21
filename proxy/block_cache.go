@@ -29,6 +29,12 @@ const maxConcurrentBlockFetches = 4
 // size this is ~128 MiB of range before the cap engages.
 const maxRangeBlockFanout = 32
 
+// certifiedRangeReadTimeout bounds only the speculative pre-commit reads for a certified span.
+// It is derived from the caller context (so a shorter request deadline wins) and matches the
+// existing five-second cache-read bound used by Cache.Has. A timeout abandons this optimization
+// while the original request context can still perform its upstream fallback.
+const certifiedRangeReadTimeout = 5 * time.Second
+
 // errBlockETagMismatch means a block fetched from upstream belongs to a different object
 // version than the meta we hold (a concurrent overwrite), so it must not be cached.
 var errBlockETagMismatch = errors.New("block etag mismatch")
@@ -86,6 +92,46 @@ func (s *Service) isBlockEligibleSize(contentLength int64) bool {
 		contentLength >= s.config.Cache.BlockSize
 }
 
+// blockSpanForRange turns the range that created a block-mode entry into a bounded,
+// write-once hint. The caller invokes this only after fetchBlocksToCache has returned
+// successfully, so publishing the span cannot claim blocks that were not durable.
+func blockSpanForRange(meta *cache.CachedObjectMeta, touched []int64) *cache.BlockSpan {
+	if meta == nil || meta.BlockSize <= 0 || meta.ContentLength <= 0 || len(touched) == 0 ||
+		len(touched) > maxRangeBlockFanout {
+		return nil
+	}
+	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
+	if touched[0] < 0 || touched[len(touched)-1] > lastBlock {
+		return nil
+	}
+	for i := 1; i < len(touched); i++ {
+		if touched[i] != touched[i-1]+1 {
+			return nil
+		}
+	}
+	if touched[len(touched)-1]-touched[0]+1 != int64(len(touched)) {
+		return nil
+	}
+	return &cache.BlockSpan{First: touched[0], Last: touched[len(touched)-1]}
+}
+
+// certifiedRangeBlockSpanCovers accepts a span only when it is still meaningful
+// for this metadata row's ETag and block layout. The certificate is advisory: a
+// later eviction is detected by the payload read and returned to the old pre-commit gate.
+func certifiedRangeBlockSpanCovers(meta *cache.CachedObjectMeta, b0, bK int64) bool {
+	if meta == nil || meta.ETag == "" || meta.BlockSize <= 0 || meta.ContentLength <= 0 ||
+		meta.RangeBlockSpan == nil || b0 < 0 || bK < b0 {
+		return false
+	}
+	lastBlock := (meta.ContentLength - 1) / meta.BlockSize
+	span := meta.RangeBlockSpan
+	if span.First < 0 || span.Last < span.First || span.Last > lastBlock ||
+		span.Last-span.First+1 > maxRangeBlockFanout {
+		return false
+	}
+	return span.First <= b0 && bK <= span.Last
+}
+
 // blockBounds returns the inclusive object-byte bounds [start,end] of block i for an object
 // of contentLength bytes cached at blockSize granularity. The last block is clamped to the
 // object end.
@@ -129,9 +175,10 @@ func touchedBlocks(rangeHeader string, totalSize, blockSize int64) []int64 {
 // serveRangeFromBlockCache serves a single-range request from a block-mode cache entry
 // (meta.BlockSize > 0). A range no longer than one block — the hot footer/row-group pattern —
 // is assembled probe-free into a pooled buffer (serveAssembledRange): each present block is
-// read exactly once, with the read itself acting as the existence check. Larger ranges (and
-// small ones the assembly-buffer budget declines) take the probe-first path: probe the
-// covering blocks, fetch any missing, then stream.
+// read exactly once, with the read itself acting as the existence check. A larger range covered
+// by a range-created span certificate stages every requested payload slice before commitment;
+// other larger ranges (and requests whose full-range staging budget declines) take the probe-first
+// path: probe the covering blocks, fetch any missing, then stream.
 //
 // It returns served=true when it has produced a complete client response (a 206 body, or a
 // definitive 416). It returns served=false, without having written anything to w, when the
@@ -155,6 +202,7 @@ func (s *Service) serveRangeFromBlockCache(
 		return true, nil
 	}
 	rng := ranges[0]
+	rangeLen := rng.end - rng.start + 1
 
 	// Probe-free hot path: a range no longer than one block covers at most two blocks, so the
 	// requested bytes are assembled into a pooled buffer BEFORE anything is committed. Each
@@ -169,7 +217,7 @@ func (s *Service) serveRangeFromBlockCache(
 	// A fetch failure inside assembly (including a populate-budget decline) returns with the
 	// response untouched and the caller forwards upstream — the probe path's own fetch draws
 	// on the same populate budget, so retrying there could only repeat the outcome.
-	if rangeLen := rng.end - rng.start + 1; rangeLen <= meta.BlockSize {
+	if rangeLen <= meta.BlockSize {
 		weight := s.stagingWeight(rangeLen)
 		if s.populateBudget == nil || s.populateBudget.tryAcquireStaging(weight) {
 			assembled, aerr := s.serveAssembledRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng, startTime)
@@ -182,6 +230,28 @@ func (s *Service) serveRangeFromBlockCache(
 	}
 
 	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
+
+	// A range-created entry carries a bounded hint for the contiguous blocks that were durable
+	// when its metadata was published. For a later multi-block request wholly inside that span,
+	// stage every requested payload slice before committing headers. An all-hit result replaces the
+	// presence preflight with the reads needed for the response. If any slice is missing or transient,
+	// discard the speculative buffer and use the established probe/fetch/stream path; it remains the
+	// owner of missing-block recovery and pre-commit stale-version handling. The hint stays advisory
+	// because blocks can evict independently. A short range that crosses a block boundary keeps its
+	// existing assembled path, and a staging-budget decline keeps probe-first behavior.
+	if rangeLen > meta.BlockSize && bK > b0 && certifiedRangeBlockSpanCovers(meta, b0, bK) {
+		weight := s.stagingWeight(rangeLen)
+		if s.populateBudget == nil || s.populateBudget.tryAcquireStaging(weight) {
+			served, retryProbe, rangeErr := s.serveCertifiedRange(ctx, w, bucket, key, accessKey, secretKey, meta, rng, startTime, weight)
+			if served || !retryProbe {
+				return served, rangeErr
+			}
+			// A miss or ordinary transient abandons the optimization. The existing gate rechecks
+			// every block before commitment and preserves its fetch/remainder behavior.
+		} else {
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Certified range staging budget declined - serving via probe path")
+		}
+	}
 
 	// Make the covering blocks present (probe + fetch any missing, coalesced/concurrent). Cap the
 	// per-request fan-out (maxRangeBlockFanout): a normal footer/row-group read assembles its few
@@ -209,8 +279,206 @@ func (s *Service) serveRangeFromBlockCache(
 		return true, berr
 	}
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
 	return true, nil
+}
+
+// serveCertifiedRange is an all-hit fast path for a range-created span certificate. It stages the
+// exact requested bytes before committing, so a missing block or stale version still reaches the
+// existing probe/fetch gate before headers. The certified reads run concurrently; the first slice
+// is observed separately so a later error can cancel an earlier stalled read instead of being hidden
+// behind ordered waiting. Only a complete payload hit skips the ordinary presence preflight.
+func (s *Service) serveCertifiedRange(
+	ctx context.Context,
+	w http.ResponseWriter,
+	bucket, key, accessKey, secretKey string,
+	meta *cache.CachedObjectMeta,
+	rng byteRange,
+	startTime time.Time,
+	stagingWeight int64,
+) (served bool, retryProbe bool, err error) {
+	if s.populateBudget != nil {
+		defer s.populateBudget.releaseStaging(stagingWeight)
+	}
+	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
+	rangeLen := rng.end - rng.start + 1
+
+	type blockSlice struct {
+		idx, localStart, localEnd, n int64
+	}
+	type readFailure struct {
+		idx int64
+		err error
+	}
+	reads := make([]blockSlice, int(bK-b0+1))
+	off := int64(0)
+	for i := b0; i <= bK; i++ {
+		localStart, localEnd := blockLocalRange(i, rng.start, rng.end, meta.BlockSize, meta.ContentLength)
+		n := localEnd - localStart + 1
+		reads[int(i-b0)] = blockSlice{idx: i, localStart: localStart, localEnd: localEnd, n: n}
+		off += n
+	}
+	if off != rangeLen {
+		return false, false, fmt.Errorf("block range assembly: staged %d of %d bytes", off, rangeLen)
+	}
+
+	// Keep one exact-sized pooled buffer per block slice. A single range-sized allocation would
+	// be discarded whenever it exceeds maxPooledBlockBufBytes, turning each large warm hit into a
+	// full-range allocation even though the ordinary stream path reuses block-sized buffers.
+	buffers := make([]*[]byte, len(reads))
+	defer func() {
+		for _, bufp := range buffers {
+			if bufp != nil {
+				putBlockBuf(bufp)
+			}
+		}
+	}()
+	for i, rr := range reads {
+		buffers[i] = getExactBlockBuf(rr.n)
+	}
+
+	// The speculative gate is bounded by both the request's remaining time and a shorter cache-read
+	// deadline. A timeout abandons this path while the parent request can still fall back upstream.
+	readCtx, cancelRead := context.WithTimeout(ctx, certifiedRangeReadTimeout)
+	defer cancelRead()
+	tailCtx, cancelTail := context.WithCancel(readCtx)
+	defer cancelTail()
+
+	first := reads[0]
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- s.readCachedBlockSlice(readCtx, bucket, key, meta, first.idx, first.localStart, first.localEnd, (*buffers[0])[:first.n])
+	}()
+
+	// Start the later slices concurrently, but report the first tail failure immediately. The
+	// caller will re-run the established probe/fetch/stream path after these readers are canceled
+	// and joined; it must not wait for an earlier slow slice before observing a later failure.
+	tailFailures := make(chan readFailure, 1)
+	var tailWG sync.WaitGroup
+	for i := 1; i < len(reads); i++ {
+		rr := reads[i]
+		dst := (*buffers[i])[:rr.n]
+		tailWG.Add(1)
+		go func(rr blockSlice, dst []byte) {
+			defer tailWG.Done()
+			if rerr := s.readCachedBlockSlice(tailCtx, bucket, key, meta, rr.idx, rr.localStart, rr.localEnd, dst); rerr != nil {
+				select {
+				case tailFailures <- readFailure{idx: rr.idx, err: rerr}:
+				default:
+				}
+				cancelTail()
+			}
+		}(rr, dst)
+	}
+	tailDone := make(chan struct{})
+	go func() {
+		tailWG.Wait()
+		close(tailDone)
+	}()
+
+	firstFinished, tailsFinished := false, false
+	var firstErr error
+	var tailFailure *readFailure
+	finishReads := func() {
+		cancelRead()
+		cancelTail()
+		if !firstFinished {
+			firstErr = <-firstDone
+			firstFinished = true
+		}
+		if !tailsFinished {
+			<-tailDone
+			tailsFinished = true
+		}
+	}
+	for !firstFinished || !tailsFinished {
+		select {
+		case firstErr = <-firstDone:
+			firstFinished = true
+		case failure := <-tailFailures:
+			tailFailure = &failure
+		case <-tailDone:
+			tailDone = nil // disable the closed channel while the first slice is pending
+			tailsFinished = true
+			// Every worker publishes its failure before Done; if tailDone wins the select,
+			// consume that already-buffered failure before considering the read a hit.
+			select {
+			case failure := <-tailFailures:
+				tailFailure = &failure
+			default:
+			}
+		case <-readCtx.Done():
+			parentErr := ctx.Err()
+			stageErr := readCtx.Err()
+			finishReads()
+			if parentErr != nil {
+				return false, false, parentErr
+			}
+			return false, false, stageErr
+		}
+
+		if tailFailure != nil {
+			parentErr := ctx.Err()
+			stageErr := readCtx.Err()
+			finishReads()
+			if parentErr != nil {
+				return false, false, parentErr
+			}
+			if stageErr != nil || errors.Is(tailFailure.err, context.Canceled) || errors.Is(tailFailure.err, context.DeadlineExceeded) {
+				return false, false, blockReadSliceError(tailFailure.idx, tailFailure.err)
+			}
+			if errors.Is(tailFailure.err, cache.ErrNotFound) {
+				return false, true, nil
+			}
+			// A transient payload error retries the original preflight/stream path. It can
+			// recover inline or use the validated upstream remainder exactly as before.
+			return false, true, nil
+		}
+		if firstFinished && firstErr != nil {
+			parentErr := ctx.Err()
+			stageErr := readCtx.Err()
+			finishReads()
+			if parentErr != nil {
+				return false, false, parentErr
+			}
+			if stageErr != nil || errors.Is(firstErr, context.Canceled) || errors.Is(firstErr, context.DeadlineExceeded) {
+				return false, false, blockReadSliceError(b0, firstErr)
+			}
+			if errors.Is(firstErr, cache.ErrNotFound) {
+				return false, true, nil
+			}
+			// A transient in the commitment slice must take the clean upstream fallback.
+			return false, false, blockReadSliceError(b0, firstErr)
+		}
+	}
+	if ctx.Err() != nil {
+		return false, false, ctx.Err()
+	}
+
+	// The complete-cache block counters are recorded at the response-commit boundary, before
+	// headers, matching the existing probe-first and assembled-range paths if the client write fails.
+	recordBlockServeMetrics(bK-b0+1, 0)
+	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
+	writeCacheStatus(w, XCacheHit)
+	w.WriteHeader(http.StatusPartialContent)
+	for i, rr := range reads {
+		n, werr := w.Write((*buffers[i])[:rr.n])
+		if n > 0 {
+			metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
+		}
+		if werr == nil && int64(n) != rr.n {
+			werr = io.ErrShortWrite
+		}
+		if werr != nil {
+			return true, false, werr
+		}
+	}
+	metrics.RecordRangeFromCacheHit()
+	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	// Preserve the ordinary post-serve footer hint. This path passes no retained body slice, so
+	// the helper reads any needed trailer from cache in its detached work.
+	s.maybePrefetchParquetFooter(bucket, key, accessKey, secretKey, meta, rng.start, rng.end, nil)
+	return true, false, nil
 }
 
 // sliceWriter writes into a fixed destination slice, failing on overflow. Used to land a
@@ -238,10 +506,9 @@ var maxPooledBlockBufBytes atomic.Int64
 
 func init() { maxPooledBlockBufBytes.Store(4 << 20) }
 
-// blockBufPool recycles block-sized scratch buffers: pre-commit range/first-block assembly on
-// the serve paths, and the block staging buffers on the populate paths (fetchOneBlock,
-// putBlocksFromStream). Buffers are handed out by capacity; a request larger than a pooled
-// buffer's capacity allocates fresh.
+// blockBufPool recycles scratch buffers for pre-commit range assembly, certified-range staging,
+// and block-populate paths (fetchOneBlock, putBlocksFromStream). Buffers are handed out by
+// capacity; a request larger than a pooled buffer's capacity allocates fresh.
 var blockBufPool sync.Pool
 
 func getBlockBuf(n int64) *[]byte {
@@ -256,8 +523,8 @@ func getBlockBuf(n int64) *[]byte {
 	return &b
 }
 
-// getExactBlockBuf returns a scratch buffer whose capacity is exactly n. The direct
-// full-object writer reserves the configured block size; it must not activate a larger
+// getExactBlockBuf returns a scratch buffer whose capacity is exactly n. Certified-range and
+// direct full-object writers reserve the requested byte count; they must not activate a larger
 // process-wide pooled buffer that another service caused to be retained.
 func getExactBlockBuf(n int64) *[]byte {
 	bp := getBlockBuf(n)
@@ -374,7 +641,7 @@ func (s *Service) serveAssembledRange(
 		return true, werr
 	}
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
 	// A parquet reader's trailer probe is a few bytes, so it is served here rather
 	// than by streamBlockRange — this, not the streaming path, is where the footer
 	// signal actually arrives for a reader opening a file.
@@ -467,7 +734,7 @@ func (s *Service) streamBlockRange(ctx context.Context, w http.ResponseWriter, b
 			return out, rerr
 		}
 		if errors.Is(err, errBlocksMostlyAbsent) {
-			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+			s.invalidateStaleMeta(bucket, key, meta.ETag)
 		}
 		out.remainder = true
 		return out, nil
@@ -717,7 +984,7 @@ func (s *Service) streamRemainderFromUpstream(ctx context.Context, cw *countingW
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		s.invalidateStaleMeta(bucket, key, meta.ETag)
 		return errBlockUpstreamGone
 	}
 	if resp.StatusCode != http.StatusPartialContent {
@@ -728,7 +995,7 @@ func (s *Service) streamRemainderFromUpstream(ctx context.Context, cw *countingW
 		return fmt.Errorf("remainder fetch: response missing ETag, cannot verify version")
 	}
 	if respETag != meta.ETag {
-		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		s.invalidateStaleMeta(bucket, key, meta.ETag)
 		return errBlockETagMismatch
 	}
 	if rs, re, _, ok := parseContentRange(resp.Header.Get("Content-Range")); !ok || rs != absStart || re != absEnd {
@@ -784,9 +1051,21 @@ func (s *Service) serveFullObjectFromBlockCache(
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Complete-serve buffer budget declined - serving via probe path")
 	}
 
-	// Stamp the promotion's write-start BEFORE the assembly work below: any invalidation that
-	// lands during it is then provably newer and blocks the promoted meta write.
-	writeStartTime := startTime.UnixNano()
+	// Decision-time token for the post-assembly promotion, read BEFORE assembly begins: the
+	// promotion's claim ("every block present") is decided by the assembly, so an invalidation
+	// landing DURING it must refuse the commit. A token read after assembly would postdate such
+	// an invalidation and let the promotion mark a concurrently re-established (possibly
+	// partial) same-ETag entry complete. The token counts only with its OWN snapshot live and
+	// carrying the serve ETag — an absent or different-ETag entry means the serve-path copy is
+	// already displaced, and its token could order the commit against the wrong history. A
+	// failed or disqualified read just skips the promotion.
+	var promoToken uint64
+	promoTokenOK := false
+	if !meta.BlocksComplete {
+		if cur, tok, found, terr := s.cache.GetMetaWithVersion(ctx, bucket, key); terr == nil && found && cur != nil && cur.ETag == meta.ETag {
+			promoToken, promoTokenOK = tok, true
+		}
+	}
 
 	// A full GET must produce every block. bailIfMostlyMissing=true asks ensureBlocksCached to
 	// fall through (rather than assemble) when most blocks are absent — e.g. only a footer range
@@ -810,33 +1089,49 @@ func (s *Service) serveFullObjectFromBlockCache(
 			// later reads would reuse — but that traded a correctness property for a performance
 			// one. Losing the entry costs one discovery round trip on the next read; keeping a
 			// stale one answers wrongly for up to the TTL.
-			s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+			s.invalidateStaleMeta(bucket, key, meta.ETag)
 			return false, nil
 		}
 		log.Debug().Err(ferr).Str("bucket", bucket).Str("key", key).Msg("Full-object block assembly failed - falling through to upstream")
 		return false, ferr
 	}
 
-	// Every block is now present: promote the entry to complete (async, tombstone-aware with
-	// the pre-assembly timestamp, so a racing invalidation blocks the write) — later full GETs
-	// then take the probe-free path instead of re-probing every block. The rewrite carries the
-	// entry's REMAINING TTL, never a fresh one: promotion does not consult upstream, so
-	// extending the lifetime would reset the staleness clock (up to doubling the configured
-	// bound after an out-of-band overwrite) and guarantee a window where the meta outlives
-	// every block. Best-effort: a skipped or failed promotion only means the next full GET
-	// probes again.
-	if !meta.BlocksComplete {
-		if remaining := s.remainingMetaTTL(meta); remaining > 0 {
-			promoted := *meta
+	// Every block is now present: promote the entry to complete (async, committed under the
+	// PRE-assembly token, so an invalidation racing the assembly refuses the write) — later
+	// full GETs then take the probe-free path instead of re-probing every block. The rewrite
+	// carries the entry's REMAINING TTL, never a fresh one: promotion does not consult
+	// upstream, so extending the lifetime would reset the staleness clock (up to doubling the
+	// configured bound after an out-of-band overwrite) and guarantee a window where the meta
+	// outlives every block. Best-effort: a skipped or failed promotion only means the next
+	// full GET probes again.
+	if !meta.BlocksComplete && promoTokenOK && s.remainingMetaTTL(meta) > 0 {
+		expectETag := meta.ETag
+		go func() {
+			pctx, cancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
+			defer cancel()
+			// Re-read for the CONTENT to promote (a promoted copy of a stale
+			// snapshot must never clobber a fresh entry) — but commit under
+			// the pre-assembly decision-time token: any invalidation or
+			// overwrite since that read, including one DURING the assembly,
+			// loses the precondition. Any skip just means the next full GET
+			// probes again.
+			cur, _, found, gerr := s.cache.GetMetaWithVersion(pctx, bucket, key)
+			if gerr != nil || !found || cur == nil || cur.ETag != expectETag || cur.BlocksComplete {
+				return
+			}
+			// TTL from the RE-READ snapshot: the serve-path copy may have
+			// expired and been re-established since, and stamping the fresh
+			// row with the old copy's nearly-spent TTL would expire it early.
+			remaining := s.remainingMetaTTL(cur)
+			if remaining <= 0 {
+				return
+			}
+			promoted := *cur
 			promoted.BlocksComplete = true
-			go func() {
-				pctx, cancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
-				defer cancel()
-				if _, perr := s.cache.PutMetaTombstoneAware(pctx, bucket, key, &promoted, remaining, writeStartTime); perr != nil {
-					log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Blocks-complete promotion failed")
-				}
-			}()
-		}
+			if _, perr := s.cache.PutMetaIfVersion(pctx, bucket, key, &promoted, remaining, promoToken); perr != nil {
+				log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Msg("Blocks-complete promotion failed")
+			}
+		}()
 	}
 
 	meta.WriteHeaders(w)
@@ -846,7 +1141,7 @@ func (s *Service) serveFullObjectFromBlockCache(
 	if _, berr := s.streamBlockRange(ctx, w, bucket, key, accessKey, secretKey, meta, 0, meta.ContentLength-1); berr != nil {
 		return true, berr
 	}
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -936,7 +1231,7 @@ func (s *Service) serveCompleteFromBlocks(
 	if berr != nil {
 		return true, berr
 	}
-	metrics.RecordRequest("GetObject", "success", time.Since(startTime).Seconds())
+	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -947,14 +1242,32 @@ func (s *Service) serveCompleteFromBlocks(
 // errors ensureBlocksCached acts on to invalidate, so a fast transient failure of one block
 // must not mask a slower stale signal from another (which would leave the stale meta to retry
 // until TTL). Blocks are therefore not canceled on a sibling's error — each runs to completion
-// so its signal is observed — but the caller's ctx still aborts them (e.g. client disconnect).
+// so its signal is observed. Caller cancellation stops admitting new block states; already-admitted
+// fetches remain detached. After the group drains, a collected stale signal wins; otherwise a
+// canceled admission returns the context error.
 func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdxs []int64) error {
+	if len(blockIdxs) == 0 {
+		return nil
+	}
 	var g errgroup.Group
 	g.SetLimit(maxConcurrentBlockFetches)
 	var mu sync.Mutex
 	var stale, transient error
+	var canceledAdmission bool
 	for _, idx := range blockIdxs {
+		if ctx.Err() != nil {
+			mu.Lock()
+			canceledAdmission = true
+			mu.Unlock()
+			break
+		}
 		g.Go(func() error {
+			if ctx.Err() != nil {
+				mu.Lock()
+				canceledAdmission = true
+				mu.Unlock()
+				return nil
+			}
 			err := s.fetchOneBlock(ctx, bucket, key, accessKey, secretKey, meta, idx)
 			if err == nil {
 				return nil
@@ -974,17 +1287,24 @@ func (s *Service) fetchBlocksToCache(ctx context.Context, bucket, key, accessKey
 		})
 	}
 	_ = g.Wait()
-	if stale != nil {
+	mu.Lock()
+	staleErr, transientErr := stale, transient
+	wasAdmissionCanceled := canceledAdmission
+	mu.Unlock()
+	if staleErr != nil {
 		// A definitive stale signal means the cached meta describes a version upstream no
 		// longer serves. Invalidate HERE — every block fetch flows through this point — so no
 		// caller can forget it and leave the stale meta to fail again until TTL.
-		// invalidateStaleBlockMeta is ETag-guarded and idempotent, so central invocation is
+		// invalidateStaleMeta is ETag-guarded and idempotent, so central invocation is
 		// safe for every caller.
-		log.Debug().Err(stale).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
-		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
-		return stale
+		log.Debug().Err(staleErr).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
+		s.invalidateStaleMeta(bucket, key, meta.ETag)
+		return staleErr
 	}
-	return transient
+	if wasAdmissionCanceled {
+		return ctx.Err()
+	}
+	return transientErr
 }
 
 // recordBlockServeMetrics records per-block hit/miss counts and the full/partial serve
@@ -1044,16 +1364,29 @@ func (l *blockFetchLease) release() {
 // which makes ownership exact even when a fast remote write finishes before
 // waiters wake up.
 func (s *Service) beginBlockFetch(blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) *blockFetchState {
+	return s.beginBlockFetchWithContext(nil, blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, knownMissing)
+}
+
+// beginBlockFetchWithContext applies ctx only to new-state admission. Existing
+// states are still joined for single-flight coalescing; callers observe
+// cancellation while waiting on the shared state. A canceled admission without
+// an existing state returns nil; checking under blockFetchMu closes the gap
+// between a task's earlier context check and detached fetch creation.
+func (s *Service) beginBlockFetchWithContext(ctx context.Context, blockKey, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64, knownMissing bool) *blockFetchState {
 	s.blockFetchMu.Lock()
-	if s.blockFetches == nil {
-		s.blockFetches = make(map[string]*blockFetchState)
-	}
 	if state := s.blockFetches[blockKey]; state != nil {
 		state.mu.Lock()
 		state.consumers++
 		state.mu.Unlock()
 		s.blockFetchMu.Unlock()
 		return state
+	}
+	if ctx != nil && ctx.Err() != nil {
+		s.blockFetchMu.Unlock()
+		return nil
+	}
+	if s.blockFetches == nil {
+		s.blockFetches = make(map[string]*blockFetchState)
 	}
 
 	state := &blockFetchState{
@@ -1156,7 +1489,10 @@ func (s *Service) fetchOneBlockForAssembly(ctx context.Context, bucket, key, acc
 // after validation while this same state keeps the bounded writer alive.
 func (s *Service) fetchOneBlock(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, blockIdx int64) error {
 	blockKey := cache.MakeBlockKey(bucket, key, meta.ETag, meta.BlockSize, blockIdx)
-	state := s.beginBlockFetch(blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, false)
+	state := s.beginBlockFetchWithContext(ctx, blockKey, bucket, key, accessKey, secretKey, meta, blockIdx, false)
+	if state == nil {
+		return ctx.Err()
+	}
 
 	select {
 	case <-state.cacheDone:
@@ -1208,7 +1544,7 @@ func (s *Service) fetchBlocksForAssembly(ctx context.Context, bucket, key, acces
 			lease.release()
 		}
 		log.Debug().Err(stale).Str("bucket", bucket).Str("key", key).Msg("Invalidating stale block-mode meta")
-		s.invalidateStaleBlockMeta(bucket, key, meta.ETag)
+		s.invalidateStaleMeta(bucket, key, meta.ETag)
 		return nil, stale
 	}
 	if transient != nil {
@@ -1350,28 +1686,29 @@ func (s *Service) runBlockFetch(state *blockFetchState, blockKey, bucket, key, a
 	}()
 }
 
-// invalidateStaleBlockMeta deletes the object's cache entry only if the stored meta still carries
-// the given (stale) ETag. A request that detected staleness for version X must not wipe a newer
-// entry that another request re-established after an out-of-band overwrite (X' != X): deleting that
-// fresh entry would force needless re-population and churn under concurrency. There is a small
-// GetMeta→Delete window, but this narrows it from "always deletes whatever is stored" to "deletes
-// only the version we just observed as stale".
-func (s *Service) invalidateStaleBlockMeta(bucket, key, staleETag string) {
-	ctx := context.Background()
-	if m, found, err := s.cache.GetMeta(ctx, bucket, key); err != nil || !found || m == nil || m.ETag != staleETag {
-		return // already gone, or replaced by a newer version — leave it
-	}
-	if err := s.cache.Delete(ctx, bucket, key); err != nil {
+// invalidateStaleMeta deletes the object's cache entry only if the stored meta
+// still carries the given (stale) ETag. A request that detected staleness for
+// version X must not wipe a newer entry that another request re-established
+// after an out-of-band overwrite (X' != X): deleting that fresh entry would
+// force needless re-population and churn under concurrency. The guard is CAS
+// (cache.DeleteIfETag): exact against version-stamped writers, and equal to
+// the old narrowed GetMeta→Delete window against today's plain-put populates
+// (see DeleteIfETag's scope note) — never wider than before.
+func (s *Service) invalidateStaleMeta(bucket, key, staleETag string) {
+	deleted, err := s.cache.DeleteIfETag(context.Background(), bucket, key, staleETag)
+	if err != nil {
 		// Record the failure rather than discarding it. This delete is what stops a
 		// stale entry answering later reads, so a silent failure leaves exactly the
 		// hazard it exists to prevent — and a delete metric that only ever reports
 		// success would hide it. invalidateObject treats its own failures the same way.
 		metrics.RecordCacheOperation("delete", "error")
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).
-			Msg("Stale block-mode meta not invalidated - entry may serve stale metadata until TTL")
+			Msg("Stale meta not invalidated - entry may serve stale metadata until TTL")
 		return
 	}
-	metrics.RecordCacheOperation("delete", "success")
+	if deleted {
+		metrics.RecordCacheOperation("delete", "success")
+	}
 }
 
 // ensureBlocksCached makes covering blocks [b0,bK] present in cache: it probes the range once,
@@ -1438,7 +1775,7 @@ func (s *Service) buildBlockMeta(bucket, key string, respHeader http.Header, tot
 }
 
 // putBlocksFromStream consumes a full-object body and writes it as fixed-size blocks
-// (meta.BlockSize), then stamps the block-mode meta (tombstone-aware) as the visibility gate —
+// (meta.BlockSize), then publishes the block-mode meta (version-preconditioned) as the visibility gate —
 // mirroring the range path's "blocks first, meta last" ordering. It buffers at most one block
 // (<= block_size) at a time, so peak memory is bounded regardless of object size. This is the
 // shared full-object populate path: block mode is established from ANY full-object fetch (a
@@ -1452,7 +1789,7 @@ func (s *Service) buildBlockMeta(bucket, key string, respHeader http.Header, tot
 // truncated bytes under a committed length (and poison a later range-path populate that trusts
 // existing blocks). fetchOneBlock validates block length the same way; this keeps the two block
 // writers consistent. A body longer than Content-Length is likewise rejected before the meta.
-func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, writeStartTime int64) (err error) {
+func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, r io.Reader, ttl int, expected uint64) (wrote bool, err error) {
 	// On any early return, drain the rest of r. setupCacheListener feeds this from an io.Pipe; if
 	// we stop reading with bytes still queued (a mid-object PutBlockStream error, or an oversize
 	// body), the pipe writer goroutine blocks forever on Write, leaking it and never releasing the
@@ -1473,10 +1810,10 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 		bStart, bEnd := blockBounds(idx, meta.BlockSize, meta.ContentLength)
 		want := bEnd - bStart + 1
 		if _, err := io.ReadFull(r, buf[:want]); err != nil {
-			return fmt.Errorf("block split: block %d short read (%w) - upstream body shorter than Content-Length %d", idx, err, meta.ContentLength)
+			return false, fmt.Errorf("block split: block %d short read (%w) - upstream body shorter than Content-Length %d", idx, err, meta.ContentLength)
 		}
 		if perr := s.cache.PutBlockStream(ctx, bucket, key, meta.ETag, meta.BlockSize, idx, bytes.NewReader(buf[:want]), ttl); perr != nil {
-			return perr
+			return false, perr
 		}
 		metrics.CacheBlockPopulated.Inc()
 		metrics.CacheBlockBytesPopulated.Add(float64(want))
@@ -1485,20 +1822,20 @@ func (s *Service) putBlocksFromStream(ctx context.Context, bucket, key string, m
 	// before the meta so the entry can't claim a length its blocks overrun.
 	var probe [1]byte
 	if _, err := io.ReadFull(r, probe[:]); err != io.EOF {
-		return fmt.Errorf("block split: upstream body longer than Content-Length %d", meta.ContentLength)
+		return false, fmt.Errorf("block split: upstream body longer than Content-Length %d", meta.ContentLength)
 	}
 	// Every block was just written, so stamp the meta complete: full-object serves can skip
 	// the per-block probe pass and stream optimistically.
 	meta.BlocksComplete = true
-	if _, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime); err != nil {
-		return err
-	}
-	return nil
+	// The store's verdict passes through: callers on conditional paths (the
+	// tiered engine's If-Match/If-None-Match PUTs) must distinguish a refused
+	// precondition from a written entry; populate paths ignore it.
+	return s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, expected)
 }
 
 // triggerBlockModePopulate populates a block-mode entry in the background after a cold range
 // miss: it fetches the blocks the request touched and, only if they all land, writes the
-// block-mode meta (tombstone-aware, the visibility gate). It never touches the original
+// block-mode meta (version-preconditioned, the visibility gate). It never touches the original
 // request or its response body — blocks are fetched with fresh aligned range GETs.
 func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, touched []int64) {
 	// Cap the background fan-out (same bound as the range serve): a request that touched a huge
@@ -1512,17 +1849,36 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
-
-		// Stamp the write start BEFORE fetching, so an invalidation that lands mid-populate is
-		// newer than our timestamp and blocks the meta write (mirrors the whole-object paths).
-		writeStartTime := time.Now().UnixNano()
-
-		if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, touched); err != nil {
-			log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block-mode populate skipped - block fetch failed")
-			return
-		}
-		s.finalizeBlockModeMeta(ctx, bucket, key, meta, len(touched), writeStartTime)
+		s.populateBlockMode(ctx, bucket, key, accessKey, secretKey, meta, touched)
 	}()
+}
+
+// populateBlockMode captures the decision-time token before fetching and commits the block-mode
+// metadata only after every touched block is durable. Keeping the operation body synchronous makes
+// its token-failure and mid-fetch invalidation outcomes directly testable at the publication owner;
+// triggerBlockModePopulate still runs it under the same detached, bounded context.
+func (s *Service) populateBlockMode(ctx context.Context, bucket, key, accessKey, secretKey string, meta *cache.CachedObjectMeta, touched []int64) {
+	// Decision-time token BEFORE fetching, so an invalidation that lands
+	// mid-populate bumps the fence past it and the meta commit loses
+	// (mirrors the whole-object paths). No token, no ordered commit: skip.
+	// An entry present at decision time does NOT skip: the blocks are
+	// ETag-keyed and useful to it, and finalizeBlockModeMeta's own
+	// re-check backs off the meta write in its favor.
+	_, expected, _, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+	if tokErr != nil {
+		return
+	}
+
+	if err := s.fetchBlocksToCache(ctx, bucket, key, accessKey, secretKey, meta, touched); err != nil {
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Block-mode populate skipped - block fetch failed")
+		return
+	}
+	// Publish the certificate only after every touched block has reached its cache owner.
+	// Keep it on this fresh metadata copy: later range reads never extend the original
+	// span, and the version-preconditioned meta write remains the sole publication point.
+	publishedMeta := *meta
+	publishedMeta.RangeBlockSpan = blockSpanForRange(meta, touched)
+	s.finalizeBlockModeMeta(ctx, bucket, key, &publishedMeta, len(touched), expected)
 }
 
 // finalizeBlockModeMeta stamps the block-mode meta once its blocks have landed — the
@@ -1530,9 +1886,10 @@ func (s *Service) triggerBlockModePopulate(bucket, key, accessKey, secretKey str
 // need to act between the two steps (write-time footer warming records per-block
 // attribution there) share this logic instead of re-deriving its race handling.
 //
-// writeStartTime must be stamped BEFORE the blocks were fetched, so an invalidation
-// landing mid-populate is newer and blocks the meta write.
-func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, blockCount int, writeStartTime int64) {
+// expected must be the caller's decision-time token, read BEFORE the blocks were
+// fetched (or the HEAD made): an invalidation landing mid-populate bumps the
+// fence past it and the meta commit loses.
+func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string, meta *cache.CachedObjectMeta, blockCount int, expected uint64) {
 	// Re-check that no entry was established concurrently before stamping block-mode meta.
 	// The schedule-time !found gate can go stale during the block fetch: a racing
 	// full-GET miss may have whole-cached the object. Overwriting that with block-mode meta
@@ -1543,9 +1900,12 @@ func (s *Service) finalizeBlockModeMeta(ctx context.Context, bucket, key string,
 		return
 	}
 	ttl := int(s.config.Cache.TTL.Seconds())
-	wrote, err := s.cache.PutMetaTombstoneAware(ctx, bucket, key, meta, ttl, writeStartTime)
+	// Committed under the decision-time absence token: a racer (a warm, another
+	// establish) or a fenced delete that landed since bumps the version and the
+	// lost precondition leaves the newer state in place.
+	wrote, err := s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, expected)
 	if err != nil || !wrote {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (tombstone or error)")
+		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Bool("wrote", wrote).Msg("Block-mode meta not written (precondition lost or error)")
 		return
 	}
 	log.Debug().Str("bucket", bucket).Str("key", key).Int("blocks", blockCount).Int64("block_size", meta.BlockSize).Msg("Block-mode entry populated")

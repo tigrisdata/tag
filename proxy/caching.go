@@ -150,7 +150,7 @@ func waitForCacheWrite(ctx context.Context, cacheErrCh <-chan error) (error, boo
 // setupCacheListener creates a listener that streams chunks directly to cache via io.Pipe.
 // This avoids buffering the entire response in memory.
 // Stores both metadata (from headers) and body in separate cache entries.
-// Uses tombstone-aware writes to prevent stale cache after invalidation.
+// Uses version-preconditioned writes so a racing invalidation wins.
 //
 // Uses a hybrid signaling reader + intermediate buffer pattern:
 // - io.Pipe has zero buffer, so writes block until reads occur
@@ -165,7 +165,7 @@ func (s *Service) setupCacheListener(
 	broadcaster *broadcast.Broadcaster,
 	slotHeld bool,
 	weight int64,
-	writeStartTime int64,
+	expected uint64, // decision-time token; the meta commit's CAS precondition
 ) (*io.PipeWriter, chan error) {
 	// Bound concurrent cache-populate operations. When the limit is saturated,
 	// skip caching entirely: the object is still served/forwarded from upstream,
@@ -250,14 +250,25 @@ func (s *Service) setupCacheListener(
 			// read-back. The whole-vs-block boundary is size, not access pattern (RFC 0001): both
 			// full and range paths converge on one representation per size class. Sub-block objects
 			// keep the single whole-body write.
+			// The decision-time token from before the upstream fetch: when the
+			// miss path runs while metadata still exists (a forced-revalidation
+			// fall-through, an anonymous read of a non-public entry) this
+			// populate refreshes exactly the version it observed — and loses
+			// to anything newer, including a fenced delete, instead of
+			// last-write-winning stale bytes over it.
 			if s.isBlockEligibleSize(meta.ContentLength) {
 				meta.BlockSize = s.config.Cache.BlockSize
-				cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+				_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, sigReader, ttl, expected)
 			} else {
-				_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(cacheCtx, bucket, key, meta, sigReader, ttl, writeStartTime)
+				_, cacheErr = s.cache.PutWithMetaStreamIfVersion(cacheCtx, bucket, key, meta, sigReader, ttl, expected)
 			}
 			if cacheErr != nil {
 				log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")
+				// A failed cache write may stop reading before EOF. Close the read
+				// end to interrupt a blocked pipe write, then cancel the relay context
+				// to wake a writer waiting for its first read and stop queueing chunks.
+				_ = pipeReader.CloseWithError(cacheErr)
+				cacheCancel()
 			}
 			cacheErrCh <- cacheErr
 		}()
@@ -270,11 +281,13 @@ func (s *Service) setupCacheListener(
 			case <-sigReader.Ready():
 				// Reader is ready, safe to write
 			case <-cacheCtx.Done():
-				pipeErrCh <- cacheCtx.Err()
-				// Drain queue to unblock producer, returning pooled buffers
+				writeErr := cacheCtx.Err()
+				// Drain queue before reporting relay completion so the populate
+				// owner does not release its reservation while buffers remain held.
 				for chunk := range chunkQueue {
 					broadcast.PutChunkBuf(chunk)
 				}
+				pipeErrCh <- writeErr
 				return
 			}
 
@@ -300,6 +313,7 @@ func (s *Service) setupCacheListener(
 		// This runs in parallel with cache writer initialization,
 		// with the intermediate buffer absorbing chunks during the startup window.
 		var chunkErr error
+		var relayErr error
 		var earlyExit bool
 	chunkLoop:
 		for chunk := range listener.Chunks() {
@@ -317,7 +331,7 @@ func (s *Service) setupCacheListener(
 					// Ownership transferred - don't Release()
 				case <-cacheCtx.Done():
 					broadcast.PutChunkBuf(chunk.Data) // Return unused buffer
-					chunkErr = cacheCtx.Err()
+					relayErr = cacheCtx.Err()
 					earlyExit = true
 					break chunkLoop
 				}
@@ -326,10 +340,13 @@ func (s *Service) setupCacheListener(
 			}
 		}
 
-		// Drain remaining listener chunks to return pooled buffers on early exit.
-		// Runs async since the broadcaster may still be streaming (channel not closed yet).
+		// The populate reservation covers the listener's buffers too. Keep this
+		// owner until every remaining chunk has been returned, even when the
+		// cache deadline or upstream stream error stops relaying to the cache.
 		if earlyExit {
-			listener.DrainAndRelease()
+			for chunk := range listener.Chunks() {
+				chunk.Release()
+			}
 		}
 
 		// Close queue to signal pipe writer to finish
@@ -343,6 +360,11 @@ func (s *Service) setupCacheListener(
 			pipeWriter.CloseWithError(chunkErr)
 		} else if pipeWriteErr != nil {
 			pipeWriter.CloseWithError(pipeWriteErr)
+		} else if relayErr != nil {
+			// A relay deadline can stop forwarding after the cache queue fills.
+			// Do not turn that incomplete stream into a clean EOF that can publish
+			// metadata for a truncated whole-body cache entry.
+			pipeWriter.CloseWithError(relayErr)
 		} else {
 			pipeWriter.Close()
 		}
@@ -351,10 +373,12 @@ func (s *Service) setupCacheListener(
 		cacheErr := <-cacheErrCh
 		if chunkErr != nil {
 			errCh <- chunkErr
+		} else if cacheErr != nil {
+			errCh <- cacheErr
 		} else if pipeWriteErr != nil {
 			errCh <- pipeWriteErr
 		} else {
-			errCh <- cacheErr
+			errCh <- relayErr
 		}
 	}()
 
@@ -383,6 +407,7 @@ func (s *Service) fetchFullObjectToCache(
 	bucket, key, accessKey, secretKey string,
 	anonymous bool,
 	prio populatePriority,
+	expected uint64, // meta-write precondition (see putMetaVersioned)
 ) error {
 	// This is a background fetch whose only purpose is to populate the cache, so
 	// reserve a cache-populate slot up front. If the concurrent-write limit is
@@ -417,11 +442,9 @@ func (s *Service) fetchFullObjectToCache(
 		}
 	}()
 
-	// Stamp the cache-write start BEFORE the upstream request, for the same reason
-	// as the inline path: a timestamp taken after the response leaves the whole
-	// round-trip unguarded, letting an invalidation that landed mid-fetch look older
-	// than our write and pass the tombstone check.
-	writeStartTime := time.Now().UnixNano()
+	// No stamp needed: the trigger's decision-time token (expected) predates
+	// this fetch, so an invalidation landing anywhere in the round-trip bumps
+	// the fence past it and the meta commit loses atomically.
 
 	// Execute full object request (no Range header). An anonymous warm uses an
 	// unsigned request so upstream applies anonymous authorization — 200 only if the
@@ -540,14 +563,20 @@ func (s *Service) fetchFullObjectToCache(
 	go func() {
 		var cacheErr error
 		// Block-eligible full fetches retain the size-based representation used by the
-		// foreground miss path: blocks are written first and tombstone-aware metadata is
+		// foreground miss path: blocks are written first and version-preconditioned metadata is
 		// published last. Smaller objects use the whole-body stream writer.
+		// The precondition is the trigger's decision-time token: the absence
+		// token for the absent-gated re-warms, the revalidation picker's
+		// verdict for a revalidation re-warm (so a FAILED guarded delete
+		// cannot leave known-stale state the repopulate refuses to repair),
+		// and warmToken for the warm-after-write paths. A trigger that cannot
+		// read a token does not fire.
 		if blockMode {
 			meta.BlockSize = s.config.Cache.BlockSize
-			cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, writeStartTime)
+			_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, expected)
 		} else {
-			_, cacheErr = s.cache.PutWithMetaStreamTombstoneAware(
-				cacheCtx, bucket, key, meta, body, ttl, writeStartTime,
+			_, cacheErr = s.cache.PutWithMetaStreamIfVersion(
+				cacheCtx, bucket, key, meta, body, ttl, expected,
 			)
 		}
 		cacheErrCh <- cacheErr
@@ -582,15 +611,32 @@ func (s *Service) fetchFullObjectToCache(
 // This avoids broadcast.Manager's "no late joiners" policy which incorrectly
 // allows multiple fetches when the first has already started streaming.
 // When anonymous is true the fetch is issued without credentials and, on success,
+// backgroundFetchKey is the coalescing key for one background fetch: bucket,
+// key, and the commit precondition. One definition, shared with the tests that
+// wait on in-flight markers, so a format change cannot silently break their
+// waits into instant misses.
+func backgroundFetchKey(bucket, key string, expected uint64) string {
+	return fmt.Sprintf("bg:%s/%s|%d", bucket, key, expected)
+}
+
 // cached as public-read (see fetchFullObjectToCache); accessKey/secretKey are then
 // ignored. Pass anonymous=true exactly when the triggering request was anonymous, so
 // public-read is only ever inferred from a confirmed anonymous read.
-func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority) {
-	bcastKey := "bg:" + bucket + "/" + key
+func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey string, anonymous bool, prio populatePriority, expected uint64) {
+	// Coalesce only triggers with IDENTICAL commit semantics: the precondition
+	// is part of the dedup key. Keyed by bucket/key alone, a write repair
+	// arriving while an absent-gated warm is in flight would be dropped
+	// WITH its precondition — the in-flight warm then loses to the write's
+	// newer fence (its token predates it) and the repair that would have
+	// fixed the surviving state never runs. Distinct-precondition fetches for
+	// one key are bounded by the distinct races that spawned them, and each is
+	// budget-gated like any populate; identical triggers (a read-miss stampede)
+	// still coalesce to one fetch.
+	bcastKey := backgroundFetchKey(bucket, key, expected)
 
-	// Atomic check-and-set: if key exists, a fetch is already in progress
+	// Atomic check-and-set: if key exists, an equivalent fetch is already in progress
 	if _, loaded := s.activeBackgroundFetches.LoadOrStore(bcastKey, struct{}{}); loaded {
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background fetch already in progress, coalescing")
+		log.Debug().Str("bucket", bucket).Str("key", key).Uint64("expected", expected).Msg("Equivalent background fetch already in progress, coalescing")
 		return
 	}
 
@@ -604,7 +650,7 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
 		defer cancel()
 
-		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, prio)
+		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, prio, expected)
 
 		switch {
 		case errors.Is(err, errCachePopulateDeclined):

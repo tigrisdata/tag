@@ -4,11 +4,6 @@ import (
 	"context"
 	"encoding/xml"
 	"net/http"
-	"time"
-
-	"github.com/rs/zerolog/log"
-
-	"github.com/tigrisdata/tag/cache"
 )
 
 // Metadata caching on write (prototype).
@@ -73,28 +68,20 @@ func (s *Service) establishBlockMetaFromHead(bucket, key, accessKey, secretKey, 
 
 	// Stamp before the HEAD, so an invalidation landing mid-flight is newer than this
 	// timestamp and blocks the meta write.
-	writeStartTime := time.Now().UnixNano()
-
-	resp, err := s.forwarder.DoConditionalHeadRequest(ctx, bucket, key, accessKey, secretKey, "", 0)
-	if err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Meta-on-write - HEAD failed")
-		return
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	// Decision-time token BEFORE the HEAD; no token, no ordered commit.
+	_, expected, found, tokErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+	if tokErr != nil || found {
 		return
 	}
 
-	// Only establish the version we actually wrote. A concurrent overwrite returns a
-	// different ETag, and caching that meta would describe an object whose blocks a
-	// later read would fetch under a different version — the same torn-pair hazard
-	// write_through guards against.
-	if resp.Header.Get("ETag") != writtenETag {
-		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Meta-on-write skipped - superseded by a concurrent overwrite")
+	// Shared HEAD-and-verify: ok only when upstream answers 200 for exactly
+	// the ETag this write produced — a concurrent overwrite's meta would
+	// describe an object whose blocks a later read fetches under a different
+	// version, the torn-pair hazard write_through guards against.
+	meta, ok := s.headObjectMeta(ctx, bucket, key, accessKey, secretKey, writtenETag)
+	if !ok {
 		return
 	}
-
-	meta := cache.MetaFromHTTPHeaders(bucket, key, http.StatusOK, resp.Header)
 	if !meta.IsCacheable(s.config.Cache.SizeThreshold) {
 		return
 	}
@@ -107,7 +94,7 @@ func (s *Service) establishBlockMetaFromHead(bucket, key, accessKey, secretKey, 
 
 	// Deliberately NOT BlocksComplete: no block has been written, so a full-object
 	// serve must take the probe pass rather than stream optimistically.
-	s.finalizeBlockModeMeta(ctx, bucket, key, meta, 0, writeStartTime)
+	s.finalizeBlockModeMeta(ctx, bucket, key, meta, 0, expected)
 }
 
 // completedMultipartETag extracts the ETag from a CompleteMultipartUpload response.

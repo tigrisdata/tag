@@ -13,6 +13,7 @@ func newVersioningTestCache(t *testing.T) (*Cache, cacheclient.CacheClient) {
 	t.Helper()
 	mem := cacheclient.NewMemoryCache()
 	cfg := config.NewDefault()
+	cfg.Cache.SetLegacyCoordination(false) // versioning tests assert CAS semantics
 	return NewCacheWithClient(mem, &cfg.Cache), mem
 }
 
@@ -128,8 +129,8 @@ func TestETagVersionedBody_EmptyETagNotCachedViaStream(t *testing.T) {
 
 	body := bytes.NewReader([]byte("body-bytes"))
 	meta := &CachedObjectMeta{Bucket: bucket, Key: key, ETag: "", ContentLength: 10, StatusCode: 200}
-	if _, err := c.PutWithMetaStreamTombstoneAware(ctx, bucket, key, meta, body, 60, 1); err != nil {
-		t.Fatalf("PutWithMetaStreamTombstoneAware: %v", err)
+	if _, err := c.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, body, 60, VersionAny); err != nil {
+		t.Fatalf("PutWithMetaStreamIfVersion: %v", err)
 	}
 	if _, found, _ := c.GetMeta(ctx, bucket, key); found {
 		t.Error("empty-ETag object should not be cached via the streaming path (meta present)")
@@ -160,41 +161,5 @@ func TestETagVersionedBody_EmptyETagIsNotCached(t *testing.T) {
 	}
 	if _, err := mem.Get(ctx, MakeBodyKey(bucket, key, "")); err == nil {
 		t.Error("empty-ETag object should not be cached (body present)")
-	}
-}
-
-// A tombstone must outlive any cache-populate that could race it: the populate is
-// only compared against the tombstone right before its metadata write, so an
-// expired tombstone reads as zero and lets the stale write through. The TTL is
-// therefore derived from the size threshold, not fixed — raising size_threshold
-// must not silently shorten the guard relative to the write it has to outlive.
-func TestTombstoneTTLSeconds(t *testing.T) {
-	// Never below the floor, and always well past the fixed 60s that shipped before
-	// (which was far shorter than a large object's write).
-	if got := TombstoneTTLSeconds(0); got < MinTombstoneTTLSeconds {
-		t.Errorf("TombstoneTTLSeconds(0) = %d, want >= floor %d", got, MinTombstoneTTLSeconds)
-	}
-	if MinTombstoneTTLSeconds <= 60 {
-		t.Errorf("floor %d is not meaningfully above the old 60s tombstone TTL", MinTombstoneTTLSeconds)
-	}
-
-	// The TTL must track the write time ADDITIVELY. Doubling the threshold must add
-	// roughly the extra write time, not double the whole TTL: a multiplicative curve
-	// crosses the additive populate window and collapses the margin (see
-	// TestTombstoneTTLCoversPopulateWindow).
-	const gib = int64(1) << 30
-	d2, d4 := TombstoneTTLSeconds(2*gib), TombstoneTTLSeconds(4*gib)
-	extraWrite := (4*gib)/tombstoneWriteThroughput - (2*gib)/tombstoneWriteThroughput
-	if d4-d2 != extraWrite {
-		t.Errorf("TTL grew by %ds when the threshold went 2GiB->4GiB; want the added write time %ds (TTL must be additive in write time)", d4-d2, extraWrite)
-	}
-
-	// Monotonic and scaling past the floor for large thresholds.
-	big := 10 * gib
-	if TombstoneTTLSeconds(big) <= MinTombstoneTTLSeconds {
-		t.Errorf("TombstoneTTLSeconds(10GiB) = %d, want > floor %d (must scale with size_threshold)", TombstoneTTLSeconds(big), MinTombstoneTTLSeconds)
-	}
-	if TombstoneTTLSeconds(big) <= TombstoneTTLSeconds(big/4) {
-		t.Error("TombstoneTTLSeconds must be non-decreasing in size_threshold")
 	}
 }

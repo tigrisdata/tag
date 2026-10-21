@@ -111,6 +111,34 @@ func (s *RequestSigner) SignRequest(ctx context.Context, method, path string,
 	// Set path (Go will properly encode special characters like % when converting to string)
 	baseURL.Path = pathPart
 	baseURL.RawQuery = queryPart
+	return s.signURL(ctx, method, &baseURL, body, bodyHash, accessKey, secretKey, headers)
+}
+
+// SignObjectRequest signs a synthetic single-object request built by TAG
+// itself (background fetches, revalidations, the tiered cross-tier cleanup
+// DELETE). Unlike SignRequest's combined path parameter, the KEY IS TAKEN
+// LITERALLY: it is never split on '?', so a key containing query-reserved
+// characters ('?' is legal in S3 keys) signs and routes to the exact object
+// instead of a truncated sibling — for a DELETE, a destructive request aimed
+// at the wrong key. The URL layer percent-encodes the path on the wire and
+// the canonical URI uses the same encoding, so signature and routing agree.
+func (s *RequestSigner) SignObjectRequest(ctx context.Context, method, bucket, key string,
+	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header) (*http.Request, error) {
+
+	if s.endpointErr != nil {
+		return nil, fmt.Errorf("failed to parse endpoint: %w", s.endpointErr)
+	}
+	baseURL := *s.endpointURL
+	baseURL.Path = "/" + bucket + "/" + key
+	baseURL.RawQuery = ""
+	return s.signURL(ctx, method, &baseURL, body, bodyHash, accessKey, secretKey, headers)
+}
+
+// signURL finishes request construction and SigV4 signing for an already-built
+// URL (path and query set as their decoded forms).
+func (s *RequestSigner) signURL(ctx context.Context, method string, baseURL *url.URL,
+	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header) (*http.Request, error) {
+
 	if baseURL.Opaque != "" {
 		// URL.String ignores Path for opaque URLs, so the old stringify-and-parse
 		// path returned an empty Path as well.
@@ -146,7 +174,7 @@ func (s *RequestSigner) SignRequest(ctx context.Context, method, path string,
 		// attach the completed URL directly rather than serializing and reparsing it.
 		req, err = http.NewRequestWithContext(ctx, method, "", body)
 		if err == nil {
-			req.URL = &baseURL
+			req.URL = baseURL
 			req.Host = baseURL.Host
 		}
 	}
@@ -277,6 +305,43 @@ func canonicalQueryString(query url.Values) string {
 	return result.String()
 }
 
+// canonicalHeaderValue applies the shared SigV4 header-value normalization.
+// It trims surrounding whitespace and collapses runs of ASCII spaces while
+// preserving other interior whitespace, such as tabs.
+func canonicalHeaderValue(value string) string {
+	value = strings.TrimSpace(value)
+	if !strings.Contains(value, "  ") {
+		return value
+	}
+
+	var normalized strings.Builder
+	normalized.Grow(len(value))
+	previousSpace := false
+	for i := 0; i < len(value); i++ {
+		if value[i] == ' ' {
+			if previousSpace {
+				continue
+			}
+			previousSpace = true
+		} else {
+			previousSpace = false
+		}
+		normalized.WriteByte(value[i])
+	}
+	return normalized.String()
+}
+
+// writeCanonicalHeaderValues normalizes header values in order and joins them
+// with commas without modifying the borrowed values slice.
+func writeCanonicalHeaderValues(builder *strings.Builder, values []string) {
+	for i, value := range values {
+		if i > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(canonicalHeaderValue(value))
+	}
+}
+
 // buildCanonicalHeaders builds canonical headers and signed headers string.
 func (s *RequestSigner) buildCanonicalHeaders(req *http.Request) (string, string) {
 	// Get headers to sign
@@ -304,14 +369,9 @@ func (s *RequestSigner) buildCanonicalHeaders(req *http.Request) (string, string
 	// Build canonical headers string
 	var canonicalHeaders strings.Builder
 	for _, name := range headerNames {
-		values := headers[name]
-		// Trim and collapse whitespace
-		for i, v := range values {
-			values[i] = strings.TrimSpace(v)
-		}
 		canonicalHeaders.WriteString(name)
 		canonicalHeaders.WriteString(":")
-		canonicalHeaders.WriteString(strings.Join(values, ","))
+		writeCanonicalHeaderValues(&canonicalHeaders, headers[name])
 		canonicalHeaders.WriteString("\n")
 	}
 

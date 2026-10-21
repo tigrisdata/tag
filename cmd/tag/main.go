@@ -92,6 +92,9 @@ func main() {
 		cfg = config.NewDefault()
 	}
 
+	// Stamp the operating mode on the request metrics before anything serves.
+	metrics.SetMode(cfg.ResolvedMode())
+
 	// Override cache enabled from command line flag
 	if *disableCache {
 		cfg.Cache.SetEnabled(false)
@@ -148,7 +151,7 @@ func main() {
 			Str("endpoint", cfg.Upstream.Endpoint).
 			Str("region", cfg.Upstream.Region).
 			Int("max_idle_conns_per_host", cfg.Upstream.MaxIdleConnsPerHost).
-			Bool("transparent_proxy", cfg.Upstream.IsTransparentProxy()),
+			Str("mode", cfg.ResolvedMode()),
 		).
 		Dict("cache", zerolog.Dict().
 			Bool("enabled", cfg.Cache.IsEnabled()).
@@ -188,25 +191,35 @@ func main() {
 		log.Warn().Err(err).Msg("Failed to load credentials from environment")
 	}
 
-	// Initialize proxy signer if transparent proxy is enabled
+	// Initialize the proxy signer for transparent forwarding (proxy headers,
+	// TAG's own creds). Whether tiered forwards transparently or by signing
+	// is decided by its endpoint — see Config.ForwardsTransparently.
 	var proxySigner *auth.ProxySigner
-	if cfg.Upstream.IsTransparentProxy() {
+	if cfg.ForwardsTransparently() {
 		accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
 		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 		if accessKey == "" || secretKey == "" {
-			log.Fatal().Msg("Transparent proxy requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+			log.Fatal().Str("mode", cfg.ResolvedMode()).Msg("This mode requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
 		}
 		proxySigner = auth.NewProxySigner(accessKey, secretKey)
-		log.Info().Msg("Transparent proxy mode enabled")
+		log.Info().Str("mode", cfg.ResolvedMode()).Msg("Proxy mode enabled")
 	} else {
-		log.Info().Str("endpoint", cfg.Upstream.Endpoint).Msg("Signing mode enabled")
+		log.Info().Str("mode", cfg.ResolvedMode()).Str("endpoint", cfg.Upstream.Endpoint).Msg("Signing forwarding enabled")
 		if !config.IsTigrisEndpoint(cfg.Upstream.Endpoint) {
 			log.Warn().Str("endpoint", cfg.Upstream.Endpoint).
 				Msg("Running against a non-Tigris S3 endpoint; transparent-proxy features are unavailable and third-party backends are community-supported")
+			if cfg.IsTiered() {
+				// The cross-tier cleanup DELETE is safe only where If-Match is
+				// enforced (verified on Tigris), so it is disabled here by
+				// construction; say so once so the accumulating displaced
+				// copies are not a surprise.
+				log.Info().Str("endpoint", cfg.Upstream.Endpoint).
+					Msg("Tiered mode on a non-Tigris endpoint: cross-tier cleanup is disabled (If-Match on DELETE is verified on Tigris only); displaced upstream copies age out by bucket expiry")
+			}
 		}
 	}
 
-	if credStore.Count() == 0 && !cfg.Upstream.IsTransparentProxy() {
+	if credStore.Count() == 0 && !cfg.ForwardsTransparently() {
 		log.Warn().Msg("No credentials loaded - TAG will reject all requests")
 	}
 
@@ -276,6 +289,11 @@ func main() {
 
 		// Wrap embedded cache with the cache.Cache interface.
 		objectCache = cache.NewCacheWithClient(newEmbeddedBlockCacheClient(embeddedCache), &cfg.Cache)
+		if cfg.Cache.IsLegacyCoordination() {
+			log.Info().Msg("Cache meta coordination: legacy tombstones (set cache.legacy_coordination=false for fenced CAS once all nodes support it)")
+		} else {
+			log.Info().Msg("Cache meta coordination: fenced CAS")
+		}
 
 		// Publish this node's local cache size as tag_cache_size_bytes. ocache keeps
 		// the total live (an atomic), so sampling it is cheap.
@@ -306,9 +324,11 @@ func main() {
 		objectCache = cache.NewDisabledCache()
 	}
 
-	// 3. Initialize local auth for transparent proxy
+	// 3. Initialize local auth (transparent forwarding: derived signing keys
+	// learned from Tigris). Signing forwarding validates against the
+	// credential store inside the forwarder instead.
 	var localAuth *proxy.LocalAuthConfig
-	if cfg.Upstream.IsTransparentProxy() {
+	if cfg.ForwardsTransparently() {
 		secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 		derivedKeyStore := auth.NewDerivedKeyStore(auth.DefaultDerivedKeyTTL)
 		keyUnwrapper, err := auth.NewKeyUnwrapper(secretKey)

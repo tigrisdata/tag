@@ -57,7 +57,7 @@ All dependencies are public, including the Tigris `ocache` modules (`github.com/
 - **Optional Clustering**: Memberlist gossip for discovery, gRPC for cache key routing between nodes
 - **Broadcast/Subscriber Pattern**: Request coalescing via `proxy/broadcast/` - streams chunks to multiple listeners simultaneously
 - **Two-Key Cache Storage**: Objects stored as `meta|bucket|key` (headers/ETag) and `body|bucket|key` (raw bytes)
-- **Tombstone Invalidation**: Writes tombstone marker before DELETE to prevent stale async cache writes
+- **Meta Coordination Strategy**: Invalidation/populate ordering is a construction-time strategy (`cache/coordinator.go`, `cache.legacy_coordination`). Default is the legacy tombstone mechanism (safe for any cluster mix, including direct ≤v1.20 upgrades); flipping the flag off selects fenced CAS ops (ocache v1.13.0, ocache#267) where every populate commits under a decision-time version token and writes that observed pre-delete state lose atomically. The proxy layer is mode-blind — it carries an opaque token, never branches on the mode
 - **Ingress Admission**: `server.max_inflight_requests` (default 1024) bounds concurrently-served S3 requests; excess is shed with 503 SlowDown. Operational endpoints (`/health`, `/metrics`, `/debug/pprof/*`) are exempt. `0`/unset = default, negative = disabled.
 - **Semaphore-Gated Cache Writes**: `cache.max_concurrent_writes` (default 256) bounds concurrent cache-populate operations; when saturated, objects are served from upstream without being cached. `0`/unset = default, negative = disabled.
 

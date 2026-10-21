@@ -27,6 +27,8 @@ Total number of requests processed by TAG.
 | ----------- | -------------------------------------------------------------------- |
 | `operation` | S3 operation: `GetObject`, `PutObject`, `DeleteObject`, `HeadObject` |
 | `status`    | Result: `success`, `error`, `auth_error`, `range_not_satisfiable`    |
+| `mode`      | The process's operating mode (`transparent`, `signing`, `tiered`) — one constant value per instance, for fleet-wide splits |
+| `source`    | Where the response was produced: `local` (TAG's own store or knowledge — cache hits, revalidated-304 serves, authoritative misses, auth errors) or `upstream` (proxied) |
 
 **Example queries:**
 
@@ -36,6 +38,9 @@ rate(tag_requests_total[5m])
 
 # Error rate
 sum(rate(tag_requests_total{status="error"}[5m])) / sum(rate(tag_requests_total[5m]))
+
+# Share of traffic answered without touching upstream (per mode)
+sum(rate(tag_requests_total{source="local"}[5m])) by (mode) / sum(rate(tag_requests_total[5m])) by (mode)
 
 # GetObject success rate
 rate(tag_requests_total{operation="GetObject",status="success"}[5m]) /
@@ -51,6 +56,8 @@ Request duration in seconds.
 | Label       | Description  |
 | ----------- | ------------ |
 | `operation` | S3 operation |
+| `mode`      | Operating mode (constant per instance) |
+| `source`    | `local` or `upstream` — where the response was produced |
 
 **Buckets:** 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10 (the default Prometheus buckets plus extra tail resolution at 1.5, 2, 3, 4 and 7.5 seconds)
 
@@ -368,35 +375,50 @@ see [docs/parquet-optimization.md](parquet-optimization.md).
 
 **Type:** Histogram
 
-Size of the parquet metadata region, read from the trailer of objects while
-`cache.parquet_optimization` is on. Recorded for **every** parquet object whose trailer is
-read, including ones that are not prefetched, so the distribution describes the whole
-population rather than just the prefetched tail of it.
+Size of the parquet metadata region, read from a valid trailer while
+`cache.parquet_optimization` is on. Admitted read scans and write warms record an observation;
+a read trigger shed by the service-wide scan limit does not inspect the trailer and is not
+recorded. Under saturation, the histogram can therefore omit eligible tail reads.
 
-Note the population depends on which triggers are active. The read trigger observes objects
-as they are read; the write trigger observes them as they are written. With both on, an object
-written and later read through the same node is observed twice, and write-heavy deployments
-will weight the distribution toward recently written objects. Read it as a distribution of
-*observations*, not of distinct objects — that is what makes it useful for drift detection and
-what to keep in mind before comparing across deployments.
+The population also depends on which triggers are active. With both on, an object written and
+later read through the same node can be observed twice, and write-heavy deployments will weight
+the distribution toward recently written objects. Read it as a distribution of *observations*,
+not of distinct objects — that is what makes it useful for drift detection and what to keep in
+mind before comparing across deployments.
 
-The prefetch does work whenever `footer + 8` exceeds the **remainder** block
-(`ContentLength mod block_size`, averaging half a block) — not merely when the footer exceeds
-`block_size`.
+An admitted prefetch needs blocks beyond the cached tail whenever `footer + 8` exceeds the
+**remainder** block (`ContentLength mod block_size`, averaging half a block) — not merely when
+the footer exceeds `block_size`.
 
 Footer size scales with row groups and columns, since the footer carries per-column
 statistics. On a production deployment with a wide schema, footers ran **~1.25% of object
 size** — several MB on a few-hundred-MB object — so at a 1 MiB `block_size` the metadata spans
-several blocks and the prefetch does real work on most objects. A narrow schema keeps the
-footer inside the tail block, where there is nothing to prefetch.
+several blocks. A narrow schema keeps the footer inside the tail block, where an admitted
+prefetch has nothing to fetch.
 
-Use the histogram to establish that ratio for your own data, and to detect drift: a schema
-change alters footer size, and a distribution that collapses below the remainder-block size
-means the optimization has stopped earning its keep.
+Use the histogram to estimate that ratio for the observed population and detect drift: a schema
+change alters footer size, but under saturation shed read scans are absent from the sample. A
+distribution that collapses below the remainder-block size means the optimization has stopped
+earning its keep only when scan admission is not distorting the population.
 
 ```promql
 # Median footer size — compare against cache.block_size.
 histogram_quantile(0.5, sum(rate(tag_cache_parquet_footer_bytes_bucket[1h])) by (le))
+```
+
+#### tag_cache_parquet_footer_prefetch_shed_total
+
+**Type:** Counter
+
+Eligible read-triggered footer prefetch attempts declined because the service-wide
+concurrent-scan limit was full. A nonzero rate signals admission pressure, but the
+counter is not an exact count of distinct footer observations omitted: admission
+precedes per-version coalescing, so a denied attempt can be for a version another
+scan is already handling.
+
+```promql
+# Read-triggered footer-prefetch attempts refused by the scan limit.
+rate(tag_cache_parquet_footer_prefetch_shed_total[5m])
 ```
 
 #### tag_cache_block_hits_total / tag_cache_block_misses_total
@@ -448,6 +470,43 @@ rate(tag_cache_populate_skipped_total{source="warm_on_write"}[5m])
 # Total populate shed rate
 sum(rate(tag_cache_populate_skipped_total[5m]))
 ```
+
+#### tag_tiered_cleanup_total
+
+**Type:** Counter
+
+Tiered mode's cross-tier cleanup deletes (issued when a small local write
+displaces an upstream-tier version), by outcome — exactly one per cleanup.
+Cleanup is best-effort: anything other than `deleted` / `already_gone` /
+`replaced` / `marker_repaired` leaves an orphan for the upstream bucket's own
+expiry — failures are Debug-logged, so this counter is the rollout-visibility
+signal.
+
+| Label     | Description                                                              |
+| --------- | ------------------------------------------------------------------------ |
+| `outcome` | `deleted`, `already_gone` (404), `replaced` (412 — a newer version took the key, left alone), `rejected` (other upstream refusal), `error` (request failed), `no_etag` (no displaced ETag to bind to; skipped), `unverified_backend` (skipped: non-Tigris endpoint, where If-Match enforcement on DELETE is unverified — cleanup is disabled by construction), `live_marker` (skipped: the key's current metadata is a live marker for this ETag — the body is authoritative again), `marker_repaired` (a same-ETag marker raced in during the delete; the repair removed it, converging on an authoritative miss the caller re-populates), `repair_failed` (the repair could not run or could not remove the raced-in marker — it may stay authoritative over a deleted body until TTL) |
+
+```promql
+# Orphan-producing cleanup rate (should be ~0)
+sum(rate(tag_tiered_cleanup_total{outcome=~"rejected|error|no_etag|repair_failed"}[5m]))
+```
+
+#### tag_tiered_retier_total
+
+**Type:** Counter
+
+Tiered mode's re-tier-on-read attempts: a validated GET that hits an
+upstream-tier marker whose size fits the local tier triggers a one-shot
+background move of the body into the local tier (healing objects mis-placed
+by, e.g., a cold-start PUT forwarded before its key was learned).
+
+| Label     | Description                                                              |
+| --------- | ------------------------------------------------------------------------ |
+| `outcome` | `retiered` (moved into the local tier), `shed` (populate budget refused the buffer), `changed` (object replaced/deleted mid-flight; its newer state wins), `canceled` (a concurrent write claimed the key — normal coordination), `error` (fetch or store failed) |
+
+A sustained `retiered` rate outside restart windows means writes keep landing
+in the wrong tier — check key learning. Per-key dedup skips are not counted.
+
 
 ### Revalidation Metrics
 
