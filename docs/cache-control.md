@@ -9,7 +9,7 @@ TAG supports RFC 7234-compliant cache revalidation. Clients can control caching 
 | `HIT`         | A cache entry was selected to serve the response (including revalidation that confirmed the object is unchanged) |
 | `MISS`        | Not in cache, fetched from upstream and now cached                               |
 | `REVALIDATED` | Revalidated with upstream, object changed, new content returned                  |
-| `BYPASS`      | Cache bypassed entirely (client requested `no-store`)                            |
+| `BYPASS`      | Cache bypassed entirely (client requested `no-store`, or the request carries a representation selector: `versionId`, `partNumber`, `response-*`) |
 | `DISABLED`    | Caching is disabled server-side (`TAG_CACHE_DISABLED=true`)                      |
 
 In block mode, a committed stream can recover missing bytes from an upstream range only after validating the cached ETag and exact range. Because `HIT` is committed before the body streams, it describes the cache-backed request, not each byte's source or whether the transfer completed. See [S3 compatibility](s3-compatibility.md#caching-behavior) for incomplete cache-range behavior.

@@ -179,6 +179,36 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// countingReadSeeker is countingReader for a seekable body. The store retries
+// a local put only when the body it is handed implements io.Seeker (rewinding
+// it with Seek(0, io.SeekStart) before each attempt), so a plain wrapper would
+// silently cost a seekable body — the write-through fill's bytes.Reader — its
+// retries. Seek forwards to the body and resets the count to the new absolute
+// offset, so a retried attempt counts the bytes once.
+type countingReadSeeker struct {
+	*countingReader
+	s io.Seeker
+}
+
+func (c *countingReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	pos, err := c.s.Seek(offset, whence)
+	if err != nil {
+		return pos, err
+	}
+	c.n = pos
+	return pos, nil
+}
+
+// newCountingReader wraps body so the bytes the store consumes can be read
+// back from the returned countingReader, preserving io.Seeker when body has it.
+func newCountingReader(body io.Reader) (io.Reader, *countingReader) {
+	counted := &countingReader{r: body}
+	if seeker, ok := body.(io.Seeker); ok {
+		return &countingReadSeeker{countingReader: counted, s: seeker}, counted
+	}
+	return counted, counted
+}
+
 // PutWithMetaStreamIfVersion is like PutWithMetaStream but commits the
 // metadata under the caller's decision-time version precondition (see
 // putMetaVersioned): body first, then the meta write that makes the entry
@@ -234,9 +264,10 @@ func (c *Cache) PutWithMetaStreamIfVersion(
 
 	// Stream body to cache, counting the bytes the store actually consumed so
 	// the meta commit below can be refused for a body that does not match the
-	// declared length.
-	counted := &countingReader{r: body}
-	if err := c.client.PutStream(ctx, bodyKey, counted, int64(ttl)); err != nil {
+	// declared length. A seekable body stays seekable so the store keeps its
+	// retry-with-rewind for it.
+	countedBody, counted := newCountingReader(body)
+	if err := c.client.PutStream(ctx, bodyKey, countedBody, int64(ttl)); err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body put error")
 		return false, err
 	}

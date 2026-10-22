@@ -24,7 +24,7 @@ const (
 	XCacheHeader      = "X-Cache"
 	XCacheHit         = "HIT"
 	XCacheMiss        = "MISS"
-	XCacheBypass      = "BYPASS"      // Cache-Control: no-store bypassed cache
+	XCacheBypass      = "BYPASS"      // Cache-Control: no-store or a representation selector bypassed cache
 	XCacheDisabled    = "DISABLED"    // Cache is disabled
 	XCacheRevalidated = "REVALIDATED" // Object revalidated with upstream
 )
@@ -875,6 +875,14 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		metrics.RecordRequest("HeadObject", "auth_error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
+	}
+
+	// A representation selector (?versionId, ?partNumber, response-* header
+	// overrides) is not answered by the cached current-object metadata; forward
+	// upstream as-is, exactly like the GET path.
+	if hasRepresentationSelectors(r) {
+		log.Debug().Str("bucket", bucket).Str("key", key).Str("query", r.URL.RawQuery).Msg("HEAD representation selector, forwarding upstream")
+		return s.forwardRepresentationSelector(ctx, w, r, "HeadObject", start)
 	}
 
 	// Try to serve from cached metadata (no body needed)

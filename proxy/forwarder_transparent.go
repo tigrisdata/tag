@@ -65,10 +65,11 @@ func isReadAuthorizationQuery(rawQuery string) bool {
 	}
 
 	for key := range query {
+		if isReadRepresentationSelector(key) {
+			continue
+		}
 		switch key {
-		case "versionId", "partNumber", "response-cache-control", "response-content-disposition",
-			"response-content-encoding", "response-content-language", "response-content-type", "response-expires",
-			"X-Amz-Checksum-Mode", "x-amz-expected-bucket-owner", "x-amz-request-payer":
+		case "X-Amz-Checksum-Mode", "x-amz-expected-bucket-owner", "x-amz-request-payer":
 			continue
 		}
 

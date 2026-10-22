@@ -708,3 +708,58 @@ func shouldBypassCache(r *http.Request) bool {
 	cc := r.Header.Get("Cache-Control")
 	return strings.Contains(cc, "no-store")
 }
+
+// readRepresentationSelectors are the GetObject/HeadObject query parameters
+// that select a representation other than the current object as stored:
+// another version, a single part, or the current body under overridden
+// response headers. The cache holds only the current object under its own
+// headers, so a request carrying any of them can neither be answered from the
+// cache nor populate it. The transparent forwarder's read-authorization check
+// (isReadAuthorizationQuery) shares this list: these are exactly the
+// parameters that still mean "GetObject/HeadObject" rather than another S3
+// operation.
+var readRepresentationSelectors = []string{
+	"versionId", "partNumber",
+	"response-cache-control", "response-content-disposition", "response-content-encoding",
+	"response-content-language", "response-content-type", "response-expires",
+}
+
+// isReadRepresentationSelector reports whether a query parameter name is one
+// of readRepresentationSelectors. S3 query parameter names are case-sensitive.
+func isReadRepresentationSelector(name string) bool {
+	for _, p := range readRepresentationSelectors {
+		if name == p {
+			return true
+		}
+	}
+	return false
+}
+
+// hasRepresentationSelectors reports whether an object GET/HEAD carries any
+// readRepresentationSelectors. Such a request is forwarded upstream as-is:
+// never served from the cache (it would return the current object with the
+// cached headers, ignoring the selector) and never used to populate it.
+func hasRepresentationSelectors(r *http.Request) bool {
+	if r.URL.RawQuery == "" {
+		return false
+	}
+	for name := range r.URL.Query() {
+		if isReadRepresentationSelector(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// forwardRepresentationSelector is the GET/HEAD path for a request with
+// representation selectors: a plain upstream forward with no cache read, no
+// broadcast coalescing (the broadcast key is bucket/key only, so a
+// ?versionId=old fetch must not be shared with a current-object fetch), and
+// no populate of any kind. X-Cache reports BYPASS, like Cache-Control:
+// no-store.
+func (s *Service) forwardRepresentationSelector(ctx context.Context, w http.ResponseWriter, r *http.Request, operation string, start time.Time) error {
+	writeCacheStatus(w, s.cacheMissStatus(true))
+	err := s.forwarder.Forward(ctx, w, r)
+	metrics.RecordRequestResult(operation, metrics.SourceUpstream, err, time.Since(start).Seconds())
+	return err
+}

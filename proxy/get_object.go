@@ -130,6 +130,16 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 
+	// A representation selector (?versionId, ?partNumber, response-* header
+	// overrides) asks for something the cache does not hold: the cache has only
+	// the current object under its own headers. Forward upstream as-is — no
+	// cache read, no coalescing, no populate (presigned download links commonly
+	// carry these, and #266 made URL-only presigned GETs locally validated).
+	if hasRepresentationSelectors(r) {
+		log.Debug().Str("bucket", bucket).Str("key", key).Str("query", r.URL.RawQuery).Msg("Representation selector, forwarding upstream")
+		return s.forwardRepresentationSelector(ctx, w, r, "GetObject", start)
+	}
+
 	// 2. Check cache (fast path) - now also works for range requests!
 	// For range requests: check if full object is in cache, then serve range from it.
 	// Uses two-phase approach: GetMeta first, then GetBodyStream for direct streaming.
