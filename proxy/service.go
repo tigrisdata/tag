@@ -881,7 +881,7 @@ func (s *Service) HandleHeadObject(w http.ResponseWriter, r *http.Request) error
 	// overrides) is not answered by the cached current-object metadata; forward
 	// upstream as-is, exactly like the GET path.
 	if hasRepresentationSelectors(r) {
-		log.Debug().Str("bucket", bucket).Str("key", key).Str("query", r.URL.RawQuery).Msg("HEAD representation selector, forwarding upstream")
+		log.Debug().Str("bucket", bucket).Str("key", key).Strs("selectors", representationSelectorNames(r)).Msg("HEAD representation selector, forwarding upstream")
 		return s.forwardRepresentationSelector(ctx, w, r, "HeadObject", start)
 	}
 

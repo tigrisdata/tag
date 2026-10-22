@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -739,6 +740,21 @@ func isReadRepresentationSelector(name string) bool {
 // readRepresentationSelectors. Such a request is forwarded upstream as-is:
 // never served from the cache (it would return the current object with the
 // cached headers, ignoring the selector) and never used to populate it.
+// representationSelectorNames returns the representation selector names
+// present in the request query, sorted, for logging. Only the names are
+// returned: the raw query of a presigned request carries its signature and
+// the other fields needed to reuse the URL, which must not reach the logs.
+func representationSelectorNames(r *http.Request) []string {
+	var names []string
+	for name := range r.URL.Query() {
+		if isReadRepresentationSelector(name) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 func hasRepresentationSelectors(r *http.Request) bool {
 	if r.URL.RawQuery == "" {
 		return false

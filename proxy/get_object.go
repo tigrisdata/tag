@@ -136,7 +136,7 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// cache read, no coalescing, no populate (presigned download links commonly
 	// carry these, and #266 made URL-only presigned GETs locally validated).
 	if hasRepresentationSelectors(r) {
-		log.Debug().Str("bucket", bucket).Str("key", key).Str("query", r.URL.RawQuery).Msg("Representation selector, forwarding upstream")
+		log.Debug().Str("bucket", bucket).Str("key", key).Strs("selectors", representationSelectorNames(r)).Msg("Representation selector, forwarding upstream")
 		return s.forwardRepresentationSelector(ctx, w, r, "GetObject", start)
 	}
 
