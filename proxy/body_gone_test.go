@@ -37,6 +37,7 @@ func TestBodyGone(t *testing.T) {
 		{"wrapped empty stream", fmt.Errorf("cache body unavailable: %w", io.EOF), true},
 		{"body shorter than metadata claims", status.Error(codes.InvalidArgument, "invalid range"), true},
 		{"plain empty-body error", errors.New("cache body empty for b/k"), true},
+		{"body length mismatch", fmt.Errorf("%w for b/k", errCacheBodyLengthMismatch), true},
 
 		// Transient — must NOT evict a still-valid entry.
 		{"canceled context", context.Canceled, false},

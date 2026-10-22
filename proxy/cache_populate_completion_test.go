@@ -195,6 +195,107 @@ func TestSetupCacheListener_PublishesWhenHeadersReadyAtRequestCancellation(t *te
 	svc.releaseCacheSlot(1)
 }
 
+// cancelingPipeStreamCache models a remote cache owner that stops consuming a
+// streamed write as soon as its service context is canceled. The retained reader
+// lets the test release the relay if Stop fails to close the pipe on that return.
+type cancelingPipeStreamCache struct {
+	cacheclient.CacheClient
+	readerStarted chan struct{}
+	reader        chan io.Reader
+	writerExited  chan struct{}
+}
+
+func (c *cancelingPipeStreamCache) PutStream(ctx context.Context, _ string, r io.Reader, _ int64) error {
+	var firstByte [1]byte
+	n, err := r.Read(firstByte[:])
+	if n == 0 {
+		if err != nil {
+			return err
+		}
+		return io.ErrNoProgress
+	}
+
+	c.reader <- r
+	close(c.readerStarted)
+	<-ctx.Done()
+	close(c.writerExited)
+	return ctx.Err()
+}
+
+// TestServiceStopUnblocksFullGetWhenCacheWriterStopsReading covers a full GET
+// whose detached cache writer has begun a pipe read but returns on shutdown
+// without consuming the rest of the body. The HTTP response must finish normally;
+// Stop must then join the abandoned relay rather than waiting on its blocked write.
+func TestServiceStopUnblocksFullGetWhenCacheWriterStopsReading(t *testing.T) {
+	const body = "cache relay has more bytes than its reader consumes"
+
+	cfg := config.NewDefault()
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Broadcast.ChunkSize = 8
+	client := &cancelingPipeStreamCache{
+		CacheClient:   cacheclient.NewMemoryCache(),
+		readerStarted: make(chan struct{}),
+		reader:        make(chan io.Reader, 1),
+		writerExited:  make(chan struct{}),
+	}
+	cacheStore := cache.NewCacheWithClient(client, &cfg.Cache)
+	forwarder := &mockForwarder{
+		doRequestFunc: func(context.Context, *http.Request, string, string) (*http.Response, error) {
+			return cacheableGetResponse(body, `"pipe-shutdown-etag"`), nil
+		},
+	}
+	svc := NewService(forwarder, cacheStore, cfg)
+	recorder := httptest.NewRecorder()
+	requestDone := make(chan error, 1)
+	go func() {
+		requestDone <- svc.HandleGetObject(recorder, httptest.NewRequest(http.MethodGet, "/pipe-bucket/pipe-key", nil))
+	}()
+
+	select {
+	case <-client.readerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("full GET cache writer did not start reading the body")
+	}
+	select {
+	case err := <-requestDone:
+		if err != nil {
+			t.Fatalf("HandleGetObject: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("full GET response did not finish while cache writer was held")
+	}
+	if recorder.Code != http.StatusOK || recorder.Body.String() != body {
+		t.Fatalf("full GET response = (%d, %q), want (200, %q)", recorder.Code, recorder.Body.String(), body)
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		svc.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-client.writerExited:
+	case <-time.After(time.Second):
+		t.Fatal("cache writer did not return after service cancellation")
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		// The writer has returned, so no cache operation owns this reader any more.
+		// Drain it only to unblock a failing implementation and leave no goroutine
+		// behind after reporting the missing pipe-close handoff.
+		if _, err := io.Copy(io.Discard, <-client.reader); err != nil {
+			t.Errorf("drain abandoned test reader: %v", err)
+		}
+		select {
+		case <-stopDone:
+		case <-time.After(time.Second):
+			t.Fatal("Service.Stop remained blocked after the abandoned reader was drained")
+		}
+		t.Fatal("Service.Stop did not join after the cache writer returned")
+	}
+}
+
 // lateFailingStreamCache waits until the test has observed the client handler
 // return, then fails the stream write. This forces the cache error to arrive
 // after broadcaster completion rather than before the upstream EOF path returns.

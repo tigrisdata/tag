@@ -95,7 +95,7 @@ on:
 # The delete-bucket step below removes the run's bucket and sweeps any leaked ones.
 
 env:
-  GO_VERSION: "1.24.2"
+  GO_VERSION: "1.27.2"
 
 jobs:
   warp-benchmarks:

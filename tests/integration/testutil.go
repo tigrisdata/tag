@@ -28,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
+	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/ocache/embedded"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
@@ -497,6 +498,9 @@ func (e *TestEnvironment) Close() {
 	if e.TAGServer != nil {
 		e.TAGServer.Close()
 	}
+	if e.Service != nil {
+		e.Service.Stop()
+	}
 	if e.UpstreamServer != nil {
 		e.UpstreamServer.Close()
 	}
@@ -851,12 +855,13 @@ func setupSharedCache() error {
 		return fmt.Errorf("failed to get free port for gRPC: %w", err)
 	}
 
-	// Initialize embedded cache
+	// Initialize the single-node test cache with a loopback memberlist address;
+	// tests do not need remote peers or host-private IP discovery.
 	embeddedCache, err := embedded.New(&embedded.Config{
 		DiskPath:    tempDir,
 		TTL:         config.DefaultCacheTTL,
 		NodeID:      "test-node",
-		ClusterAddr: fmt.Sprintf(":%d", clusterPort),
+		ClusterAddr: fmt.Sprintf("127.0.0.1:%d", clusterPort),
 		GRPCAddr:    fmt.Sprintf(":%d", grpcPort),
 	})
 	if err != nil {
@@ -995,6 +1000,11 @@ func newSigningKeysUpstreamHandler(t *testing.T, backend *s3mem.Backend) http.Ha
 // and local auth enabled. Uses shared embedded cache for cache-hit testing.
 func NewTestEnvironmentWithTransparentAuth(t *testing.T, upstreamHandler http.HandlerFunc) *TestEnvironment {
 	t.Helper()
+	return newTestEnvironmentWithTransparentAuthCacheClient(t, upstreamHandler, sharedEmbeddedCache)
+}
+
+func newTestEnvironmentWithTransparentAuthCacheClient(t *testing.T, upstreamHandler http.HandlerFunc, cacheClient cacheclient.CacheClient) *TestEnvironment {
+	t.Helper()
 
 	if sharedEmbeddedCache == nil {
 		panic("Shared embedded cache not initialized - TestMain must run first")
@@ -1049,7 +1059,7 @@ func NewTestEnvironmentWithTransparentAuth(t *testing.T, upstreamHandler http.Ha
 		},
 	}
 
-	testCache := cache.NewCacheWithClient(sharedEmbeddedCache, &cfg.Cache)
+	testCache := cache.NewCacheWithClient(cacheClient, &cfg.Cache)
 
 	forwarder := proxy.NewForwarder(credStore, cfg.Upstream.Endpoint, cfg.Upstream.Region, cfg.Upstream.MaxIdleConnsPerHost, proxySigner, localAuth)
 	service := proxy.NewService(forwarder, testCache, cfg)

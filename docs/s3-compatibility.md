@@ -53,9 +53,17 @@ All bucket operations support both `/{bucket}` and `/{bucket}/` path forms for c
 | InitiateMultipartUpload | POST   | `/{bucket}/{key}?uploads`               |                                            |
 | UploadPart              | PUT    | `/{bucket}/{key}?uploadId=&partNumber=` |                                            |
 | UploadPartCopy          | PUT    | `/{bucket}/{key}?uploadId=&partNumber=` | Detected via `X-Amz-Copy-Source` header    |
-| CompleteMultipartUpload | POST   | `/{bucket}/{key}?uploadId=`             | Idempotent — successful completions cached |
+| CompleteMultipartUpload | POST   | `/{bucket}/{key}?uploadId=`             |                                            |
 | AbortMultipartUpload    | DELETE | `/{bucket}/{key}?uploadId=`             |                                            |
 | ListParts               | GET    | `/{bucket}/{key}?uploadId=`             |                                            |
+
+## Response Delivery
+
+The direct-streaming path forwards the upstream status and headers before streaming the body. If copying a response body fails after headers are sent, TAG aborts the downstream response instead of completing its framing around the received prefix. Clients may see a transport error or body-read error. TAG does not append S3 error XML after commitment.
+
+For directly streamed PUT and DELETE operations, an upstream 2xx still triggers cache invalidation or a tiered marker when caching is enabled, even if response delivery fails. A delivery error alone does not establish that the mutation failed.
+
+This describes the direct-streaming path. Operations that capture an upstream body for XML processing use a separate response path.
 
 ## AWS Chunked Transfer Encoding
 
@@ -71,18 +79,20 @@ TAG adds a caching layer for read operations. The `X-Cache` response header indi
 
 | Value      | Meaning                                                  |
 | ---------- | -------------------------------------------------------- |
-| `HIT`      | Served entirely from cache                               |
+| `HIT`      | A cache entry was selected to serve the request; block streams may also recover a verified upstream remainder |
 | `MISS`     | Fetched from Tigris and cached                           |
 | `BYPASS`   | Caching skipped (e.g., conditional request returned 304) |
 | `DISABLED` | Caching is turned off                                    |
 
 Key caching behaviors:
 
-- **Request coalescing** — Multiple concurrent GETs for the same object are coalesced into a single upstream fetch using a broadcast/subscriber pattern.
+- **Request coalescing** — Multiple concurrent GETs for the same object are coalesced into a single upstream fetch using a broadcast/subscriber pattern. For live requests, a fetch failure before response commitment returns TAG's existing S3 error response to waiting GETs; errors after commitment terminate the stream.
 - **Range requests** — If the full object is cached, range requests are served from cache. On a range cache miss, the range is served directly from Tigris while a background fetch populates the cache with the full object.
+- **Incomplete cached ranges** — TAG checks that a cached range supplies the requested byte count. A committed block GET can recover an unwritten suffix only when the upstream ETag and exact range match. `X-Cache: HIT` is committed before the body streams, so it describes the cache-backed request, not per-byte provenance or successful completion. If the ETag changes, TAG rejects the suffix without appending it; the already-sent 200 status and Content-Length remain, so the client may receive only the cached prefix while the handler reports an error. A whole-object cached Range response commits its 206 when the first nonempty cache chunk arrives and cannot restart upstream; a later positive short read returns a handler error while its 206 and Content-Length remain. Client write failures are not retried upstream.
 - **Conditional requests** — `If-None-Match` and `If-Modified-Since` are evaluated against cached metadata and can return 304 without hitting Tigris.
-- **Write-through invalidation** — PUT, DELETE, CopyObject, and DeleteObjects invalidate the cache _before_ forwarding to Tigris to prevent stale reads.
+- **Write-through invalidation** — In proxy mode, PUT, DELETE, CopyObject, and DeleteObjects invalidate affected cache entries before forwarding. For cache-enabled DeleteObjects requests with a nonempty parsed key list, TAG completes an upstream 2xx only after the post-success invalidation attempts return, bounded by a 10-second fence timeout; a fence that does not converge in time is logged as a warning and the 2xx is still returned.
 - **Tombstone protection** — A short-lived tombstone is written on DELETE to prevent in-flight background cache writes from resurrecting deleted objects.
+- **Multipart completion replay** — A fully captured successful response is cached for five seconds when TAG can identify a caller. A replay must match the exact bucket, object key, and upload ID and pass local validation for the saved access key; transparent mode also checks the caller's current bucket authorization. Entries without a saved caller identity are treated as misses; other requests follow normal forwarding and authorization.
 
 ## Addressing Style
 
@@ -94,7 +104,7 @@ All requests must be signed with AWS Signature Version 4 (header-based).
 
 In **transparent proxy mode** (default), TAG forwards the client's original Authorization header as-is and adds proxy headers (`X-Tigris-Forwarded-Host`, etc.) so Tigris validates the signature against the original host. No local credential store is needed.
 
-In **signing mode**, TAG validates the incoming signature against its credential store, then re-signs the request with the same credentials for the Tigris upstream endpoint.
+In **signing mode**, TAG validates the incoming signature against its credential store, then re-signs the request with the same credentials for the Tigris upstream endpoint. During SigV4 signing, TAG trims surrounding whitespace and collapses runs of ASCII spaces in each signed header value. This normalization affects signature calculation only; forwarded metadata retains its interior spacing and tabs.
 
 Presigned URL authentication (`X-Amz-Algorithm` query parameter) is supported for request validation.
 

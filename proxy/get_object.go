@@ -62,6 +62,13 @@ type lazyCommitWriter struct {
 	meta      *cache.CachedObjectMeta
 	written   int64
 	committed bool
+
+	// A range response needs different headers and status than a full-body
+	// response, but it has the same lazy-commit contract.
+	rangeResponse bool
+	rangeStart    int64
+	rangeEnd      int64
+	rangeTotal    int64
 }
 
 func (cw *lazyCommitWriter) Write(p []byte) (int, error) {
@@ -69,14 +76,23 @@ func (cw *lazyCommitWriter) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 	if !cw.committed {
-		cw.meta.WriteHeaders(cw.w)
-		writeCacheStatus(cw.w, XCacheHit)
-		cw.w.WriteHeader(cw.meta.StatusCode)
+		if cw.rangeResponse {
+			cw.meta.WriteHeaders(cw.w, cache.WithRangeHeaders(cw.rangeStart, cw.rangeEnd, cw.rangeTotal))
+			writeCacheStatus(cw.w, XCacheHit)
+			cw.w.WriteHeader(http.StatusPartialContent)
+		} else {
+			cw.meta.WriteHeaders(cw.w)
+			writeCacheStatus(cw.w, XCacheHit)
+			cw.w.WriteHeader(cw.meta.StatusCode)
+		}
 		cw.committed = true
 	}
 
 	n, err := cw.w.Write(p)
 	cw.written += int64(n)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
 	return n, err
 }
 
@@ -112,6 +128,16 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		metrics.RecordRequest("GetObject", "auth_error", metrics.SourceLocal, time.Since(start).Seconds())
 		return err
+	}
+
+	// A representation selector (?versionId, ?partNumber, response-* header
+	// overrides) asks for something the cache does not hold: the cache has only
+	// the current object under its own headers. Forward upstream as-is — no
+	// cache read, no coalescing, no populate (presigned download links commonly
+	// carry these, and #266 made URL-only presigned GETs locally validated).
+	if hasRepresentationSelectors(r) {
+		log.Debug().Str("bucket", bucket).Str("key", key).Strs("selectors", representationSelectorNames(r)).Msg("Representation selector, forwarding upstream")
+		return s.forwardRepresentationSelector(ctx, w, r, "GetObject", start)
 	}
 
 	// 2. Check cache (fast path) - now also works for range requests!
@@ -254,14 +280,14 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	broadcaster, isFirstCaller := s.broadcastManager.GetOrCreate(bcastKey)
 
 	// Update active broadcasts metric
-	metrics.SetActiveBroadcasts(s.broadcastManager.ActiveCount())
+	s.setActiveBroadcasts()
 
 	if isFirstCaller {
 		// I'm the fetcher - stream from upstream and broadcast to all listeners
 		metrics.RecordBroadcastFetch()
 		defer func() {
 			s.broadcastManager.Remove(bcastKey)
-			metrics.SetActiveBroadcasts(s.broadcastManager.ActiveCount())
+			s.setActiveBroadcasts()
 		}()
 		return s.fetchAndBroadcast(ctx, w, r, bucket, key, accessKey, secretKey, broadcaster, start, xCache)
 	}
@@ -269,12 +295,16 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 	// I'm a listener - try to subscribe
 	listener := broadcaster.Subscribe()
 	if listener == nil {
-		// Streaming already started (no late joiners) - start own fetch
+		// Streaming already started (no late joiners). This request needs an
+		// independent broadcast: sharing a late key would let multiple upstream
+		// producers send different response headers and chunks to the same listeners.
 		metrics.RecordBroadcastFetch()
-		newBroadcaster, _ := s.broadcastManager.GetOrCreate(bcastKey + ":late")
+		newBroadcaster := broadcast.NewBroadcaster(s.config.Broadcast.ChannelBuffer)
+		s.activeIndependentBroadcasts.Add(1)
+		s.setActiveBroadcasts()
 		defer func() {
-			s.broadcastManager.Remove(bcastKey + ":late")
-			metrics.SetActiveBroadcasts(s.broadcastManager.ActiveCount())
+			s.activeIndependentBroadcasts.Add(-1)
+			s.setActiveBroadcasts()
 		}()
 		return s.fetchAndBroadcast(ctx, w, r, bucket, key, accessKey, secretKey, newBroadcaster, start, xCache)
 	}
@@ -307,11 +337,14 @@ func (s *Service) fetchAndBroadcast(
 	// Subscribe ourselves as the first listener
 	listener := broadcaster.Subscribe()
 
-	// Start the upstream fetch in a goroutine
-	go func() {
-		err := s.streamFromUpstream(ctx, r, bucket, key, accessKey, secretKey, broadcaster)
+	// Start the upstream fetch in a service-owned task. It is also bound to
+	// the request context, so client cancellation retains its current behavior.
+	if !s.startBackgroundTask(ctx, func(fetchCtx context.Context) {
+		err := s.streamFromUpstream(fetchCtx, r, bucket, key, accessKey, secretKey, broadcaster)
 		broadcaster.Complete(err)
-	}()
+	}) {
+		broadcaster.Complete(context.Canceled)
+	}
 
 	// Receive chunks like any other listener
 	err := s.writeChunksToResponse(ctx, w, listener, xCache)
@@ -341,7 +374,7 @@ func (s *Service) fetchAndBroadcast(
 		<-broadcaster.Done() // the fetch goroutine above records the upstream outcome
 		if upErr := broadcaster.Error(); upErr == nil ||
 			errors.Is(upErr, context.Canceled) || errors.Is(upErr, context.DeadlineExceeded) {
-			if _, tok, found, gerr := s.cache.GetMetaWithVersion(context.Background(), bucket, key); gerr == nil && !found {
+			if _, tok, found, gerr := s.cache.GetMetaWithVersion(s.workers.ctx, bucket, key); gerr == nil && !found {
 				// Absent-gated, carrying the absence TOKEN (ocache v1.13.0):
 				// the warm is ordered against a fenced delete landing after
 				// this look, where a bare put-if-absent would recreate over it.
@@ -424,12 +457,37 @@ func (s *Service) streamFromUpstream(
 	if chunkSize <= 0 {
 		chunkSize = broadcast.DefaultChunkSize
 	}
-	buf := make([]byte, chunkSize)
+	// Lease the first read buffer from the broadcast pool. BroadcastOwned transfers
+	// a successful read to one listener and leaves this lease with us only when no
+	// listener accepted it, so a disconnected broadcast can keep reusing it.
+	// Keep the existing reusable input path for larger configured chunks: those
+	// buffers are intentionally not pooled, and leasing a fresh one per read would
+	// turn a single reusable allocation into one allocation per chunk.
+	ownedInput := chunkSize <= broadcast.DefaultChunkSize
+	var buf []byte
+	if ownedInput {
+		buf = broadcast.GetChunkBuf(chunkSize)
+	} else {
+		buf = make([]byte, chunkSize)
+	}
+	defer func() {
+		broadcast.PutChunkBuf(buf)
+	}()
 
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
-			broadcaster.Broadcast(buf[:n])
+			if ownedInput && broadcaster.BroadcastOwned(buf[:n]) {
+				// The first successful listener now owns this buffer. A fresh lease
+				// is needed before the next read so queued listeners cannot observe
+				// reuse.
+				buf = nil
+				if readErr == nil {
+					buf = broadcast.GetChunkBuf(chunkSize)
+				}
+			} else if !ownedInput {
+				broadcaster.Broadcast(buf[:n])
+			}
 		}
 
 		if readErr == io.EOF {
@@ -554,6 +612,19 @@ func (s *Service) writeChunksToResponse(
 		} else {
 			chunk.Release() // Return zero-length pooled buffers
 		}
+	}
+
+	// The channel closed without an error chunk. That is a clean completion
+	// unless the listener's queue was full when it failed (slow-consumer
+	// disconnect or a failed completion), in which case the broadcaster could
+	// not queue the error chunk and only recorded it on the listener. Every
+	// queued data chunk has already been written above, in order; surface the
+	// error now exactly as if it had arrived as a chunk.
+	if err := listener.Err(); err != nil {
+		if err == broadcast.ErrSlowConsumer {
+			metrics.RecordBroadcastSlowConsumer()
+		}
+		return err
 	}
 
 	// Zero-byte response or all-empty chunks: commit headers now
@@ -693,59 +764,58 @@ func (s *Service) serveRangeFromCache(
 
 	rng := ranges[0]
 
-	// Probe the body BEFORE committing 206 status + headers: stream the range
-	// through a pipe and read the first byte. If the versioned body is not
-	// resolvable, no headers have been sent yet, so we report served=false and let
-	// the caller forward to upstream instead of streaming a truncated 206 that the
-	// client cannot distinguish from a valid short read.
-	pr, pw := io.Pipe()
-	go func() {
-		streamErr := s.cache.GetRangeStream(ctx, bucket, key, meta.BodyDiscriminator(), rng.start, rng.end, pw)
-		if streamErr != nil {
-			pw.CloseWithError(streamErr)
-		} else {
-			pw.Close()
-		}
-	}()
+	// Stream directly to a writer that commits 206 only when the cache produces
+	// its first nonempty chunk. An absent or empty body therefore leaves the
+	// response untouched for the caller's upstream fallback, without staging the
+	// range through an io.Pipe and a second copy.
+	cw := &lazyCommitWriter{
+		w:             w,
+		meta:          meta,
+		rangeResponse: true,
+		rangeStart:    rng.start,
+		rangeEnd:      rng.end,
+		rangeTotal:    meta.ContentLength,
+	}
+	// The client paces this read (the response writer is its sink), so a size-scaled
+	// bound would punish slow clients; the flat cap matches the server's WriteTimeout.
+	readCtx, cancel := context.WithTimeout(ctx, cacheStreamReadTimeout)
+	defer cancel()
+	streamErr := s.cache.GetRangeStream(readCtx, bucket, key, meta.BodyDiscriminator(), rng.start, rng.end, cw)
 
-	firstByte := make([]byte, 1)
-	n, readErr := pr.Read(firstByte)
-	if readErr != nil {
-		pr.Close()
-		log.Debug().Err(readErr).Str("bucket", bucket).Str("key", key).
+	if streamErr != nil {
+		if !cw.committed {
+			log.Debug().Err(streamErr).Str("bucket", bucket).Str("key", key).
+				Int64("start", rng.start).Int64("end", rng.end).
+				Msg("Range cache body unavailable before headers - falling through to upstream")
+			// Report the underlying error, not just served=false: the caller uses it to
+			// tell a genuinely-missing body (invalidate the orphaned meta) from a
+			// transient failure like a canceled client (leave the entry alone).
+			return false, streamErr
+		}
+
+		if cw.written > 0 {
+			metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
+		}
+		log.Warn().Err(streamErr).Str("bucket", bucket).Str("key", key).
 			Int64("start", rng.start).Int64("end", rng.end).
-			Msg("Range cache body unavailable before headers - falling through to upstream")
-		// Report the underlying error, not just served=false: the caller uses it to
-		// tell a genuinely-missing body (invalidate the orphaned meta) from a
-		// transient failure like a canceled client (leave the entry alone).
-		return false, readErr
+			Msg("Failed to stream range from cache")
+		// Headers already sent, can't return an upstream response after the partial
+		// cache body.
+		metrics.RecordRequestResult("GetObject", metrics.SourceLocal, streamErr, time.Since(startTime).Seconds())
+		return true, streamErr
 	}
 
-	meta.WriteHeaders(w, cache.WithRangeHeaders(rng.start, rng.end, meta.ContentLength))
-	writeCacheStatus(w, XCacheHit)
-	w.WriteHeader(http.StatusPartialContent)
+	if !cw.committed {
+		// Cache.GetRangeStream normally maps a no-write read to ErrNotFound. Keep
+		// this guard in case a future cache implementation returns nil instead.
+		return false, fmt.Errorf("cache range body empty for %s/%s", bucket, key)
+	}
 
-	// Stream range from cache using counting writer to track actual bytes
-	cw := &countingWriter{w: w}
-	cw.Write(firstByte[:n])
-	_, copyErr := io.Copy(cw, pr)
-	pr.Close()
-
-	// Track bytes out (even on error, some bytes may have been written)
 	if cw.written > 0 {
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(cw.written))
 	}
-
-	if copyErr != nil {
-		log.Warn().Err(copyErr).Str("bucket", bucket).Str("key", key).
-			Int64("start", rng.start).Int64("end", rng.end).
-			Msg("Failed to stream range from cache")
-		// Headers already sent, can't return error to client
-		return true, copyErr
-	}
-
 	metrics.RecordRangeFromCacheHit()
-	metrics.RecordRequest("GetObject", "success", metrics.SourceLocal, time.Since(startTime).Seconds())
+	metrics.RecordRequestResult("GetObject", metrics.SourceLocal, nil, time.Since(startTime).Seconds())
 	return true, nil
 }
 
@@ -830,14 +900,14 @@ func (s *Service) handleRangeWithBackgroundCache(
 			// collisions → wrong bytes). Existing entries are filled incrementally by the serve
 			// path under their own captured BlockSize instead.
 			defer func() {
-				if _, found, _ := s.cache.GetMeta(context.Background(), bucket, key); !found {
+				if _, found, _ := s.cache.GetMeta(s.workers.ctx, bucket, key); !found {
 					s.triggerBlockModePopulate(bucket, key, accessKey, secretKey, meta, touched)
 				}
 			}()
 		}
 	} else if cacheable {
 		defer func() {
-			if _, tok, found, gerr := s.cache.GetMetaWithVersion(context.Background(), bucket, key); gerr == nil && !found {
+			if _, tok, found, gerr := s.cache.GetMetaWithVersion(s.workers.ctx, bucket, key); gerr == nil && !found {
 				// Absent-gated, carrying the absence TOKEN (ocache v1.13.0):
 				// the warm is ordered against a fenced delete landing after
 				// this look, where a bare put-if-absent would recreate over it.

@@ -1,7 +1,9 @@
 package broadcast
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -54,6 +56,138 @@ func TestBroadcasterBasicStreaming(t *testing.T) {
 
 	if string(received) != string(testData) {
 		t.Errorf("Expected %q, got %q", testData, received)
+	}
+}
+
+func TestBroadcasterBroadcastOwnedTransfersAndCopies(t *testing.T) {
+	b := NewBroadcaster(DefaultChannelBuffer)
+	first := b.Subscribe()
+	second := b.Subscribe()
+	if first == nil || second == nil {
+		t.Fatal("Subscribe failed")
+	}
+	b.SetHeaders(http.StatusOK, http.Header{})
+
+	const payload = "owned broadcast payload"
+	data := GetChunkBuf(len(payload))
+	copy(data, payload)
+	if !b.BroadcastOwned(data) {
+		t.Fatal("BroadcastOwned reported that no listener accepted the data")
+	}
+	b.Complete(nil)
+
+	firstChunk := <-first.Chunks()
+	secondChunk := <-second.Chunks()
+	if firstChunk.Err != nil || secondChunk.Err != nil {
+		t.Fatalf("unexpected terminal chunk: first=%v second=%v", firstChunk.Err, secondChunk.Err)
+	}
+	if &firstChunk.Data[0] != &data[0] {
+		t.Fatal("first listener did not receive the owned input buffer")
+	}
+	if &secondChunk.Data[0] == &data[0] {
+		t.Fatal("second listener shares the first listener's input buffer")
+	}
+	firstChunk.Data[0] = 'O'
+	if got := secondChunk.Data[0]; got != payload[0] {
+		t.Fatalf("second listener data changed with first listener: got %q, want %q", got, payload[0])
+	}
+	firstChunk.Release()
+	secondChunk.Release()
+	for chunk := range first.Chunks() {
+		chunk.Release()
+	}
+	for chunk := range second.Chunks() {
+		chunk.Release()
+	}
+}
+
+func TestBroadcasterBroadcastOwnedPreservesInputForLaterListener(t *testing.T) {
+	b := NewBroadcaster(1)
+	slow := b.Subscribe()
+	fast := b.Subscribe()
+	if slow == nil || fast == nil {
+		t.Fatal("Subscribe failed")
+	}
+	b.SetHeaders(http.StatusOK, http.Header{})
+
+	// Fill both listeners, then consume only the second one. The first listener
+	// must be disconnected without taking ownership of the next input buffer.
+	b.Broadcast([]byte("queued"))
+	queued := <-fast.Chunks()
+	queued.Release()
+
+	const payload = "later listener owns this"
+	data := GetChunkBuf(len(payload))
+	copy(data, payload)
+	if !b.BroadcastOwned(data) {
+		t.Fatal("BroadcastOwned did not transfer to the available listener")
+	}
+	b.Complete(nil)
+
+	owned := <-fast.Chunks()
+	if owned.Err != nil {
+		t.Fatalf("fast listener got terminal chunk before data: %v", owned.Err)
+	}
+	if &owned.Data[0] != &data[0] {
+		t.Fatal("available listener did not receive the caller-owned buffer")
+	}
+	if string(owned.Data) != payload {
+		t.Fatalf("fast listener data = %q, want %q", owned.Data, payload)
+	}
+	owned.Release()
+	for chunk := range fast.Chunks() {
+		chunk.Release()
+	}
+	for chunk := range slow.Chunks() {
+		chunk.Release()
+	}
+	if got := b.ListenerCount(); got != 1 {
+		t.Fatalf("active listener count = %d, want 1", got)
+	}
+}
+
+func TestBroadcasterBroadcastOwnedReturnsInputWhenUnaccepted(t *testing.T) {
+	b := NewBroadcaster(DefaultChannelBuffer)
+	const payload = "no listeners"
+	data := GetChunkBuf(len(payload))
+	copy(data, payload)
+
+	if b.BroadcastOwned(data) {
+		t.Fatal("BroadcastOwned reported ownership transfer without a listener")
+	}
+	if !b.IsStreaming() {
+		t.Fatal("BroadcastOwned did not mark the broadcast as streaming")
+	}
+	if string(data) != payload {
+		t.Fatalf("caller-owned data changed: got %q, want %q", data, payload)
+	}
+	PutChunkBuf(data)
+	b.Complete(nil)
+}
+
+func TestBroadcasterBroadcastCopiesCallerData(t *testing.T) {
+	b := NewBroadcaster(DefaultChannelBuffer)
+	listener := b.Subscribe()
+	if listener == nil {
+		t.Fatal("Subscribe failed")
+	}
+	b.SetHeaders(http.StatusOK, http.Header{})
+
+	data := []byte("copy before caller reuse")
+	b.Broadcast(data)
+	data[0] = 'X'
+	b.Complete(nil)
+
+	chunk := <-listener.Chunks()
+	if chunk.Err != nil {
+		t.Fatalf("unexpected terminal chunk: %v", chunk.Err)
+	}
+	if got := string(chunk.Data); got != "copy before caller reuse" {
+		t.Fatalf("listener data = %q, want original caller data", got)
+	}
+	chunk.Release()
+	for chunk := range listener.Chunks() {
+		chunk.Release()
 	}
 }
 
@@ -165,6 +299,7 @@ func TestBroadcasterSlowConsumerDisconnect(t *testing.T) {
 				return
 			}
 			fastReceived = append(fastReceived, chunk.Data...)
+			chunk.Release()
 		}
 	}()
 
@@ -189,12 +324,16 @@ func TestBroadcasterSlowConsumerDisconnect(t *testing.T) {
 				return
 			}
 			received += len(chunk.Data)
+			chunk.Release()
 		}
-		// Channel closed without error chunk (buffer was full)
+		// The queue was full when the broadcaster disconnected this listener, so
+		// there was no room for an error chunk: the terminal error is only
+		// recorded on the listener. A nil Err() here is the failure this test
+		// is meant to catch.
 		slowResult <- struct {
 			err          error
 			receivedData int
-		}{nil, received}
+		}{slowListener.Err(), received}
 	}()
 
 	// Broadcast many chunks quickly to overflow slow consumer's buffer
@@ -209,16 +348,12 @@ func TestBroadcasterSlowConsumerDisconnect(t *testing.T) {
 
 	<-fastDone
 
-	// Slow consumer should either:
-	// 1. Get ErrSlowConsumer if error chunk was sent before buffer filled
-	// 2. Get channel closed with partial data (buffer was completely full when disconnected)
+	// A slow consumer must receive the terminal error even when its queue was full.
 	select {
 	case result := <-slowResult:
-		if result.err != nil && result.err != ErrSlowConsumer {
-			t.Errorf("Slow consumer got unexpected error: %v", result.err)
+		if result.err != ErrSlowConsumer {
+			t.Errorf("Slow consumer error = %v, want %v", result.err, ErrSlowConsumer)
 		}
-		// Either ErrSlowConsumer or nil (channel closed) is acceptable
-		// The important thing is that slow consumer was disconnected (received less data than fast)
 		t.Logf("Slow consumer received %d bytes, err=%v", result.receivedData, result.err)
 	case <-time.After(2 * time.Second):
 		t.Error("Timeout waiting for slow consumer to finish")
@@ -277,6 +412,147 @@ func TestBroadcasterHeadersWinOverConcurrentCancellation(t *testing.T) {
 	}
 	if got := gotHeaders.Get("ETag"); got != `"ready"` {
 		t.Errorf("ETag = %q, want %q", got, `"ready"`)
+	}
+}
+
+type observedHeaderWaitContext struct {
+	done        chan struct{}
+	entered     chan struct{}
+	cancelOnce  sync.Once
+	enteredOnce sync.Once
+}
+
+func newObservedHeaderWaitContext() *observedHeaderWaitContext {
+	return &observedHeaderWaitContext{done: make(chan struct{}), entered: make(chan struct{})}
+}
+
+func (c *observedHeaderWaitContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (c *observedHeaderWaitContext) Done() <-chan struct{} {
+	c.enteredOnce.Do(func() { close(c.entered) })
+	return c.done
+}
+
+func (c *observedHeaderWaitContext) Err() error {
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+
+func (c *observedHeaderWaitContext) Value(any) any { return nil }
+
+func (c *observedHeaderWaitContext) cancel() { c.cancelOnce.Do(func() { close(c.done) }) }
+
+func TestBroadcasterCancellationBeforePreHeaderCompletion(t *testing.T) {
+	b := NewBroadcaster(DefaultChannelBuffer)
+	listener := b.Subscribe()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	b.Complete(errors.New("upstream transport failed"))
+
+	_, _, err := listener.WaitForHeaders(ctx)
+	if err != context.Canceled {
+		t.Errorf("WaitForHeaders error = %v, want context.Canceled after cancellation before completion", err)
+	}
+}
+
+func TestBroadcasterCompletionBeforeHeadersWakesExistingAndLateListeners(t *testing.T) {
+	b := NewBroadcaster(DefaultChannelBuffer)
+	first := b.Subscribe()
+	second := b.Subscribe()
+	if first == nil || second == nil {
+		t.Fatal("Subscribe returned nil before streaming")
+	}
+
+	upstreamErr := errors.New("upstream transport failed")
+	type headerWait struct {
+		name   string
+		ctx    *observedHeaderWaitContext
+		result chan error
+	}
+	startHeaderWait := func(name string, listener *Listener) headerWait {
+		ctx := newObservedHeaderWaitContext()
+		t.Cleanup(ctx.cancel)
+		result := make(chan error, 1)
+		go func() {
+			_, _, err := listener.WaitForHeaders(ctx)
+			result <- err
+		}()
+		return headerWait{name: name, ctx: ctx, result: result}
+	}
+	waitUntilWaiting := func(wait headerWait) {
+		t.Helper()
+		select {
+		case <-wait.ctx.entered:
+		case <-time.After(time.Second):
+			wait.ctx.cancel()
+			t.Fatalf("%s WaitForHeaders did not start", wait.name)
+		}
+	}
+	waitForPreHeaderError := func(wait headerWait) {
+		t.Helper()
+		select {
+		case err := <-wait.result:
+			if err != upstreamErr {
+				t.Errorf("%s WaitForHeaders error = %v, want original error %v", wait.name, err, upstreamErr)
+			}
+			if wait.ctx.Err() != nil {
+				t.Errorf("%s context was canceled before WaitForHeaders returned", wait.name)
+			}
+		case <-time.After(time.Second):
+			if wait.ctx.Err() != nil {
+				t.Errorf("%s context was canceled before the bounded wait completed", wait.name)
+			}
+			wait.ctx.cancel()
+			if err := <-wait.result; !errors.Is(err, context.Canceled) {
+				t.Errorf("%s cleanup WaitForHeaders error = %v, want context.Canceled", wait.name, err)
+			}
+			t.Errorf("%s WaitForHeaders did not return the upstream error while its context remained live", wait.name)
+		}
+		wait.ctx.cancel()
+	}
+
+	firstWait := startHeaderWait("first", first)
+	secondWait := startHeaderWait("second", second)
+	waitUntilWaiting(firstWait)
+	waitUntilWaiting(secondWait)
+	b.Complete(upstreamErr)
+
+	for i, listener := range []*Listener{first, second} {
+		chunk, ok := <-listener.Chunks()
+		if !ok {
+			t.Fatalf("listener %d chunk channel closed without the completion error", i)
+		}
+		if chunk.Err != upstreamErr {
+			t.Errorf("listener %d chunk error = %v, want original error %v", i, chunk.Err, upstreamErr)
+		}
+		if _, ok := <-listener.Chunks(); ok {
+			t.Errorf("listener %d chunk channel remained open after completion", i)
+		}
+	}
+
+	waitForPreHeaderError(firstWait)
+	waitForPreHeaderError(secondWait)
+
+	late := b.Subscribe()
+	if late == nil {
+		t.Fatal("Subscribe returned nil after an unstreamed completion")
+	}
+	lateWait := startHeaderWait("late", late)
+	waitForPreHeaderError(lateWait)
+	select {
+	case chunk, ok := <-late.Chunks():
+		if !ok || chunk.Err != upstreamErr {
+			t.Errorf("late listener chunk = %#v, open=%v, want the original completion error", chunk, ok)
+		}
+		if _, ok := <-late.Chunks(); ok {
+			t.Error("late listener chunk channel remained open after completion")
+		}
+	case <-time.After(time.Second):
+		t.Error("late listener did not receive the completed broadcast's terminal chunk")
 	}
 }
 
@@ -450,4 +726,208 @@ func TestConcurrentRequestsCoalescing(t *testing.T) {
 	}
 
 	t.Logf("Coalesced %d requests into %d fetches (%d subscribed)", numRequests, fetchCount, subscribedCount)
+}
+
+// A slow-consumer disconnect against a full queue must never cost the consumer
+// a data chunk: every chunk that was queued is delivered, in order, and the
+// disconnect is then surfaced via Err(). The old behaviour displaced the OLDEST
+// queued chunk to make room for the error chunk, which handed the consumer
+// chunk k+1 at chunk k's offset (a hole in the body) before it learned anything
+// was wrong.
+func TestBroadcasterSlowConsumerDeliversQueuedChunksInOrder(t *testing.T) {
+	const buf = 4
+	b := NewBroadcaster(buf)
+	l := b.Subscribe()
+	if l == nil {
+		t.Fatal("Subscribe failed")
+	}
+	b.SetHeaders(http.StatusOK, http.Header{})
+
+	// Fill the queue exactly, then overflow it by one: the listener is now
+	// disconnected with a full buffer and no room for an error chunk.
+	for i := 0; i < buf+1; i++ {
+		b.Broadcast([]byte{byte(i)})
+	}
+	if n := b.ListenerCount(); n != 0 {
+		t.Fatalf("ListenerCount = %d after overflow, want 0 (listener disconnected)", n)
+	}
+
+	var got []byte
+	var errChunk error
+	for chunk := range l.Chunks() {
+		if chunk.Err != nil {
+			errChunk = chunk.Err
+			continue
+		}
+		got = append(got, chunk.Data...)
+		chunk.Release()
+	}
+
+	want := []byte{0, 1, 2, 3}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("queued chunks delivered = %v, want %v (no hole, no reorder)", got, want)
+	}
+	if errChunk != nil {
+		t.Fatalf("unexpected error chunk %v: the queue was full, so none could be sent", errChunk)
+	}
+	if err := l.Err(); err != ErrSlowConsumer {
+		t.Fatalf("Err() = %v, want %v", err, ErrSlowConsumer)
+	}
+
+	// Completing afterwards must not resurrect or re-close the disconnected listener.
+	b.Complete(nil)
+	if err := l.Err(); err != ErrSlowConsumer {
+		t.Fatalf("Err() after Complete = %v, want %v", err, ErrSlowConsumer)
+	}
+}
+
+// A failed completion against a full queue keeps every queued chunk and
+// surfaces the completion error via Err(); when the queue has room the error
+// also arrives as a chunk. A clean completion leaves Err() nil either way.
+func TestBroadcasterCompleteErrorSurvivesFullQueue(t *testing.T) {
+	upstreamErr := errors.New("upstream cut")
+
+	t.Run("full queue", func(t *testing.T) {
+		b := NewBroadcaster(2)
+		l := b.Subscribe()
+		b.SetHeaders(http.StatusOK, http.Header{})
+		b.Broadcast([]byte("a"))
+		b.Broadcast([]byte("b"))
+		b.Complete(upstreamErr)
+
+		var got []byte
+		var errChunk error
+		for chunk := range l.Chunks() {
+			if chunk.Err != nil {
+				errChunk = chunk.Err
+				continue
+			}
+			got = append(got, chunk.Data...)
+			chunk.Release()
+		}
+		if string(got) != "ab" {
+			t.Fatalf("data = %q, want %q", got, "ab")
+		}
+		if errChunk != nil {
+			t.Fatalf("unexpected error chunk %v on a full queue", errChunk)
+		}
+		if err := l.Err(); err != upstreamErr {
+			t.Fatalf("Err() = %v, want %v", err, upstreamErr)
+		}
+	})
+
+	t.Run("queue has room", func(t *testing.T) {
+		b := NewBroadcaster(4)
+		l := b.Subscribe()
+		b.SetHeaders(http.StatusOK, http.Header{})
+		b.Broadcast([]byte("a"))
+		b.Complete(upstreamErr)
+
+		var got []byte
+		var errChunk error
+		for chunk := range l.Chunks() {
+			if chunk.Err != nil {
+				errChunk = chunk.Err
+				continue
+			}
+			got = append(got, chunk.Data...)
+			chunk.Release()
+		}
+		if string(got) != "a" {
+			t.Fatalf("data = %q, want %q", got, "a")
+		}
+		if errChunk != upstreamErr {
+			t.Fatalf("error chunk = %v, want %v", errChunk, upstreamErr)
+		}
+		if err := l.Err(); err != upstreamErr {
+			t.Fatalf("Err() = %v, want %v", err, upstreamErr)
+		}
+	})
+
+	t.Run("clean completion", func(t *testing.T) {
+		b := NewBroadcaster(2)
+		l := b.Subscribe()
+		b.SetHeaders(http.StatusOK, http.Header{})
+		b.Broadcast([]byte("a"))
+		b.Broadcast([]byte("b"))
+		b.Complete(nil)
+
+		var got []byte
+		for chunk := range l.Chunks() {
+			if chunk.Err != nil {
+				t.Fatalf("unexpected error chunk %v", chunk.Err)
+			}
+			got = append(got, chunk.Data...)
+			chunk.Release()
+		}
+		if string(got) != "ab" {
+			t.Fatalf("data = %q, want %q", got, "ab")
+		}
+		if err := l.Err(); err != nil {
+			t.Fatalf("Err() = %v, want nil", err)
+		}
+	})
+}
+
+// An owned chunk that overflows the only candidate owner's queue is never
+// queued: BroadcastOwned reports no transfer, the caller keeps the buffer, and
+// the disconnected listener still drains every chunk it already owns in order.
+// This pins the merge of ownership transfer with closeWithError: the disconnect
+// path neither displaces a queued chunk nor releases a buffer it does not own.
+func TestBroadcasterBroadcastOwnedSlowConsumerKeepsCallerBuffer(t *testing.T) {
+	const buf = 4
+	b := NewBroadcaster(buf)
+	l := b.Subscribe()
+	if l == nil {
+		t.Fatal("Subscribe failed")
+	}
+	b.SetHeaders(http.StatusOK, http.Header{})
+
+	for i := 0; i < buf; i++ {
+		data := GetChunkBuf(1)
+		data[0] = byte(i)
+		if !b.BroadcastOwned(data) {
+			t.Fatalf("BroadcastOwned(%d) did not transfer ownership with room in the queue", i)
+		}
+	}
+
+	overflow := GetChunkBuf(1)
+	overflow[0] = 0xff
+	if b.BroadcastOwned(overflow) {
+		t.Fatal("BroadcastOwned reported a transfer into a full queue")
+	}
+	if n := b.ListenerCount(); n != 0 {
+		t.Fatalf("ListenerCount = %d after overflow, want 0 (listener disconnected)", n)
+	}
+	if overflow[0] != 0xff {
+		t.Fatalf("caller-owned overflow buffer changed: got %#x, want 0xff", overflow[0])
+	}
+	// The caller still owns the rejected buffer and releases it exactly once.
+	PutChunkBuf(overflow)
+
+	var got []byte
+	var errChunk error
+	for chunk := range l.Chunks() {
+		if chunk.Err != nil {
+			errChunk = chunk.Err
+			continue
+		}
+		got = append(got, chunk.Data...)
+		chunk.Release()
+	}
+	want := []byte{0, 1, 2, 3}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("queued owned chunks delivered = %v, want %v (no hole, no reorder)", got, want)
+	}
+	if errChunk != nil {
+		t.Fatalf("unexpected error chunk %v: the queue was full, so none could be sent", errChunk)
+	}
+	if err := l.Err(); err != ErrSlowConsumer {
+		t.Fatalf("Err() = %v, want %v", err, ErrSlowConsumer)
+	}
+
+	b.Complete(nil)
+	if err := l.Err(); err != ErrSlowConsumer {
+		t.Fatalf("Err() after Complete = %v, want %v", err, ErrSlowConsumer)
+	}
 }

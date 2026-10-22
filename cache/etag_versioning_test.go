@@ -3,6 +3,7 @@ package cache
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	cacheclient "github.com/tigrisdata/ocache/client"
@@ -161,5 +162,76 @@ func TestETagVersionedBody_EmptyETagIsNotCached(t *testing.T) {
 	}
 	if _, err := mem.Get(ctx, MakeBodyKey(bucket, key, "")); err == nil {
 		t.Error("empty-ETag object should not be cached (body present)")
+	}
+}
+
+// The whole-body streaming populate must refuse to commit metadata when the
+// bytes the store consumed do not match the declared Content-Length. The
+// producer normally fails the pipe on a cut stream, but if that signal is lost
+// (a store that treats a short read as EOF, a listener that closed without an
+// error chunk) a committed meta would serve a truncated body under the full
+// length. This guard is the last line of defense.
+func TestPutWithMetaStreamIfVersion_LengthMismatchNotCommitted(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"short body", "12345"},
+		{"long body", "1234567890abc"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := newVersioningTestCache(t)
+			ctx := context.Background()
+			bucket, key := "b", "k-"+tc.name
+
+			meta := &CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"v1"`, ContentLength: 10, StatusCode: 200}
+			wrote, err := c.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, bytes.NewReader([]byte(tc.body)), 60, VersionAny)
+			if err == nil {
+				t.Fatal("PutWithMetaStreamIfVersion: want error for length mismatch, got nil")
+			}
+			if !errors.Is(err, ErrBodyLengthMismatch) {
+				t.Fatalf("error = %v, want ErrBodyLengthMismatch", err)
+			}
+			if wrote {
+				t.Fatal("wrote = true, want false (meta must not be committed)")
+			}
+			if _, found, _ := c.GetMeta(ctx, bucket, key); found {
+				t.Fatal("meta present after length mismatch: truncated body would be served under full Content-Length")
+			}
+		})
+	}
+}
+
+// The exact length commits as before, including an unknown (-1) Content-Length
+// which has nothing to check against.
+func TestPutWithMetaStreamIfVersion_MatchingLengthCommits(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		contentLength int64
+	}{
+		{"exact", 10},
+		{"unknown", -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := newVersioningTestCache(t)
+			ctx := context.Background()
+			bucket, key := "b", "k-"+tc.name
+
+			meta := &CachedObjectMeta{Bucket: bucket, Key: key, ETag: `"v1"`, ContentLength: tc.contentLength, StatusCode: 200}
+			wrote, err := c.PutWithMetaStreamIfVersion(ctx, bucket, key, meta, bytes.NewReader([]byte("1234567890")), 60, VersionAny)
+			if err != nil {
+				t.Fatalf("PutWithMetaStreamIfVersion: %v", err)
+			}
+			if !wrote {
+				t.Fatal("wrote = false, want true")
+			}
+			var buf bytes.Buffer
+			if err := c.GetBodyStream(ctx, bucket, key, meta.ETag, &buf); err != nil {
+				t.Fatalf("GetBodyStream: %v", err)
+			}
+			if buf.String() != "1234567890" {
+				t.Fatalf("body = %q, want %q", buf.String(), "1234567890")
+			}
+		})
 	}
 }

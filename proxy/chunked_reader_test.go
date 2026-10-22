@@ -109,7 +109,7 @@ func TestDecodeChunkedIfNeeded_NotChunked(t *testing.T) {
 	req.Header.Set("X-Amz-Content-Sha256", "abc123hash")
 	req.ContentLength = 5
 
-	gotBody, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req)
+	gotBody, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req, nil)
 
 	if gotChunked {
 		t.Error("chunked = true, want false")
@@ -135,7 +135,7 @@ func TestDecodeChunkedIfNeeded_Chunked(t *testing.T) {
 	req.Header.Set("X-Amz-Decoded-Content-Length", "4")
 	req.ContentLength = int64(len(chunkedBody))
 
-	gotBody, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req)
+	gotBody, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req, nil)
 
 	if !gotChunked {
 		t.Error("chunked = false, want true")
@@ -163,7 +163,7 @@ func TestDecodeChunkedIfNeeded_MissingDecodedLength(t *testing.T) {
 	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
 	// No X-Amz-Decoded-Content-Length header
 
-	_, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req)
+	_, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req, nil)
 
 	if !gotChunked {
 		t.Error("chunked = false, want true")
@@ -212,7 +212,7 @@ func TestDecodeChunkedIfNeeded_ZeroByteChunked(t *testing.T) {
 	req.Header.Set("X-Amz-Decoded-Content-Length", "0")
 	req.ContentLength = int64(len(chunkedBody))
 
-	gotBody, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req)
+	gotBody, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req, nil)
 
 	if !gotChunked {
 		t.Error("chunked = false, want true")
@@ -239,6 +239,7 @@ func TestPrepareForwardedRequest_Chunked(t *testing.T) {
 	req.Header.Set("Content-Encoding", "aws-chunked")
 	req.ContentLength = 2000 // wire size
 
+	req.Header = headersForForwardedSigning(req.Header, true)
 	prepareForwardedRequest(req, 1024, true)
 
 	if req.ContentLength != 1024 {
@@ -257,6 +258,7 @@ func TestPrepareForwardedRequest_ChunkedZeroByte(t *testing.T) {
 	req.Header.Set("X-Amz-Decoded-Content-Length", "0")
 	req.ContentLength = 100 // wire size with chunk framing
 
+	req.Header = headersForForwardedSigning(req.Header, true)
 	prepareForwardedRequest(req, 0, true)
 
 	if req.ContentLength != 0 {
@@ -333,7 +335,7 @@ func TestDecodeChunkedIfNeeded_UnsignedTrailer(t *testing.T) {
 	req.Header.Set("X-Amz-Decoded-Content-Length", "4")
 	req.ContentLength = int64(len(chunkedBody))
 
-	gotBody, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req)
+	gotBody, gotHash, gotLen, gotChunked := decodeChunkedIfNeeded(req, nil)
 
 	if !gotChunked {
 		t.Error("chunked = false, want true")
@@ -376,6 +378,7 @@ func TestPrepareForwardedRequest_PreservesNonAWSContentEncoding(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
 	req.Header.Set("Content-Encoding", "gzip")
 
+	req.Header = headersForForwardedSigning(req.Header, true)
 	prepareForwardedRequest(req, 1024, true)
 
 	if req.Header.Get("Content-Encoding") != "gzip" {
@@ -390,6 +393,7 @@ func TestPrepareForwardedRequest_CombinedContentEncoding(t *testing.T) {
 	req.Header.Set("Content-Encoding", "aws-chunked,gzip")
 	req.ContentLength = 2000
 
+	req.Header = headersForForwardedSigning(req.Header, true)
 	prepareForwardedRequest(req, 1024, true)
 
 	if got := req.Header.Get("Content-Encoding"); got != "gzip" {
@@ -402,6 +406,7 @@ func TestPrepareForwardedRequest_CombinedContentEncodingWithSpaces(t *testing.T)
 	req := httptest.NewRequest(http.MethodPut, "http://localhost/bucket/key", nil)
 	req.Header.Set("Content-Encoding", "aws-chunked , gzip")
 
+	req.Header = headersForForwardedSigning(req.Header, true)
 	prepareForwardedRequest(req, 1024, true)
 
 	if got := req.Header.Get("Content-Encoding"); got != "gzip" {

@@ -8,9 +8,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"strconv"
@@ -18,6 +21,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/s3err"
@@ -201,6 +205,8 @@ func (s *Service) entryServable(ctx context.Context, bucket, key string, meta *c
 	if meta.ContentLength == 0 {
 		return true, nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, cacheReadTimeoutForSize(0))
+	defer cancel()
 	return s.cache.BodyExistsErr(ctx, bucket, key, meta.BodyDiscriminator())
 }
 
@@ -233,6 +239,21 @@ func writePreconditionFailed(w http.ResponseWriter, r *http.Request, meta *cache
 		}
 	}
 	return false
+}
+
+// concretePayloadSHA256 returns a decoded, concrete SigV4 payload digest. Sentinel
+// values and malformed hashes are not body digests and retain their existing handling.
+func concretePayloadSHA256(r *http.Request) []byte {
+	payloadHash := r.Header.Get("X-Amz-Content-Sha256")
+	if payloadHash == "" || payloadHash == "UNSIGNED-PAYLOAD" ||
+		IsStreamingPayload(payloadHash) || len(payloadHash) != sha256.Size*2 {
+		return nil
+	}
+	digest, err := hex.DecodeString(payloadHash)
+	if err != nil {
+		return nil
+	}
+	return digest
 }
 
 // originlessPutSize returns the number of body bytes a PUT declares. For a
@@ -292,7 +313,30 @@ func originlessPlainObject(r *http.Request) bool {
 // mode's semantics: new meta points at the new ETag-keyed body; the old body
 // ages out by TTL.
 func (s *Service) HandleOriginlessPut(w http.ResponseWriter, r *http.Request) error {
-	return s.handleOriginlessPut(w, r, nil)
+	// Origin-less mode evaluates no signatures (the network is the boundary),
+	// so a signed streaming body has no chain to verify against.
+	return s.handleOriginlessPut(w, r, nil, nil, nil)
+}
+
+// chunkVerifierProvider is implemented by forwarders that validate SigV4
+// locally and can therefore hand the engine PUT the chunk chain of a
+// STREAMING-AWS4-HMAC-SHA256-PAYLOAD body it decodes itself.
+type chunkVerifierProvider interface {
+	chunkVerifier(r *http.Request) (*auth.ChunkVerifier, error)
+}
+
+// streamingChunkVerifier returns the chunk-chain verifier for a signed
+// streaming PUT the local tier is about to decode, nil when the body is not
+// signed-streaming or the forwarder holds no signing material.
+func (s *Service) streamingChunkVerifier(r *http.Request) (*auth.ChunkVerifier, error) {
+	if r.Header.Get("X-Amz-Content-Sha256") != StreamingPayloadHash {
+		return nil, nil
+	}
+	p, ok := s.forwarder.(chunkVerifierProvider)
+	if !ok {
+		return nil, nil
+	}
+	return p.chunkVerifier(r)
 }
 
 // putPrior is a metadata snapshot the caller already read, threaded into the
@@ -305,7 +349,7 @@ type putPrior struct {
 	found   bool
 }
 
-func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, prior *putPrior) error {
+func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, prior *putPrior, expectedSHA256 []byte, chunkVerifier *auth.ChunkVerifier) error {
 	start := time.Now()
 	ctx := r.Context()
 	bucket, key := ParseBucketKey(r)
@@ -465,10 +509,16 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 
 	// Unwrap AWS chunked framing so the stored bytes — and the ETag computed over
 	// them — are the object, not the wire encoding. Storing the framing serves
-	// corrupt bytes with a 200, which the caller cannot detect as a miss.
+	// corrupt bytes with a 200, which the caller cannot detect as a miss. With a
+	// chunk verifier, a chunk whose signature does not continue the request's
+	// chain — or a frame that does not fit the declared size this store is
+	// sized by — errors the stream, which takes the reader-error path below:
+	// no commit, staged body reclaimed. An EMPTY declared body is verified
+	// the same way: the store below reads the decoder to EOF, and the
+	// decoder's EOF exists only after the terminal frame verified.
 	reader := r.Body
 	if streaming {
-		reader = io.NopCloser(newAWSChunkedReader(r.Body))
+		reader = io.NopCloser(newVerifyingAWSChunkedReader(r.Body, chunkVerifier, declaredSize))
 	}
 
 	// The stream is limited to declared+1 bytes (the extra byte detects a
@@ -479,7 +529,13 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 	// whose meta never commits is an orphan, and TTL is the backstop when
 	// the delete itself fails.
 	hasher := md5.New()
-	src := &captureReader{r: io.TeeReader(io.LimitReader(reader, declaredSize+1), hasher)}
+	var payloadHasher hash.Hash
+	var digestWriter io.Writer = hasher
+	if expectedSHA256 != nil {
+		payloadHasher = sha256.New()
+		digestWriter = io.MultiWriter(hasher, payloadHasher)
+	}
+	src := &captureReader{r: io.TeeReader(io.LimitReader(reader, declaredSize+1), digestWriter)}
 	ref := cache.NewBodyRef()
 	ttl := int(s.config.Cache.TTL.Seconds())
 	// ONE deferred, panic-safe reclamation for the staged body, in place of a
@@ -517,10 +573,17 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 		// resets, and read-deadline expiries mid-body all classify as the
 		// client misdescribing or abandoning the request: 400
 		// IncompleteBody, never a retryable 500 (and never a server-error
-		// metric for a client fault). Only a cache-side write failure —
-		// putErr with no reader error — propagates.
+		// metric for a client fault). A chunk whose signature fails the
+		// request's chain is the one reader error that is not a transfer
+		// fault but an authentication one: SignatureDoesNotMatch, as S3
+		// answers it. Only a cache-side write failure — putErr with no
+		// reader error — propagates.
 		if src.err != nil {
-			s3err.WriteError(w, r, s3err.ErrIncompleteBody)
+			code := s3err.ErrIncompleteBody
+			if errors.Is(src.err, auth.ErrChunkSignatureMismatch) {
+				code = s3err.ErrSignatureDoesNotMatch
+			}
+			s3err.WriteError(w, r, code)
 			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
 		}
@@ -545,6 +608,11 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 	etag := `"` + hex.EncodeToString(sum) + `"`
 	if wantMD5 != nil && !bytes.Equal(wantMD5, sum) {
 		s3err.WriteError(w, r, s3err.ErrBadDigest)
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
+	}
+	if payloadHasher != nil && !bytes.Equal(payloadHasher.Sum(nil), expectedSHA256) {
+		s3err.WriteError(w, r, s3err.ErrContentSHA256Mismatch)
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return nil
 	}

@@ -239,6 +239,9 @@ func TestCacheBlockMetaOnWrite(t *testing.T) {
 		if meta.BlocksComplete {
 			t.Error("BlocksComplete set, but no block was written - a full serve would stream optimistically over absent blocks")
 		}
+		if meta.RangeBlockSpan != nil {
+			t.Errorf("RangeBlockSpan = %#v, want nil for metadata-only-on-write entry", meta.RangeBlockSpan)
+		}
 	})
 
 	t.Run("refuses a version other than the one written", func(t *testing.T) {

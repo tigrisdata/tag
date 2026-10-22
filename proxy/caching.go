@@ -59,7 +59,50 @@ const (
 	// Used to compute dynamic timeouts for large objects.
 	// 5 MB/s is conservative for local disk writes.
 	minCacheWriteThroughput = 5 * 1024 * 1024 // 5 MB/s
+
+	// cacheReadTimeout is the floor for a single cache read (a presence probe or
+	// the first bytes of a body). Cache reads go to remote peer pods over gRPC,
+	// so it must absorb a cluster-wide hiccup without failing healthy reads.
+	cacheReadTimeout = 30 * time.Second
+
+	// minCacheReadThroughput is the per-byte allowance added to cacheReadTimeout.
+	// Only buffered reads use it (the client never paces those), so it is a
+	// generous lower bound on peer-to-pod gRPC throughput.
+	minCacheReadThroughput = 1024 * 1024 // 1 MiB/s
+
+	// maxCacheReadTimeout caps the read deadline at the server's WriteTimeout
+	// (handlers/server.go): a read that outlives the response cannot help it.
+	maxCacheReadTimeout = 5 * time.Minute
 )
+
+// cacheStreamReadTimeout bounds a cache read whose destination is the client: the
+// response writer is the read's sink, so the client paces the read and a
+// size-scaled bound would cut off a slow-but-progressing client earlier than
+// the server itself does. The flat cap only restates the bound the server's
+// WriteTimeout already enforces, so it can never truncate a response that would
+// otherwise have completed. It is a variable so tests can inject a short deadline.
+var cacheStreamReadTimeout = maxCacheReadTimeout
+
+// cacheReadTimeoutForSize bounds one cache read of n bytes INTO A BUFFER (or a
+// presence probe) with a size-scaled deadline, mirroring cacheWriteTimeoutForSize:
+// cacheReadTimeout plus one second per minCacheReadThroughput, capped at
+// maxCacheReadTimeout. n <= 0 (a presence probe) gets the floor. Without it a
+// stalled peer read holds the request until the client disconnects or the
+// server's WriteTimeout fires. The deadline never extends the caller's own: a
+// shorter parent deadline still wins. Reads that stream straight to the client
+// use cacheStreamReadTimeout instead.
+//
+// A timeout is an ordinary transient read error on every path: bodyGone and the
+// block-stream salvage already classify context.DeadlineExceeded as "not
+// evidence the body is gone", so a slow peer never evicts a still-valid entry.
+// It is a variable so tests can inject a short deadline.
+var cacheReadTimeoutForSize = func(n int64) time.Duration {
+	timeout := cacheReadTimeout
+	if n > 0 {
+		timeout += time.Duration(n/minCacheReadThroughput) * time.Second
+	}
+	return min(timeout, maxCacheReadTimeout)
+}
 
 // errCachePopulateDeclined signals that a background cache populate was
 // deliberately skipped because the concurrent-cache-write limit was saturated.
@@ -135,6 +178,17 @@ func (r *contextBoundReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// cachePipeReadError keeps EOF-shaped terminal failures distinguishable from a
+// clean short value. The embedded cache's inline size probe accepts io.EOF and
+// io.ErrUnexpectedEOF as normal short-value terminators, so a failed broadcast
+// carrying either sentinel must be wrapped before it reaches that reader.
+func cachePipeReadError(err error) error {
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return fmt.Errorf("cache stream failed: %w", err)
+	}
+	return err
+}
+
 // waitForCacheWrite waits for a detached cache writer while retaining the
 // deadline that bounds the background fetch. The result channel is buffered by
 // the caller so a writer that ignores cancellation can still finish later.
@@ -187,8 +241,15 @@ func (s *Service) setupCacheListener(
 		}
 	}
 
+	taskCtx, taskDone, admitted := s.beginBackgroundTask(ctx)
+	if !admitted {
+		s.releaseCacheSlot(weight)
+		return nil, nil
+	}
+
 	listener := broadcaster.Subscribe()
 	if listener == nil {
+		taskDone()
 		s.releaseCacheSlot(weight)
 		return nil, nil
 	}
@@ -199,11 +260,14 @@ func (s *Service) setupCacheListener(
 
 	// Start goroutine to consume chunks, build metadata, and write to cache
 	go func() {
+		defer taskDone()
 		defer s.releaseCacheSlot(weight)
 		defer close(errCh)
 
-		// Wait for headers to build metadata
-		statusCode, headers, err := listener.WaitForHeaders(ctx)
+		// Wait for headers to build metadata. This context includes both the
+		// request lifetime and the service lifetime; after headers arrive the
+		// cache write below detaches from the request but not from the service.
+		statusCode, headers, err := listener.WaitForHeaders(taskCtx)
 		if err != nil {
 			pipeWriter.CloseWithError(err)
 			listener.DrainAndRelease() // Return any buffered pooled chunks
@@ -223,7 +287,7 @@ func (s *Service) setupCacheListener(
 
 		// Use a detached context for cache writes to avoid cancellation when HTTP request completes.
 		// Scale timeout by content length so large objects have enough time to write.
-		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
+		cacheCtx, cacheCancel := context.WithTimeout(s.workers.ctx, cacheWriteTimeoutForSize(meta.ContentLength))
 		defer cacheCancel()
 
 		ttl := int(s.config.Cache.TTL.Seconds())
@@ -245,6 +309,16 @@ func (s *Service) setupCacheListener(
 		cacheErrCh := make(chan error, 1)
 		go func() {
 			var cacheErr error
+			// Some cache clients can return before consuming their input (for example,
+			// when a remote stream is canceled). Close the reader as soon as its owner
+			// exits so the relay cannot block writing bytes no cache operation will read.
+			defer func() {
+				if cacheErr != nil {
+					_ = pipeReader.CloseWithError(cacheErr)
+				} else {
+					_ = pipeReader.Close()
+				}
+			}()
 			// Block-eligible objects (>= block_size, block caching on) are stored as fixed-size
 			// blocks regardless of how they were fetched — a full-GET read miss or a warm-on-write
 			// read-back. The whole-vs-block boundary is size, not access pattern (RFC 0001): both
@@ -264,6 +338,11 @@ func (s *Service) setupCacheListener(
 			}
 			if cacheErr != nil {
 				log.Debug().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write with metadata failed")
+				// A failed cache write may stop reading before EOF. Close the read
+				// end to interrupt a blocked pipe write, then cancel the relay context
+				// to wake a writer waiting for its first read and stop queueing chunks.
+				_ = pipeReader.CloseWithError(cacheErr)
+				cacheCancel()
 			}
 			cacheErrCh <- cacheErr
 		}()
@@ -276,11 +355,13 @@ func (s *Service) setupCacheListener(
 			case <-sigReader.Ready():
 				// Reader is ready, safe to write
 			case <-cacheCtx.Done():
-				pipeErrCh <- cacheCtx.Err()
-				// Drain queue to unblock producer, returning pooled buffers
+				writeErr := cacheCtx.Err()
+				// Drain queue before reporting relay completion so the populate
+				// owner does not release its reservation while buffers remain held.
 				for chunk := range chunkQueue {
 					broadcast.PutChunkBuf(chunk)
 				}
+				pipeErrCh <- writeErr
 				return
 			}
 
@@ -306,6 +387,7 @@ func (s *Service) setupCacheListener(
 		// This runs in parallel with cache writer initialization,
 		// with the intermediate buffer absorbing chunks during the startup window.
 		var chunkErr error
+		var relayErr error
 		var earlyExit bool
 	chunkLoop:
 		for chunk := range listener.Chunks() {
@@ -323,7 +405,7 @@ func (s *Service) setupCacheListener(
 					// Ownership transferred - don't Release()
 				case <-cacheCtx.Done():
 					broadcast.PutChunkBuf(chunk.Data) // Return unused buffer
-					chunkErr = cacheCtx.Err()
+					relayErr = cacheCtx.Err()
 					earlyExit = true
 					break chunkLoop
 				}
@@ -332,10 +414,20 @@ func (s *Service) setupCacheListener(
 			}
 		}
 
-		// Drain remaining listener chunks to return pooled buffers on early exit.
-		// Runs async since the broadcaster may still be streaming (channel not closed yet).
+		// The populate reservation covers the listener's buffers too. Keep this
+		// owner until every remaining chunk has been returned, even when the
+		// cache deadline or upstream stream error stops relaying to the cache.
 		if earlyExit {
-			listener.DrainAndRelease()
+			for chunk := range listener.Chunks() {
+				chunk.Release()
+			}
+		} else if err := listener.Err(); err != nil {
+			// The channel closed without room for an error chunk (a slow-consumer
+			// disconnect or a failed completion against a full queue). Every queued
+			// data chunk was delivered above; the terminal error is only recorded
+			// on the listener. Treat it exactly like an error chunk so the pipe
+			// fails and no metadata is committed for the truncated body.
+			chunkErr = err
 		}
 
 		// Close queue to signal pipe writer to finish
@@ -346,9 +438,14 @@ func (s *Service) setupCacheListener(
 
 		// Close the pipe to signal EOF to the reader
 		if chunkErr != nil {
-			pipeWriter.CloseWithError(chunkErr)
+			pipeWriter.CloseWithError(cachePipeReadError(chunkErr))
 		} else if pipeWriteErr != nil {
-			pipeWriter.CloseWithError(pipeWriteErr)
+			pipeWriter.CloseWithError(cachePipeReadError(pipeWriteErr))
+		} else if relayErr != nil {
+			// A relay deadline can stop forwarding after the cache queue fills.
+			// Do not turn that incomplete stream into a clean EOF that can publish
+			// metadata for a truncated whole-body cache entry.
+			pipeWriter.CloseWithError(cachePipeReadError(relayErr))
 		} else {
 			pipeWriter.Close()
 		}
@@ -357,10 +454,12 @@ func (s *Service) setupCacheListener(
 		cacheErr := <-cacheErrCh
 		if chunkErr != nil {
 			errCh <- chunkErr
+		} else if cacheErr != nil {
+			errCh <- cacheErr
 		} else if pipeWriteErr != nil {
 			errCh <- pipeWriteErr
 		} else {
-			errCh <- cacheErr
+			errCh <- relayErr
 		}
 	}()
 
@@ -526,7 +625,7 @@ func (s *Service) fetchFullObjectToCache(
 		}
 	}
 
-	cacheCtx, cacheCancel := context.WithTimeout(context.Background(), cacheWriteTimeoutForSize(meta.ContentLength))
+	cacheCtx, cacheCancel := context.WithTimeout(s.workers.ctx, cacheWriteTimeoutForSize(meta.ContentLength))
 	defer cacheCancel()
 	// Embedded local storage reaches storage.Put through a non-seekable reader and
 	// does not observe the context itself. Close the upstream body when the detached
@@ -542,27 +641,39 @@ func (s *Service) fetchFullObjectToCache(
 	// the writer until it actually exits; releasing it while an uncooperative cache
 	// client still holds buffers would break the aggregate memory bound.
 	cacheErrCh := make(chan error, 1)
-	go func() {
-		var cacheErr error
-		// Block-eligible full fetches retain the size-based representation used by the
-		// foreground miss path: blocks are written first and version-preconditioned metadata is
-		// published last. Smaller objects use the whole-body stream writer.
-		// The precondition is the trigger's decision-time token: the absence
-		// token for the absent-gated re-warms, the revalidation picker's
-		// verdict for a revalidation re-warm (so a FAILED guarded delete
-		// cannot leave known-stale state the repopulate refuses to repair),
-		// and warmToken for the warm-after-write paths. A trigger that cannot
-		// read a token does not fire.
-		if blockMode {
-			meta.BlockSize = s.config.Cache.BlockSize
-			_, cacheErr = s.putBlocksFromStream(cacheCtx, bucket, key, meta, body, ttl, expected)
-		} else {
-			_, cacheErr = s.cache.PutWithMetaStreamIfVersion(
-				cacheCtx, bucket, key, meta, body, ttl, expected,
+	if !s.startBackgroundTask(cacheCtx, func(writerCtx context.Context) {
+		// The count and byte reservation belong to the actual cache writer, not
+		// its supervisor. It can outlive the supervisor's timeout if the cache
+		// client does not return when its context is canceled.
+		cacheErr := func() error {
+			defer s.releaseCacheSlot(weight)
+			// Block-eligible full fetches retain the size-based representation used by the
+			// foreground miss path: blocks are written first and version-preconditioned metadata is
+			// published last. Smaller objects use the whole-body stream writer.
+			// The precondition is the trigger's decision-time token: the absence
+			// token for the absent-gated re-warms, the revalidation picker's
+			// verdict for a revalidation re-warm (so a FAILED guarded delete
+			// cannot leave known-stale state the repopulate refuses to repair),
+			// and warmToken for the warm-after-write paths. A trigger that cannot
+			// read a token does not fire.
+			if blockMode {
+				meta.BlockSize = s.config.Cache.BlockSize
+				_, err := s.putBlocksFromStream(writerCtx, bucket, key, meta, body, ttl, expected)
+				return err
+			}
+			_, err := s.cache.PutWithMetaStreamIfVersion(
+				writerCtx, bucket, key, meta, body, ttl, expected,
 			)
-		}
+			return err
+		}()
+		// Publish only after the reservation is released, so a completed result
+		// retains the prior synchronous ownership boundary.
 		cacheErrCh <- cacheErr
-	}()
+	}) {
+		return context.Canceled
+	}
+	// From here the registered writer owns the reservation through its actual exit.
+	slotOwned = false
 
 	cacheErr, timedOut := waitForCacheWrite(cacheCtx, cacheErrCh)
 	if timedOut {
@@ -570,11 +681,6 @@ func (s *Service) fetchFullObjectToCache(
 		// queued when the context case wins, and net/http bodies use Close to unblock Read.
 		_ = resp.Body.Close()
 		log.Warn().Str("bucket", bucket).Str("key", key).Msg("Background cache write timeout")
-		slotOwned = false
-		go func() {
-			<-cacheErrCh
-			s.releaseCacheSlot(weight)
-		}()
 		return errors.New("cache write timeout")
 	}
 	if cacheErr != nil {
@@ -624,12 +730,11 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 
 	metrics.RecordBackgroundFetchTriggered()
 	metrics.ActiveBackgroundFetches.Inc()
-
-	go func() {
+	if !s.startBackgroundTask(s.workers.ctx, func(parent context.Context) {
 		defer metrics.ActiveBackgroundFetches.Dec()
 		defer s.activeBackgroundFetches.Delete(bcastKey)
 
-		ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+		ctx, cancel := context.WithTimeout(parent, backgroundFetchTimeout)
 		defer cancel()
 
 		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, prio, expected)
@@ -646,7 +751,11 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background cache fetch completed")
 			metrics.RecordBackgroundFetchSucceeded()
 		}
-	}()
+	}) {
+		metrics.ActiveBackgroundFetches.Dec()
+		s.activeBackgroundFetches.Delete(bcastKey)
+		return
+	}
 }
 
 // hasNoCacheDirectives reports whether any Cache-Control field has a directive that

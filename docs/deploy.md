@@ -69,7 +69,7 @@ resources:
   - ../../base
 images:
   - name: tigrisdata/tag
-    newTag: v1.22.1
+    newTag: v1.22.3
 ```
 
 ## Production Considerations
@@ -77,6 +77,13 @@ images:
 ### Operating mode
 
 The manifests run the default **transparent** mode against Tigris. Set `TAG_MODE` to `signing` to front a non-Tigris S3-compatible endpoint, or to `tiered` to run TAG as a two-tier cache over a capacity-priced upstream bucket — see [Tiered store mode](tiered-mode.md) for its semantics, credential requirements, and the block-caching interaction. The [Configuration Reference](configuration.md) covers all three.
+### Graceful shutdown
+
+On SIGINT or SIGTERM, TAG stops admitting HTTP requests and drains admitted handlers for up to 30 seconds. A request that finishes inside the drain window retains its normal response. When the drain deadline passes with handlers still running, TAG cancels their request contexts and closes their HTTP connections, logs a warning with the in-flight count, and then keeps waiting for those handlers and their cache-consistency cleanup to return; a longer request may be aborted, but its handler is still joined before shutdown proceeds.
+
+After the handlers return, TAG cancels the Service lifetime and joins admitted detached cache work before closing embedded storage. This join has no deadline: a cache call that does not return after cancellation can extend process shutdown, and TAG logs a warning with the outstanding task count if the join passes 30 seconds. An admitted tiered cleanup continues under its own timeout so it may finish its conditional S3 delete and metadata repair; the join still waits for it.
+
+The base StatefulSet sets `terminationGracePeriodSeconds: 30`, which is a separate process-termination limit. When that grace expires, Kubernetes sends SIGKILL even if TAG is still waiting for handler cleanup or detached cache work. Set the pod's termination grace to the longest cleanup interval you need to allow; no finite grace can guarantee completion for uncooperative storage.
 
 ### High Availability
 
@@ -243,6 +250,17 @@ Cache invalidation and populate ordering are coordinated by one of two mechanism
 3. Let the rollout complete promptly. During the restart, nodes on different mechanisms do not see each other's ordering (a CAS delete writes no tombstone for a legacy populate to check, and vice versa). The exposure is bounded and converges by TTL, but it lasts as long as the rollout — do not pause it midway.
 
 Parsing is fail-safe: only an explicit `false` or `0` selects CAS; any other value keeps legacy. A standalone (single-node) deployment may flip at any time. **Tiered mode** always runs CAS: it selects CAS when the setting is unset and refuses to start with an explicit `true` (see [Tiered store mode](tiered-mode.md)). Reverting (`true`) carries the same mixed-window exposure, so do it with the same brisk rolling restart.
+
+#### Upgrading to v1.22.3
+
+v1.22.3 tightens request checks and cache integrity; nothing needs reconfiguring, but these behaviours are visible to operators and clients:
+
+- **Cached-read grants (transparent mode)** come only from a successful `GetObject` or `HeadObject`. A principal that only writes no longer unlocks cached reads for the bucket, and in tiered mode its small PUTs forward upstream instead of landing in the local tier. See [Security](security.md).
+- **Signed streaming uploads (signing mode)** have every chunk signature verified and bounded by the declared length; tampered, truncated or replayed streams get `403 SignatureDoesNotMatch` and never reach upstream or the cache.
+- **Presigned GETs** without `X-Amz-Content-Sha256` are validated locally and can be served from cache. `X-Amz-Expires` must be present, between 1 and 604800 seconds, and not expired; signing dates more than 15 minutes in the future are rejected. In tiered mode a presigned GET for an object TAG has no metadata for answers `NoSuchKey`, matching header-signed requests.
+- **Representation selectors** (`versionId`, `partNumber`, `response-*` overrides) bypass the cache entirely and forward upstream (`X-Cache: BYPASS`).
+- **Cache integrity:** truncated or over-long cached bodies are refused and invalidated on detection; every cache read runs under a deadline (size-scaled for buffered reads, five minutes for client-paced streams); bulk `DeleteObjects` returns only after its cache fences finish, bounded at 10 seconds.
+- **Shutdown** waits past the drain deadline for in-flight handlers and detached cache work before closing storage (see [Graceful shutdown](#graceful-shutdown)). With the base `terminationGracePeriodSeconds: 30`, a pod still busy at the deadline is SIGKILLed where older versions closed storage early; raise the grace period if clean exits matter.
 
 ### Health Checks
 

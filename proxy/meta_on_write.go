@@ -51,10 +51,12 @@ func (s *Service) cacheBlockMetaOnWrite(r *http.Request, bucket, key, writtenETa
 	if _, loaded := s.activeBackgroundFetches.LoadOrStore(dedupKey, struct{}{}); loaded {
 		return
 	}
-	go func() {
+	if !s.startBackgroundTask(nil, func(ctx context.Context) {
 		defer s.activeBackgroundFetches.Delete(dedupKey)
-		s.establishBlockMetaFromHead(bucket, key, accessKey, secretKey, writtenETag)
-	}()
+		s.establishBlockMetaFromHeadWithContext(ctx, bucket, key, accessKey, secretKey, writtenETag)
+	}) {
+		s.activeBackgroundFetches.Delete(dedupKey)
+	}
 }
 
 // establishBlockMetaFromHead HEADs the object and stamps a block-mode entry whose
@@ -63,7 +65,11 @@ func (s *Service) cacheBlockMetaOnWrite(r *http.Request, bucket, key, writtenETa
 // an evicted block takes. What it buys is that the first read resolves metadata from
 // cache instead of paying an upstream round trip to discover it.
 func (s *Service) establishBlockMetaFromHead(bucket, key, accessKey, secretKey, writtenETag string) {
-	ctx, cancel := context.WithTimeout(context.Background(), backgroundFetchTimeout)
+	s.establishBlockMetaFromHeadWithContext(s.workers.ctx, bucket, key, accessKey, secretKey, writtenETag)
+}
+
+func (s *Service) establishBlockMetaFromHeadWithContext(parent context.Context, bucket, key, accessKey, secretKey, writtenETag string) {
+	ctx, cancel := context.WithTimeout(parent, backgroundFetchTimeout)
 	defer cancel()
 
 	// Stamp before the HEAD, so an invalidation landing mid-flight is newer than this

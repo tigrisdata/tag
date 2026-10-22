@@ -105,6 +105,8 @@ Client                     TAG                          Tigris
 
 **RequestValidator** performs cryptographic SigV4 validation using stored signing keys. Uses constant-time comparison (HMAC-Equal) to prevent timing attacks. Enforces a 15-minute clock skew tolerance.
 
+A valid SigV4 presigned GET can omit `X-Amz-Content-Sha256`; its signature uses `UNSIGNED-PAYLOAD`. Header-authenticated requests and other methods still require the header. A presigned URL must carry exactly one integer `X-Amz-Expires` in `[1, 604800]` (seven days, as on AWS); it is rejected once that many seconds have passed since `X-Amz-Date`, or if `X-Amz-Date` is more than 15 minutes in the future. Cache serving still requires a learned signing key and an authorization grant for the requested bucket.
+
 ## Access Control Flow
 
 ```text
@@ -131,13 +133,13 @@ Request arrives at TAG
 
 ## Authorization Lifecycle
 
-Authorization decisions are cached per `(accessKey, bucket)` pair:
+Authorization decisions are cached per `(accessKey, bucket)` pair. TAG may learn signing keys from any successful response with the internal header. Those keys prove identity, not read permission. TAG grants bucket authorization only after a successful upstream `GetObject` or `HeadObject` response. Successful writes and other passthrough operations do not grant cached-read access.
 
-| Event                                | Action                                    |
-| ------------------------------------ | ----------------------------------------- |
-| Tigris returns 2xx with signing keys | `AuthzCache.Grant(accessKey, bucket)`     |
-| Tigris returns 403                   | `AuthzCache.Revoke(accessKey, bucket)`    |
-| TTL expires (10 min default)         | Entry removed, next request re-authorizes |
+| Event                                              | Action                                    |
+| -------------------------------------------------- | ----------------------------------------- |
+| Upstream 2xx to client `GetObject` or `HeadObject` | `AuthzCache.Grant(accessKey, bucket)`     |
+| Tigris returns 403                                 | `AuthzCache.Revoke(accessKey, bucket)`    |
+| TTL expires (10 min default)                       | Entry removed, next request re-authorizes |
 
 Authorization is strictly per-bucket. A client may have access to some buckets but not others, and TAG enforces this at the cache level.
 

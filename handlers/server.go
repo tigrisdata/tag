@@ -2,12 +2,16 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -16,6 +20,11 @@ import (
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/proxy"
 	"github.com/tigrisdata/tag/s3err"
+)
+
+const (
+	handlerStoppingBit uint64 = 1 << 63
+	handlerCountMask   uint64 = handlerStoppingBit - 1
 )
 
 // Server is the HTTP server for S3-compatible API.
@@ -30,14 +39,22 @@ type Server struct {
 	// admissionSem bounds concurrently-served S3 requests. nil disables admission
 	// control (unlimited).
 	admissionSem chan struct{}
+
+	handlerState    atomic.Uint64
+	handlerDoneOnce sync.Once
+	handlersDone    chan struct{}
+	cancelRequests  context.CancelFunc
 }
 
 // NewServer creates a new HTTP server.
 func NewServer(service *proxy.Service, bindIP string, port int, pprofEnabled bool, maxInflight int) *Server {
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
 	s := &Server{
-		service:      service,
-		bindAddr:     fmt.Sprintf("%s:%d", bindIP, port),
-		pprofEnabled: pprofEnabled,
+		service:        service,
+		bindAddr:       fmt.Sprintf("%s:%d", bindIP, port),
+		pprofEnabled:   pprofEnabled,
+		handlersDone:   make(chan struct{}),
+		cancelRequests: cancelRequests,
 	}
 
 	if maxInflight > 0 {
@@ -45,6 +62,18 @@ func NewServer(service *proxy.Service, bindIP string, port int, pprofEnabled boo
 	}
 
 	s.router = s.setupRouter()
+	// Initialize before Start can run in another goroutine so Stop always sees
+	// this same server, even when shutdown wins the race to start serving.
+	s.httpServer = &http.Server{
+		Addr:         s.bindAddr,
+		Handler:      s.foregroundHandlerMiddleware(s.router),
+		ReadTimeout:  5 * time.Minute,
+		WriteTimeout: 5 * time.Minute,
+		IdleTimeout:  120 * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			return requestCtx
+		},
+	}
 	return s
 }
 
@@ -60,6 +89,46 @@ func (s *Server) connectionTrackingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		metrics.ActiveConnections.Inc()
 		defer metrics.ActiveConnections.Dec()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// enterHandler increments before checking the stop bit to order admission against
+// shutdown. A late request drops the count and is rejected before calling next.
+func (s *Server) enterHandler() bool {
+	state := s.handlerState.Add(1)
+	if state&handlerStoppingBit != 0 {
+		s.leaveHandler()
+		return false
+	}
+	return true
+}
+
+func (s *Server) leaveHandler() {
+	state := s.handlerState.Add(^uint64(0))
+	if state&handlerStoppingBit != 0 && state&handlerCountMask == 0 {
+		s.handlerDoneOnce.Do(func() { close(s.handlersDone) })
+	}
+}
+
+func (s *Server) closeHandlerAdmission() {
+	state := s.handlerState.Or(handlerStoppingBit)
+	if state&handlerCountMask == 0 {
+		s.handlerDoneOnce.Do(func() { close(s.handlersDone) })
+	}
+}
+
+// foregroundHandlerMiddleware closes handler admission before Stop starts draining.
+// The count covers the handler's full synchronous lifetime, including any final
+// cache consistency work after the response has been forwarded.
+func (s *Server) foregroundHandlerMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.enterHandler() {
+			s.rejectShutdownRequest(w, r)
+			return
+		}
+
+		defer s.leaveHandler()
 		next.ServeHTTP(w, r)
 	})
 }
@@ -103,7 +172,10 @@ func (s *Server) admissionMiddleware(next http.Handler) http.Handler {
 // a request to /debug/pprof/large-key matches the object route whose template is
 // "/{bucket}/{object:.+}", so it is correctly subject to admission.
 func isExemptFromAdmission(r *http.Request) bool {
-	route := mux.CurrentRoute(r)
+	return isOperationalRoute(mux.CurrentRoute(r))
+}
+
+func isOperationalRoute(route *mux.Route) bool {
 	if route == nil {
 		return false
 	}
@@ -114,16 +186,45 @@ func isExemptFromAdmission(r *http.Request) bool {
 	return tmpl == "/health" || tmpl == "/metrics" || strings.HasPrefix(tmpl, "/debug/pprof/")
 }
 
+// rejectShutdownRequest keeps S3 errors in TAG's XML wire format while leaving
+// operational and unmatched paths on the ordinary HTTP 503 response.
+func (s *Server) rejectShutdownRequest(w http.ResponseWriter, r *http.Request) {
+	if s.matchesS3Operation(r) {
+		s3err.WriteError(w, r, s3err.ErrServiceUnavailable)
+		return
+	}
+	http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+}
+
+func (s *Server) matchesS3Operation(r *http.Request) bool {
+	var match mux.RouteMatch
+	if s.router.Match(r, &match) {
+		return match.Route != nil && !isOperationalRoute(match.Route)
+	}
+	if match.MatchErr != mux.ErrMethodMismatch {
+		return false
+	}
+
+	// Unsupported methods still belong to an S3 route when another supported
+	// method matches the same path and query.
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost, http.MethodDelete} {
+		candidate := r.Clone(r.Context())
+		candidate.Method = method
+		var candidateMatch mux.RouteMatch
+		if s.router.Match(candidate, &candidateMatch) && candidateMatch.Route != nil && !isOperationalRoute(candidateMatch.Route) {
+			return true
+		}
+	}
+	return false
+}
+
 // setupRouter configures the S3-compatible routes.
 func (s *Server) setupRouter() *mux.Router {
 	r := mux.NewRouter()
 	r.SkipClean(true) // Preserve path for S3 compatibility
 
-	// Apply connection tracking middleware
-	r.Use(s.connectionTrackingMiddleware)
-
-	// Bound concurrently-served S3 requests (sheds with 503 SlowDown when full)
-	r.Use(s.admissionMiddleware)
+	// Mux rebuilds Router.Use chains on every match. Wrap the static route
+	// handlers once after registration to preserve the same middleware order.
 
 	// Health check endpoint
 	r.HandleFunc("/health", s.handleHealth).Methods("GET")
@@ -241,20 +342,20 @@ func (s *Server) setupRouter() *mux.Router {
 	// List buckets (service level)
 	r.HandleFunc("/", s.handleListBuckets).Methods("GET")
 
+	if err := r.Walk(func(route *mux.Route, _ *mux.Router, _ []*mux.Route) error {
+		if handler := route.GetHandler(); handler != nil {
+			route.Handler(s.connectionTrackingMiddleware(s.admissionMiddleware(handler)))
+		}
+		return nil
+	}); err != nil {
+		panic(err)
+	}
 	return r
 }
 
 // Start starts the HTTP server.
 // If TLS is configured via SetTLS, the server listens with HTTPS.
 func (s *Server) Start() error {
-	s.httpServer = &http.Server{
-		Addr:         s.bindAddr,
-		Handler:      s.router,
-		ReadTimeout:  5 * time.Minute,
-		WriteTimeout: 5 * time.Minute,
-		IdleTimeout:  120 * time.Second,
-	}
-
 	if s.tlsCertFile != "" && s.tlsKeyFile != "" {
 		log.Info().Str("addr", s.bindAddr).Msg("Starting HTTPS server (TLS enabled)")
 		return s.httpServer.ListenAndServeTLS(s.tlsCertFile, s.tlsKeyFile)
@@ -269,14 +370,78 @@ func (s *Server) Router() http.Handler {
 	return s.router
 }
 
-// Stop gracefully stops the HTTP server.
+// Stop gracefully stops the HTTP server. If ctx ends during the drain or
+// handler join, it cancels active request contexts and closes connections. It
+// always waits for every admitted handler to finish before returning.
 func (s *Server) Stop(ctx context.Context) error {
-	if s.httpServer == nil {
+	server := s.httpServer
+	if server == nil {
 		return nil
 	}
 
+	s.closeHandlerAdmission()
+
 	log.Info().Msg("Stopping HTTP server")
-	return s.httpServer.Shutdown(ctx)
+	err := server.Shutdown(ctx)
+	var closeErr error
+	var stopDeadline func() bool
+	var deadlineCloseErr <-chan error
+	// joinStart is set when the drain deadline passes while handlers are still
+	// running, marking the start of the unbounded handler join below.
+	var joinStart time.Time
+	if err != nil {
+		if s.cancelRequests != nil {
+			s.cancelRequests()
+		}
+		closeErr = server.Close()
+		joinStart = s.warnHandlerJoinPastDeadline(err)
+	} else {
+		closeResult := make(chan error, 1)
+		deadlineCloseErr = closeResult
+		stopDeadline = context.AfterFunc(ctx, func() {
+			if s.cancelRequests != nil {
+				s.cancelRequests()
+			}
+			closeResultErr := server.Close()
+			// Written before the send so the receive below publishes it.
+			joinStart = s.warnHandlerJoinPastDeadline(ctx.Err())
+			closeResult <- closeResultErr
+		})
+	}
+
+	<-s.handlersDone
+	if stopDeadline != nil && !stopDeadline() {
+		closeErr = <-deadlineCloseErr
+	}
+	if !joinStart.IsZero() {
+		log.Info().Dur("waited", time.Since(joinStart)).Msg("In-flight HTTP handlers finished after the drain deadline")
+	}
+	if s.cancelRequests != nil {
+		s.cancelRequests()
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+		err = errors.Join(err, ctxErr)
+	}
+	if closeErr != nil {
+		err = errors.Join(err, closeErr)
+	}
+	return err
+}
+
+// warnHandlerJoinPastDeadline logs once when the drain context ends while
+// admitted handlers are still running, since Stop then waits for them without a
+// bound. It returns when the wait began, or the zero time if nothing is running.
+func (s *Server) warnHandlerJoinPastDeadline(cause error) time.Time {
+	select {
+	case <-s.handlersDone:
+		return time.Time{}
+	default:
+	}
+	log.Warn().
+		Err(cause).
+		Uint64("inflight_handlers", s.handlerState.Load()&handlerCountMask).
+		Msg("HTTP drain deadline passed; shutdown is waiting past the drain deadline for in-flight handlers to finish")
+	return time.Now()
 }
 
 // responseTracker wraps http.ResponseWriter to track whether headers have been
@@ -306,15 +471,20 @@ func (rt *responseTracker) Flush() {
 
 // handleWithError calls a handler function and handles any returned error.
 // If headers have already been committed (e.g., the handler started streaming
-// a response before encountering an error), the error is logged but no error
-// response is written to avoid corrupting the HTTP stream.
+// a response before encountering an error), the response is aborted so the
+// server does not complete framing for a partial body or append error XML.
 func handleWithError(w http.ResponseWriter, r *http.Request, handler func(http.ResponseWriter, *http.Request) error) {
 	rt := &responseTracker{ResponseWriter: w}
 	err := handler(rt, r)
 	if err != nil {
 		if rt.committed {
 			log.Warn().Err(err).Str("path", r.URL.Path).
-				Msg("Error after response headers committed, cannot send error response")
+				Msg("Error after response headers committed, aborting response")
+			// Go closes the connection without completing the response framing;
+			// an HTTP/1.0 client, which reads an unknown-length body to EOF, cannot
+			// tell that truncation from completion, an accepted limitation since
+			// no real client speaks HTTP/1.0 to TAG.
+			panic(http.ErrAbortHandler)
 		} else {
 			handleError(rt, r, err)
 		}
