@@ -6,7 +6,6 @@ TAG is a high-performance S3-compatible caching proxy for [Tigris](https://tigri
 
 - **S3-Compatible API**: Supports all S3 API endpoints supported by Tigris
 - **Transparent Proxy Mode**: Forwards client requests as-is with proxy headers, preserving original signatures (enabled by default)
-- **Tiered Store Mode**: `mode: tiered` runs TAG as a two-tier cache — small objects live entirely in the local tier with authoritative misses, large objects in a capacity-priced upstream bucket (see [docs/tiered-mode.md](docs/tiered-mode.md))
 - **Embedded Cache**: High-performance RocksDB-based cache with automatic cluster discovery
 - **Request Coalescing**: Streaming broadcast pattern reduces duplicate upstream requests under concurrent load
 - **Range Request Caching**: Background fetch of full objects on range cache miss for optimal ML training workloads
@@ -136,7 +135,6 @@ For production, TAG ships manifests, Compose files, and guides under [`deploy/`]
 - **Docker** — single-node and cluster Compose in [`deploy/docker/`](deploy/docker/); see [docs/docker.md](docs/docker.md).
 - **TLS/HTTPS** — see [docs/tls.md](docs/tls.md).
 - **Upgrades** — meta coordination mode and rolling-upgrade guidance in [docs/deploy.md](docs/deploy.md#upgrades-and-meta-coordination).
-- **Tiered store mode** — TAG as a two-tier cache over a capacity-priced upstream; see [docs/tiered-mode.md](docs/tiered-mode.md).
 - **Parquet workloads** — `cache.parquet_optimization` warms footer blocks and `cache.meta_on_write` caches object metadata before readers need them; see [docs/parquet-optimization.md](docs/parquet-optimization.md).
 - **Benchmarks** — see [docs/benchmarks.md](docs/benchmarks.md).
 
@@ -203,7 +201,7 @@ See [docs/metrics.md](docs/metrics.md) for complete metrics reference.
 
 ## Security
 
-TAG supports transparent proxy mode (default) with local SigV4 validation and per-bucket authorization caching, signing mode with local credential stores, and tiered store mode, which forwards transparently on Tigris endpoints and by signing on any other. In transparent mode, TAG grants cached-read authorization for a bucket only after a successful upstream `GetObject` or `HeadObject`. Successful writes and other passthrough responses do not grant cached-read access.
+TAG supports transparent proxy mode (default) with local SigV4 validation and per-bucket authorization caching, as well as signing mode with local credential stores. In transparent mode, TAG grants cached-read authorization for a bucket only after a successful upstream `GetObject` or `HeadObject`. Successful writes and other passthrough responses do not grant cached-read access.
 
 After key learning and bucket authorization, local auth can validate a valid SigV4 presigned GET without an `X-Amz-Content-Sha256` header; header-authenticated requests and other methods still require it.
 

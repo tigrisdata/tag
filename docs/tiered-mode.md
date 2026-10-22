@@ -52,6 +52,21 @@ to the marker version that triggered it; if a later write replaces that
 metadata, the stale move cannot change the newer entry. The displaced
 upstream copy is left for the upstream bucket's own expiry.
 
+## Persistence
+
+The local tier is a cache, not durable storage. A small object written through
+tiered mode exists only in the embedded cache on the pod that owns its key:
+there is no upstream copy and no replication to other pods. Losing that pod's
+volume loses every local-tier object it held. Local-tier entries are also
+stored under `cache.ttl` (default 24h) and read as misses once they expire,
+exactly like a cache eviction. Large objects keep their body upstream; only
+their metadata marker is subject to the same single-copy, TTL-bound storage.
+
+The caller must therefore keep the authoritative copy elsewhere and treat
+every TAG miss, whether from expiry, eviction, or data loss, as "not cached".
+Tiered mode trades durability for zero upstream traffic on small objects; it
+is not a store of record.
+
 ## Authentication
 
 The transparent-proxy flow, unchanged. Tiered semantics apply only to requests
