@@ -292,7 +292,6 @@ Client3                 │                                  │
 - First request becomes the "fetcher" and initiates the upstream request
 - Requests that subscribe before streaming starts join as "listeners"
 - All listeners of a broadcast receive the same upstream response as chunks arrive
-- Once streaming starts, later requests cannot join that broadcast and start their own upstream fetch
 - Memory usage scales with listeners, not object size
 - For live requests, an upstream failure before response commitment is returned through the existing S3 error mapping for each waiting GET; after commitment, the stream cannot be replaced by an error document
 

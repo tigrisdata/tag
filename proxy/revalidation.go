@@ -290,11 +290,7 @@ func (s *Service) handleRevalidation200(
 		// committed upstream response independent of cache availability.
 		n, copyErr := io.Copy(w, resp.Body)
 		metrics.BytesTransferred.WithLabelValues("out").Add(float64(n))
-		status := "success"
-		if copyErr != nil {
-			status = "error"
-		}
-		metrics.RecordRequest("GetObject", status, metrics.SourceUpstream, time.Since(start).Seconds())
+		metrics.RecordRequestResult("GetObject", metrics.SourceUpstream, copyErr, time.Since(start).Seconds())
 		return copyErr
 	}
 
