@@ -321,10 +321,14 @@ func (s *Service) populateWeight(contentLength int64) int64 {
 //
 // The signal is THIS node's store. In a cluster the body may land on a peer,
 // but a balanced ring fills every node at the same rate, so one node over
-// budget means the ring is; owner-side enforcement belongs in the engine.
+// budget means the ring is over budget; owner-side enforcement belongs in the
+// engine.
 func (s *Service) diskOverBudget() bool {
+	if s.config == nil || s.cache == nil {
+		return false
+	}
 	threshold := s.config.Cache.PopulateShedDiskRatio
-	if threshold <= 0 || s.cache == nil {
+	if threshold <= 0 {
 		return false
 	}
 	ratio, ok := s.cache.DiskUsageRatio()
