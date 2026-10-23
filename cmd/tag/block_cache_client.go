@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 
 	"github.com/tigrisdata/ocache/embedded"
 	"github.com/tigrisdata/tag/cache"
@@ -25,4 +26,20 @@ func newEmbeddedBlockCacheClient(client *embedded.Client) *embeddedBlockCacheCli
 // existing path.
 func (c *embeddedBlockCacheClient) PutBlockBytes(ctx context.Context, key string, data []byte, ttlSeconds int64) (handled bool, err error) {
 	return cache.PutRemoteBlockBytes(ctx, c.Operations(), key, data, ttlSeconds)
+}
+
+// GetRangeStreamOutcome returns OCache's presence result and the bytes copied to
+// the caller. Operations.GetRangeStream discards io.Copy's count, which Cache
+// uses to preserve exact-range validation. Repeating its Get, Close, and Copy
+// sequence exposes that count without wrapping the caller's writer.
+func (c *embeddedBlockCacheClient) GetRangeStreamOutcome(ctx context.Context, key string, start, end int64, w io.Writer) (found bool, written int64, err error) {
+	reader, found, err := c.Operations().Get(ctx, key, start, end)
+	if err != nil || !found {
+		return found, 0, err
+	}
+	if closer, ok := reader.(io.Closer); ok {
+		defer closer.Close()
+	}
+	written, err = io.Copy(w, reader)
+	return found, written, err
 }

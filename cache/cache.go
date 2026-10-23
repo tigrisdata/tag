@@ -32,6 +32,14 @@ type blockBytePutter interface {
 	PutBlockBytes(ctx context.Context, key string, data []byte, ttlSeconds int64) (handled bool, err error)
 }
 
+// rangeStreamOutcomeReader is an optional CacheClient capability for clients
+// that can report key presence (without writing on absence) and the number of
+// bytes io.Copy wrote, including a partial count on error. Clients without it
+// retain the countingWriter fallback.
+type rangeStreamOutcomeReader interface {
+	GetRangeStreamOutcome(ctx context.Context, key string, start, end int64, w io.Writer) (found bool, written int64, err error)
+}
+
 // ErrNotFound indicates the key was not found in the cache.
 var ErrNotFound = errors.New("not found in cache")
 
@@ -535,7 +543,7 @@ func (c *Cache) IsBlockLocal(bucket, key, etag string, blockSize, blockIdx int64
 // ============================================================================
 
 // GetRangeStream retrieves a byte range from the cached object body.
-// Uses ocache's GetRangeStream for efficient partial reads from disk.
+// Uses the cache client's routed range operation for efficient partial reads from disk.
 // start and end are inclusive byte positions (HTTP Range semantics).
 // Pass the meta's ETag so the range resolves to the exact cached version.
 // Returns ErrNotFound if the object is not in cache. A positive short backend read returns an
@@ -560,8 +568,9 @@ func (c *Cache) GetBlockRangeStream(ctx context.Context, bucket, key, etag strin
 	return c.getRangeStreamByKey(ctx, MakeBlockKey(bucket, key, etag, blockSize, blockIdx), bucket, key, start, end, w)
 }
 
-// countingWriter wraps an io.Writer and counts the bytes written through it, so a range read
-// can distinguish an absent key (embedded backend returns nil + zero bytes) from a real read.
+// countingWriter wraps a writer for CacheClients without a range-outcome capability. It counts
+// the generic fallback's output so Cache can distinguish an absent key (nil error, zero bytes)
+// from a successful non-empty read.
 type countingWriter struct {
 	w       io.Writer
 	written int64
@@ -608,13 +617,21 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 		return err
 	}
 
-	// ocache now uses inclusive end (same as HTTP Range semantics). Count bytes written so the
-	// absent-key gap (embedded returns nil + zero bytes rather than not-found) is mapped to
-	// ErrNotFound below: the requested range [start,end] is inclusive and non-empty here, and an
-	// in-bounds read of a present block always yields at least one byte, so zero bytes with no
-	// error means the key is absent — not a legitimately empty read.
-	cw := &countingWriter{w: w}
-	err := c.client.GetRangeStream(ctx, cacheKey, start, end, cw)
+	// Both paths preserve the embedded backend's nil-error absence result. Clients
+	// with an outcome capability also return io.Copy's byte count; generic clients
+	// count writes through the fallback adapter. The count remains necessary to
+	// reject positive short or excessive reads below.
+	var found bool
+	var written int64
+	var err error
+	if outcomeClient, ok := c.client.(rangeStreamOutcomeReader); ok {
+		found, written, err = outcomeClient.GetRangeStreamOutcome(ctx, cacheKey, start, end, w)
+	} else {
+		cw := &countingWriter{w: w}
+		err = c.client.GetRangeStream(ctx, cacheKey, start, end, cw)
+		written = cw.written
+		found = written > 0
+	}
 	if err != nil {
 		if isNotFoundError(err) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
@@ -628,7 +645,9 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 			Msg("Cache range get error")
 		return err
 	}
-	if cw.written == 0 {
+	// Keep the legacy zero-byte result mapping even when a backend reports found=true,
+	// such as a range that starts beyond a present body's end.
+	if !found || written == 0 {
 		log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
 		return ErrNotFound
 	}
@@ -639,11 +658,11 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 	if start >= 0 && end >= start {
 		want := end - start + 1
 		if want > 0 {
-			if cw.written < want {
-				return fmt.Errorf("cache range short read: got %d of %d bytes: %w", cw.written, want, io.ErrUnexpectedEOF)
+			if written < want {
+				return fmt.Errorf("cache range short read: got %d of %d bytes: %w", written, want, io.ErrUnexpectedEOF)
 			}
-			if cw.written > want {
-				return fmt.Errorf("cache range over-read: got %d bytes, want %d", cw.written, want)
+			if written > want {
+				return fmt.Errorf("cache range over-read: got %d bytes, want %d", written, want)
 			}
 		}
 	}
