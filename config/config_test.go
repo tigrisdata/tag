@@ -1439,6 +1439,16 @@ func TestLoad_PopulateShedDiskRatioDefaultAndEnv(t *testing.T) {
 		t.Errorf("Cache.PopulateShedDiskRatio = %v, want 1.2 from env", cfg.Cache.PopulateShedDiskRatio)
 	}
 
+	// Zero from the environment keeps the default rather than disabling the guard.
+	t.Setenv("TAG_CACHE_POPULATE_SHED_DISK_RATIO", "0")
+	cfg, err = Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.PopulateShedDiskRatio != DefaultCachePopulateShedDiskRatio {
+		t.Errorf("Cache.PopulateShedDiskRatio = %v after env 0, want default %v", cfg.Cache.PopulateShedDiskRatio, DefaultCachePopulateShedDiskRatio)
+	}
+
 	// Negative disables shedding and must survive default application.
 	t.Setenv("TAG_CACHE_POPULATE_SHED_DISK_RATIO", "-1")
 	cfg, err = Load(tmpFile)

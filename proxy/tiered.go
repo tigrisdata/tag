@@ -169,11 +169,15 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// forwards and never needs the prior version — a metadata failure must not
 	// block a PUT that goes upstream anyway (including the unknown-key writes
 	// that bootstrap credential learning).
+	conditional := r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != ""
+
 	// A local-tier write while the store is over its disk budget would be
 	// evicted before it is read; send it upstream instead (the upstream tier is
-	// a legitimate placement) and let eviction catch up.
+	// a legitimate placement) and let eviction catch up. Conditional writes are
+	// exempt: their precondition must be evaluated against the local copy, which
+	// upstream cannot see, so they take the local path whatever the budget.
 	localTier := result == AuthValidated && originlessPlainObject(r) && sized && declaredSize <= s.config.Cache.SizeThreshold
-	if localTier && s.diskOverBudget() {
+	if localTier && !conditional && s.diskOverBudget() {
 		metrics.RecordCachePopulateDiskShed("tiered_put")
 		localTier = false
 	}
@@ -190,7 +194,6 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 		if found {
 			prior = priorMeta
 		}
-		conditional := r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != ""
 
 		// A conditional write against an upstream-tier prior forwards: the
 		// engine can only evaluate preconditions against a local body, and

@@ -671,8 +671,9 @@ func applyEnvOverrides(cfg *Config) {
 				cfg.Cache.MaxDiskUsageBytes = size
 			}
 		}
+		// 0 keeps the default (like the neighbouring limits); negative disables.
 		if shed := os.Getenv("TAG_CACHE_POPULATE_SHED_DISK_RATIO"); shed != "" {
-			if ratio, err := strconv.ParseFloat(shed, 64); err == nil {
+			if ratio, err := strconv.ParseFloat(shed, 64); err == nil && ratio != 0 {
 				cfg.Cache.PopulateShedDiskRatio = ratio
 			}
 		}

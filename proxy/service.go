@@ -318,6 +318,10 @@ func (s *Service) populateWeight(contentLength int64) int64 {
 // new body would be evicted before it is read back, so populates are shed and
 // the object is served without caching. False when shedding is disabled, there
 // is no disk cap, or the engine cannot report usage.
+//
+// The signal is THIS node's store. In a cluster the body may land on a peer,
+// but a balanced ring fills every node at the same rate, so one node over
+// budget means the ring is; owner-side enforcement belongs in the engine.
 func (s *Service) diskOverBudget() bool {
 	threshold := s.config.Cache.PopulateShedDiskRatio
 	if threshold <= 0 || s.cache == nil {

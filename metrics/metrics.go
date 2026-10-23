@@ -163,7 +163,7 @@ var (
 	CachePopulateSkipped = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "tag_cache_populate_skipped_total",
-			Help: "Total cache populates skipped due to the concurrent-cache-write limit, by source",
+			Help: "Total cache populates skipped because a populate limiter refused (write-count limit, memory budget, or disk-budget shed; see tag_cache_populate_disk_shed_total), by source",
 		},
 		[]string{"source"},
 	)

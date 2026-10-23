@@ -2273,6 +2273,25 @@ func TestTieredPutShedsToUpstreamWhenOverDiskBudget(t *testing.T) {
 		t.Fatalf("under-budget PUT must be local-tier: found=%v err=%v meta=%+v", found, err, meta)
 	}
 
+	// A conditional write is never shed: its precondition is evaluated against
+	// the local copy, which upstream cannot see. If-None-Match: * on a new key
+	// must land locally even over budget.
+	client.used.Store(1100)
+	if w := tieredDo(t, svc, http.MethodPut, "/b/conditional", "small body", map[string]string{"If-None-Match": "*"}); w.Code != http.StatusOK {
+		t.Fatalf("conditional PUT status = %d", w.Code)
+	}
+	if n := forwards.Load(); n != 1 {
+		t.Fatalf("forwards after conditional over-budget PUT = %d, want 1 (stayed local)", n)
+	}
+	meta, found, err = c.GetMeta(context.Background(), "b", "conditional")
+	if err != nil || !found || meta == nil || meta.BodyUpstream {
+		t.Fatalf("conditional PUT must be local-tier: found=%v err=%v meta=%+v", found, err, meta)
+	}
+	// And the precondition still holds against that local copy.
+	if w := tieredDo(t, svc, http.MethodPut, "/b/conditional", "small body", map[string]string{"If-None-Match": "*"}); w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("second If-None-Match: * PUT status = %d, want 412", w.Code)
+	}
+
 	// Disabled guard: over budget no longer sheds.
 	cfg.Cache.PopulateShedDiskRatio = -1
 	client.used.Store(1100)
