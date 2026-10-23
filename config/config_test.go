@@ -1414,3 +1414,38 @@ func TestLoad_LegacyCoordinationOverrideByEnv(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_PopulateShedDiskRatioDefaultAndEnv(t *testing.T) {
+	content := "cache:\n  enabled: true\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.PopulateShedDiskRatio != DefaultCachePopulateShedDiskRatio {
+		t.Errorf("Cache.PopulateShedDiskRatio = %v, want default %v", cfg.Cache.PopulateShedDiskRatio, DefaultCachePopulateShedDiskRatio)
+	}
+
+	t.Setenv("TAG_CACHE_POPULATE_SHED_DISK_RATIO", "1.2")
+	cfg, err = Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.PopulateShedDiskRatio != 1.2 {
+		t.Errorf("Cache.PopulateShedDiskRatio = %v, want 1.2 from env", cfg.Cache.PopulateShedDiskRatio)
+	}
+
+	// Negative disables shedding and must survive default application.
+	t.Setenv("TAG_CACHE_POPULATE_SHED_DISK_RATIO", "-1")
+	cfg, err = Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.PopulateShedDiskRatio != -1 {
+		t.Errorf("Cache.PopulateShedDiskRatio = %v, want -1 (disabled)", cfg.Cache.PopulateShedDiskRatio)
+	}
+}

@@ -169,7 +169,15 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// forwards and never needs the prior version — a metadata failure must not
 	// block a PUT that goes upstream anyway (including the unknown-key writes
 	// that bootstrap credential learning).
-	if result == AuthValidated && originlessPlainObject(r) && sized && declaredSize <= s.config.Cache.SizeThreshold {
+	// A local-tier write while the store is over its disk budget would be
+	// evicted before it is read; send it upstream instead (the upstream tier is
+	// a legitimate placement) and let eviction catch up.
+	localTier := result == AuthValidated && originlessPlainObject(r) && sized && declaredSize <= s.config.Cache.SizeThreshold
+	if localTier && s.diskOverBudget() {
+		metrics.RecordCachePopulateDiskShed("tiered_put")
+		localTier = false
+	}
+	if localTier {
 		// The prior version's tier decides what an overwrite must clean up and
 		// where a conditional write is evaluated, so a failed lookup cannot be
 		// read as "no prior". Fail retryably instead.
@@ -542,6 +550,12 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 		return
 	}
 	if accessKey == "" || secretKey == "" || !s.cache.IsEnabled() {
+		return
+	}
+	// Over the disk budget the healed body would be evicted straight away.
+	if s.diskOverBudget() {
+		metrics.RecordCachePopulateDiskShed("retier")
+		metrics.RecordTieredRetier("shed")
 		return
 	}
 	// Backoff, not an outcome: a recent attempt for this exact marker version

@@ -34,6 +34,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_DELETE_BATCH_SIZE`     | File deletions processed per deletion-queue batch                               | `1000`                   |
 | `TAG_CACHE_RECOVERY_WORKERS`      | Parallel workers for startup file recovery                                      | `16`                     |
 | `TAG_CACHE_MAX_CONCURRENT_WRITES` | Max concurrent cache-populate operations                                        | `256`                    |
+| `TAG_CACHE_POPULATE_SHED_DISK_RATIO` | Shed populates once disk usage reaches this fraction of the cap (negative disables) | `1.05`                |
 | `TAG_CACHE_MAX_POPULATE_MEMORY`   | Aggregate memory budget (bytes) for all cache buffering — populate + block-serve staging (one honest total) | `2147483648` (2 GiB)     |
 | `TAG_MAX_INFLIGHT_REQUESTS`       | Max concurrently-served S3 requests before shedding with 503 SlowDown           | `1024`                   |
 | `TAG_HTTP_PORT`                   | Port for the S3 API                                                             | `8080`                   |
@@ -267,6 +268,12 @@ cache:
   # Default: 256 (0 or unset = default; negative = disabled)
   # Override with TAG_CACHE_MAX_CONCURRENT_WRITES env var
   max_concurrent_writes: 256
+  # Shed populates (tiered PUTs go upstream, re-tiers and proxy populates are
+  # skipped, objects still served) while tracked disk usage is at or above this
+  # fraction of max_disk_usage_bytes, i.e. while eviction is behind ingest.
+  # Only applies with a disk cap. Negative disables.
+  # Override with TAG_CACHE_POPULATE_SHED_DISK_RATIO env var
+  populate_shed_disk_ratio: 1.05
 
   # Aggregate memory budget for ALL cache buffering — cache-populate and block-serve
   # staging share this one pool, so the value is an honest total (buffering never

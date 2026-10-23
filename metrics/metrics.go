@@ -168,6 +168,18 @@ var (
 		[]string{"source"},
 	)
 
+	// CachePopulateDiskShed counts populates shed because tracked disk usage
+	// reached cache.populate_shed_disk_ratio of the disk cap: the store cannot
+	// evict as fast as it is being filled, so new bodies are served without
+	// being cached (tiered PUTs go upstream) until eviction catches up.
+	CachePopulateDiskShed = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "tag_cache_populate_disk_shed_total",
+			Help: "Total cache populates shed because disk usage is over the shed ratio, by source",
+		},
+		[]string{"source"},
+	)
+
 	// BytesTransferred tracks bytes transferred.
 	BytesTransferred = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -587,6 +599,11 @@ const (
 // RecordCachePopulateSkipped records a shed cache-populate, attributed to its source.
 func RecordCachePopulateSkipped(source string) {
 	CachePopulateSkipped.WithLabelValues(source).Inc()
+}
+
+// RecordCachePopulateDiskShed records a populate shed by the disk-usage guard.
+func RecordCachePopulateDiskShed(source string) {
+	CachePopulateDiskShed.WithLabelValues(source).Inc()
 }
 
 // RecordCacheServeLocality records a cache body read as served locally or

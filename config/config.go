@@ -107,6 +107,11 @@ const (
 	// byte budget, not the count, is what actually bounds this memory.
 	DefaultCacheMaxPopulateMemoryBytes = 2 << 30
 
+	// DefaultCachePopulateShedDiskRatio is the default for PopulateShedDiskRatio:
+	// populates are shed once tracked disk usage reaches 105% of
+	// MaxDiskUsageBytes, i.e. only when eviction has clearly fallen behind.
+	DefaultCachePopulateShedDiskRatio = 1.05
+
 	// DefaultWarmOnWriteReservedFraction is the default cap on the fraction of the
 	// cache-populate memory budget reserved for warm-on-write populates (when
 	// warm_on_write is enabled). The reservation is demand-driven and elastic:
@@ -288,6 +293,14 @@ type CacheConfig struct {
 	// unbounded. 0 or unset uses DefaultCacheMaxConcurrentWrites; a negative
 	// value disables the limit.
 	MaxConcurrentWrites int `yaml:"max_concurrent_writes"`
+	// PopulateShedDiskRatio sheds cache populates while tracked disk usage is at
+	// or above this fraction of MaxDiskUsageBytes: tiered local-tier PUTs go
+	// upstream instead, re-tiers and proxy-mode populates are skipped, and the
+	// object is still served. Protects the node from ingesting faster than it
+	// can evict (writes that are evicted before they are ever read). Only takes
+	// effect when MaxDiskUsageBytes > 0. 0 or unset uses
+	// DefaultCachePopulateShedDiskRatio; a negative value disables shedding.
+	PopulateShedDiskRatio float64 `yaml:"populate_shed_disk_ratio"`
 	// MaxPopulateMemoryBytes bounds the aggregate memory buffered by ALL cache buffering —
 	// cache-populate and block-serve staging together — as one honest total: buffering never
 	// exceeds this value. Foreground coalesced populates reserve their object size, capped at
@@ -536,6 +549,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cache.MaxPopulateMemoryBytes == 0 {
 		cfg.Cache.MaxPopulateMemoryBytes = DefaultCacheMaxPopulateMemoryBytes
 	}
+	if cfg.Cache.PopulateShedDiskRatio == 0 {
+		cfg.Cache.PopulateShedDiskRatio = DefaultCachePopulateShedDiskRatio
+	}
 	if cfg.Cache.WarmOnWriteReservedFraction == 0 {
 		cfg.Cache.WarmOnWriteReservedFraction = DefaultWarmOnWriteReservedFraction
 	}
@@ -653,6 +669,11 @@ func applyEnvOverrides(cfg *Config) {
 		if maxDisk := os.Getenv("TAG_CACHE_MAX_DISK_USAGE"); maxDisk != "" {
 			if size, err := strconv.ParseInt(maxDisk, 10, 64); err == nil && size >= 0 {
 				cfg.Cache.MaxDiskUsageBytes = size
+			}
+		}
+		if shed := os.Getenv("TAG_CACHE_POPULATE_SHED_DISK_RATIO"); shed != "" {
+			if ratio, err := strconv.ParseFloat(shed, 64); err == nil {
+				cfg.Cache.PopulateShedDiskRatio = ratio
 			}
 		}
 		if nodeID := os.Getenv("TAG_CACHE_NODE_ID"); nodeID != "" {

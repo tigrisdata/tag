@@ -26,3 +26,13 @@ func newEmbeddedBlockCacheClient(client *embedded.Client) *embeddedBlockCacheCli
 func (c *embeddedBlockCacheClient) PutBlockBytes(ctx context.Context, key string, data []byte, ttlSeconds int64) (handled bool, err error) {
 	return cache.PutRemoteBlockBytes(ctx, c.Operations(), key, data, ttlSeconds)
 }
+
+// DiskUsageBytes reports the engine's tracked local store size (the same
+// total behind ocache_disk_usage_ratio), so the proxy can shed populates when
+// eviction has fallen behind the disk cap. See cache.DiskUsageReporter.
+func (c *embeddedBlockCacheClient) DiskUsageBytes() int64 {
+	if s := c.Storage(); s != nil {
+		return s.TotalSize()
+	}
+	return 0
+}

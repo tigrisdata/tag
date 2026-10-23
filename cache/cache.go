@@ -46,6 +46,29 @@ type Cache struct {
 	closed     bool // coord is the meta-key ordering strategy: legacy tombstones (default)
 	// or CAS fences/versions. Selected once at construction; see coordinator.go.
 	coord metaCoordinator
+	// maxDiskUsage is the configured disk cap (0 = none); DiskUsageRatio
+	// reports tracked usage against it when the client can report usage.
+	maxDiskUsage int64
+}
+
+// DiskUsageReporter is implemented by cache clients that can report the bytes
+// their local store currently holds (the embedded engine's tracked total).
+type DiskUsageReporter interface {
+	DiskUsageBytes() int64
+}
+
+// DiskUsageRatio returns tracked local disk usage as a fraction of the
+// configured cap. ok is false when there is no cap or the client cannot report
+// usage, in which case callers must not shed on it.
+func (c *Cache) DiskUsageRatio() (ratio float64, ok bool) {
+	if c == nil || c.maxDiskUsage <= 0 || c.client == nil {
+		return 0, false
+	}
+	r, isReporter := c.client.(DiskUsageReporter)
+	if !isReporter {
+		return 0, false
+	}
+	return float64(r.DiskUsageBytes()) / float64(c.maxDiskUsage), true
 }
 
 // NewCacheWithClient creates a cache with an injected client.
@@ -54,7 +77,7 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 	ttl := int64(config.DefaultCacheTTL.Seconds())
 	enabled := true // Default to enabled
 	legacy := true  // Default to the legacy coordinator (see coordinator.go)
-	var sizeThreshold int64
+	var sizeThreshold, maxDiskUsage int64
 	if cfg != nil {
 		if cfg.TTL > 0 {
 			ttl = int64(cfg.TTL.Seconds())
@@ -62,6 +85,7 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 		enabled = cfg.IsEnabled()
 		legacy = cfg.IsLegacyCoordination()
 		sizeThreshold = cfg.SizeThreshold
+		maxDiskUsage = cfg.MaxDiskUsageBytes
 	}
 	var coord metaCoordinator
 	if legacy {
@@ -70,10 +94,11 @@ func NewCacheWithClient(client cacheclient.CacheClient, cfg *config.CacheConfig)
 		coord = &casCoordinator{client: client}
 	}
 	return &Cache{
-		client:     client,
-		defaultTTL: ttl,
-		enabled:    enabled,
-		coord:      coord,
+		client:       client,
+		defaultTTL:   ttl,
+		enabled:      enabled,
+		coord:        coord,
+		maxDiskUsage: maxDiskUsage,
 	}
 }
 
