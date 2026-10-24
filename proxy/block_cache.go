@@ -1744,17 +1744,21 @@ func (s *Service) runBlockFetch(parent context.Context, state *blockFetchState, 
 		perr := s.cache.PutBlock(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, blockBuf, ttl)
 		s.releaseCacheSlot(reserveWeight)
 		cancel()
-		if perr != nil {
+		if perr != nil && !errors.Is(perr, cache.ErrPopulateShed) {
 			putBlockBuf(bufp)
 			metrics.CacheBlockPopulateFailed.Inc()
 			state.completeServe(nil, nil, perr)
 			s.finishBlockFetch(blockKey, state, perr)
 			return
 		}
-		metrics.CacheBlockPopulated.Inc()
-		metrics.CacheBlockBytesPopulated.Add(float64(blockLen))
+		if perr == nil {
+			metrics.CacheBlockPopulated.Inc()
+			metrics.CacheBlockBytesPopulated.Add(float64(blockLen))
+		}
+		// A shed (perr == ErrPopulateShed, counted by the cache) still serves the
+		// validated bytes; only the persistence is skipped.
 		state.completeServe(bufp, blockBuf, nil)
-		s.finishBlockFetch(blockKey, state, nil)
+		s.finishBlockFetch(blockKey, state, perr)
 		return
 	}
 
@@ -1763,7 +1767,9 @@ func (s *Service) runBlockFetch(parent context.Context, state *blockFetchState, 
 	// bytes, and releases the slot and buffer only after PutBlock actually exits.
 	state.completeServe(bufp, blockBuf, nil)
 	perr := s.cache.PutBlock(fetchCtx, bucket, key, meta.ETag, meta.BlockSize, blockIdx, blockBuf, ttl)
-	if perr != nil {
+	if errors.Is(perr, cache.ErrPopulateShed) {
+		// Counted as a shed by the cache; the block was served, not persisted.
+	} else if perr != nil {
 		metrics.CacheBlockPopulateFailed.Inc()
 		log.Debug().Err(perr).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Detached remote block cache write failed")
 	} else {

@@ -826,19 +826,27 @@ func (c *Cache) PutBlock(ctx context.Context, bucket, key, etag string, blockSiz
 		if putter, ok := c.client.(blockBytePutter); ok {
 			handled, err := putter.PutBlockBytes(ctx, blockKey, data, int64(ttl))
 			if handled || err != nil {
-				if err != nil {
-					log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
-				}
-				return err
+				return c.blockPutResult(err, bucket, key, blockIdx)
 			}
 		}
 	}
 
-	if err := c.putBody(ctx, blockKey, bytes.NewReader(data), int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
+	return c.blockPutResult(c.putBody(ctx, blockKey, bytes.NewReader(data), int64(ttl)), bucket, key, blockIdx)
+}
+
+// blockPutResult classifies a block write's outcome: an owner's over-budget
+// refusal is counted as a shed and passed through as ErrPopulateShed for the
+// caller to treat as "not persisted", never as a cache failure.
+func (c *Cache) blockPutResult(err error, bucket, key string, blockIdx int64) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrPopulateShed) {
+		metrics.RecordCachePopulateDiskShed("block_owner")
 		return err
 	}
-	return nil
+	log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
+	return err
 }
 
 // PutBlockStream writes a single block of a block-mode object to cache. Blocks are
@@ -856,11 +864,7 @@ func (c *Cache) PutBlockStream(ctx context.Context, bucket, key, etag string, bl
 		ttl = int(c.defaultTTL)
 	}
 	blockKey := MakeBlockKey(bucket, key, etag, blockSize, blockIdx)
-	if err := c.putBody(ctx, blockKey, r, int64(ttl)); err != nil {
-		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Int64("block", blockIdx).Msg("Cache block put error")
-		return err
-	}
-	return nil
+	return c.blockPutResult(c.putBody(ctx, blockKey, r, int64(ttl)), bucket, key, blockIdx)
 }
 
 // PutMetaIfVersion writes only the object metadata (no body), committed under

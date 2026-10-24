@@ -276,8 +276,12 @@ func (s *Service) handleRevalidation200(
 				cacheCtx, bucket, key, newMeta, pr, ttl, expected,
 			)
 		}
-		if cacheErr != nil && !errors.Is(cacheErr, cache.ErrPopulateShed) {
-			log.Warn().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write failed during revalidation update")
+		if cacheErr != nil {
+			if errors.Is(cacheErr, cache.ErrPopulateShed) {
+				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache write shed during revalidation update: owner over disk budget")
+			} else {
+				log.Warn().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Cache write failed during revalidation update")
+			}
 			// Drain remaining pipe data so the foreground TeeReader doesn't block. Without this,
 			// io.Pipe's zero-buffer causes pw.Write to hang. (putBlocksFromStream also drains on
 			// error; this covers the whole-body path and is harmless when already drained.)
