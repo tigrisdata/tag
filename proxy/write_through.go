@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -213,6 +214,7 @@ const (
 	teeCached       teeOutcome = iota // meta+body written; no fallback needed
 	teeNotCacheable                   // HEAD authoritatively says not cacheable; a warm would only re-download and re-reject
 	teeFallbackWarm                   // couldn't confirm/write the version; a read-back warm may still cache the current object
+	teeShed                           // the owning node refused the body (over its disk budget); a warm would be refused the same way
 )
 
 // cacheTeedBodyFromHead HEADs the object for authoritative metadata and, only if the object
@@ -276,6 +278,11 @@ func (s *Service) cacheTeedBodyFromHead(ctx context.Context, bucket, key, putETa
 	// Put-if-absent: this tee follows the PUT's own invalidation; a racer that
 	// re-established the entry (a warm) caches the current version and wins.
 	wrote, err := s.cache.PutWithMetaStreamIfVersion(cacheCtx, bucket, key, meta, bytes.NewReader(body), ttl, expected)
+	if errors.Is(err, cache.ErrPopulateShed) {
+		// The owner has already said not to store this body; a warm would only
+		// re-download it to be refused again.
+		return teeShed
+	}
 	if err != nil {
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Write-through cache tee write failed")
 		return teeFallbackWarm

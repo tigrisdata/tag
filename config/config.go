@@ -549,7 +549,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Cache.MaxPopulateMemoryBytes == 0 {
 		cfg.Cache.MaxPopulateMemoryBytes = DefaultCacheMaxPopulateMemoryBytes
 	}
-	if cfg.Cache.PopulateShedDiskRatio == 0 {
+	// 0 means default; NaN or ±Inf (accepted by YAML and ParseFloat) would make
+	// the over-budget comparison silently false, so they take the default too.
+	if r := cfg.Cache.PopulateShedDiskRatio; r == 0 || math.IsNaN(r) || math.IsInf(r, 0) {
 		cfg.Cache.PopulateShedDiskRatio = DefaultCachePopulateShedDiskRatio
 	}
 	if cfg.Cache.WarmOnWriteReservedFraction == 0 {
@@ -673,7 +675,7 @@ func applyEnvOverrides(cfg *Config) {
 		}
 		// 0 keeps the default (like the neighbouring limits); negative disables.
 		if shed := os.Getenv("TAG_CACHE_POPULATE_SHED_DISK_RATIO"); shed != "" {
-			if ratio, err := strconv.ParseFloat(shed, 64); err == nil && ratio != 0 {
+			if ratio, err := strconv.ParseFloat(shed, 64); err == nil && ratio != 0 && !math.IsNaN(ratio) && !math.IsInf(ratio, 0) {
 				cfg.Cache.PopulateShedDiskRatio = ratio
 			}
 		}

@@ -688,6 +688,9 @@ func (s *Service) fetchFullObjectToCache(
 		// had already consumed the upstream body before observing that failure, so
 		// drain the remainder here to preserve a reusable upstream connection.
 		_, _ = io.Copy(io.Discard, resp.Body)
+		if errors.Is(cacheErr, cache.ErrPopulateShed) {
+			return cacheErr // a deliberate skip; the trigger logs it at debug
+		}
 		log.Warn().Err(cacheErr).Str("bucket", bucket).Str("key", key).Msg("Background cache write failed")
 	}
 	return cacheErr
@@ -740,6 +743,9 @@ func (s *Service) triggerBackgroundCacheFetch(bucket, key, accessKey, secretKey 
 		err := s.fetchFullObjectToCache(ctx, bucket, key, accessKey, secretKey, anonymous, prio, expected)
 
 		switch {
+		case errors.Is(err, cache.ErrPopulateShed):
+			// Counted by the cache (populate_owner); the body is served, not stored.
+			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Background cache fetch skipped - owner over disk budget")
 		case errors.Is(err, errCachePopulateDeclined):
 			// Deliberately skipped because the cache-write limit was saturated —
 			// not a fetch success or failure (already counted as a populate skip).
