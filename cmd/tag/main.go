@@ -235,9 +235,12 @@ func main() {
 			Msg("Initializing embedded cache")
 
 		embeddedCfg := &embedded.Config{
-			DiskPath:      cfg.Cache.DiskPath,
-			TTL:           cfg.Cache.TTL,
-			MaxDiskUsage:  cfg.Cache.MaxDiskUsageBytes,
+			DiskPath:     cfg.Cache.DiskPath,
+			TTL:          cfg.Cache.TTL,
+			MaxDiskUsage: cfg.Cache.MaxDiskUsageBytes,
+			// The engine refuses sheddable body writes at the OWNING node over this
+			// ratio — the same knob as the proxy's local pre-check (negative = off).
+			ShedDiskRatio: max(cfg.Cache.PopulateShedDiskRatio, 0),
 			NodeID:        cfg.Cache.NodeID,
 			ClusterAddr:   cfg.Cache.ClusterAddr,
 			GRPCAddr:      cfg.Cache.GRPCAddr,

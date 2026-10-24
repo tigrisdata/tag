@@ -587,6 +587,16 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return nil
 		}
+		if errors.Is(putErr, cache.ErrPopulateShed) {
+			// The owning node is over its disk budget and refused the body
+			// (the local pre-check in handleTieredPut saw a different node).
+			// The body is already consumed, so it cannot be re-routed
+			// upstream: answer retryable SlowDown and count the shed.
+			metrics.RecordCachePopulateDiskShed("tiered_put_owner")
+			s3err.WriteError(w, r, s3err.ErrSlowDown)
+			metrics.RecordRequest("PutObject", "shed", metrics.SourceLocal, time.Since(start).Seconds())
+			return nil
+		}
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return putErr
 	}

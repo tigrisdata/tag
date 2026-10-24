@@ -102,3 +102,19 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20260706201446-f0a921348800 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
 )
+
+replace github.com/tigrisdata/ocache/client => github.com/tigrisdata/ocache/client v0.0.0-20261024001938-5a96506073f1
+
+replace github.com/tigrisdata/ocache/coordinator => github.com/tigrisdata/ocache/coordinator v0.0.0-20261024001938-5a96506073f1
+
+replace github.com/tigrisdata/ocache/embedded => github.com/tigrisdata/ocache/embedded v0.0.0-20261024001938-5a96506073f1
+
+replace github.com/tigrisdata/ocache/proto => github.com/tigrisdata/ocache/proto v0.0.0-20261024001938-5a96506073f1
+
+replace github.com/tigrisdata/ocache/storage => github.com/tigrisdata/ocache/storage v0.0.0-20261024001938-5a96506073f1
+
+replace github.com/tigrisdata/ocache/common => github.com/tigrisdata/ocache/common v0.0.0-20261024001938-5a96506073f1
+
+replace github.com/tigrisdata/ocache/coordinator/proto => github.com/tigrisdata/ocache/coordinator/proto v0.0.0-20261024001938-5a96506073f1
+
+replace github.com/tigrisdata/ocache/server => github.com/tigrisdata/ocache/server v0.0.0-20261024001938-5a96506073f1

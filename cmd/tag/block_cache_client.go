@@ -27,6 +27,13 @@ func (c *embeddedBlockCacheClient) PutBlockBytes(ctx context.Context, key string
 	return cache.PutRemoteBlockBytes(ctx, c.Operations(), key, data, ttlSeconds)
 }
 
+// IsOverBudget tells the cache layer that a PutStreamSheddable error (promoted
+// from embedded.Client) is the owning node's over-budget refusal, which the
+// cache reports as cache.ErrPopulateShed. See cache.OverBudgetClassifier.
+func (c *embeddedBlockCacheClient) IsOverBudget(err error) bool {
+	return embedded.IsOverBudget(err)
+}
+
 // DiskUsageBytes reports the engine's tracked local store size (the same
 // total behind ocache_disk_usage_ratio), so the proxy can shed populates when
 // eviction has fallen behind the disk cap. See cache.DiskUsageReporter.

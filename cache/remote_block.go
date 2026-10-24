@@ -32,15 +32,20 @@ func PutRemoteBlockBytes(ctx context.Context, router RemoteBlockRouter, key stri
 	if err != nil {
 		return true, err
 	}
+	// Blocks are bodies: let an over-budget owner refuse them (ErrPopulateShed).
 	resp, err := client.PutObject(ctx, &pb.PutRequest{
-		Key:        key,
-		Data:       data,
-		TtlSeconds: ttlSeconds,
+		Key:            key,
+		Data:           data,
+		TtlSeconds:     ttlSeconds,
+		ShedOverBudget: true,
 	})
 	if err != nil {
 		return true, err
 	}
 	if resp != nil && !resp.Success {
+		if resp.Shed {
+			return true, ErrPopulateShed
+		}
 		return true, fmt.Errorf("put failed: %s", resp.Error)
 	}
 	return true, nil

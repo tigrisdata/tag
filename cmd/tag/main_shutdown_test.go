@@ -97,12 +97,22 @@ func (w *shutdownSignalLogWriter) Write(p []byte) (int, error) {
 // After release it delegates to embedded storage unless Close has already run;
 // in that case it reports the forbidden ordering without touching a closed DB.
 func (c *embeddedBlockCacheClient) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
+	return c.probePut(ctx, key, r, ttlSeconds, c.Client.PutStream)
+}
+
+// PutStreamSheddable is the path body populates take (cache.putBody); probe it
+// the same way so the detached writer is intercepted whichever one it uses.
+func (c *embeddedBlockCacheClient) PutStreamSheddable(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
+	return c.probePut(ctx, key, r, ttlSeconds, c.Client.PutStreamSheddable)
+}
+
+func (c *embeddedBlockCacheClient) probePut(ctx context.Context, key string, r io.Reader, ttlSeconds int64, put func(context.Context, string, io.Reader, int64) error) error {
 	state := shutdownTestChild.Load()
 	if os.Getenv(shutdownTestChildEnv) == "1" && state != nil {
 		state.setStorage(c.Client.Storage())
 	}
 	if os.Getenv(shutdownTestChildEnv) != "1" || os.Getenv(shutdownTestHoldEnv) != "true" || key != cache.MakeBodyKey(shutdownProbeBucket, shutdownProbeKey, shutdownProbeETag) {
-		return c.Client.PutStream(ctx, key, r, ttlSeconds)
+		return put(ctx, key, r, ttlSeconds)
 	}
 
 	if state == nil {
@@ -129,7 +139,7 @@ func (c *embeddedBlockCacheClient) PutStream(ctx context.Context, key string, r 
 		state.event("writer-exited")
 		return errors.New("embedded storage closed while a cache write was active")
 	}
-	err := c.Client.PutStream(ctx, key, r, ttlSeconds)
+	err := put(ctx, key, r, ttlSeconds)
 	state.writerActive.Store(false)
 	state.event("writer-exited")
 	return err

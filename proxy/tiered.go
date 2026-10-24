@@ -698,6 +698,13 @@ func (s *Service) maybeRetierOnRead(bucket, key, accessKey, secretKey string, ma
 				log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Re-tier staged body delete failed; orphan ages out by TTL")
 			}
 		}
+		if errors.Is(putBodyErr, cache.ErrPopulateShed) {
+			// The owning node refused the heal: over budget, not a fault.
+			discardRef()
+			metrics.RecordCachePopulateDiskShed("retier_owner")
+			metrics.RecordTieredRetier("shed")
+			return
+		}
 		if putBodyErr != nil {
 			// Transport failure mid-body or a cache write fault: transient,
 			// nothing safe to commit — and no backoff, a blip must not

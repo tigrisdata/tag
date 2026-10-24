@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/tigrisdata/tag/metrics"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2300,5 +2302,61 @@ func TestTieredPutShedsToUpstreamWhenOverDiskBudget(t *testing.T) {
 	}
 	if n := forwards.Load(); n != 1 {
 		t.Fatalf("forwards with shedding disabled = %d, want 1", n)
+	}
+}
+
+// ownerShedClient models an engine whose OWNING node refuses sheddable body
+// writes while over budget: PutStreamSheddable returns cache.ErrPopulateShed
+// when shed is set and otherwise behaves like a plain streamed put.
+type ownerShedClient struct {
+	cacheclient.CacheClient
+	shed atomic.Bool
+}
+
+func (o *ownerShedClient) PutStreamSheddable(ctx context.Context, key string, r io.Reader, ttl int64) error {
+	if o.shed.Load() {
+		return cache.ErrPopulateShed
+	}
+	return o.CacheClient.PutStream(ctx, key, r, ttl)
+}
+
+// A body refused by the owning node answers a retryable SlowDown, leaves no
+// local metadata behind, and is counted as a shed, not an error.
+func TestTieredPutOwnerRefusalAnswersSlowDown(t *testing.T) {
+	mock, forwards, _ := tieredMock()
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 64
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	client := &ownerShedClient{CacheClient: cacheclient.NewMemoryCache()}
+	c := cache.NewCacheWithClient(client, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	shedBefore := testutil.ToFloat64(metrics.CachePopulateDiskShed.WithLabelValues("tiered_put_owner"))
+	client.shed.Store(true)
+	w := tieredDo(t, svc, http.MethodPut, "/b/refused", "small body", nil)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "SlowDown") {
+		t.Fatalf("PUT status = %d body %q, want 503 SlowDown", w.Code, w.Body.String())
+	}
+	if n := forwards.Load(); n != 0 {
+		t.Fatalf("forwards = %d, want 0 (body already consumed; never re-routed upstream)", n)
+	}
+	if _, found, err := c.GetMeta(context.Background(), "b", "refused"); err != nil || found {
+		t.Fatalf("refused PUT must leave no metadata: found=%v err=%v", found, err)
+	}
+	if got := testutil.ToFloat64(metrics.CachePopulateDiskShed.WithLabelValues("tiered_put_owner")) - shedBefore; got != 1 {
+		t.Fatalf("tiered_put_owner shed count delta = %v, want 1", got)
+	}
+
+	client.shed.Store(false)
+	if w := tieredDo(t, svc, http.MethodPut, "/b/accepted", "small body", nil); w.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d after the owner recovers", w.Code)
+	}
+	meta, found, err := c.GetMeta(context.Background(), "b", "accepted")
+	if err != nil || !found || meta == nil || meta.BodyUpstream {
+		t.Fatalf("accepted PUT must be local-tier: found=%v err=%v meta=%+v", found, err, meta)
 	}
 }

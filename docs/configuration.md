@@ -271,6 +271,9 @@ cache:
   # Shed populates (tiered PUTs go upstream, re-tiers and proxy populates are
   # skipped, objects still served) while tracked disk usage is at or above this
   # fraction of max_disk_usage_bytes, i.e. while eviction is behind ingest.
+  # Enforced twice: a local pre-check on the node serving the request, and by
+  # the cache engine at the node that owns the body (a refused tiered PUT is
+  # answered with a retryable 503 SlowDown). Metadata is never shed.
   # Only applies with a disk cap. 0 keeps the default; negative disables.
   # Override with TAG_CACHE_POPULATE_SHED_DISK_RATIO env var
   populate_shed_disk_ratio: 1.05
