@@ -54,6 +54,12 @@ cache:
   # Default: 0
   max_disk_usage_bytes: 0
 
+  # Stop writing new cache bodies while tracked usage is at or above this
+  # fraction of max_disk_usage_bytes (eviction behind ingest). Objects are still
+  # served. Only applies with a disk cap; 0 keeps the default, negative disables.
+  # Default: 1.05
+  populate_shed_disk_ratio: 1.05
+
   # Unique node identifier for cluster mode
   # Required for multi-node deployments
   node_id: "tag-node-1"

@@ -67,6 +67,17 @@ every TAG miss, whether from expiry, eviction, or data loss, as "not cached".
 Tiered mode trades durability for zero upstream traffic on small objects; it
 is not a store of record.
 
+The local tier also has a budget. While the owning node's tracked usage is at
+or above `cache.populate_shed_disk_ratio` (default 1.05) of
+`max_disk_usage_bytes`, a small PUT is placed upstream with a marker instead
+of in the local tier, and the re-tier that would normally pull it back on read
+is skipped; conditional writes (`If-Match`, `If-None-Match`) always stay
+local because their precondition is evaluated against the local copy. When
+only the owning node is over budget and refuses the body after it has been
+consumed, the PUT answers `503 SlowDown` and the client retries. Sheds are
+counted in `tag_cache_populate_disk_shed_total`; see
+[Deploy](deploy.md#upgrading-to-v1230).
+
 ## Authentication
 
 The transparent-proxy flow, unchanged. Tiered semantics apply only to requests
