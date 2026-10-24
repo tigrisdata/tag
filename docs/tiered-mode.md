@@ -67,14 +67,16 @@ every TAG miss, whether from expiry, eviction, or data loss, as "not cached".
 Tiered mode trades durability for zero upstream traffic on small objects; it
 is not a store of record.
 
-The local tier also has a budget. While the owning node's tracked usage is at
+The local tier also has a budget. While the serving node's tracked usage is at
 or above `cache.populate_shed_disk_ratio` (default 1.05) of
 `max_disk_usage_bytes`, a small PUT is placed upstream with a marker instead
 of in the local tier, and the re-tier that would normally pull it back on read
-is skipped; conditional writes (`If-Match`, `If-None-Match`) always stay
-local because their precondition is evaluated against the local copy. When
-only the owning node is over budget and refuses the body after it has been
-consumed, the PUT answers `503 SlowDown` and the client retries. Sheds are
+is skipped. Conditional writes (`If-Match`, `If-None-Match`) are exempt from
+that check, since their precondition is evaluated against the local copy; a
+conditional write against an upstream-tier marker still forwards upstream, as
+it always has. In a cluster the body may belong to another node: when only
+that owning node is over budget, it refuses the body after it has been
+consumed and the PUT answers `503 SlowDown` for the client to retry. Sheds are
 counted in `tag_cache_populate_disk_shed_total`; see
 [Deploy](deploy.md#upgrading-to-v1230).
 
