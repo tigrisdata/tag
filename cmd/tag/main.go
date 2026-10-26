@@ -36,8 +36,20 @@ const (
 	// Cluster ready timeout for embedded cache
 	clusterReadyTimeout = 30 * time.Second
 
-	// Shutdown timeout for graceful shutdown
-	shutdownTimeout = 30 * time.Second
+	// baseTerminationGrace is the pod termination grace the base manifests set
+	// (deploy/kubernetes/base). Shutdown has to finish inside it or the pod is
+	// SIGKILLed before the cache has left the gossip cluster.
+	baseTerminationGrace = 30 * time.Second
+
+	// clusterLeaveReserve is what embeddedCache.Close needs after the HTTP drain:
+	// gRPC GracefulStop, the ring LEAVING announcement and its propagation delay,
+	// the memberlist leave (5s timeout) and closing storage. A pod killed before
+	// the leave leaves a stale alive entry that peers must first detect dead.
+	clusterLeaveReserve = 10 * time.Second
+
+	// shutdownTimeout bounds the HTTP drain so the cluster leave fits in the
+	// termination grace.
+	shutdownTimeout = baseTerminationGrace - clusterLeaveReserve
 
 	// How often the local cache size is sampled into tag_cache_size_bytes.
 	cacheSizeSampleInterval = 30 * time.Second
