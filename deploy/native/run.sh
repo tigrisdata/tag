@@ -62,7 +62,8 @@ TAG_CACHE_GRPC_ADDR="${TAG_CACHE_GRPC_ADDR:-:19000}"
 # TAG settings
 TAG_LOG_LEVEL="${TAG_LOG_LEVEL:-info}"
 TAG_PPROF_ENABLED="${TAG_PPROF_ENABLED:-false}"
-TAG_MAX_IDLE_CONNS_PER_HOST="${TAG_MAX_IDLE_CONNS_PER_HOST:-100}"
+# Leave TAG_MAX_IDLE_CONNS_PER_HOST unset unless the operator supplies it, so
+# the YAML value or the binary default remains authoritative.
 
 # Seconds to wait for /health during start. Warm-cache boots open the on-disk
 # store before the HTTP server listens, which on a large cache can take minutes
@@ -258,7 +259,7 @@ cmd_start() {
     TAG_CACHE_GRPC_ADDR="${TAG_CACHE_GRPC_ADDR}" \
     TAG_LOG_LEVEL="${TAG_LOG_LEVEL}" \
     TAG_PPROF_ENABLED="${TAG_PPROF_ENABLED}" \
-    TAG_MAX_IDLE_CONNS_PER_HOST="${TAG_MAX_IDLE_CONNS_PER_HOST}" \
+    TAG_MAX_IDLE_CONNS_PER_HOST="${TAG_MAX_IDLE_CONNS_PER_HOST:-}" \
     "${tag_bin}" ${config_args[@]+"${config_args[@]}"} \
         > "${LOG_DIR}/tag.log" 2>&1 &
     local tag_pid=$!
@@ -357,7 +358,7 @@ cmd_help() {
     echo "  TAG_VERSION            TAG version (default: ${TAG_VERSION})"
     echo "  TAG_LOG_LEVEL          Log level: debug, info, warn, error (default: ${TAG_LOG_LEVEL})"
     echo "  TAG_PPROF_ENABLED      Enable pprof profiling: true, false (default: ${TAG_PPROF_ENABLED})"
-    echo "  TAG_MAX_IDLE_CONNS_PER_HOST  Max idle connections per host (default: ${TAG_MAX_IDLE_CONNS_PER_HOST})"
+    echo "  TAG_MAX_IDLE_CONNS_PER_HOST  Override total/per-host upstream idle cap (unset: YAML value or 1024)"
     echo "  TAG_PORT               TAG HTTP port (default: ${TAG_PORT})"
     echo "  TAG_START_TIMEOUT      Seconds to wait for /health on start (default: ${TAG_START_TIMEOUT})"
     echo "  TAG_CONFIG_FILE        Config file passed to tag if it exists; empty to disable (default: ${TAG_CONFIG_FILE})"

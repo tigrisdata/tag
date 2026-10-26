@@ -8,12 +8,42 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 )
 
 type forwarderTestTransport func(*http.Request) (*http.Response, error)
+
+func TestNewBaseForwarderUsesBoundedIdlePool(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		configuredPool int
+		wantPool       int
+	}{
+		{name: "default", configuredPool: 0, wantPool: config.DefaultMaxIdleConnsPerHost},
+		{name: "operator cap", configuredPool: 64, wantPool: 64},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			forwarder := newBaseForwarder("https://upstream.example.com", "us-east-1", test.configuredPool)
+			transport, ok := forwarder.httpClient.Transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("transport type = %T, want *http.Transport", forwarder.httpClient.Transport)
+			}
+			if transport.MaxIdleConns != test.wantPool {
+				t.Errorf("MaxIdleConns = %d, want %d", transport.MaxIdleConns, test.wantPool)
+			}
+			if transport.MaxIdleConnsPerHost != test.wantPool {
+				t.Errorf("MaxIdleConnsPerHost = %d, want %d", transport.MaxIdleConnsPerHost, test.wantPool)
+			}
+			if transport.IdleConnTimeout != 90*time.Second {
+				t.Errorf("IdleConnTimeout = %v, want 90s", transport.IdleConnTimeout)
+			}
+		})
+	}
+}
 
 func (f forwarderTestTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)

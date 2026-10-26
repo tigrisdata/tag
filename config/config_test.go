@@ -16,6 +16,7 @@ server:
 upstream:
   endpoint: "https://fly.storage.tigris.dev"
   region: "us-west-2"
+  max_idle_conns_per_host: 256
 cache:
   enabled: true
   ttl: 10m
@@ -53,6 +54,9 @@ log:
 	}
 	if cfg.Upstream.Region != "us-west-2" {
 		t.Errorf("Upstream.Region = %q, want us-west-2", cfg.Upstream.Region)
+	}
+	if cfg.Upstream.MaxIdleConnsPerHost != 256 {
+		t.Errorf("Upstream.MaxIdleConnsPerHost = %d, want explicit YAML cap 256", cfg.Upstream.MaxIdleConnsPerHost)
 	}
 
 	// Verify cache config
@@ -100,6 +104,15 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.Server.BindIP != DefaultBindIP {
 		t.Errorf("BindIP = %q, want %q", cfg.Server.BindIP, DefaultBindIP)
 	}
+	if cfg.Server.MaxInflightRequests != DefaultServerMaxInflightRequests {
+		t.Errorf("Server.MaxInflightRequests = %d, want %d", cfg.Server.MaxInflightRequests, DefaultServerMaxInflightRequests)
+	}
+	if DefaultMaxIdleConnsPerHost != DefaultServerMaxInflightRequests {
+		t.Errorf("default upstream idle cap = %d, want default request limit %d", DefaultMaxIdleConnsPerHost, DefaultServerMaxInflightRequests)
+	}
+	if cfg.Upstream.MaxIdleConnsPerHost != DefaultMaxIdleConnsPerHost {
+		t.Errorf("Upstream.MaxIdleConnsPerHost = %d, want %d", cfg.Upstream.MaxIdleConnsPerHost, DefaultMaxIdleConnsPerHost)
+	}
 	if cfg.Upstream.Endpoint != DefaultUpstreamEndpoint {
 		t.Errorf("Upstream.Endpoint = %q, want %q", cfg.Upstream.Endpoint, DefaultUpstreamEndpoint)
 	}
@@ -136,6 +149,7 @@ log:
 	// Set environment variables
 	t.Setenv("TAG_UPSTREAM_ENDPOINT", "https://t3.storage.dev")
 	t.Setenv("TAG_UPSTREAM_REGION", "us-west-2")
+	t.Setenv("TAG_MAX_IDLE_CONNS_PER_HOST", "128")
 	t.Setenv("TAG_CACHE_NODE_ID", "env-node-1")
 	t.Setenv("TAG_CACHE_DISK_PATH", "/env/cache/path")
 	t.Setenv("TAG_CACHE_SEED_NODES", "env-node-0:7000,env-node-1:7000")
@@ -152,6 +166,9 @@ log:
 	}
 	if cfg.Upstream.Region != "us-west-2" {
 		t.Errorf("Upstream.Region = %q, want us-west-2 (TAG_UPSTREAM_REGION override)", cfg.Upstream.Region)
+	}
+	if cfg.Upstream.MaxIdleConnsPerHost != 128 {
+		t.Errorf("Upstream.MaxIdleConnsPerHost = %d, want TAG_MAX_IDLE_CONNS_PER_HOST override 128", cfg.Upstream.MaxIdleConnsPerHost)
 	}
 	if cfg.Cache.NodeID != "env-node-1" {
 		t.Errorf("Cache.NodeID = %q, want env-node-1", cfg.Cache.NodeID)
