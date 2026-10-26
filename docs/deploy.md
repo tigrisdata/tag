@@ -69,7 +69,7 @@ resources:
   - ../../base
 images:
   - name: tigrisdata/tag
-    newTag: v1.23.0
+    newTag: v1.23.1
 ```
 
 ## Production Considerations
@@ -274,6 +274,14 @@ v1.23.0 adds **disk-budget populate shedding** (embedded engine ocache v1.14.0).
 - **Tiered mode.** When the serving node is over budget, a small PUT that would land in the local tier goes upstream with a marker instead. Conditional writes are exempt from that check (their precondition is evaluated against the local copy); a conditional write against an upstream-tier marker still forwards upstream as before. If only the owning node is over budget and refuses after the body has been consumed, the PUT answers `503 SlowDown`; clients retry as for any throttle. Re-tier-on-read is skipped while over budget.
 - **Observing it.** `tag_cache_populate_disk_shed_total{source}` counts sheds by path (`tiered_put`, `retier`, `read_miss`, `warm_on_write` for the local pre-check; `*_owner` for refusals by the owning node); `ocache_rpc_requests_total{status="shed"}` counts them on the engine side. A node that sheds continuously is undersized for its write rate; raise `max_disk_usage_bytes` or add nodes.
 - **Tuning.** `TAG_CACHE_POPULATE_SHED_DISK_RATIO` sets the ratio (`0` keeps the default, a negative value disables shedding; non-finite values are ignored). Without a disk cap nothing is ever shed.
+
+#### Upgrading to v1.23.1
+
+v1.23.1 makes rolling restarts converge quickly (embedded engine ocache v1.14.1). No configuration change is needed:
+
+- **Gossip after a restart.** A pod that comes back on a new address is now accepted by its peers within seconds. Previously, peers kept dialing the old address until the kernel connect timeout and refused the new one as a conflict, which could leave the ring split for minutes after a roll, with keys owned by a node marked unhealthy answering errors. The transport now bounds each gossip dial (2s) and write (5s), reclaims a dead node's name after 5s, and rejoins through the seed address every minute.
+- **Shutdown budget.** The HTTP drain is 20 seconds instead of 30, leaving 10 seconds of the base 30-second termination grace for the cache to announce leaving and leave the gossip cluster before the pod is killed (see [Graceful shutdown](#graceful-shutdown)). A request still running 20 seconds into shutdown is cancelled 10 seconds earlier than before.
+- **Watching a roll.** `memberlist_client_cluster_members_count` on each pod should return to the replica count, and `ring_members{name="ocache",state="Unhealthy"}` to zero, shortly after the last pod is ready.
 
 ### Health Checks
 
