@@ -301,6 +301,13 @@ type CacheConfig struct {
 	// effect when MaxDiskUsageBytes > 0. 0 or unset uses
 	// DefaultCachePopulateShedDiskRatio; a negative value disables shedding.
 	PopulateShedDiskRatio float64 `yaml:"populate_shed_disk_ratio"`
+	// PopulateShedReject answers a shed tiered local-tier PUT with 503 SlowDown
+	// instead of placing it upstream with a marker. Use it where the upstream
+	// tier is slow to read back (a cold object store behind TAG): an
+	// upstream-tier small object then costs more to serve than a miss. The
+	// owner-side refusal already answers SlowDown; this makes the local
+	// pre-check do the same. Conditional writes are unaffected (never shed).
+	PopulateShedReject bool `yaml:"populate_shed_reject"`
 	// MaxPopulateMemoryBytes bounds the aggregate memory buffered by ALL cache buffering —
 	// cache-populate and block-serve staging together — as one honest total: buffering never
 	// exceeds this value. Foreground coalesced populates reserve their object size, capped at
@@ -678,6 +685,9 @@ func applyEnvOverrides(cfg *Config) {
 			if ratio, err := strconv.ParseFloat(shed, 64); err == nil && ratio != 0 && !math.IsNaN(ratio) && !math.IsInf(ratio, 0) {
 				cfg.Cache.PopulateShedDiskRatio = ratio
 			}
+		}
+		if reject, ok := envBool("TAG_CACHE_POPULATE_SHED_REJECT"); ok {
+			cfg.Cache.PopulateShedReject = reject
 		}
 		if nodeID := os.Getenv("TAG_CACHE_NODE_ID"); nodeID != "" {
 			cfg.Cache.NodeID = nodeID

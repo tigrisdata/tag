@@ -55,6 +55,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
+	"github.com/tigrisdata/tag/s3err"
 )
 
 // tieredCleanupTimeout bounds the background cross-tier DELETE.
@@ -179,6 +180,14 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	localTier := result == AuthValidated && originlessPlainObject(r) && sized && declaredSize <= s.config.Cache.SizeThreshold
 	if localTier && !conditional && s.diskOverBudget() {
 		metrics.RecordCachePopulateDiskShed("tiered_put")
+		if s.config.Cache.PopulateShedReject {
+			// Refuse rather than place upstream: the body is unread, so the
+			// client simply retries later, and no upstream-tier object is
+			// created that would be slow to read back.
+			s3err.WriteError(w, r, s3err.ErrSlowDown)
+			metrics.RecordRequest("PutObject", "shed", metrics.SourceLocal, time.Since(start).Seconds())
+			return nil
+		}
 		localTier = false
 	}
 	if localTier {

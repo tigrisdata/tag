@@ -76,7 +76,10 @@ that check, since their precondition is evaluated against the local copy; a
 conditional write against an upstream-tier marker still forwards upstream, as
 it always has. In a cluster the body may belong to another node: when only
 that owning node is over budget, it refuses the body after it has been
-consumed and the PUT answers `503 SlowDown` for the client to retry. Sheds are
+consumed and the PUT answers `503 SlowDown` for the client to retry. With
+`cache.populate_shed_reject` the serving node's own pre-check answers
+`503 SlowDown` too, instead of placing the body upstream, for deployments
+where an upstream-tier object is slower to serve than a miss. Sheds are
 counted in `tag_cache_populate_disk_shed_total`; see
 [Deploy](deploy.md#upgrading-to-v1230).
 

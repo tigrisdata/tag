@@ -35,6 +35,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `TAG_CACHE_RECOVERY_WORKERS`      | Parallel workers for startup file recovery                                      | `16`                     |
 | `TAG_CACHE_MAX_CONCURRENT_WRITES` | Max concurrent cache-populate operations                                        | `256`                    |
 | `TAG_CACHE_POPULATE_SHED_DISK_RATIO` | Shed populates once disk usage reaches this fraction of the cap (0 = default, negative disables) | `1.05` |
+| `TAG_CACHE_POPULATE_SHED_REJECT` | Answer a shed tiered PUT with 503 SlowDown instead of placing it upstream with a marker | `false` |
 | `TAG_CACHE_MAX_POPULATE_MEMORY`   | Aggregate memory budget (bytes) for all cache buffering — populate + block-serve staging (one honest total) | `2147483648` (2 GiB)     |
 | `TAG_MAX_INFLIGHT_REQUESTS`       | Max concurrently-served S3 requests before shedding with 503 SlowDown           | `1024`                   |
 | `TAG_HTTP_PORT`                   | Port for the S3 API                                                             | `8080`                   |
@@ -277,6 +278,13 @@ cache:
   # Only applies with a disk cap. 0 keeps the default; negative disables.
   # Override with TAG_CACHE_POPULATE_SHED_DISK_RATIO env var
   populate_shed_disk_ratio: 1.05
+
+  # Tiered mode: answer a shed local-tier PUT with 503 SlowDown instead of
+  # placing it upstream with a marker. Set this where the upstream tier is slow
+  # to read back (a cold object store behind TAG), so a shed write
+  # becomes a miss rather than a slow upstream-tier object. Conditional writes
+  # are never shed. Override with TAG_CACHE_POPULATE_SHED_REJECT env var
+  populate_shed_reject: false
 
   # Aggregate memory budget for ALL cache buffering — cache-populate and block-serve
   # staging share this one pool, so the value is an honest total (buffering never

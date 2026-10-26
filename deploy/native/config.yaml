@@ -60,6 +60,11 @@ cache:
   # Default: 1.05
   populate_shed_disk_ratio: 1.05
 
+  # Tiered mode: refuse a shed small PUT with 503 SlowDown instead of placing
+  # it upstream with a marker (use where the upstream tier is slow to read back).
+  # Default: false
+  populate_shed_reject: false
+
   # Unique node identifier for cluster mode
   # Required for multi-node deployments
   node_id: "tag-node-1"

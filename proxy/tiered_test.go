@@ -2237,6 +2237,58 @@ func (d *diskUsageClient) DiskUsageBytes() int64 { return d.used.Load() }
 
 // Over the disk budget a small, validated PUT must go upstream with a marker
 // instead of landing in the local tier; under budget it stays local again.
+// With populate_shed_reject the local pre-check answers 503 SlowDown instead
+// of placing the body upstream: nothing is forwarded, no marker is stamped,
+// and the client retries. Conditional writes and under-budget writes are
+// unchanged.
+func TestTieredPutRejectsWhenOverDiskBudgetAndRejectConfigured(t *testing.T) {
+	mock, forwards, _ := tieredMock()
+	cfg := config.NewDefault()
+	cfg.Mode = config.ModeTiered
+	cfg.Cache.SetBlockCachingEnabled(false)
+	cfg.Cache.SizeThreshold = 64
+	cfg.Cache.MaxDiskUsageBytes = 1000
+	cfg.Cache.PopulateShedReject = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	client := &diskUsageClient{CacheClient: cacheclient.NewMemoryCache()}
+	c := cache.NewCacheWithClient(client, &cfg.Cache)
+	svc := NewService(mock, c, cfg)
+
+	client.used.Store(1100) // over budget
+	if w := tieredDo(t, svc, http.MethodPut, "/b/over", "small body", nil); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("over-budget PUT status = %d, want 503", w.Code)
+	}
+	if n := forwards.Load(); n != 0 {
+		t.Fatalf("forwards after rejected PUT = %d, want 0", n)
+	}
+	if _, found, err := c.GetMeta(context.Background(), "b", "over"); err != nil || found {
+		t.Fatalf("rejected PUT must leave no metadata: found=%v err=%v", found, err)
+	}
+
+	// Conditional writes are never shed, so they are never rejected either.
+	if w := tieredDo(t, svc, http.MethodPut, "/b/conditional", "small body", map[string]string{"If-None-Match": "*"}); w.Code != http.StatusOK {
+		t.Fatalf("conditional PUT status = %d", w.Code)
+	}
+	meta, found, err := c.GetMeta(context.Background(), "b", "conditional")
+	if err != nil || !found || meta == nil || meta.BodyUpstream {
+		t.Fatalf("conditional PUT must be local-tier: found=%v err=%v meta=%+v", found, err, meta)
+	}
+
+	client.used.Store(500) // back under budget: local tier resumes
+	if w := tieredDo(t, svc, http.MethodPut, "/b/under", "small body", nil); w.Code != http.StatusOK {
+		t.Fatalf("under-budget PUT status = %d", w.Code)
+	}
+	if n := forwards.Load(); n != 0 {
+		t.Fatalf("forwards after under-budget PUT = %d, want 0", n)
+	}
+	meta, found, err = c.GetMeta(context.Background(), "b", "under")
+	if err != nil || !found || meta == nil || meta.BodyUpstream {
+		t.Fatalf("under-budget PUT must be local-tier: found=%v err=%v meta=%+v", found, err, meta)
+	}
+}
+
 func TestTieredPutShedsToUpstreamWhenOverDiskBudget(t *testing.T) {
 	mock, forwards, _ := tieredMock()
 	cfg := config.NewDefault()

@@ -1415,6 +1415,50 @@ func TestLoad_LegacyCoordinationOverrideByEnv(t *testing.T) {
 	}
 }
 
+func TestLoad_PopulateShedRejectDefaultAndEnv(t *testing.T) {
+	content := "cache:\n  enabled: true\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.PopulateShedReject {
+		t.Error("Cache.PopulateShedReject = true by default, want false (shed places upstream)")
+	}
+
+	t.Setenv("TAG_CACHE_POPULATE_SHED_REJECT", "true")
+	if cfg, err = Load(tmpFile); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Cache.PopulateShedReject {
+		t.Error("Cache.PopulateShedReject = false with env true")
+	}
+
+	// The environment overrides YAML in both directions.
+	yes := "cache:\n  enabled: true\n  populate_shed_reject: true\n"
+	if err := os.WriteFile(tmpFile, []byte(yes), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TAG_CACHE_POPULATE_SHED_REJECT", "false")
+	if cfg, err = Load(tmpFile); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Cache.PopulateShedReject {
+		t.Error("Cache.PopulateShedReject = true with env false over YAML true")
+	}
+	t.Setenv("TAG_CACHE_POPULATE_SHED_REJECT", "")
+	if cfg, err = Load(tmpFile); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Cache.PopulateShedReject {
+		t.Error("Cache.PopulateShedReject = false from YAML true")
+	}
+}
+
 func TestLoad_PopulateShedDiskRatioDefaultAndEnv(t *testing.T) {
 	content := "cache:\n  enabled: true\n"
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
