@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,12 +38,28 @@ type bulkDeleteFenceCacheClient struct {
 	releaseFence    <-chan struct{}
 	putCount        atomic.Int32
 	once            sync.Once
+	cancelOnce      sync.Once
+	fenceContext    chan context.Context
+	fenceCancelled  chan struct{}
 }
 
 func (c *bulkDeleteFenceCacheClient) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
 	if key == c.targetTombstone && c.putCount.Add(1) == 2 {
 		c.once.Do(func() { close(c.postFence) })
-		<-c.releaseFence
+		if c.fenceContext != nil {
+			select {
+			case c.fenceContext <- ctx:
+			default:
+			}
+		}
+		select {
+		case <-ctx.Done():
+			if c.fenceCancelled != nil {
+				c.cancelOnce.Do(func() { close(c.fenceCancelled) })
+			}
+			return ctx.Err()
+		case <-c.releaseFence:
+		}
 	}
 	return c.CacheClient.Put(ctx, key, data, ttlSeconds)
 }
@@ -563,5 +580,137 @@ func TestBulkDeleteWithCacheDisabledKeepsStreaming(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatalf("cache-disabled response did not finish after the remaining upstream body was released: %v", ctx.Err())
+	}
+}
+
+// Once upstream has confirmed a bulk delete, client cancellation must not cancel
+// the bounded cache fence that prevents a racing refill from surviving.
+func TestBulkDeleteClientCancellationDoesNotCancelPostSuccessFence(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	releaseFence := make(chan struct{})
+	var releaseOnce sync.Once
+	releasePostFence := func() { releaseOnce.Do(func() { close(releaseFence) }) }
+	fenceContext := make(chan context.Context, 1)
+	fenceCancelled := make(chan struct{})
+	const key = "cancel-after-upstream-key"
+	owner := &bulkDeleteFenceCacheClient{
+		CacheClient:     cacheclient.NewMemoryCache(),
+		targetTombstone: cache.MakeTombstoneKey(bulkDeleteFenceBucket, key),
+		postFence:       make(chan struct{}),
+		releaseFence:    releaseFence,
+		fenceContext:    fenceContext,
+		fenceCancelled:  fenceCancelled,
+	}
+
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !r.URL.Query().Has("delete") {
+			http.NotFound(w, r)
+			return
+		}
+		upstreamCalls.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `<DeleteResult><Deleted><Key>`+key+`</Key></Deleted></DeleteResult>`)
+	}))
+	cfg := config.NewDefault()
+	cfg.Upstream.Endpoint = upstream.URL
+	cacheStore := cache.NewCacheWithClient(owner, &cfg.Cache)
+	forwarder := proxy.NewForwarder(
+		nil,
+		cfg.Upstream.Endpoint,
+		cfg.Upstream.Region,
+		cfg.Upstream.MaxIdleConnsPerHost,
+		auth.NewProxySigner("bulk-delete-fence-test", "bulk-delete-fence-secret"),
+		nil,
+	)
+	service := proxy.NewService(forwarder, cacheStore, cfg)
+	router := NewServer(service, "127.0.0.1", 0, false, cfg.Server.MaxInflightRequests).Router()
+	handlerDone := make(chan struct{})
+	gatewayRequestContext := make(chan context.Context, 1)
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gatewayRequestContext <- r.Context()
+		defer close(handlerDone)
+		router.ServeHTTP(w, r)
+	}))
+	client := &http.Client{}
+	t.Cleanup(func() {
+		releasePostFence()
+		gateway.Close()
+		client.CloseIdleConnections()
+		upstream.Close()
+	})
+
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	defer cancelRequest()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, gateway.URL+"/"+bulkDeleteFenceBucket+"?delete", strings.NewReader(`<Delete><Object><Key>`+key+`</Key></Object></Delete>`))
+	if err != nil {
+		t.Fatalf("create DeleteObjects request: %v", err)
+	}
+	request.Header.Set("Authorization", bulkDeleteFenceAuthorization)
+	request.Header.Set("Content-Type", "application/xml")
+	clientDone := make(chan error, 1)
+	go func() {
+		_, err := doBulkDeleteFenceRequest(client, request)
+		clientDone <- err
+	}()
+
+	if err := waitBulkDeleteFenceSignal(ctx, owner.postFence, "post-success cache fence"); err != nil {
+		t.Fatal(err)
+	}
+	var gatewayCtx context.Context
+	select {
+	case gatewayCtx = <-gatewayRequestContext:
+	case <-ctx.Done():
+		t.Fatalf("gateway did not receive DeleteObjects request: %v", ctx.Err())
+	}
+	var fenceCtx context.Context
+	select {
+	case fenceCtx = <-fenceContext:
+	case <-ctx.Done():
+		t.Fatalf("post-success cache call did not publish its context: %v", ctx.Err())
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream successful deletes = %d, want 1 before the held fence", got)
+	}
+
+	cancelRequest()
+	var clientErr error
+	select {
+	case clientErr = <-clientDone:
+	case <-ctx.Done():
+		t.Fatalf("canceled client call did not return: %v", ctx.Err())
+	}
+	if !errors.Is(clientErr, context.Canceled) {
+		t.Errorf("canceled DeleteObjects client error = %v, want context.Canceled", clientErr)
+	}
+	select {
+	case <-gatewayCtx.Done():
+	case <-ctx.Done():
+		t.Fatalf("gateway request did not observe client cancellation: %v", ctx.Err())
+	}
+	if err := gatewayCtx.Err(); !errors.Is(err, context.Canceled) {
+		t.Errorf("gateway request context error = %v, want context.Canceled", err)
+	}
+	if err := fenceCtx.Err(); err != nil {
+		t.Errorf("client cancellation reached the detached post-success fence context: %v", err)
+	}
+	select {
+	case <-fenceCancelled:
+		t.Errorf("post-success cache fence observed client cancellation before owner release")
+	default:
+	}
+	select {
+	case <-handlerDone:
+		t.Errorf("handler returned before the post-success fence owner was released")
+	default:
+	}
+
+	releasePostFence()
+	if err := waitBulkDeleteFenceSignal(ctx, handlerDone, "handler completion after releasing the post-success fence"); err != nil {
+		t.Fatalf("handler did not finish after fence release: %v", err)
 	}
 }

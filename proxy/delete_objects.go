@@ -144,6 +144,7 @@ func (w *deleteObjectsResponseStager) commit(dst http.ResponseWriter, capture *R
 // Invalidates cache for requested objects BEFORE forwarding to ensure consistency.
 func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()
+	requestCtx := r.Context()
 	bucket, _ := ParseBucketKey(r)
 
 	log.Debug().Str("bucket", bucket).Msg("HandleDeleteObjects")
@@ -154,6 +155,10 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		return fmt.Errorf("failed to read request body: %w", err)
 	}
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	recordRequestResult := func(err error) error {
+		metrics.RecordRequestResult("DeleteObjects", metrics.SourceUpstream, err, time.Since(start).Seconds())
+		return err
+	}
 
 	// Parse request to get keys being deleted and invalidate cache BEFORE forwarding
 	// This ensures cache consistency even if forwarding fails after cache invalidation.
@@ -175,11 +180,17 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		if xmlErr := xml.Unmarshal(bodyBytes, &deleteReq); xmlErr == nil {
 			requestedCounts = make(map[string]int)
 			for _, obj := range deleteReq.Objects {
+				if err := requestCtx.Err(); err != nil {
+					return recordRequestResult(err)
+				}
 				// Proxy modes only — see preForwardInvalidate; in tiered
 				// mode a listed key may be a local-tier only-copy that a
 				// rejected bulk delete must leave intact (the per-key
 				// post-success converge below carries tiered).
-				s.preForwardInvalidate(context.Background(), bucket, obj.Key)
+				s.preForwardInvalidate(requestCtx, bucket, obj.Key)
+				if err := requestCtx.Err(); err != nil {
+					return recordRequestResult(err)
+				}
 				if tieredPriors != nil {
 					if _, seen := tieredPriors[obj.Key]; !seen {
 						// Claim before capturing the token, held for the whole
@@ -188,7 +199,7 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 						// converge (see HandleDeleteObject).
 						s.claimRetierWrite(bucket, obj.Key)
 						defer s.releaseRetierWrite(bucket, obj.Key)
-						_, v, known := s.captureMarkerPrior(context.Background(), bucket, obj.Key)
+						_, v, known := s.captureMarkerPrior(requestCtx, bucket, obj.Key)
 						tieredPriors[obj.Key] = tieredPrior{version: v, known: known}
 					}
 				}
@@ -211,10 +222,19 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		forwardWriter = responseStager
 	}
 
+	// A cancellation that arrives after the last cache operation must still stop
+	// this batch before dispatch. Empty, malformed, and cache-disabled requests
+	// never enter pre-forward cache preparation and keep their existing path.
+	if len(requestedCounts) > 0 {
+		if err := requestCtx.Err(); err != nil {
+			return recordRequestResult(err)
+		}
+	}
+
 	// Forward request to upstream, capturing the response so we can tell which
 	// per-object deletes actually succeeded — S3 returns 200 OK with per-key
 	// <Error> elements for partial failures.
-	capture, err := s.forwarder.ForwardWithCapture(r.Context(), forwardWriter, r)
+	capture, err := s.forwarder.ForwardWithCapture(requestCtx, forwardWriter, r)
 
 	// Re-invalidate AFTER upstream confirms the deletes, for the same
 	// read-after-write reason as HandleDeleteObject: a GET racing the in-flight
@@ -271,12 +291,5 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		responseStager.commit(w, capture)
 	}
 
-	// Record metrics
-	status := "success"
-	if err != nil {
-		status = "error"
-	}
-	metrics.RecordRequest("DeleteObjects", status, metrics.SourceUpstream, time.Since(start).Seconds())
-
-	return err
+	return recordRequestResult(err)
 }
