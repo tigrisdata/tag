@@ -277,3 +277,89 @@ func BenchmarkServiceHandlePassthroughSigningUploadPartParallel(b *testing.B) {
 		}
 	})
 }
+
+// signingForwarderStreamingUploadBenchmarkTransport consumes the decoded body
+// as an upstream request would, without adding network latency to the benchmark.
+type signingForwarderStreamingUploadBenchmarkTransport struct {
+	bodyLength int64
+}
+
+func (t signingForwarderStreamingUploadBenchmarkTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Header.Get("X-Amz-Content-Sha256") != "UNSIGNED-PAYLOAD" {
+		return nil, fmt.Errorf("forwarded payload hash = %q, want UNSIGNED-PAYLOAD", request.Header.Get("X-Amz-Content-Sha256"))
+	}
+	if request.ContentLength != t.bodyLength {
+		return nil, fmt.Errorf("forwarded content length = %d, want %d", request.ContentLength, t.bodyLength)
+	}
+
+	got, err := io.Copy(io.Discard, request.Body)
+	if err != nil {
+		return nil, err
+	}
+	if got != t.bodyLength {
+		return nil, fmt.Errorf("forwarded body length = %d, want %d", got, t.bodyLength)
+	}
+
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       http.NoBody,
+	}, nil
+}
+
+// BenchmarkServiceHandlePassthroughSigningStreamingUploadParallel measures a
+// signed, one-MiB UploadPart request through the same Service.HandlePassthrough
+// boundary used by the registered uploadId route. The fixed decoded size keeps
+// only chunk size and header count different between sub-benchmarks. With
+// -cpu=4 and one RunParallel worker per GOMAXPROCS, four requests run concurrently.
+func BenchmarkServiceHandlePassthroughSigningStreamingUploadParallel(b *testing.B) {
+	const bodyLength = 1 << 20
+	const requestPath = "/benchmark-bucket/multipart/object?uploadId=benchmark-upload&partNumber=1"
+
+	oldLogger := log.Logger
+	log.Logger = log.Logger.Level(zerolog.WarnLevel)
+	b.Cleanup(func() { log.Logger = oldLogger })
+
+	for _, chunkSize := range []int{64 << 10, 16 << 10, 4 << 10} {
+		b.Run(fmt.Sprintf("ChunkSize=%d", chunkSize), func(b *testing.B) {
+			payload := []byte(strings.Repeat("x", bodyLength))
+			chunks := make([][]byte, 0, (len(payload)+chunkSize-1)/chunkSize)
+			for offset := 0; offset < len(payload); offset += chunkSize {
+				end := min(offset+chunkSize, len(payload))
+				chunks = append(chunks, payload[offset:end])
+			}
+
+			fixture := newStreamFixture(b, "https://upstream.example.com", requestPath, StreamingPayloadHash, bodyLength)
+			wire := fixture.wire(chunks, fixture.chain(fixture.creds))
+			wireBody := string(wire)
+
+			store := auth.NewCredentialStore()
+			store.AddCredential(chunkVerifyAccessKey, chunkVerifySecretKey)
+			base := newBaseForwarder("https://upstream.example.com", chunkVerifyRegion, 1)
+			base.httpClient = &http.Client{Transport: signingForwarderStreamingUploadBenchmarkTransport{bodyLength: bodyLength}}
+			forwarder := &signingForwarder{
+				baseForwarder: base,
+				credStore:     store,
+				validator:     auth.NewRequestValidator(store),
+			}
+			service := NewService(forwarder, cache.NewDisabledCache(), config.NewDefault())
+
+			b.SetParallelism(1)
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				req := fixture.request(wire)
+				body := newSigningForwarderBenchmarkBody(wireBody)
+				req.Body = body
+				req.GetBody = nil
+				writer := signingForwarderBenchmarkResponseWriter{header: make(http.Header)}
+				for pb.Next() {
+					body.Reset(wireBody)
+					if err := service.HandlePassthrough(&writer, req); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		})
+	}
+}

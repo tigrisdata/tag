@@ -134,7 +134,7 @@ func (u *chunkVerifyUpstream) await(t *testing.T, path string, n int) []upstream
 // signer, plus the material to sign chunk chains for it with the SDK's own
 // stream signer (an oracle independent of TAG's implementation).
 type streamFixture struct {
-	t           *testing.T
+	t           testing.TB
 	url         string
 	header      http.Header
 	signingTime time.Time
@@ -142,7 +142,7 @@ type streamFixture struct {
 	creds       aws.Credentials
 }
 
-func newStreamFixture(t *testing.T, endpoint, path, marker string, decodedLen int) *streamFixture {
+func newStreamFixture(t testing.TB, endpoint, path, marker string, decodedLen int) *streamFixture {
 	t.Helper()
 	f := &streamFixture{
 		t:           t,

@@ -326,6 +326,62 @@ func TestAWSChunkedReader_UnboundedHeaderLine(t *testing.T) {
 	}
 }
 
+func TestAWSChunkedReader_HeaderLengthBoundary(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+		wantEOF bool
+	}{
+		{
+			name:  "maximum length",
+			input: strings.Repeat("0", maxChunkHeaderLen) + "\n",
+			want:  strings.Repeat("0", maxChunkHeaderLen),
+		},
+		{
+			name:  "maximum CRLF line",
+			input: strings.Repeat("0", maxChunkHeaderLen-1) + "\r\n",
+			want:  strings.Repeat("0", maxChunkHeaderLen-1),
+		},
+		{
+			name:    "one byte over with CRLF",
+			input:   strings.Repeat("0", maxChunkHeaderLen) + "\r\n",
+			wantErr: true,
+		},
+		{
+			name:    "EOF at maximum length",
+			input:   strings.Repeat("0", maxChunkHeaderLen),
+			wantEOF: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := newAWSChunkedReader(strings.NewReader(tt.input))
+			got, err := reader.readLine()
+			if tt.wantEOF {
+				if err != io.EOF || got != "" {
+					t.Fatalf("readLine() = %q, %v; want empty line and EOF", got, err)
+				}
+				return
+			}
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "exceeds maximum length") {
+					t.Fatalf("readLine() error = %v, want maximum-length error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readLine(): %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("readLine() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDecodeChunkedIfNeeded_UnsignedTrailer(t *testing.T) {
 	// Unsigned chunked format used by AWS SDK v2 (no per-chunk signatures)
 	chunkedBody := "4\r\ntest\r\n0\r\n\r\n"
