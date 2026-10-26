@@ -171,8 +171,20 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		tieredPriors = make(map[string]tieredPrior)
 	}
 	if s.cache.IsEnabled() {
+		requestBody := bodyBytes
+		if IsStreamingPayload(r.Header.Get("X-Amz-Content-Sha256")) {
+			// Use a decoded view for key extraction, but leave the buffered wire body
+			// untouched for the configured forwarder's existing auth and forwarding path.
+			decodedBody, decodeErr := io.ReadAll(newAWSChunkedReader(bytes.NewReader(bodyBytes)))
+			if decodeErr == nil {
+				requestBody = decodedBody
+			} else {
+				// Do not collect keys from a partial payload when its framing is incomplete.
+				requestBody = nil
+			}
+		}
 		var deleteReq deleteObjectsRequest
-		if xmlErr := xml.Unmarshal(bodyBytes, &deleteReq); xmlErr == nil {
+		if xmlErr := xml.Unmarshal(requestBody, &deleteReq); xmlErr == nil {
 			requestedCounts = make(map[string]int)
 			for _, obj := range deleteReq.Objects {
 				// Proxy modes only — see preForwardInvalidate; in tiered
