@@ -42,8 +42,8 @@ func (o *revalidationBenchmarkOrigin) ServeHTTP(w http.ResponseWriter, r *http.R
 // BenchmarkRevalidationClientMatch measures the default transparent-proxy GET
 // route for a 512 KiB whole-object cache hit forced through origin revalidation.
 // The client validator matches the unchanged object; the origin round trip is
-// real loopback HTTP, while the cache client is in memory. The comparison arm
-// may return the existing 200 body; the fixed arm returns a bodyless 304.
+// real loopback HTTP and the cache client is in memory. The benchmark consumes
+// the complete gateway response so its body transfer is included in elapsed time.
 func BenchmarkRevalidationClientMatch(b *testing.B) {
 	oldLogger := log.Logger
 	log.Logger = zerolog.New(io.Discard)
