@@ -33,6 +33,11 @@ type revalidationTestOrigin struct {
 }
 
 func (o *revalidationTestOrigin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if values := r.Header.Values("If-None-Match"); len(values) > 1 {
+		r = r.Clone(r.Context())
+		r.Header = r.Header.Clone()
+		r.Header.Set("If-None-Match", strings.Join(values, ","))
+	}
 	if o.etag != "" {
 		w.Header().Set("ETag", o.etag)
 	}
@@ -260,33 +265,34 @@ func TestRevalidationClientConditionsMatchOrigin(t *testing.T) {
 	futureIMS := oldModified.Add(24 * time.Hour).Format(http.TimeFormat)
 
 	tests := []struct {
-		name             string
-		cachedETag       string
-		cachedModified   time.Time
-		cachedBody       []byte
-		originETag       string
-		originModified   time.Time
-		originBody       []byte
-		cacheControl     string
-		ifNoneMatch      string
-		ifModifiedSince  string
-		rangeHeader      string
-		wantStatus       int
-		wantBody         []byte
-		wantXCache       string
-		wantFullReads    int64
-		wantRangeReads   int64
-		wantForwardCalls int64
-		wantOutBytes     int64
-		wantRewarm       bool
-		wantCachedETag   string
-		wantCachedBody   []byte
-		wantStoredETag   string
+		name              string
+		cachedETag        string
+		cachedModified    time.Time
+		cachedBody        []byte
+		originETag        string
+		originModified    time.Time
+		originBody        []byte
+		cacheControl      string
+		ifNoneMatch       string
+		ifNoneMatchFields []string
+		ifModifiedSince   string
+		rangeHeader       string
+		wantStatus        int
+		wantBody          []byte
+		wantXCache        string
+		wantFullReads     int64
+		wantRangeReads    int64
+		wantForwardCalls  int64
+		wantOutBytes      int64
+		wantRewarm        bool
+		wantCachedETag    string
+		wantCachedBody    []byte
+		wantStoredETag    string
 	}{
 		{
-			name: "unchanged matching ETag list avoids cache read", cachedETag: `"current"`, cachedModified: oldModified,
+			name: "unchanged matching ETag list across fields avoids cache read", cachedETag: `"current"`, cachedModified: oldModified,
 			originETag: `"current"`, originModified: oldModified, originBody: currentBody,
-			ifNoneMatch: `"other", W/"current"`, wantStatus: http.StatusNotModified, wantXCache: XCacheHit, wantFullReads: 0,
+			ifNoneMatchFields: []string{`"other"`, `W/"current"`}, wantStatus: http.StatusNotModified, wantXCache: XCacheHit, wantFullReads: 0,
 		},
 		{
 			name: "weak-to-strong match returns bodyless 304", cachedETag: `W/"current"`, cachedModified: oldModified,
@@ -361,6 +367,12 @@ func TestRevalidationClientConditionsMatchOrigin(t *testing.T) {
 			ifNoneMatch: `"new"`, wantStatus: http.StatusNotModified, wantXCache: XCacheRevalidated, wantCachedETag: `"new"`, wantCachedBody: currentBody,
 		},
 		{
+			name: "later repeated If-None-Match field matches changed 200", cachedETag: `"old"`, cachedModified: oldModified,
+			originETag: `"new"`, originModified: newModified, originBody: currentBody,
+			ifNoneMatchFields: []string{`"other"`, `"new"`}, wantStatus: http.StatusNotModified,
+			wantXCache: XCacheRevalidated, wantCachedETag: `"new"`, wantCachedBody: currentBody,
+		},
+		{
 			name: "old client validator does not match changed 206", cachedETag: `"old"`, cachedModified: oldModified,
 			originETag: `"new"`, originModified: newModified, originBody: currentBody,
 			ifNoneMatch: `"old"`, rangeHeader: "bytes=0-4", wantStatus: http.StatusPartialContent,
@@ -370,6 +382,12 @@ func TestRevalidationClientConditionsMatchOrigin(t *testing.T) {
 			name: "new client validator matches changed 206 while full object is rewarmed", cachedETag: `"old"`, cachedModified: oldModified,
 			originETag: `"new"`, originModified: newModified, originBody: currentBody,
 			ifNoneMatch: `"new"`, rangeHeader: "bytes=0-4", wantStatus: http.StatusNotModified,
+			wantXCache: XCacheRevalidated, wantRewarm: true, wantCachedETag: `"new"`, wantCachedBody: currentBody,
+		},
+		{
+			name: "later repeated If-None-Match field matches changed 206 while rewarming", cachedETag: `"old"`, cachedModified: oldModified,
+			originETag: `"new"`, originModified: newModified, originBody: currentBody,
+			ifNoneMatchFields: []string{`"other"`, `"new"`}, rangeHeader: "bytes=0-4", wantStatus: http.StatusNotModified,
 			wantXCache: XCacheRevalidated, wantRewarm: true, wantCachedETag: `"new"`, wantCachedBody: currentBody,
 		},
 		{
@@ -407,7 +425,9 @@ func TestRevalidationClientConditionsMatchOrigin(t *testing.T) {
 				cacheControl = "no-cache"
 			}
 			headers.Set("Cache-Control", cacheControl)
-			if tt.ifNoneMatch != "" {
+			if len(tt.ifNoneMatchFields) != 0 {
+				headers[http.CanonicalHeaderKey("If-None-Match")] = append([]string(nil), tt.ifNoneMatchFields...)
+			} else if tt.ifNoneMatch != "" {
 				headers.Set("If-None-Match", tt.ifNoneMatch)
 			}
 			if tt.ifModifiedSince != "" {
@@ -485,6 +505,36 @@ func TestRevalidationClientConditionsMatchOrigin(t *testing.T) {
 	}
 }
 
+func TestNormalCacheHitRepeatedIfNoneMatchFields(t *testing.T) {
+	modified := time.Date(2026, 10, 27, 3, 4, 5, 0, time.UTC)
+	body := []byte("current object body")
+	origin := &revalidationTestOrigin{body: body, etag: `"current"`, lastModified: modified}
+	meta := &cache.CachedObjectMeta{
+		Bucket: revalidationTestBucket, Key: revalidationTestKey, ETag: `"current"`,
+		ContentType: "application/octet-stream", ContentLength: int64(len(body)),
+		LastModified: modified.Unix(), StatusCode: http.StatusOK,
+	}
+	fixture := newRevalidationTestFixture(t, origin, meta, body)
+	headers := http.Header{"If-None-Match": []string{`"other"`, `W/"current"`}}
+	direct := readRevalidationTestResponse(t, fixture.client, fixture.originServer.URL+"/"+revalidationTestBucket+"/"+revalidationTestKey, headers)
+	gateway := readRevalidationTestResponse(t, fixture.client, fixture.gateway.URL+"/"+revalidationTestBucket+"/"+revalidationTestKey, headers)
+	if direct.status != http.StatusNotModified || gateway.status != http.StatusNotModified || len(direct.body) != 0 || len(gateway.body) != 0 {
+		t.Fatalf("responses = direct %d body %q / gateway %d body %q, want bodyless 304", direct.status, direct.body, gateway.status, gateway.body)
+	}
+	if got, want := gateway.header.Get("ETag"), direct.header.Get("ETag"); got != want {
+		t.Errorf("gateway ETag = %q, direct origin ETag = %q", got, want)
+	}
+	if got := gateway.header.Get(XCacheHeader); got != XCacheHit {
+		t.Errorf("gateway X-Cache = %q, want %q", got, XCacheHit)
+	}
+	if got := fixture.cacheClient.bodyReads.Load(); got != 0 {
+		t.Errorf("normal cache hit performed %d body reads, want 0", got)
+	}
+	if got := fixture.forwarder.forwardCalls.Load(); got != 0 || fixture.forwarder.conditionalCalled {
+		t.Errorf("normal cache hit forwarded or revalidated: forwards=%d conditional=%v", got, fixture.forwarder.conditionalCalled)
+	}
+}
+
 func TestRevalidationBodyMissForwardsOriginalClientConditions(t *testing.T) {
 	modified := time.Date(2026, 10, 27, 3, 4, 5, 0, time.UTC)
 	body := []byte("current object body")
@@ -533,7 +583,7 @@ func TestRevalidationStaleFallbackUsesClientConditionsWithoutSuccessValidation(t
 	beforeFailed := testutil.ToFloat64(metrics.RevalidationsFailed)
 	beforeNotModified := testutil.ToFloat64(metrics.RevalidationsNotModified)
 	beforeStale := testutil.ToFloat64(metrics.RevalidationsStaleServed)
-	headers := http.Header{"Cache-Control": []string{"no-cache"}, "If-None-Match": []string{`"current"`}}
+	headers := http.Header{"Cache-Control": []string{"no-cache"}, "If-None-Match": []string{`"other"`, `"current"`}}
 	response := readRevalidationTestResponse(t, fixture.client, fixture.gateway.URL+"/"+revalidationTestBucket+"/"+revalidationTestKey, headers)
 	if response.status != http.StatusNotModified || len(response.body) != 0 {
 		t.Fatalf("stale conditional response = %d body %q, want bodyless 304", response.status, response.body)
