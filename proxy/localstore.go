@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	ocachecoordinator "github.com/tigrisdata/ocache/coordinator"
 	storageerrors "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
@@ -195,12 +194,6 @@ func (s *Service) finishServeBodyError(ctx context.Context, w http.ResponseWrite
 // policy, where an upstream can immediately refill an unusable entry.
 func originlessBodyGone(err error, ranged bool) bool {
 	if err == nil {
-		return false
-	}
-	var routeErr *ocachecoordinator.RouterError
-	if errors.As(err, &routeErr) || errors.Is(err, ocachecoordinator.ErrNodeNotFound) {
-		// The cache adapter also preserves its legacy ErrNotFound match for
-		// proxy callers, but an OCache routing failure does not prove absence.
 		return false
 	}
 	if errors.Is(err, cache.ErrInferredNotFound) {

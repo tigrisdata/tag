@@ -747,9 +747,6 @@ func (c *Cache) BodyExistsErr(ctx context.Context, bucket, key, etag string) (pr
 	if e == nil {
 		return true, nil
 	}
-	if isOCacheRouterError(e) || errors.Is(e, coordinator.ErrNodeNotFound) {
-		return false, e // a routing failure does not establish absence
-	}
 	if errors.Is(e, ErrInferredNotFound) {
 		return false, e // text alone does not establish body absence
 	}
@@ -974,17 +971,10 @@ func (c *Cache) GetMode() string {
 	return string(c.client.GetMode())
 }
 
-// isOCacheRouterError recognizes OCache routing errors even when RouterError's
-// Cause is not exposed through Unwrap.
-func isOCacheRouterError(err error) bool {
-	var routeErr *coordinator.RouterError
-	return errors.As(err, &routeErr)
-}
-
 // bodyNotFoundError prevents non-NotFound gRPC and typed storage errors from
-// becoming misses and preserves OCache's owner-routing cause for tiered reads.
-// The legacy text fallback still matches ErrNotFound for proxy and block callers,
-// but carries ErrInferredNotFound so authoritative whole-body decisions can reject it.
+// becoming misses. The legacy text fallback still matches ErrNotFound for proxy
+// and block callers, but carries ErrInferredNotFound so authoritative whole-body
+// decisions can reject it.
 func bodyNotFoundError(err error) error {
 	if st, ok := status.FromError(err); ok {
 		if st.Code() == codes.NotFound {
@@ -1000,9 +990,6 @@ func bodyNotFoundError(err error) error {
 			return ErrNotFound
 		}
 		return err
-	}
-	if isOCacheRouterError(err) || errors.Is(err, coordinator.ErrNodeNotFound) {
-		return fmt.Errorf("%w: %w", ErrNotFound, err)
 	}
 	if errors.Is(err, ErrNotFound) {
 		return err
