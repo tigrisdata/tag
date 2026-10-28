@@ -12,10 +12,13 @@ object it holds, stamped with the tier the body lives in. A metadata miss
 answers `NoSuchKey` immediately — no upstream request, in either tier.
 
 After a local-tier GET passes its body-presence probe, an unclassified body-read
-failure returns an internal server error and leaves the metadata intact for a
-retry. Only a confirmed absence or detected body-length/corruption failure is
-converted to `NoSuchKey`; cleanup remains guarded against a newer metadata
-version.
+failure before response commitment is returned as an error and leaves the
+metadata intact for a retry. For a live request, the HTTP handler maps it to an
+internal server error. Only confirmed absence or a detected body-length or
+backend-corruption failure is converted to `NoSuchKey`; cleanup remains guarded
+against a newer metadata version. Once response headers are committed, the
+existing incomplete/aborted stream handling remains in force; TAG cannot replace
+that response with an S3 error document.
 
 **Small objects (declared size ≤ `cache.size_threshold`) are the local tier.**
 PUT STREAMS the object into the local cache — the body is never buffered in
