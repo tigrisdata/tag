@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -56,10 +57,15 @@ type tieredBodyReadFixture struct {
 	client *tieredBodyReadClient
 	store  *cache.Cache
 	router http.Handler
+	key    string
 	etag   string
 }
 
 func newTieredBodyReadFixture(t *testing.T, body []byte, contentLength int64) *tieredBodyReadFixture {
+	return newTieredBodyReadFixtureForKey(t, body, contentLength, "object")
+}
+
+func newTieredBodyReadFixtureForKey(t *testing.T, body []byte, contentLength int64, key string) *tieredBodyReadFixture {
 	t.Helper()
 
 	cfg := config.NewDefault()
@@ -79,12 +85,13 @@ func newTieredBodyReadFixture(t *testing.T, body []byte, contentLength int64) *t
 		client: client,
 		store:  store,
 		router: NewServer(service, "127.0.0.1", 0, false, 0).Router(),
+		key:    key,
 		etag:   etag,
 	}
 
 	meta := &cache.CachedObjectMeta{
 		Bucket:        "bucket",
-		Key:           "object",
+		Key:           key,
 		ETag:          etag,
 		ContentLength: contentLength,
 		StatusCode:    http.StatusOK,
@@ -97,13 +104,13 @@ func newTieredBodyReadFixture(t *testing.T, body []byte, contentLength int64) *t
 
 func (f *tieredBodyReadFixture) get() *httptest.ResponseRecorder {
 	response := httptest.NewRecorder()
-	f.router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/bucket/object", nil))
+	f.router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/bucket/"+url.PathEscape(f.key), nil))
 	return response
 }
 
 func (f *tieredBodyReadFixture) getRange(value string) *httptest.ResponseRecorder {
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/bucket/object", nil)
+	request := httptest.NewRequest(http.MethodGet, "/bucket/"+url.PathEscape(f.key), nil)
 	request.Header.Set("Range", value)
 	f.router.ServeHTTP(response, request)
 	return response
@@ -111,7 +118,7 @@ func (f *tieredBodyReadFixture) getRange(value string) *httptest.ResponseRecorde
 
 func (f *tieredBodyReadFixture) put(body string) *httptest.ResponseRecorder {
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPut, "/bucket/object", strings.NewReader(body))
+	request := httptest.NewRequest(http.MethodPut, "/bucket/"+url.PathEscape(f.key), strings.NewReader(body))
 	request.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	f.router.ServeHTTP(response, request)
 	return response
@@ -172,6 +179,74 @@ func TestTieredBodyReadFailureReturnsRetryableHTTPError(t *testing.T) {
 				t.Errorf("GET after the cache read recovers: status=%d body=%q, want 200 and original body", recovered.Code, recovered.Body.String())
 			}
 		})
+	}
+}
+
+func TestTieredBodyReadIOErrorKeyContainingNotFoundRemainsRetryable(t *testing.T) {
+	body := []byte("body remains readable")
+	fixture := newTieredBodyReadFixtureForKey(t, body, int64(len(body)), "not found")
+	_, beforeVersion, found, err := fixture.store.GetMetaWithVersion(context.Background(), "bucket", fixture.key)
+	if err != nil || !found {
+		t.Fatalf("read seeded metadata: found=%v err=%v", found, err)
+	}
+
+	wantBodyKey := cache.MakeBodyKey("bucket", fixture.key, fixture.etag)
+	var readKey string
+	readError := func(key string) error {
+		readKey = key
+		return ocacheerrors.NewIOError("Get", key, errors.New("disk read failed"))
+	}
+	checkRetryable := func(stage string, response *httptest.ResponseRecorder) {
+		t.Helper()
+		if readKey != wantBodyKey {
+			t.Errorf("%s body key = %q, want %q", stage, readKey, wantBodyKey)
+		}
+		if response.Code != http.StatusInternalServerError || errorCode(t, response) != s3err.ErrInternalError {
+			t.Errorf("%s response = %d %q, want 500 InternalError", stage, response.Code, response.Body.String())
+		}
+		if got := response.Header().Get(proxy.XCacheHeader); got != "" {
+			t.Errorf("%s %s = %q, want no authoritative cache-miss response", stage, proxy.XCacheHeader, got)
+		}
+		if _, version, found, err := fixture.store.GetMetaWithVersion(context.Background(), "bucket", fixture.key); err != nil || !found || version != beforeVersion {
+			t.Errorf("metadata after %s: found=%v version=%d err=%v, want unchanged version %d", stage, found, version, err, beforeVersion)
+		}
+	}
+
+	fixture.client.getStream = func(_ context.Context, key string, _ io.Writer) error { return readError(key) }
+	checkRetryable("full GET", fixture.get())
+	fixture.client.getStream = nil
+	if recovered := fixture.get(); recovered.Code != http.StatusOK || recovered.Body.String() != string(body) {
+		t.Errorf("GET after full-read recovery = %d %q, want 200 and original body", recovered.Code, recovered.Body.String())
+	}
+
+	fixture.client.getRangeStream = func(ctx context.Context, key string, start, end int64, w io.Writer) error {
+		if start == 0 && end == 1 {
+			return fixture.client.CacheClient.GetRangeStream(ctx, key, start, end, w)
+		}
+		return readError(key)
+	}
+	checkRetryable("Range GET", fixture.getRange("bytes=2-5"))
+	fixture.client.getRangeStream = nil
+	if recovered := fixture.getRange("bytes=2-5"); recovered.Code != http.StatusPartialContent || recovered.Body.String() != string(body[2:6]) {
+		t.Errorf("Range GET after read recovery = %d %q, want 206 and %q", recovered.Code, recovered.Body.String(), body[2:6])
+	}
+
+	var bodyReads int
+	fixture.client.getRangeStream = func(_ context.Context, key string, _, _ int64, _ io.Writer) error {
+		return readError(key)
+	}
+	fixture.client.getStream = func(context.Context, string, io.Writer) error {
+		bodyReads++
+		return nil
+	}
+	checkRetryable("body-presence probe", fixture.get())
+	if bodyReads != 0 {
+		t.Errorf("body reads after failed presence probe = %d, want 0", bodyReads)
+	}
+	fixture.client.getRangeStream = nil
+	fixture.client.getStream = nil
+	if recovered := fixture.get(); recovered.Code != http.StatusOK || recovered.Body.String() != string(body) {
+		t.Errorf("GET after probe recovery = %d %q, want 200 and original body", recovered.Code, recovered.Body.String())
 	}
 }
 

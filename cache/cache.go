@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog/log"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/ocache/coordinator"
+	ocachestorageerrors "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 	"google.golang.org/grpc/codes"
@@ -976,9 +977,19 @@ func isOCacheRouterError(err error) bool {
 // joined with ErrNotFound where the legacy string match returned it, preserving
 // existing proxy miss matches.
 func bodyNotFoundError(err error) error {
-	if st, ok := status.FromError(err); ok && st.Code() != codes.NotFound {
+	if st, ok := status.FromError(err); ok {
+		if st.Code() == codes.NotFound {
+			return ErrNotFound
+		}
 		// An operational status can mention "not found" in its details without
 		// proving the body is absent.
+		return err
+	}
+	var storageErr *ocachestorageerrors.StorageError
+	if errors.As(err, &storageErr) {
+		if storageErr.GetType() == ocachestorageerrors.TypeNotFound {
+			return ErrNotFound
+		}
 		return err
 	}
 	if isOCacheRouterError(err) || errors.Is(err, coordinator.ErrNodeNotFound) {
@@ -991,6 +1002,13 @@ func bodyNotFoundError(err error) error {
 func isNotFoundError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if st, ok := status.FromError(err); ok {
+		return st.Code() == codes.NotFound
+	}
+	var storageErr *ocachestorageerrors.StorageError
+	if errors.As(err, &storageErr) {
+		return storageErr.GetType() == ocachestorageerrors.TypeNotFound
 	}
 	errStr := err.Error()
 	return errStr == "key not found" ||
