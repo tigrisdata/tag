@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	cacheclient "github.com/tigrisdata/ocache/client"
+	ocachecoordinator "github.com/tigrisdata/ocache/coordinator"
 	ocacheerrors "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
@@ -134,6 +135,7 @@ func TestTieredBodyReadFailureReturnsRetryableHTTPError(t *testing.T) {
 		{name: "ordinary I/O error", err: errors.New("disk read failed")},
 		{name: "embedded backend I/O error", err: ocacheerrors.NewIOError("Get", "body|bucket|object", errors.New("disk read failed"))},
 		{name: "cluster peer unavailable", err: status.Error(codes.Unavailable, "peer unavailable")},
+		{name: "OCache owner-routing error", err: ocachecoordinator.NewNodeNotFoundError("owner", "body|bucket/object/body-ref")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := []byte("body remains readable")
@@ -179,27 +181,59 @@ func TestTieredRangeBodyReadFailureReturnsRetryableHTTPError(t *testing.T) {
 		t.Fatalf("read seeded metadata: found=%v err=%v", found, err)
 	}
 
-	fixture.client.getRangeStream = func(ctx context.Context, key string, start, end int64, w io.Writer) error {
-		if start == 0 && end == 1 {
-			return fixture.client.CacheClient.GetRangeStream(ctx, key, start, end, w)
+	for _, readErr := range []error{
+		status.Error(codes.Internal, "backend range read failed"),
+		ocachecoordinator.NewNodeNotFoundError("owner", "body|bucket/object/body-ref"),
+	} {
+		fixture.client.getRangeStream = func(ctx context.Context, key string, start, end int64, w io.Writer) error {
+			if start == 0 && end == 1 {
+				return fixture.client.CacheClient.GetRangeStream(ctx, key, start, end, w)
+			}
+			return readErr
 		}
-		return status.Error(codes.Internal, "backend range read failed")
-	}
-	response := fixture.getRange("bytes=2-5")
-	if response.Code != http.StatusInternalServerError || errorCode(t, response) != s3err.ErrInternalError {
-		t.Errorf("range GET response = %d %q, want 500 InternalError", response.Code, response.Body.String())
-	}
-	if got := response.Header().Get(proxy.XCacheHeader); got != "" {
-		t.Errorf("%s = %q, want no authoritative cache-miss response", proxy.XCacheHeader, got)
-	}
-	if _, afterVersion, found, err := fixture.store.GetMetaWithVersion(context.Background(), "bucket", "object"); err != nil || !found || afterVersion != beforeVersion {
-		t.Errorf("metadata after range read failure: found=%v version=%d err=%v, want unchanged version %d", found, afterVersion, err, beforeVersion)
+		response := fixture.getRange("bytes=2-5")
+		if response.Code != http.StatusInternalServerError || errorCode(t, response) != s3err.ErrInternalError {
+			t.Errorf("range GET response = %d %q, want 500 InternalError", response.Code, response.Body.String())
+		}
+		if got := response.Header().Get(proxy.XCacheHeader); got != "" {
+			t.Errorf("%s = %q, want no authoritative cache-miss response", proxy.XCacheHeader, got)
+		}
+		if _, afterVersion, found, err := fixture.store.GetMetaWithVersion(context.Background(), "bucket", "object"); err != nil || !found || afterVersion != beforeVersion {
+			t.Errorf("metadata after range read failure: found=%v version=%d err=%v, want unchanged version %d", found, afterVersion, err, beforeVersion)
+		}
 	}
 
 	fixture.client.getRangeStream = nil
 	recovered := fixture.getRange("bytes=2-5")
 	if recovered.Code != http.StatusPartialContent || recovered.Body.String() != string(body[2:6]) {
 		t.Errorf("range GET after the cache read recovers: status=%d body=%q, want 206 and %q", recovered.Code, recovered.Body.String(), body[2:6])
+	}
+}
+
+func TestTieredPresenceProbeOwnerRoutingErrorIsRetryable(t *testing.T) {
+	fixture := newTieredBodyReadFixture(t, []byte("body remains readable"), int64(len("body remains readable")))
+	_, beforeVersion, found, err := fixture.store.GetMetaWithVersion(context.Background(), "bucket", "object")
+	if err != nil || !found {
+		t.Fatalf("read seeded metadata: found=%v err=%v", found, err)
+	}
+
+	var bodyReads int
+	fixture.client.getRangeStream = func(context.Context, string, int64, int64, io.Writer) error {
+		return ocachecoordinator.NewNodeNotFoundError("owner", "body|bucket/object/body-ref")
+	}
+	fixture.client.getStream = func(context.Context, string, io.Writer) error {
+		bodyReads++
+		return nil
+	}
+	response := fixture.get()
+	if response.Code != http.StatusInternalServerError || errorCode(t, response) != s3err.ErrInternalError {
+		t.Errorf("GET response = %d %q, want 500 InternalError", response.Code, response.Body.String())
+	}
+	if bodyReads != 0 {
+		t.Errorf("body reads = %d, want 0 after presence probe failed", bodyReads)
+	}
+	if _, afterVersion, found, err := fixture.store.GetMetaWithVersion(context.Background(), "bucket", "object"); err != nil || !found || afterVersion != beforeVersion {
+		t.Errorf("metadata after failed presence probe: found=%v version=%d err=%v, want unchanged version %d", found, afterVersion, err, beforeVersion)
 	}
 }
 

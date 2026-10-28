@@ -479,7 +479,7 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w i
 	if err != nil {
 		if isNotFoundError(err) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (body stream)")
-			return ErrNotFound
+			return bodyNotFoundError(err)
 		}
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body stream error")
 		return err
@@ -654,7 +654,7 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 		if err != nil {
 			if isNotFoundError(err) {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
-				return ErrNotFound
+				return bodyNotFoundError(err)
 			}
 			return err
 		}
@@ -685,7 +685,7 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 	if err != nil {
 		if isNotFoundError(err) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
-			return ErrNotFound
+			return bodyNotFoundError(err)
 		}
 		log.Debug().Err(err).
 			Str("bucket", bucket).
@@ -736,6 +736,9 @@ func (c *Cache) BodyExistsErr(ctx context.Context, bucket, key, etag string) (pr
 	e := c.getRangeStreamByKey(ctx, MakeBodyKey(bucket, key, etag), bucket, key, 0, 0, io.Discard)
 	if e == nil {
 		return true, nil
+	}
+	if errors.Is(e, coordinator.ErrNodeNotFound) {
+		return false, e // an owner-routing failure does not establish absence
 	}
 	if errors.Is(e, ErrNotFound) {
 		return false, nil // genuinely absent
@@ -957,6 +960,15 @@ func (c *Cache) GetMode() string {
 		return "disabled"
 	}
 	return string(c.client.GetMode())
+}
+
+// bodyNotFoundError keeps the ErrNotFound match used by proxy miss handling,
+// while preserving OCache's owner-routing cause for authoritative tiered reads.
+func bodyNotFoundError(err error) error {
+	if errors.Is(err, coordinator.ErrNodeNotFound) {
+		return fmt.Errorf("%w: %w", ErrNotFound, err)
+	}
+	return ErrNotFound
 }
 
 // isNotFoundError checks if the error indicates a cache miss.
