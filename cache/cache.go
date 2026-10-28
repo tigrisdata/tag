@@ -14,6 +14,8 @@ import (
 	"github.com/tigrisdata/ocache/coordinator"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // localityChecker is an optional CacheClient capability: it reports whether a
@@ -962,9 +964,16 @@ func (c *Cache) GetMode() string {
 	return string(c.client.GetMode())
 }
 
-// bodyNotFoundError keeps the ErrNotFound match used by proxy miss handling,
-// while preserving OCache's owner-routing cause for authoritative tiered reads.
+// bodyNotFoundError prevents non-NotFound gRPC statuses from becoming misses and
+// preserves OCache's owner-routing cause for tiered reads. The cause remains
+// joined with ErrNotFound where the legacy string match returned it, preserving
+// existing proxy miss matches.
 func bodyNotFoundError(err error) error {
+	if st, ok := status.FromError(err); ok && st.Code() != codes.NotFound {
+		// An operational status can mention "not found" in its details without
+		// proving the body is absent.
+		return err
+	}
 	if errors.Is(err, coordinator.ErrNodeNotFound) {
 		return fmt.Errorf("%w: %w", ErrNotFound, err)
 	}

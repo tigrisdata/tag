@@ -136,6 +136,7 @@ func TestTieredBodyReadFailureReturnsRetryableHTTPError(t *testing.T) {
 		{name: "embedded backend I/O error", err: ocacheerrors.NewIOError("Get", "body|bucket|object", errors.New("disk read failed"))},
 		{name: "cluster peer unavailable", err: status.Error(codes.Unavailable, "peer unavailable")},
 		{name: "OCache owner-routing error", err: ocachecoordinator.NewNodeNotFoundError("owner", "body|bucket/object/body-ref")},
+		{name: "OCache forwarded owner-routing error", err: status.Error(codes.Unavailable, "routing error: node not found in ring")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := []byte("body remains readable")
@@ -184,6 +185,7 @@ func TestTieredRangeBodyReadFailureReturnsRetryableHTTPError(t *testing.T) {
 	for _, readErr := range []error{
 		status.Error(codes.Internal, "backend range read failed"),
 		ocachecoordinator.NewNodeNotFoundError("owner", "body|bucket/object/body-ref"),
+		status.Error(codes.Unavailable, "routing error: node not found in ring"),
 	} {
 		fixture.client.getRangeStream = func(ctx context.Context, key string, start, end int64, w io.Writer) error {
 			if start == 0 && end == 1 {
@@ -231,6 +233,33 @@ func TestTieredPresenceProbeOwnerRoutingErrorIsRetryable(t *testing.T) {
 	}
 	if bodyReads != 0 {
 		t.Errorf("body reads = %d, want 0 after presence probe failed", bodyReads)
+	}
+	if _, afterVersion, found, err := fixture.store.GetMetaWithVersion(context.Background(), "bucket", "object"); err != nil || !found || afterVersion != beforeVersion {
+		t.Errorf("metadata after failed presence probe: found=%v version=%d err=%v, want unchanged version %d", found, afterVersion, err, beforeVersion)
+	}
+}
+
+func TestTieredPresenceProbeUnavailableWithNotFoundTextIsRetryable(t *testing.T) {
+	fixture := newTieredBodyReadFixture(t, []byte("body remains readable"), int64(len("body remains readable")))
+	_, beforeVersion, found, err := fixture.store.GetMetaWithVersion(context.Background(), "bucket", "object")
+	if err != nil || !found {
+		t.Fatalf("read seeded metadata: found=%v err=%v", found, err)
+	}
+
+	var bodyReads int
+	fixture.client.getRangeStream = func(context.Context, string, int64, int64, io.Writer) error {
+		return status.Error(codes.Unavailable, "routing error: node not found in ring")
+	}
+	fixture.client.getStream = func(context.Context, string, io.Writer) error {
+		bodyReads++
+		return nil
+	}
+	response := fixture.get()
+	if response.Code != http.StatusInternalServerError || errorCode(t, response) != s3err.ErrInternalError {
+		t.Errorf("GET response = %d %q, want 500 InternalError", response.Code, response.Body.String())
+	}
+	if bodyReads != 0 {
+		t.Errorf("body reads = %d, want 0 after presence probe failure", bodyReads)
 	}
 	if _, afterVersion, found, err := fixture.store.GetMetaWithVersion(context.Background(), "bucket", "object"); err != nil || !found || afterVersion != beforeVersion {
 		t.Errorf("metadata after failed presence probe: found=%v version=%d err=%v, want unchanged version %d", found, afterVersion, err, beforeVersion)
