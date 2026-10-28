@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 
@@ -129,6 +130,48 @@ func TestBodyReadTypedIOKeyContainingNotFoundIsNotAbsence(t *testing.T) {
 		if errors.Is(err, ErrNotFound) || !errors.As(err, &storageErr) || storageErr.GetType() != ocachestorageerrors.TypeIO {
 			t.Errorf("BodyExistsErr error = %v, want typed I/O rather than ErrNotFound", err)
 		}
+	}
+}
+
+func TestBodyReadTextNotFoundKeepsLegacyMissAndMarksUnconfirmed(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "ordinary I/O text", err: errors.New("disk read failed: object not found")},
+		{name: "wrapped cancellation text", err: fmt.Errorf("disk read failed: object not found: %w", context.Canceled)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &bodyRoutingErrorClient{CacheClient: cacheclient.NewMemoryCache(), err: tc.err}
+			cfg := config.NewDefault()
+			store := NewCacheWithClient(client, &cfg.Cache)
+
+			for _, read := range []struct {
+				name string
+				call func() error
+			}{
+				{name: "GetBodyStream", call: func() error { return store.GetBodyStream(ctx, "bucket", "object", `"etag"`, io.Discard) }},
+				{name: "GetRangeStream", call: func() error { return store.GetRangeStream(ctx, "bucket", "object", `"etag"`, 0, 1, io.Discard) }},
+			} {
+				t.Run(read.name, func(t *testing.T) {
+					err := read.call()
+					if !errors.Is(err, ErrNotFound) || !errors.Is(err, ErrInferredNotFound) {
+						t.Errorf("read error = %v, want the legacy miss match and the unconfirmed marker", err)
+					}
+					if errors.Is(err, context.Canceled) {
+						t.Errorf("read error = %v, must not expose the wrapped cancellation cause", err)
+					}
+				})
+			}
+
+			if present, err := store.BodyExistsErr(ctx, "bucket", "object", `"etag"`); present || err == nil || !errors.Is(err, ErrInferredNotFound) {
+				t.Errorf("BodyExistsErr = (%v, %v), want an unconfirmed-not-found error", present, err)
+			}
+			if present, err := store.BlockExistsErr(ctx, "bucket", "object", `"etag"`, 4, 0); present || err != nil {
+				t.Errorf("BlockExistsErr = (%v, %v), want a legacy block miss", present, err)
+			}
+		})
 	}
 }
 

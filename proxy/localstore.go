@@ -203,6 +203,9 @@ func originlessBodyGone(err error, ranged bool) bool {
 		// proxy callers, but an OCache routing failure does not prove absence.
 		return false
 	}
+	if errors.Is(err, cache.ErrInferredNotFound) {
+		return false // legacy text matching does not prove body absence
+	}
 	if errors.Is(err, cache.ErrNotFound) ||
 		errors.Is(err, errCacheBodyLengthMismatch) ||
 		storageerrors.IsCorruption(err) {
