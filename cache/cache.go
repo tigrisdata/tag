@@ -739,8 +739,8 @@ func (c *Cache) BodyExistsErr(ctx context.Context, bucket, key, etag string) (pr
 	if e == nil {
 		return true, nil
 	}
-	if errors.Is(e, coordinator.ErrNodeNotFound) {
-		return false, e // an owner-routing failure does not establish absence
+	if isOCacheRouterError(e) || errors.Is(e, coordinator.ErrNodeNotFound) {
+		return false, e // a routing failure does not establish absence
 	}
 	if errors.Is(e, ErrNotFound) {
 		return false, nil // genuinely absent
@@ -964,6 +964,13 @@ func (c *Cache) GetMode() string {
 	return string(c.client.GetMode())
 }
 
+// isOCacheRouterError recognizes OCache routing errors even when RouterError's
+// Cause is not exposed through Unwrap.
+func isOCacheRouterError(err error) bool {
+	var routeErr *coordinator.RouterError
+	return errors.As(err, &routeErr)
+}
+
 // bodyNotFoundError prevents non-NotFound gRPC statuses from becoming misses and
 // preserves OCache's owner-routing cause for tiered reads. The cause remains
 // joined with ErrNotFound where the legacy string match returned it, preserving
@@ -974,7 +981,7 @@ func bodyNotFoundError(err error) error {
 		// proving the body is absent.
 		return err
 	}
-	if errors.Is(err, coordinator.ErrNodeNotFound) {
+	if isOCacheRouterError(err) || errors.Is(err, coordinator.ErrNodeNotFound) {
 		return fmt.Errorf("%w: %w", ErrNotFound, err)
 	}
 	return ErrNotFound

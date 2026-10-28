@@ -44,6 +44,53 @@ func TestBodyReadUnavailableWithNotFoundTextIsNotAbsence(t *testing.T) {
 	}
 }
 
+func TestBodyReadRetryExhaustedOwnerRoutingErrorIsNotAbsence(t *testing.T) {
+	ctx := context.Background()
+	routeErr := ocachecoordinator.NewMaxRetriesExceededError(
+		"owner",
+		"body|bucket/object/etag",
+		1,
+		ocachecoordinator.NewNodeNotFoundError("owner", "body|bucket/object/etag"),
+	)
+	client := &bodyRoutingErrorClient{
+		CacheClient: cacheclient.NewMemoryCache(),
+		err:         routeErr,
+	}
+	cfg := config.NewDefault()
+	store := NewCacheWithClient(client, &cfg.Cache)
+
+	for _, tc := range []struct {
+		name string
+		read func() error
+	}{
+		{
+			name: "GetBodyStream",
+			read: func() error { return store.GetBodyStream(ctx, "bucket", "object", `"etag"`, io.Discard) },
+		},
+		{
+			name: "GetRangeStream",
+			read: func() error { return store.GetRangeStream(ctx, "bucket", "object", `"etag"`, 0, 1, io.Discard) },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.read()
+			var got *ocachecoordinator.RouterError
+			if !errors.Is(err, ErrNotFound) || !errors.As(err, &got) || !errors.Is(got, ocachecoordinator.ErrMaxRetriesExceeded) || !errors.Is(got.Cause, ocachecoordinator.ErrNodeNotFound) {
+				t.Errorf("read error = %v, want the legacy ErrNotFound match and the retry-exhausted routing cause", err)
+			}
+		})
+	}
+
+	if present, err := store.BodyExistsErr(ctx, "bucket", "object", `"etag"`); present || err == nil {
+		t.Errorf("BodyExistsErr = (%v, %v), want the routing error rather than absence", present, err)
+	} else {
+		var got *ocachecoordinator.RouterError
+		if !errors.Is(err, ErrNotFound) || !errors.As(err, &got) || !errors.Is(got, ocachecoordinator.ErrMaxRetriesExceeded) || !errors.Is(got.Cause, ocachecoordinator.ErrNodeNotFound) {
+			t.Errorf("BodyExistsErr error = %v, want the legacy ErrNotFound match and the retry-exhausted routing cause", err)
+		}
+	}
+}
+
 func TestBodyReadNotFoundPreservesOwnerRoutingError(t *testing.T) {
 	ctx := context.Background()
 	routeErr := ocachecoordinator.NewNodeNotFoundError("owner", "body|bucket/object/etag")
