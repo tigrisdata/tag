@@ -808,7 +808,7 @@ func (s *Service) serveRangeFromCache(
 	if !cw.committed {
 		// Cache.GetRangeStream normally maps a no-write read to ErrNotFound. Keep
 		// this guard in case a future cache implementation returns nil instead.
-		return false, fmt.Errorf("cache range body empty for %s/%s", bucket, key)
+		return false, cacheBodyEmptyError(bucket, key, meta)
 	}
 
 	if cw.written > 0 {

@@ -21,10 +21,13 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	storageerrors "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/metrics"
 	"github.com/tigrisdata/tag/s3err"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // The local-store engine: TAG serving and storing on its own, with no
@@ -163,20 +166,14 @@ func (s *Service) serveOriginlessObject(w http.ResponseWriter, r *http.Request, 
 	return nil
 }
 
-// finishServeBodyError disposes of a pre-commit body-serve failure. It
-// distinguishes two cases the mode must not conflate:
-//   - The body is GENUINELY GONE (evicted under a live meta): an
-//     authoritative miss, and the orphaned meta is invalidated — but
-//     ETag-GUARDED (DeleteIfETag), never an unconditional delete, so a
-//     concurrent PUT's just-committed newer version is never wiped. The
-//     guard resolves against the served snapshot's discriminator identity;
-//     a different current entry keeps the key.
-//   - Anything else is TRANSIENT (a cluster-peer gRPC blip, a deadline):
-//     NOT absence. Minting an authoritative NoSuchKey here would tell the
-//     caller a live object does not exist — so it propagates as a retryable
-//     5xx, matching this handler's meta-read and probe legs.
+// finishServeBodyError disposes of a pre-commit body-serve failure. An
+// authoritative miss is safe only when the cache positively reports absence or
+// a body-length/corruption check confirms unusable data. Other read failures
+// leave the metadata intact and return an error for retry; they do not prove that
+// an authoritative object is missing. The cleanup remains version-guarded to
+// protect a PUT committed after this request's metadata snapshot.
 func (s *Service) finishServeBodyError(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key string, metaVersion uint64, serveErr error, operation string, start time.Time) error {
-	if !bodyGone(serveErr) {
+	if !originlessBodyGone(serveErr, r.Header.Get("Range") != "") {
 		metrics.RecordRequest(operation, "error", metrics.SourceLocal, time.Since(start).Seconds())
 		return serveErr
 	}
@@ -190,6 +187,32 @@ func (s *Service) finishServeBodyError(ctx context.Context, w http.ResponseWrite
 		log.Debug().Err(derr).Str("bucket", bucket).Str("key", key).Msg("Orphaned-meta invalidation failed; ages out by TTL")
 	}
 	return s.originlessMiss(w, r, operation, start)
+}
+
+// originlessBodyGone limits authoritative cleanup to failures that establish
+// absence or corruption. bodyGone remains the proxy mode's broader healing
+// policy, where an upstream can immediately refill an unusable entry.
+func originlessBodyGone(err error, ranged bool) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, cache.ErrNotFound) ||
+		errors.Is(err, errCacheBodyLengthMismatch) ||
+		storageerrors.IsCorruption(err) {
+		return true
+	}
+	if status.Code(err) == codes.DataLoss {
+		// The cache server maps its storage corruption type to DataLoss for
+		// streamed reads; the embedded client returns that typed error directly.
+		return true
+	}
+	if ranged && status.Code(err) == codes.InvalidArgument {
+		// The HTTP range is validated against metadata before reaching the cache.
+		// The cache returns InvalidArgument when that valid span is outside the
+		// backing body; unrelated full-object errors with this code stay retryable.
+		return true
+	}
+	return false
 }
 
 // entryServable is the handler's single existence answer: all blocks present for

@@ -11,6 +11,12 @@ falls back to its own authoritative store.
 object it holds, stamped with the tier the body lives in. A metadata miss
 answers `NoSuchKey` immediately — no upstream request, in either tier.
 
+After a local-tier GET passes its body-presence probe, an unclassified body-read
+failure returns an internal server error and leaves the metadata intact for a
+retry. Only a confirmed absence or detected body-length/corruption failure is
+converted to `NoSuchKey`; cleanup remains guarded against a newer metadata
+version.
+
 **Small objects (declared size ≤ `cache.size_threshold`) are the local tier.**
 PUT STREAMS the object into the local cache — the body is never buffered in
 memory, so the threshold can be sized to the workload without a per-request
