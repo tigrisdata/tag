@@ -64,6 +64,31 @@ func (w *rangeStagingResponseWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// startRangeStagingRequest releases and joins the request before earlier pool cleanup runs,
+// even if the test fails while the response is held inside Write.
+func startRangeStagingRequest(t *testing.T, svc *Service, w *rangeStagingResponseWriter, r *http.Request) func() error {
+	t.Helper()
+	release := make(chan struct{})
+	w.release = release
+	done := make(chan struct{})
+	var err error
+	finish := func() error {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		<-done
+		return err
+	}
+	t.Cleanup(func() { finish() })
+	go func() {
+		err = svc.HandleGetObject(w, r)
+		close(done)
+	}()
+	return finish
+}
+
 func newRangeStagingService(tb testing.TB, budget int64) (*Service, *cache.Cache, *cache.CachedObjectMeta, []byte) {
 	tb.Helper()
 	body := make([]byte, assembledRangeBlockSize)
@@ -122,22 +147,6 @@ func TestBlockCache_AssembledRangeCapacityMatchesStagingReservation(t *testing.T
 	}
 
 	entered := make(chan rangeWriteObservation, 2)
-	releases := []chan struct{}{make(chan struct{}), make(chan struct{})}
-	writers := []*rangeStagingResponseWriter{
-		{started: entered, release: releases[0]},
-		{started: entered, release: releases[1]},
-	}
-	releaseWrites := func() {
-		for _, release := range releases {
-			select {
-			case <-release:
-			default:
-				close(release)
-			}
-		}
-	}
-	defer releaseWrites()
-	done := make(chan error, len(writers)+1)
 	waitForWrite := func() rangeWriteObservation {
 		t.Helper()
 		select {
@@ -151,7 +160,7 @@ func TestBlockCache_AssembledRangeCapacityMatchesStagingReservation(t *testing.T
 			return rangeWriteObservation{}
 		}
 	}
-	go func() { done <- svc.HandleGetObject(writers[0], blockGet(meta.Bucket, meta.Key, smallRange)) }()
+	finishFirst := startRangeStagingRequest(t, svc, &rangeStagingResponseWriter{started: entered}, blockGet(meta.Bucket, meta.Key, smallRange))
 	first := waitForWrite()
 	_, inUse := stagingBudgetSnapshot(svc.populateBudget)
 	if int64(first.capacity) > inUse {
@@ -170,7 +179,7 @@ func TestBlockCache_AssembledRangeCapacityMatchesStagingReservation(t *testing.T
 		t.Fatalf("shared block-buffer limit = %d, want %d", got, 2*assembledRangeBlockSize)
 	}
 
-	go func() { done <- svc.HandleGetObject(writers[1], blockGet(meta.Bucket, meta.Key, smallRange)) }()
+	finishSecond := startRangeStagingRequest(t, svc, &rangeStagingResponseWriter{started: entered}, blockGet(meta.Bucket, meta.Key, smallRange))
 	second := waitForWrite()
 	activeCapacity := int64(first.capacity + second.capacity)
 	_, inUse = stagingBudgetSnapshot(svc.populateBudget)
@@ -178,30 +187,17 @@ func TestBlockCache_AssembledRangeCapacityMatchesStagingReservation(t *testing.T
 		t.Errorf("active assembled range backing capacity is not covered by its staging reservation: capacity=%d reserved=%d", activeCapacity, inUse)
 	}
 
-	releaseWrites()
-	for range writers {
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("small range: %v", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for small range completion")
-		}
+	if err := finishFirst(); err != nil {
+		t.Fatalf("small range: %v", err)
+	}
+	if err := finishSecond(); err != nil {
+		t.Fatalf("small range: %v", err)
 	}
 
 	writeErr := errors.New("range response write failed")
-	errorRelease := make(chan struct{})
 	errorEntered := make(chan rangeWriteObservation, 1)
-	errorWriter := &rangeStagingResponseWriter{started: errorEntered, release: errorRelease, writeErr: writeErr}
-	defer func() {
-		select {
-		case <-errorRelease:
-		default:
-			close(errorRelease)
-		}
-	}()
-	go func() { done <- svc.HandleGetObject(errorWriter, blockGet(meta.Bucket, meta.Key, smallRange)) }()
+	errorWriter := &rangeStagingResponseWriter{started: errorEntered, writeErr: writeErr}
+	finishError := startRangeStagingRequest(t, svc, errorWriter, blockGet(meta.Bucket, meta.Key, smallRange))
 	var errorObservation rangeWriteObservation
 	select {
 	case errorObservation = <-errorEntered:
@@ -215,14 +211,8 @@ func TestBlockCache_AssembledRangeCapacityMatchesStagingReservation(t *testing.T
 	if int64(errorObservation.capacity) > inUse {
 		t.Errorf("active assembled range backing capacity is not covered by its staging reservation: capacity=%d reserved=%d on write error", errorObservation.capacity, inUse)
 	}
-	close(errorRelease)
-	select {
-	case err := <-done:
-		if !errors.Is(err, writeErr) {
-			t.Fatalf("write error = %v, want %v", err, writeErr)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for failing range completion")
+	if err := finishError(); !errors.Is(err, writeErr) {
+		t.Fatalf("write error = %v, want %v", err, writeErr)
 	}
 }
 
@@ -315,11 +305,9 @@ func TestBlockCache_AssembledRangeFitsSmallStagingBudget(t *testing.T) {
 	blockBufPool.Put(&large)
 
 	entered := make(chan rangeWriteObservation, 1)
-	release := make(chan struct{})
-	writer := &rangeStagingResponseWriter{started: entered, release: release, captureBody: true}
-	done := make(chan error, 1)
+	writer := &rangeStagingResponseWriter{started: entered, captureBody: true}
 	rangeHeader := fmt.Sprintf("bytes=0-%d", smallRangeSize-1)
-	go func() { done <- svc.HandleGetObject(writer, blockGet(meta.Bucket, meta.Key, rangeHeader)) }()
+	finish := startRangeStagingRequest(t, svc, writer, blockGet(meta.Bucket, meta.Key, rangeHeader))
 	var observation rangeWriteObservation
 	select {
 	case observation = <-entered:
@@ -339,14 +327,8 @@ func TestBlockCache_AssembledRangeFitsSmallStagingBudget(t *testing.T) {
 	if got := client.payloadReads.Load(); got != 1 {
 		t.Fatalf("exact-capacity payload reads = %d, want 1", got)
 	}
-	close(release)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("exact-capacity range: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for exact-capacity range completion")
+	if err := finish(); err != nil {
+		t.Fatalf("exact-capacity range: %v", err)
 	}
 	if writer.status != http.StatusPartialContent || !bytes.Equal(writer.body, body[:smallRangeSize]) {
 		t.Fatalf("exact-capacity response = (status=%d, bytes=%d, exact=%t), want exact 206 body", writer.status, len(writer.body), bytes.Equal(writer.body, body[:smallRangeSize]))
