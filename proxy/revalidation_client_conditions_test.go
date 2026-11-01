@@ -295,6 +295,17 @@ func TestRevalidationClientConditionsMatchOrigin(t *testing.T) {
 			ifNoneMatchFields: []string{`"other"`, `W/"current"`}, wantStatus: http.StatusNotModified, wantXCache: XCacheHit, wantFullReads: 0,
 		},
 		{
+			name: "quoted comma in repeated field matches unchanged origin", cachedETag: `"comma,tag"`, cachedModified: oldModified,
+			originETag: `"comma,tag"`, originModified: oldModified, originBody: currentBody,
+			ifNoneMatchFields: []string{`"other"`, `W/"comma,tag"`}, wantStatus: http.StatusNotModified, wantXCache: XCacheHit,
+		},
+		{
+			name: "quoted comma is not a list separator", cachedETag: `"current"`, cachedModified: oldModified,
+			originETag: `"current"`, originModified: oldModified, originBody: currentBody,
+			ifNoneMatch: `"current,other"`, ifModifiedSince: futureIMS, wantStatus: http.StatusOK,
+			wantBody: currentBody, wantXCache: XCacheHit, wantFullReads: 1, wantOutBytes: int64(len(currentBody)),
+		},
+		{
 			name: "weak-to-strong match returns bodyless 304", cachedETag: `W/"current"`, cachedModified: oldModified,
 			originETag: `"current"`, originModified: oldModified, originBody: weakCurrentBody, cachedBody: weakCachedBody,
 			ifNoneMatch: `"current"`, wantStatus: http.StatusNotModified, wantXCache: XCacheHit,
@@ -371,6 +382,18 @@ func TestRevalidationClientConditionsMatchOrigin(t *testing.T) {
 			originETag: `"new"`, originModified: newModified, originBody: currentBody,
 			ifNoneMatchFields: []string{`"other"`, `"new"`}, wantStatus: http.StatusNotModified,
 			wantXCache: XCacheRevalidated, wantCachedETag: `"new"`, wantCachedBody: currentBody,
+		},
+		{
+			name: "quoted comma matches changed 200", cachedETag: `"old"`, cachedModified: oldModified,
+			originETag: `"comma,tag"`, originModified: newModified, originBody: currentBody,
+			ifNoneMatch: `"other", W/"comma,tag"`, wantStatus: http.StatusNotModified,
+			wantXCache: XCacheRevalidated, wantCachedETag: `"comma,tag"`, wantCachedBody: currentBody,
+		},
+		{
+			name: "quoted comma matches changed 206", cachedETag: `"old"`, cachedModified: oldModified,
+			originETag: `"comma,tag"`, originModified: newModified, originBody: currentBody,
+			ifNoneMatch: `W/"comma,tag"`, rangeHeader: "bytes=0-4", wantStatus: http.StatusNotModified,
+			wantXCache: XCacheRevalidated, wantRewarm: true, wantCachedETag: `"comma,tag"`, wantCachedBody: currentBody,
 		},
 		{
 			name: "old client validator does not match changed 206", cachedETag: `"old"`, cachedModified: oldModified,
