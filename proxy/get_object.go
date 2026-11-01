@@ -934,27 +934,80 @@ func (s *Service) handleRangeWithBackgroundCache(
 	return nil
 }
 
+// clientIfNoneMatch combines repeated If-None-Match field values into the
+// comma-separated list defined by the HTTP field. Empty field values do not
+// replace a later nonempty validator.
+func clientIfNoneMatch(r *http.Request) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	values := r.Header.Values("If-None-Match")
+	if len(values) == 0 {
+		return "", false
+	}
+	if len(values) == 1 {
+		if strings.TrimSpace(values[0]) == "" {
+			return "", false
+		}
+		return values[0], true
+	}
+
+	nonempty := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			nonempty = append(nonempty, value)
+		}
+	}
+	switch len(nonempty) {
+	case 0:
+		return "", false
+	case 1:
+		return nonempty[0], true
+	default:
+		return strings.Join(nonempty, ","), true
+	}
+}
+
+// clientNotModified evaluates GET validators in RFC 7232 order. If-None-Match
+// uses weak/list comparison and takes precedence over If-Modified-Since because
+// Last-Modified is only second-granular.
+func clientNotModified(r *http.Request, meta *cache.CachedObjectMeta) bool {
+	return clientNotModifiedWithWildcard(r, meta, false)
+}
+
+// revalidationClientNotModified also handles If-None-Match: * when the current
+// upstream representation has no ETag. The revalidation response itself proves
+// that this representation exists; CachedObjectMeta's ETag matcher cannot infer
+// existence from an empty validator.
+func revalidationClientNotModified(r *http.Request, meta *cache.CachedObjectMeta) bool {
+	return clientNotModifiedWithWildcard(r, meta, true)
+}
+
+func clientNotModifiedWithWildcard(r *http.Request, meta *cache.CachedObjectMeta, wildcardMatchesExisting bool) bool {
+	if r == nil || meta == nil {
+		return false
+	}
+	if inm, ok := clientIfNoneMatch(r); ok {
+		if wildcardMatchesExisting && strings.TrimSpace(inm) == "*" {
+			return true
+		}
+		return meta.MatchesETagHeader(inm, false)
+	}
+	ims := r.Header.Get("If-Modified-Since")
+	if ims == "" {
+		return false
+	}
+	t, parseErr := http.ParseTime(ims)
+	return parseErr == nil && !meta.IsModifiedSince(t)
+}
+
 // writeNotModifiedFromCache answers a conditional request with 304 when the
-// cached entry satisfies the request's validators. Per RFC 7232 §3.3, a
-// request carrying If-None-Match is judged by it ALONE — If-Modified-Since is
-// ignored, matching or not: LastModified is second-granular, so falling back
-// to it could 304 a client across a same-second overwrite it should see.
-// Returns true when it wrote the response. Shared by the proxying GET hit
-// path and the origin-less handler so the two cannot drift.
+// cached entry satisfies the client's validators. Returns true when it wrote
+// the response. Shared by the proxying GET hit path and the origin-less handler
+// so the two cannot drift.
 func (s *Service) writeNotModifiedFromCache(w http.ResponseWriter, r *http.Request, meta *cache.CachedObjectMeta, operation string, start time.Time) bool {
-	if inm := r.Header.Get("If-None-Match"); inm != "" {
-		if !meta.MatchesETagHeader(inm, false) {
-			return false
-		}
-	} else {
-		ims := r.Header.Get("If-Modified-Since")
-		if ims == "" {
-			return false
-		}
-		t, parseErr := http.ParseTime(ims)
-		if parseErr != nil || meta.IsModifiedSince(t) {
-			return false
-		}
+	if !clientNotModified(r, meta) {
+		return false
 	}
 	writeCacheStatus(w, XCacheHit)
 	w.Header().Set("ETag", meta.ETag)
