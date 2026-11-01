@@ -291,8 +291,8 @@ func (m *CachedObjectMeta) MatchesETag(etag string) bool {
 // list that contains the live ETag never match — fatal on the authoritative
 // paths (origin-less and tiered), where there is no upstream to answer
 // correctly instead: legal conditional writes 412 and valid 304s are lost.
-// Splitting on ',' is exact here because ETags are quoted strings whose only
-// legal inner characters exclude ',' (RFC 7232 §2.3).
+// Commas delimit list members only outside quotes: the opaque tag itself may
+// contain a comma (RFC 7232 §2.3). Backslashes are literal, not quote escapes.
 //
 // strong selects the comparison function (RFC 7232 §2.3.2): If-Match REQUIRES
 // strong comparison — a W/ weak validator never matches, so a conditional
@@ -305,8 +305,18 @@ func (m *CachedObjectMeta) MatchesETagHeader(header string, strong bool) bool {
 	if header == "*" {
 		return true
 	}
-	for _, candidate := range strings.Split(header, ",") {
-		candidate = strings.TrimSpace(candidate)
+	start, quoted := 0, false
+	for i := 0; i <= len(header); i++ {
+		if i < len(header) {
+			if header[i] == '"' {
+				quoted = !quoted
+			}
+			if header[i] != ',' || quoted {
+				continue
+			}
+		}
+		candidate := strings.TrimSpace(header[start:i])
+		start = i + 1
 		if candidate == "*" {
 			return true
 		}
