@@ -571,7 +571,7 @@ func getBlockBuf(n int64) *[]byte {
 	return &b
 }
 
-// getExactBlockBuf returns a scratch buffer whose capacity is exactly n. Certified-range and
+// getExactBlockBuf returns a scratch buffer whose capacity is exactly n. Budgeted range and
 // direct full-object writers reserve the requested byte count; they must not activate a larger
 // process-wide pooled buffer that another service caused to be retained.
 func getExactBlockBuf(n int64) *[]byte {
@@ -611,7 +611,13 @@ func (s *Service) serveAssembledRange(
 ) (served bool, err error) {
 	b0, bK := coveringBlocks(rng.start, rng.end, meta.BlockSize)
 	rangeLen := rng.end - rng.start + 1
-	bufp := getBlockBuf(rangeLen)
+	var bufp *[]byte
+	if s.populateBudget == nil {
+		bufp = getBlockBuf(rangeLen)
+	} else {
+		// Match the backing capacity to the caller's requested-range reservation.
+		bufp = getExactBlockBuf(rangeLen)
+	}
 	defer putBlockBuf(bufp)
 	buf := (*bufp)[:rangeLen]
 
