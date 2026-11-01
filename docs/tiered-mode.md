@@ -37,10 +37,14 @@ validated plain-object PUT, TAG evaluates `If-Match` and `If-None-Match` against
 the servable local prior (or confirmed absence), even when the replacement
 belongs upstream. A failed condition does not forward or replace the prior.
 After a local condition succeeds, TAG removes it from the forwarded request
-and re-signs as the same caller; signed streaming bodies are verified and
-decoded while being forwarded. With an upstream-tier prior, upstream still
-evaluates the original conditions. A metadata or local-body probe error is
-retryable, not absence.
+and re-signs as the same caller. HMAC-signed streaming bodies are verified
+while forwarding. Streams with signed trailers are re-framed, checking the
+original chunk chain and trailer signature before the forwarded upload can
+complete, and keeping the checksum trailers for upstream validation. Unsigned
+trailer streams keep their original framing; signed streaming algorithms TAG
+cannot verify are not converted on this path. With an upstream-tier prior,
+upstream still evaluates the original conditions. A metadata or local-body
+probe error is retryable, not absence.
 
 The metadata snapshot used for the condition also guards publication of the
 upstream marker. With CAS coordination, a competing metadata write can refuse

@@ -221,23 +221,16 @@ func (f *transparentForwarder) forwardPutWithoutConditions(ctx context.Context, 
 	if err != nil {
 		return mapAuthError(err)
 	}
-	body, bodyHash, contentLength, chunked, err := decodeBody(r, vr)
+	modified, err := preparePutWithoutConditions(ctx, r, vr)
 	if err != nil {
 		return err
 	}
-	modified := r.Clone(ctx)
-	modified.Body = body
-	modified.Header = headersForForwardedSigning(modified.Header, chunked)
-	modified.Header.Del("If-Match")
-	modified.Header.Del("If-None-Match")
-	modified.Header.Set("X-Amz-Content-Sha256", bodyHash)
-	prepareForwardedRequest(modified, contentLength, chunked)
 	vr.Resign(modified)
 	fwdReq, err := f.buildTransparentRequest(ctx, modified)
 	if err != nil {
 		return err
 	}
-	return forwardError(f.executeAndStream(w, fwdReq, contentLength, r))
+	return forwardError(f.executeAndStream(w, fwdReq, modified.ContentLength, r))
 }
 
 // ForwardWithCapture forwards request in transparent proxy mode and captures the response.

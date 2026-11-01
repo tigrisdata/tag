@@ -1,17 +1,23 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -61,9 +67,13 @@ func (o *tieredConditionalOrigin) ServeHTTP(w http.ResponseWriter, r *http.Reque
 			w.WriteHeader(http.StatusPreconditionFailed)
 			return
 		}
-		data, err := io.ReadAll(r.Body)
+		data, err := readConditionalOriginBody(r)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			status := http.StatusBadRequest
+			if errors.Is(err, auth.ErrChunkSignatureMismatch) {
+				status = http.StatusForbidden
+			}
+			http.Error(w, err.Error(), status)
 			return
 		}
 		o.objects[r.URL.Path] = string(data)
@@ -350,20 +360,184 @@ func TestTieredLargeConditionalPutReadFailures(t *testing.T) {
 	}
 }
 
+// trailerSignature is the spec-literal trailer MAC. Chunk signatures below use
+// the AWS SDK; neither the producer nor origin uses TAG's body verifier.
+func trailerSignature(previous, signingTime, canonical string) string {
+	mac := func(key []byte, text string) []byte {
+		h := hmac.New(sha256.New, key)
+		h.Write([]byte(text))
+		return h.Sum(nil)
+	}
+	date := signingTime[:8]
+	key := mac([]byte("AWS4"+payloadHashTestSecretKey), date)
+	key = mac(key, payloadHashTestRegion)
+	key = mac(key, "s3")
+	key = mac(key, "aws4_request")
+	sum := sha256.Sum256([]byte(canonical))
+	text := strings.Join([]string{"AWS4-HMAC-SHA256-TRAILER", signingTime, date + "/" + payloadHashTestRegion + "/s3/aws4_request", previous, hex.EncodeToString(sum[:])}, "\n")
+	return hex.EncodeToString(mac(key, text))
+}
+
+func readConditionalOriginBody(r *http.Request) ([]byte, error) {
+	marker := r.Header.Get("X-Amz-Content-Sha256")
+	if !IsStreamingPayload(marker) {
+		return io.ReadAll(r.Body)
+	}
+	reader := bufio.NewReader(r.Body)
+	info, err := auth.ParseAuthInfo(r)
+	if err != nil {
+		return nil, err
+	}
+	seed, err := hex.DecodeString(info.Signature)
+	if err != nil {
+		return nil, err
+	}
+	signingTime, err := time.Parse(auth.TimeFormat, r.Header.Get("X-Amz-Date"))
+	if err != nil {
+		return nil, err
+	}
+	signer := v4.NewStreamSigner(aws.Credentials{AccessKeyID: payloadHashTestAccessKey, SecretAccessKey: payloadHashTestSecretKey}, "s3", payloadHashTestRegion, seed)
+	var data bytes.Buffer
+	previous := info.Signature
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		size, extension, _ := strings.Cut(strings.TrimSpace(line), ";chunk-signature=")
+		n, err := strconv.ParseInt(size, 16, 64)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid chunk size %q", size)
+		}
+		chunk := make([]byte, n)
+		if _, err := io.ReadFull(reader, chunk); err != nil {
+			return nil, err
+		}
+		if n > 0 || marker == StreamingPayloadHash {
+			end, err := reader.ReadString('\n')
+			if err != nil || end != "\r\n" {
+				return nil, fmt.Errorf("invalid chunk end: %q %v", end, err)
+			}
+		}
+		if marker != StreamingUnsignedTrailerHash {
+			signature, err := signer.GetSignature(r.Context(), nil, chunk, signingTime)
+			if err != nil || hex.EncodeToString(signature) != extension {
+				return nil, fmt.Errorf("invalid original chunk signature: %w", auth.ErrChunkSignatureMismatch)
+			}
+			previous = extension
+		}
+		data.Write(chunk)
+		if n == 0 {
+			break
+		}
+	}
+	if value := r.Header.Get("X-Amz-Decoded-Content-Length"); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil || n != data.Len() {
+			return nil, fmt.Errorf("wrong decoded length")
+		}
+	}
+	if marker != StreamingPayloadHash {
+		trailers, err := textproto.NewReader(reader).ReadMIMEHeader()
+		if err != nil {
+			return nil, err
+		}
+		checksum := trailers.Get("X-Amz-Checksum-Sha256")
+		if marker == StreamingPayloadHash+"-TRAILER" {
+			expected := trailerSignature(previous, signingTime.Format(auth.TimeFormat), "x-amz-checksum-sha256:"+checksum+"\n")
+			if trailers.Get("X-Amz-Trailer-Signature") != expected {
+				return nil, fmt.Errorf("invalid original trailer signature: %w", auth.ErrChunkSignatureMismatch)
+			}
+		}
+		sum := sha256.Sum256(data.Bytes())
+		if checksum != base64.StdEncoding.EncodeToString(sum[:]) {
+			return nil, fmt.Errorf("checksum mismatch")
+		}
+	}
+	return data.Bytes(), nil
+}
+
 func TestTieredLargeConditionalPutSignedChunks(t *testing.T) {
 	for _, flavor := range []payloadHashTestFlavor{payloadHashSigningFlavor, payloadHashTransparentFlavor} {
-		for _, tamper := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/tamper=%v", flavor, tamper), func(t *testing.T) {
+		for _, tc := range []struct {
+			marker, fault                                  string
+			unknown, absent, empty, upstream, large, split bool
+		}{
+			{marker: StreamingPayloadHash},
+			{marker: StreamingPayloadHash, fault: "data"},
+			{marker: StreamingPayloadHash + "-TRAILER"},
+			{marker: StreamingPayloadHash + "-TRAILER", upstream: true},
+			{marker: StreamingPayloadHash + "-TRAILER", upstream: true, unknown: true},
+			{marker: StreamingPayloadHash + "-TRAILER", unknown: true},
+			{marker: StreamingPayloadHash + "-TRAILER", absent: true},
+			{marker: StreamingPayloadHash + "-TRAILER", large: true},
+			{marker: StreamingPayloadHash + "-TRAILER", split: true},
+			{marker: StreamingPayloadHash + "-TRAILER", unknown: true, empty: true},
+			{marker: StreamingPayloadHash + "-TRAILER", fault: "data"},
+			{marker: StreamingPayloadHash + "-TRAILER", fault: "data", unknown: true, absent: true},
+			{marker: StreamingPayloadHash + "-TRAILER", fault: "terminal"},
+			{marker: StreamingPayloadHash + "-TRAILER", fault: "trailer"},
+			{marker: StreamingPayloadHash + "-TRAILER", fault: "missing trailer"},
+			{marker: StreamingPayloadHash + "-TRAILER", fault: "checksum"},
+			{marker: StreamingPayloadHash + "-TRAILER", fault: "short declaration"},
+			{marker: StreamingPayloadHash + "-TRAILER", fault: "long declaration"},
+			{marker: StreamingPayloadHash + "-TRAILER", fault: "negative terminal"},
+			{marker: StreamingPayloadHash + "-TRAILER", fault: "negative length"},
+			{marker: StreamingPayloadHash, fault: "malformed length"},
+			{marker: StreamingUnsignedTrailerHash},
+			{marker: StreamingUnsignedTrailerHash, unknown: true},
+			{marker: StreamingUnsignedTrailerHash, fault: "checksum"},
+			{marker: StreamingUnsignedTrailerHash, fault: "checksum", unknown: true},
+		} {
+			t.Run(fmt.Sprintf("%s/%s/%s/unknown=%v/absent=%v/empty=%v/upstream=%v/large=%v/split=%v", flavor, tc.marker, tc.fault, tc.unknown, tc.absent, tc.empty, tc.upstream, tc.large, tc.split), func(t *testing.T) {
 				origin := &tieredConditionalOrigin{objects: make(map[string]string)}
 				f := newTieredPayloadHashFixture(t, flavor, origin)
 				old := []byte("local only")
-				f.do(t, http.MethodPut, "object", old, payloadSHA256(old), "")
-				prior, version, _, err := f.cache.GetMetaWithVersion(t.Context(), payloadHashTestBucket, "object")
-				if err != nil {
-					t.Fatal(err)
+				if tc.upstream {
+					old = bytes.Repeat([]byte("u"), 2048)
+				}
+				if !tc.absent {
+					if w := f.do(t, http.MethodPut, "object", old, payloadSHA256(old), ""); w.Code != 200 {
+						t.Fatalf("seed: %d", w.Code)
+					}
+				}
+				prior, version, found, err := f.cache.GetMetaWithVersion(t.Context(), payloadHashTestBucket, "object")
+				if err != nil || found == tc.absent {
+					t.Fatalf("prior: %+v found=%v err=%v", prior, found, err)
 				}
 				body := bytes.Repeat([]byte("l"), 1408)
-				r := f.signedRequest(t, http.MethodPut, "object", nil, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", "", http.Header{"If-Match": {prior.ETag}, "Content-Encoding": {"aws-chunked"}, "X-Amz-Decoded-Content-Length": {fmt.Sprint(len(body))}})
+				if tc.large {
+					body = bytes.Repeat([]byte("l"), 3*len((authenticatedTrailerReader{}).buffer)+17)
+				}
+				if tc.empty {
+					body = nil
+				}
+				headers := http.Header{"Content-Encoding": {"aws-chunked"}}
+				if tc.absent {
+					headers.Set("If-None-Match", "*")
+				} else {
+					headers.Set("If-Match", prior.ETag)
+				}
+				if tc.marker != StreamingPayloadHash {
+					headers.Set("X-Amz-Trailer", "x-amz-checksum-sha256")
+				}
+				n := len(body)
+				if tc.fault == "short declaration" {
+					n--
+				}
+				if tc.fault == "long declaration" {
+					n++
+				}
+				if !tc.unknown {
+					headers.Set("X-Amz-Decoded-Content-Length", fmt.Sprint(n))
+					if tc.fault == "negative length" {
+						headers.Set("X-Amz-Decoded-Content-Length", "-1")
+					}
+					if tc.fault == "malformed length" {
+						headers.Set("X-Amz-Decoded-Content-Length", "invalid")
+					}
+				}
+				r := f.signedRequest(t, http.MethodPut, "object", nil, tc.marker, "", headers)
 				info, err := auth.ParseAuthInfo(r)
 				if err != nil {
 					t.Fatal(err)
@@ -374,48 +548,100 @@ func TestTieredLargeConditionalPutSignedChunks(t *testing.T) {
 				}
 				stream := v4.NewStreamSigner(aws.Credentials{AccessKeyID: payloadHashTestAccessKey, SecretAccessKey: payloadHashTestSecretKey}, "s3", payloadHashTestRegion, seed)
 				var wire bytes.Buffer
-				for _, chunk := range [][]byte{body, nil} {
+				var previous string
+				chunks := [][]byte{body, nil}
+				if tc.split {
+					chunks = [][]byte{body[:len(body)/2], body[len(body)/2:], nil}
+				}
+				if tc.empty {
+					chunks = [][]byte{nil}
+				}
+				for _, chunk := range chunks {
 					signature, err := stream.GetSignature(t.Context(), nil, chunk, f.signingTime)
 					if err != nil {
 						t.Fatal(err)
 					}
-					fmt.Fprintf(&wire, "%x;chunk-signature=%x\r\n", len(chunk), signature)
+					previous = hex.EncodeToString(signature)
+					if len(chunk) == 0 && tc.fault == "terminal" {
+						previous = strings.Repeat("0", 64)
+					}
+					size := fmt.Sprintf("%x", len(chunk))
+					if len(chunk) == 0 && tc.fault == "negative terminal" {
+						size = "-1"
+					}
+					wire.WriteString(size)
+					if tc.marker != StreamingUnsignedTrailerHash {
+						fmt.Fprintf(&wire, ";chunk-signature=%s", previous)
+					}
+					wire.WriteString("\r\n")
 					wire.Write(chunk)
+					if len(chunk) > 0 || tc.marker == StreamingPayloadHash {
+						wire.WriteString("\r\n")
+					}
+				}
+				if tc.marker != StreamingPayloadHash && tc.fault != "missing trailer" {
+					sum := sha256.Sum256(body)
+					if tc.fault == "checksum" {
+						sum[0] ^= 1
+					}
+					checksum := base64.StdEncoding.EncodeToString(sum[:])
+					fmt.Fprintf(&wire, "x-amz-checksum-sha256:%s\r\n", checksum)
+					if tc.marker != StreamingUnsignedTrailerHash {
+						signature := trailerSignature(previous, f.signingTime.UTC().Format(auth.TimeFormat), "x-amz-checksum-sha256:"+checksum+"\n")
+						if tc.fault == "trailer" {
+							signature = strings.Repeat("0", 64)
+						}
+						fmt.Fprintf(&wire, "x-amz-trailer-signature:%s\r\n", signature)
+					}
 					wire.WriteString("\r\n")
 				}
 				framed := wire.Bytes()
-				if tamper {
+				if tc.fault == "data" {
 					framed = flipByte(t, framed, body)
 				}
 				r.Body = io.NopCloser(bytes.NewReader(framed))
 				r.ContentLength = int64(len(framed))
-				headers := r.Header.Clone()
+				clientHeaders, clientURL := r.Header.Clone(), r.URL.String()
 				w := httptest.NewRecorder()
 				err = f.service.HandlePutObject(w, r)
-				current, currentVersion, found, readErr := f.cache.GetMetaWithVersion(t.Context(), payloadHashTestBucket, "object")
-				if readErr != nil || !found || current == nil {
-					t.Fatalf("metadata after stream: %+v %v", current, readErr)
+				current, currentVersion, currentFound, readErr := f.cache.GetMetaWithVersion(t.Context(), payloadHashTestBucket, "object")
+				if readErr != nil {
+					t.Fatal(readErr)
 				}
-				if !reflect.DeepEqual(r.Header, headers) {
-					t.Error("forwarder mutated the signed client headers")
+				if !reflect.DeepEqual(r.Header, clientHeaders) || r.URL.String() != clientURL {
+					t.Fatal("forwarder mutated the signed client request")
 				}
-				if tamper {
-					if authErr, ok := IsAuthError(err); !ok || authErr.Code != ErrCodeSignatureMismatch {
-						t.Fatalf("tampered signed chunk error = %v, want signature mismatch", err)
+				if tc.fault != "" {
+					if tc.fault != "checksum" {
+						if e, ok := IsAuthError(err); !ok || e.Code != ErrCodeSignatureMismatch {
+							t.Fatalf("invalid stream: error=%v status=%d; want signature mismatch", err, w.Code)
+						}
+					} else if err != nil || w.Code != 400 {
+						t.Fatalf("bad checksum: error=%v status=%d; want origin rejection", err, w.Code)
 					}
-					if currentVersion != version || !reflect.DeepEqual(current, prior) {
-						t.Fatal("failed stream replaced local metadata")
+					if currentFound != found || (found && currentVersion != version) || !reflect.DeepEqual(current, prior) {
+						t.Fatalf("failed stream replaced local metadata: %+v/%d -> %+v/%d", prior, version, current, currentVersion)
 					}
-				} else if err != nil || w.Code != 200 || !current.BodyUpstream {
-					t.Fatalf("valid stream: err=%v status=%d metadata=%+v", err, w.Code, current)
+					origin.mu.Lock()
+					_, committed := origin.objects["/"+payloadHashTestBucket+"/object"]
+					origin.mu.Unlock()
+					if committed {
+						t.Fatal("origin committed an invalid upload")
+					}
+				} else if err != nil || w.Code != 200 || !currentFound || !current.BodyUpstream {
+					t.Fatalf("valid stream: error=%v status=%d metadata=%+v", err, w.Code, current)
 				}
 				get := f.do(t, http.MethodGet, "object", nil, "UNSIGNED-PAYLOAD", "")
-				want := body
-				if tamper {
+				want, wantStatus := body, 200
+				if tc.fault != "" {
 					want = old
+					if tc.absent {
+						want = nil
+						wantStatus = 404
+					}
 				}
-				if get.Code != 200 || get.Body.String() != string(want) {
-					t.Fatalf("GET after stream = %d %q, want %q", get.Code, get.Body.String(), want)
+				if get.Code != wantStatus || (wantStatus == 200 && get.Body.String() != string(want)) {
+					t.Fatalf("GET after stream=%d %q, want %d %q", get.Code, get.Body.String(), wantStatus, want)
 				}
 			})
 		}
@@ -456,6 +682,33 @@ func TestTieredLargeConditionalPutPresigned(t *testing.T) {
 			}
 			if r.URL.String() != originalURL || !reflect.DeepEqual(r.Header, originalHeaders) {
 				t.Fatal("forwarder mutated the presigned caller request")
+			}
+		})
+	}
+}
+
+func TestTieredConditionalBodyClosesInbound(t *testing.T) {
+	for _, marker := range []string{StreamingPayloadHash, StreamingPayloadHash + "-TRAILER"} {
+		t.Run(marker, func(t *testing.T) {
+			f := newTieredPayloadHashFixture(t, payloadHashSigningFlavor)
+			r := f.signedRequest(t, http.MethodPut, "object", nil, marker, "", http.Header{"If-None-Match": {"*"}, "X-Amz-Decoded-Content-Length": {"1408"}, "X-Amz-Trailer": {"x-amz-checksum-sha256"}})
+			credentials := auth.NewCredentialStore()
+			credentials.AddCredential(payloadHashTestAccessKey, payloadHashTestSecretKey)
+			vr, err := auth.NewRequestValidator(credentials).Validate(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := &countingReadCloser{Reader: strings.NewReader("")}
+			r.Body = body
+			prepared, err := preparePutWithoutConditions(t.Context(), r, vr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := prepared.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !body.closed {
+				t.Fatal("closing the forwarded body did not close the inbound body")
 			}
 		})
 	}

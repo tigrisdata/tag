@@ -121,15 +121,21 @@ func (f *signingForwarder) forward(ctx context.Context, w http.ResponseWriter, r
 	if err != nil {
 		return err
 	}
-	body, bodyHash, contentLength, chunked, err := decodeBody(r, vr)
-	if err != nil {
-		return err
-	}
-
+	var body io.ReadCloser
+	var bodyHash string
+	var contentLength int64
+	var chunked bool
 	if localConditions {
-		r = r.Clone(ctx)
-		r.Header.Del("If-Match")
-		r.Header.Del("If-None-Match")
+		r, err = preparePutWithoutConditions(ctx, r, vr)
+		if err != nil {
+			return err
+		}
+		body, bodyHash, contentLength = r.Body, r.Header.Get("X-Amz-Content-Sha256"), r.ContentLength
+	} else {
+		body, bodyHash, contentLength, chunked, err = decodeBody(r, vr)
+		if err != nil {
+			return err
+		}
 	}
 	fwdReq, err := f.signForward(ctx, r, body, bodyHash, contentLength, chunked, vr.AccessKey, secretKey)
 	if err != nil {

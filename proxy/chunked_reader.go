@@ -106,6 +106,10 @@ type awsChunkedReader struct {
 	// has claimed yet; -1 when the request declared no decoded length.
 	// Verifying readers only.
 	undeclared int64
+
+	// Optional authentication of trailers after the terminal chunk. It runs
+	// before done is set or the final payload byte is released.
+	verifyTerminal func(int64) error
 }
 
 // awsChunkedReaderBufSize is the decoder's internal bufio buffer. Named so
@@ -307,6 +311,12 @@ func (r *awsChunkedReader) readChunkHeader() error {
 	}
 
 	if size <= 0 {
+		if r.verifyTerminal != nil {
+			if err := r.verifyTerminal(size); err != nil {
+				r.err = err
+				return err
+			}
+		}
 		r.done = true
 		return nil
 	}

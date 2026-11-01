@@ -131,3 +131,36 @@ func TestValidate_FailsWithoutOutcome(t *testing.T) {
 		t.Fatalf("Validate = (%v, %v), want (nil, error)", vr, err)
 	}
 }
+
+func TestChunkVerifier_AuthenticatesTrailer(t *testing.T) {
+	vr, key, timeAndScope, previous := validatedStreamingPut(t)
+	signingTime, scope, _ := strings.Cut(timeAndScope, "\x00")
+	verifier := vr.ChunkVerifier()
+	for _, chunk := range [][]byte{[]byte("hello world"), nil} {
+		signature := chainSignature(key, signingTime, scope, previous, chunk)
+		sum := sha256.Sum256(chunk)
+		if err := verifier.VerifyChunk(signature, sum[:]); err != nil {
+			t.Fatal(err)
+		}
+		previous = signature
+	}
+	sum := sha256.Sum256([]byte("x-amz-checksum-sha256:checksum\n"))
+	text := strings.Join([]string{"AWS4-HMAC-SHA256-TRAILER", signingTime, scope, previous, hex.EncodeToString(sum[:])}, "\n")
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(text))
+	signature := hex.EncodeToString(mac.Sum(nil))
+	if err := verifier.VerifyTrailer(signature, sum[:]); err != nil {
+		t.Fatal(err)
+	}
+	tampered := sum
+	tampered[0] ^= 1
+	if err := verifier.VerifyTrailer(signature, tampered[:]); !errors.Is(err, ErrChunkSignatureMismatch) {
+		t.Fatalf("changed trailer: %v", err)
+	}
+	if err := vr.ChunkVerifier().VerifyTrailer(signature, sum[:]); !errors.Is(err, ErrChunkSignatureMismatch) {
+		t.Fatalf("trailer without its chunk chain: %v", err)
+	}
+	if err := verifier.VerifyTrailer(strings.Repeat("0", 64), sum[:]); !errors.Is(err, ErrChunkSignatureMismatch) {
+		t.Fatalf("wrong trailer signature: %v", err)
+	}
+}
