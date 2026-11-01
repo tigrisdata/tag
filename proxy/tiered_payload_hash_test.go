@@ -98,12 +98,12 @@ type tieredPayloadHashFixture struct {
 	signingTime time.Time
 }
 
-func newTieredPayloadHashFixture(t *testing.T, flavor payloadHashTestFlavor) *tieredPayloadHashFixture {
+func newTieredPayloadHashFixture(t *testing.T, flavor payloadHashTestFlavor, upstreamHandler ...http.Handler) *tieredPayloadHashFixture {
 	t.Helper()
 
 	var forwards atomic.Int64
 	signingTime := time.Now().UTC()
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		forwards.Add(1)
 		if r.Method == http.MethodPut {
 			w.Header().Set("ETag", `"upstream"`)
@@ -112,7 +112,11 @@ func newTieredPayloadHashFixture(t *testing.T, flavor payloadHashTestFlavor) *ti
 		if r.Method == http.MethodGet {
 			_, _ = w.Write([]byte("upstream body"))
 		}
-	}))
+	})
+	if len(upstreamHandler) != 0 {
+		handler = upstreamHandler[0]
+	}
+	upstream := httptest.NewServer(handler)
 	t.Cleanup(upstream.Close)
 
 	cfg := config.NewDefault()

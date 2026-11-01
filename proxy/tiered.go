@@ -166,10 +166,10 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 
 	// Local-tier eligibility, before any metadata lookup: a validated caller
 	// (the engine serves from cache with no upstream auth check), a plain
-	// object PUT, and a declared size within the threshold. Everything else
-	// forwards and never needs the prior version — a metadata failure must not
-	// block a PUT that goes upstream anyway (including the unknown-key writes
-	// that bootstrap credential learning).
+	// object PUT, and a declared size within the threshold. Validated plain
+	// conditional PUTs also need the prior, regardless of size: upstream cannot
+	// evaluate a condition against a local-only object. Other forwards remain
+	// tolerant of metadata failures, including credential-learning writes.
 	conditional := r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != ""
 
 	// A local-tier write while the store is over its disk budget would be
@@ -177,7 +177,8 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// a legitimate placement) and let eviction catch up. Conditional writes are
 	// exempt: their precondition must be evaluated against the local copy, which
 	// upstream cannot see, so they take the local path whatever the budget.
-	localTier := result == AuthValidated && originlessPlainObject(r) && sized && declaredSize <= s.config.Cache.SizeThreshold
+	validatedPlain := result == AuthValidated && originlessPlainObject(r)
+	localTier := validatedPlain && sized && declaredSize <= s.config.Cache.SizeThreshold
 	if localTier && !conditional && s.diskOverBudget() {
 		metrics.RecordCachePopulateDiskShed("tiered_put")
 		if s.config.Cache.PopulateShedReject {
@@ -190,16 +191,21 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 		}
 		localTier = false
 	}
-	if localTier {
+	var prior *cache.CachedObjectMeta
+	var priorVersion uint64
+	priorKnown := false
+	localConditions := false
+	if localTier || (validatedPlain && conditional) {
 		// The prior version's tier decides what an overwrite must clean up and
 		// where a conditional write is evaluated, so a failed lookup cannot be
 		// read as "no prior". Fail retryably instead.
-		priorMeta, priorVersion, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
+		priorMeta, version, found, cacheErr := s.cache.GetMetaWithVersion(ctx, bucket, key)
 		if cacheErr != nil {
 			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
 			return cacheErr
 		}
-		var prior *cache.CachedObjectMeta
+		priorKnown = true
+		priorVersion = version
 		if found {
 			prior = priorMeta
 		}
@@ -207,7 +213,20 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 		// A conditional write against an upstream-tier prior forwards: the
 		// engine can only evaluate preconditions against a local body, and
 		// upstream owns that object's version.
-		if !(conditional && prior != nil && prior.BodyUpstream) {
+		if conditional && (prior == nil || !prior.BodyUpstream) && !localTier {
+			code, err := s.checkPutConditions(r, prior, found)
+			if err != nil {
+				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+				return err
+			}
+			if code != "" {
+				s3err.WriteError(w, r, code)
+				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+				return nil
+			}
+			localConditions = true
+		}
+		if localTier && !(conditional && prior != nil && prior.BodyUpstream) {
 			rec := &statusRecorder{ResponseWriter: w}
 			// Thread the SAME snapshot into the engine: the tier decision
 			// above and the engine's precondition/token now share one read,
@@ -265,15 +284,26 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// into an authoritative miss.
 	markerOwning := originlessPlainObject(r)
 
-	var prior *cache.CachedObjectMeta
-	var priorVersion uint64
-	priorKnown := false
-	if markerOwning {
+	if markerOwning && !priorKnown {
 		prior, priorVersion, priorKnown = s.captureMarkerPrior(ctx, bucket, key)
 	}
 
 	rec := &statusRecorder{ResponseWriter: w}
-	err = s.forwarder.Forward(ctx, rec, r)
+	if localConditions {
+		// These conditions were consumed against the local snapshot. Re-sign
+		// without them rather than asking upstream about an unrelated copy.
+		forwarder, ok := s.forwarder.(interface {
+			forwardPutWithoutConditions(context.Context, http.ResponseWriter, *http.Request) error
+		})
+		if !ok {
+			s3err.WriteError(w, r, s3err.ErrNotImplemented)
+			metrics.RecordRequest("PutObject", "unsupported", metrics.SourceLocal, time.Since(start).Seconds())
+			return nil
+		}
+		err = forwarder.forwardPutWithoutConditions(ctx, rec, r)
+	} else {
+		err = s.forwarder.Forward(ctx, rec, r)
+	}
 
 	if rec.wroteSuccess() && markerOwning && s.cache.IsEnabled() {
 		s.putUpstreamMarker(r, w.Header().Get("ETag"), bucket, key, prior, priorVersion, priorKnown)
