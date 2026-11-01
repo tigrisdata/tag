@@ -109,6 +109,14 @@ func decodeBody(r *http.Request, vr *auth.ValidatedRequest) (body io.ReadCloser,
 // (streaming SigV4), the body is decoded on-the-fly — verifying each chunk's
 // signature for the signed marker — and forwarded as UNSIGNED-PAYLOAD.
 func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+	return f.forward(ctx, w, r, false)
+}
+
+func (f *signingForwarder) forwardPutWithoutConditions(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+	return f.forward(ctx, w, r, true)
+}
+
+func (f *signingForwarder) forward(ctx context.Context, w http.ResponseWriter, r *http.Request, localConditions bool) error {
 	vr, secretKey, err := f.validate(r)
 	if err != nil {
 		return err
@@ -118,6 +126,11 @@ func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r
 		return err
 	}
 
+	if localConditions {
+		r = r.Clone(ctx)
+		r.Header.Del("If-Match")
+		r.Header.Del("If-None-Match")
+	}
 	fwdReq, err := f.signForward(ctx, r, body, bodyHash, contentLength, chunked, vr.AccessKey, secretKey)
 	if err != nil {
 		return err

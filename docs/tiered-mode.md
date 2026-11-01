@@ -32,6 +32,22 @@ TAG stores a metadata marker locally. HEAD answers from the marker; GET
 forwards for the body — the mode's only body traffic. DELETE forwards and
 drops the marker.
 
+**PUT preconditions follow the prior tier, not the replacement's size.** For a
+validated plain-object PUT, TAG evaluates `If-Match` and `If-None-Match` against
+the servable local prior (or confirmed absence), even when the replacement
+belongs upstream. A failed condition does not forward or replace the prior.
+After a local condition succeeds, TAG removes it from the forwarded request
+and re-signs as the same caller; signed streaming bodies are verified and
+decoded while being forwarded. With an upstream-tier prior, upstream still
+evaluates the original conditions. A metadata or local-body probe error is
+retryable, not absence.
+
+The metadata snapshot used for the condition also guards publication of the
+upstream marker. With CAS coordination, a competing metadata write can refuse
+that publication. Legacy coordination retains its existing write-vs-write
+check-then-store window. The upstream write and local metadata commit are not
+one atomic transaction.
+
 **Cross-tier overwrites clean up the displaced version.** A small write over an
 upstream-tier object deletes the upstream copy asynchronously (best-effort —
 a failure leaves an orphan for the upstream bucket's own expiry to collect).
@@ -85,8 +101,8 @@ counted in `tag_cache_populate_disk_shed_total`; see
 
 ## Authentication
 
-The transparent-proxy flow, unchanged. Tiered semantics apply only to requests
-whose SigV4 signature TAG validated locally; a request it cannot validate yet
+Tiered mode uses the transparent-proxy authentication flow. Tiered semantics
+apply only to requests whose SigV4 signature TAG validated locally; a request it cannot validate yet
 (unknown key, anonymous) forwards to upstream exactly as in transparent mode,
 and keys are learned from those responses. Until keys are learned, reads
 behave like cache misses, and small writes land in the upstream tier (with a
@@ -97,9 +113,10 @@ on their first validated read.
 **Forwarding flavor is decided by the endpoint.** Tiering is a caching
 topology, not a forwarding flavor: a tiered deployment fronting a Tigris
 domain (`*.tigris.dev`, `*.storage.dev`) forwards the transparent way (client
-signature preserved, `X-Tigris-Proxy-*` identity headers, keys learned from
-Tigris); one fronting any other endpoint — including `localhost`, which
-transparent mode allows for local testing but which earns no trust claim
+signature preserved unless a local PUT condition was consumed,
+`X-Tigris-Proxy-*` identity headers, keys learned from Tigris); one fronting any
+other endpoint — including `localhost`, which transparent mode allows for local
+testing but which earns no trust claim
 about the backend behind it — forwards the signing way (TAG validates the
 caller against its credential store and re-signs). The startup log states
 which flavor was selected.

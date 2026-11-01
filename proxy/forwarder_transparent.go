@@ -211,6 +211,35 @@ func (f *transparentForwarder) Forward(ctx context.Context, w http.ResponseWrite
 	return f.executeAndStream(w, fwdReq, r.ContentLength, r)
 }
 
+// forwardPutWithoutConditions consumes conditions already checked against TAG's
+// local prior. Keep the caller's identity, not TAG's background credentials.
+func (f *transparentForwarder) forwardPutWithoutConditions(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+	if f.validator == nil {
+		return mapAuthError(auth.ErrMissingAuth)
+	}
+	vr, err := f.validator.Validate(r)
+	if err != nil {
+		return mapAuthError(err)
+	}
+	body, bodyHash, contentLength, chunked, err := decodeBody(r, vr)
+	if err != nil {
+		return err
+	}
+	modified := r.Clone(ctx)
+	modified.Body = body
+	modified.Header = headersForForwardedSigning(modified.Header, chunked)
+	modified.Header.Del("If-Match")
+	modified.Header.Del("If-None-Match")
+	modified.Header.Set("X-Amz-Content-Sha256", bodyHash)
+	prepareForwardedRequest(modified, contentLength, chunked)
+	vr.Resign(modified)
+	fwdReq, err := f.buildTransparentRequest(ctx, modified)
+	if err != nil {
+		return err
+	}
+	return forwardError(f.executeAndStream(w, fwdReq, contentLength, r))
+}
+
 // ForwardWithCapture forwards request in transparent proxy mode and captures the response.
 // Response interception (signing key learning, header stripping, authZ revocation)
 // is handled by the base forwarder's response interceptor.
