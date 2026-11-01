@@ -398,8 +398,10 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 		}
 	}
 	conditional := false
-	ifMatch := r.Header.Get("If-Match")
-	ifNoneMatch := r.Header.Get("If-None-Match")
+	// Repeated field lines are one entity-tag list, just like a single
+	// comma-joined field. Keep the header map intact for signed requests.
+	ifMatch := strings.Join(r.Header.Values("If-Match"), ",")
+	ifNoneMatch := strings.Join(r.Header.Values("If-None-Match"), ",")
 	if ifMatch != "" || ifNoneMatch != "" {
 		conditional = true
 		// Existence means SERVABLE existence — the same gate every read uses. An
