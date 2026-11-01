@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/hmac"
 	"crypto/md5"
@@ -35,6 +36,7 @@ import (
 type tieredConditionalOrigin struct {
 	mu             sync.Mutex
 	objects        map[string]string
+	encodings      map[string]string
 	puts           int
 	lastConditions http.Header
 }
@@ -77,6 +79,10 @@ func (o *tieredConditionalOrigin) ServeHTTP(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		o.objects[r.URL.Path] = string(data)
+		if o.encodings == nil {
+			o.encodings = make(map[string]string)
+		}
+		o.encodings[r.URL.Path] = stripAWSChunkedToken(strings.Join(r.Header.Values("Content-Encoding"), ","))
 		w.Header().Set("ETag", fmt.Sprintf(`"%x"`, md5.Sum(data)))
 	case http.MethodGet:
 		if !exists {
@@ -84,6 +90,7 @@ func (o *tieredConditionalOrigin) ServeHTTP(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Encoding", o.encodings[r.URL.Path])
 		_, _ = io.WriteString(w, body)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -645,6 +652,76 @@ func TestTieredLargeConditionalPutSignedChunks(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestTieredLargeConditionalPutContentEncoding(t *testing.T) {
+	// Stored DEFLATE blocks keep this valid gzip body above the tier threshold.
+	var compressed bytes.Buffer
+	writer, err := gzip.NewWriterLevel(&compressed, gzip.NoCompression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(bytes.Repeat([]byte("g"), 1408)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	body := compressed.Bytes()
+	for _, flavor := range []payloadHashTestFlavor{payloadHashSigningFlavor, payloadHashTransparentFlavor} {
+		t.Run(string(flavor), func(t *testing.T) {
+			origin := &tieredConditionalOrigin{objects: make(map[string]string)}
+			f := newTieredPayloadHashFixture(t, flavor, origin)
+			r := f.signedRequest(t, http.MethodPut, "object", nil, StreamingPayloadHash, "", http.Header{
+				"If-None-Match":                {"*"},
+				"Content-Encoding":             {"aws-chunked", "gzip"},
+				"X-Amz-Decoded-Content-Length": {strconv.Itoa(len(body))},
+			})
+			info, err := auth.ParseAuthInfo(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seed, err := hex.DecodeString(info.Signature)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream := v4.NewStreamSigner(aws.Credentials{AccessKeyID: payloadHashTestAccessKey, SecretAccessKey: payloadHashTestSecretKey}, "s3", payloadHashTestRegion, seed)
+			var wire bytes.Buffer
+			for _, chunk := range [][]byte{body, nil} {
+				signature, err := stream.GetSignature(t.Context(), nil, chunk, f.signingTime)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fmt.Fprintf(&wire, "%x;chunk-signature=%x\r\n", len(chunk), signature)
+				wire.Write(chunk)
+				wire.WriteString("\r\n")
+			}
+			r.Body = io.NopCloser(bytes.NewReader(wire.Bytes()))
+			r.ContentLength = int64(wire.Len())
+			original := r.Header.Clone()
+			w := httptest.NewRecorder()
+			if err := f.service.HandlePutObject(w, r); err != nil || w.Code != http.StatusOK {
+				t.Fatalf("PUT = %d %s, error=%v", w.Code, w.Body.String(), err)
+			}
+			origin.mu.Lock()
+			encoding := origin.encodings["/"+payloadHashTestBucket+"/object"]
+			origin.mu.Unlock()
+			if encoding != "gzip" {
+				t.Errorf("upstream encoding = %q, want gzip", encoding)
+			}
+			get := f.do(t, http.MethodGet, "object", nil, "UNSIGNED-PAYLOAD", "")
+			if get.Code != http.StatusOK || get.Header().Get("Content-Encoding") != "gzip" || !bytes.Equal(get.Body.Bytes(), body) {
+				t.Errorf("GET = %d, encoding=%q, exact body=%v; want 200, gzip, and unchanged bytes", get.Code, get.Header().Get("Content-Encoding"), bytes.Equal(get.Body.Bytes(), body))
+			}
+			head := f.do(t, http.MethodHead, "object", nil, "UNSIGNED-PAYLOAD", "")
+			if head.Code != http.StatusOK || head.Header().Get("Content-Encoding") != "gzip" {
+				t.Errorf("HEAD = %d, encoding=%q; want 200 and gzip", head.Code, head.Header().Get("Content-Encoding"))
+			}
+			if !reflect.DeepEqual(r.Header, original) {
+				t.Error("caller headers changed while forwarding")
+			}
+		})
 	}
 }
 

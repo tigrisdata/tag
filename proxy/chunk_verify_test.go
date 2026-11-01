@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -687,5 +688,27 @@ func TestHeadersForForwardedSigning(t *testing.T) {
 	}
 	if got := headersForForwardedSigning(client, false); got.Get("X-Amz-Decoded-Content-Length") != "10" {
 		t.Fatalf("non-chunked headers altered: %v", got)
+	}
+	for _, tc := range []struct {
+		name   string
+		values []string
+		want   string
+	}{
+		{"separate fields", []string{"aws-chunked", "gzip"}, "gzip"},
+		{"framing last", []string{"gzip", "aws-chunked"}, "gzip"},
+		{"multiple encodings", []string{"aws-chunked, gzip", "br"}, "gzip,br"},
+		{"empty first field", []string{"", "aws-chunked", "gzip"}, "gzip"},
+		{"framing only", []string{"aws-chunked", "aws-chunked"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := http.Header{"Content-Encoding": tc.values}
+			original := client.Clone()
+			if got := headersForForwardedSigning(client, true).Get("Content-Encoding"); got != tc.want {
+				t.Errorf("decoded content encoding = %q, want %q", got, tc.want)
+			}
+			if !reflect.DeepEqual(client, original) || !reflect.DeepEqual(headersForForwardedSigning(client, false), original) {
+				t.Error("client or non-chunked headers altered")
+			}
+		})
 	}
 }
