@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -21,6 +23,9 @@ import (
 // bulk delete waits on before committing its staged upstream response, so a
 // stalled cache peer delays the client's 2xx by at most this long.
 const bulkDeleteFenceTimeout = 10 * time.Second
+
+// Bound each request's remote cache work without delaying dispatch for batching.
+const bulkDeleteConcurrency = 8
 
 // deleteObjectsRequest represents the S3 DeleteObjects request body.
 type deleteObjectsRequest struct {
@@ -175,11 +180,6 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		if xmlErr := xml.Unmarshal(bodyBytes, &deleteReq); xmlErr == nil {
 			requestedCounts = make(map[string]int)
 			for _, obj := range deleteReq.Objects {
-				// Proxy modes only — see preForwardInvalidate; in tiered
-				// mode a listed key may be a local-tier only-copy that a
-				// rejected bulk delete must leave intact (the per-key
-				// post-success converge below carries tiered).
-				s.preForwardInvalidate(context.Background(), bucket, obj.Key)
 				if tieredPriors != nil {
 					if _, seen := tieredPriors[obj.Key]; !seen {
 						// Claim before capturing the token, held for the whole
@@ -193,10 +193,21 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 					}
 				}
 				requestedCounts[obj.Key]++
-				log.Debug().
-					Str("bucket", bucket).
-					Str("key", obj.Key).
-					Msg("Cache invalidated for bulk-delete object")
+				if tieredPriors != nil {
+					log.Debug().Str("bucket", bucket).Str("key", obj.Key).
+						Msg("Cache invalidated for bulk-delete object")
+				}
+			}
+			if tieredPriors == nil {
+				// Each key stays on one worker, including all repeated entries.
+				// Join the entire phase before dispatching the upstream request.
+				s.forEachBulkDeleteKey(bucket, requestedCounts, func(key string, count int) {
+					for range count {
+						s.preForwardInvalidate(context.Background(), bucket, key)
+						log.Debug().Str("bucket", bucket).Str("key", key).
+							Msg("Cache invalidated for bulk-delete object")
+					}
+				})
 			}
 		}
 	}
@@ -233,34 +244,43 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		// remaining per-key attempts fail fast, the captured 2xx is still
 		// committed below, and the stale metadata ages out via TTL.
 		fenceCtx, cancelFence := context.WithTimeout(context.WithoutCancel(r.Context()), bulkDeleteFenceTimeout)
-		fencedKeys, skippedKeys := 0, 0
+		var fencedKeys, skippedKeys atomic.Int64
 		erroredCounts, parsed := erroredDeleteKeyCounts(capture.Body)
-		for key, reqN := range requestedCounts {
+		fenceKey := func(key string, reqN int) {
 			// On a parse failure, over-invalidate every requested key (safe).
 			if parsed && reqN <= erroredCounts[key] {
-				continue // every requested entry for this key errored — object still present
+				return // every requested entry for this key errored — object still present
 			}
 			// Once the shared deadline has passed, stop starting per-key fences in
 			// either mode: the tiered helper runs under its own per-key timeout, so
 			// without this check a large tiered batch could hold the 2xx for N times
 			// that timeout. Skipped keys age out via TTL and are counted below.
 			if fenceCtx.Err() != nil {
-				skippedKeys++
-				continue
+				skippedKeys.Add(1)
+				return
 			}
-			fencedKeys++
+			fencedKeys.Add(1)
 			if tieredPriors != nil {
 				p := tieredPriors[key]
 				s.convergeTieredDelete(bucket, key, p.version, p.known)
-				continue
+				return
 			}
 			s.convergeInvalidation(fenceCtx, bucket, key)
+		}
+		if tieredPriors != nil {
+			// Tiered convergence owns authoritative local state and retains its
+			// existing version-guarded, sequential path.
+			for key, count := range requestedCounts {
+				fenceKey(key, count)
+			}
+		} else {
+			s.forEachBulkDeleteKey(bucket, requestedCounts, fenceKey)
 		}
 		if fenceCtx.Err() != nil {
 			log.Warn().
 				Str("bucket", bucket).
-				Int("keys", fencedKeys).
-				Int("skipped_keys", skippedKeys).
+				Int64("keys", fencedKeys.Load()).
+				Int64("skipped_keys", skippedKeys.Load()).
 				Dur("timeout", bulkDeleteFenceTimeout).
 				Msg("Bulk-delete cache fence did not converge within the timeout; responding with the upstream result, stale metadata may serve until TTL")
 		}
@@ -279,4 +299,40 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	metrics.RecordRequest("DeleteObjects", status, metrics.SourceUpstream, time.Since(start).Seconds())
 
 	return err
+}
+
+// forEachBulkDeleteKey overlaps independent keys without batching delays. Repeated
+// entries for one key are handled by the same visit. The caller cannot cross a
+// phase barrier until all visits return. Single-key and entirely local batches
+// stay sequential to avoid contention on the local storage writer.
+func (s *Service) forEachBulkDeleteKey(bucket string, counts map[string]int, visit func(string, int)) {
+	local := true
+	if len(counts) > 1 {
+		for key := range counts {
+			if !s.cache.IsInvalidationLocal(bucket, key) {
+				local = false
+				break
+			}
+		}
+	}
+	if local {
+		for key, count := range counts {
+			visit(key, count)
+		}
+		return
+	}
+	jobs := make(chan string)
+	var workers sync.WaitGroup
+	for range min(bulkDeleteConcurrency, len(counts)) {
+		workers.Go(func() {
+			for key := range jobs {
+				visit(key, counts[key])
+			}
+		})
+	}
+	for key := range counts {
+		jobs <- key
+	}
+	close(jobs)
+	workers.Wait()
 }
