@@ -14,21 +14,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/ocache/embedded"
-	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/tag/auth"
 	"github.com/tigrisdata/tag/cache"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/proxy"
-	"google.golang.org/grpc"
 )
 
 // BenchmarkBulkDeleteInvalidation measures complete HTTP bulk deletes with live
 // cached metadata. Remote runs send all cache operations to one disk-backed owner
-// over loopback gRPC; local runs use the same embedded storage directly. There is
+// through a two-node embedded ring over loopback gRPC, including streaming
+// tombstones and inter-node authentication; local runs use embedded storage
+// directly. There is
 // no injected cache or origin delay. This isolates owner contention, not a WAN RTT.
 func BenchmarkBulkDeleteInvalidation(b *testing.B) {
 	oldLogger := log.Logger
@@ -47,40 +47,19 @@ func BenchmarkBulkDeleteInvalidation(b *testing.B) {
 func benchmarkBulkDeleteInvalidation(b *testing.B, remote, legacy bool, keys int) {
 	cfg := config.NewDefault()
 	cfg.Cache.SetLegacyCoordination(legacy)
-	owner, err := embedded.New(&embedded.Config{DiskPath: b.TempDir(), TTL: cfg.Cache.TTL})
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { _ = owner.Close() })
-	var client cacheclient.CacheClient = owner
-	if remote {
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			b.Fatal(err)
-		}
-		server := grpc.NewServer()
-		pb.RegisterCacheServiceServer(server, owner.Service())
-		go func() { _ = server.Serve(listener) }()
-		b.Cleanup(server.Stop)
-		peer, err := cacheclient.NewSimpleClient(&cacheclient.ClientConfig{Addrs: []string{listener.Addr().String()}, Mode: cacheclient.ModeSimple, ConnectionPoolSize: 1})
-		if err != nil {
-			b.Fatal(err)
-		}
-		b.Cleanup(func() { _ = peer.Close() })
-		client = peer
-	}
+	client, objectKeys := newBulkDeleteCache(b, remote, keys, cfg.Cache.TTL)
 	store := cache.NewCacheWithClient(client, &cfg.Cache)
 	var request strings.Builder
 	request.WriteString("<Delete>")
-	for i := 0; i < keys; i++ {
-		fmt.Fprintf(&request, "<Object><Key>key-%d</Key></Object>", i)
+	for _, key := range objectKeys {
+		fmt.Fprintf(&request, "<Object><Key>%s</Key></Object>", key)
 	}
 	request.WriteString("</Delete>")
 	requestBody := []byte(request.String())
 	var response strings.Builder
 	response.WriteString("<DeleteResult>")
-	for i := 0; i < keys; i++ {
-		fmt.Fprintf(&response, "<Deleted><Key>key-%d</Key></Deleted>", i)
+	for _, key := range objectKeys {
+		fmt.Fprintf(&response, "<Deleted><Key>%s</Key></Deleted>", key)
 	}
 	response.WriteString("</DeleteResult>")
 	result := []byte(response.String())
@@ -109,8 +88,7 @@ func benchmarkBulkDeleteInvalidation(b *testing.B, remote, legacy bool, keys int
 		b.StopTimer()
 		// Restore the live metadata ordinary deletes invalidate. Do not bypass
 		// the coordinator: seeding uses its normal unconditional publication.
-		for i := 0; i < keys; i++ {
-			key := fmt.Sprintf("key-%d", i)
+		for _, key := range objectKeys {
 			meta := &cache.CachedObjectMeta{Bucket: "benchmark", Key: key, ETag: `"old"`, StatusCode: http.StatusOK}
 			if err := store.PutWithMeta(context.Background(), "benchmark", key, meta, nil, 60); err != nil {
 				b.Fatal(err)
@@ -142,4 +120,73 @@ func benchmarkBulkDeleteInvalidation(b *testing.B, remote, legacy bool, keys int
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	b.ReportMetric(float64(latencies[(len(latencies)-1)*50/100]), "p50-ns/op")
 	b.ReportMetric(float64(latencies[(len(latencies)-1)*95/100]), "p95-ns/op")
+}
+
+// newBulkDeleteCache uses the same embedded requester, routing and server setup
+// as TAG. Selecting keys owned by the peer for both metadata and tombstones
+// isolates the remote case without replacing any cache operation.
+func newBulkDeleteCache(b *testing.B, remote bool, count int, ttl time.Duration) (*embedded.Client, []string) {
+	b.Helper()
+	address := func() string {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			b.Fatal(err)
+		}
+		addr := listener.Addr().String()
+		if err := listener.Close(); err != nil {
+			b.Fatal(err)
+		}
+		return addr
+	}
+	token := auth.DeriveGRPCAuthToken("benchmark", "benchmark-secret")
+	newNode := func(name string, seeds []string) (*embedded.Client, string) {
+		cfg := &embedded.Config{DiskPath: b.TempDir(), TTL: ttl}
+		if remote {
+			cfg.NodeID, cfg.ClusterAddr, cfg.GRPCAddr = name, address(), address()
+			cfg.AdvertiseAddr, cfg.SeedNodes = cfg.GRPCAddr, seeds
+			cfg.Registerer = prometheus.NewRegistry()
+			cfg.GRPCServerOptions = auth.GRPCServerOptions(token)
+			cfg.GRPCDialOptions = auth.GRPCDialOptions(token)
+		}
+		client, err := embedded.New(cfg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { _ = client.Close() })
+		if remote {
+			if err := client.StartGRPCServer(); err != nil {
+				b.Fatal(err)
+			}
+		}
+		return client, cfg.ClusterAddr
+	}
+	owner, seed := newNode("owner", nil)
+	client := owner
+	if remote {
+		client, _ = newNode("requester", []string{seed})
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for _, node := range []*embedded.Client{owner, client} {
+			if err := node.WaitReady(ctx); err != nil {
+				b.Fatal(err)
+			}
+		}
+		for len(owner.Coordinator().GetRing().GetActiveNodes()) != 2 || len(client.Coordinator().GetRing().GetActiveNodes()) != 2 || owner.Coordinator().GetEpoch() != client.Coordinator().GetEpoch() {
+			select {
+			case <-ctx.Done():
+				b.Fatal("two-node cache ring did not converge")
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
+	objectKeys := make([]string, 0, count)
+	for i := 0; len(objectKeys) < count; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		meta, tomb := cache.MakeMetaKey("benchmark", key), cache.MakeTombstoneKey("benchmark", key)
+		if remote && (client.IsLocal(meta) || client.IsLocal(tomb) || !owner.IsLocal(meta) || !owner.IsLocal(tomb)) {
+			continue
+		}
+		objectKeys = append(objectKeys, key)
+	}
+	return client, objectKeys
 }
