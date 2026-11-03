@@ -71,13 +71,19 @@ func benchmarkBulkDeleteInvalidation(b *testing.B, remote, legacy bool, keys int
 	}
 	store := cache.NewCacheWithClient(client, &cfg.Cache)
 	var request strings.Builder
-	request.WriteString("<Delete><Quiet>true</Quiet>")
+	request.WriteString("<Delete>")
 	for i := 0; i < keys; i++ {
 		fmt.Fprintf(&request, "<Object><Key>key-%d</Key></Object>", i)
 	}
 	request.WriteString("</Delete>")
 	requestBody := []byte(request.String())
-	result := []byte("<DeleteResult/>")
+	var response strings.Builder
+	response.WriteString("<DeleteResult>")
+	for i := 0; i < keys; i++ {
+		fmt.Fprintf(&response, "<Deleted><Key>key-%d</Key></Deleted>", i)
+	}
+	response.WriteString("</DeleteResult>")
+	result := []byte(response.String())
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil || !bytes.Equal(body, requestBody) {
