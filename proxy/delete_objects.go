@@ -148,13 +148,6 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 
 	log.Debug().Str("bucket", bucket).Msg("HandleDeleteObjects")
 
-	// Read request body to buffer it for parsing and forwarding
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read request body: %w", err)
-	}
-	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
 	// Parse request to get keys being deleted and invalidate cache BEFORE forwarding
 	// This ensures cache consistency even if forwarding fails after cache invalidation.
 	// requestedCounts tracks how many entries each key was requested under (the same
@@ -171,6 +164,14 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		tieredPriors = make(map[string]tieredPrior)
 	}
 	if s.cache.IsEnabled() {
+		// Cache fences need the complete key list before forwarding. Without
+		// caching, leave the incoming body for the forwarder to stream.
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			return fmt.Errorf("failed to read request body: %w", err)
+		}
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
 		var deleteReq deleteObjectsRequest
 		if xmlErr := xml.Unmarshal(bodyBytes, &deleteReq); xmlErr == nil {
 			requestedCounts = make(map[string]int)
