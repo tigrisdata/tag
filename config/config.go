@@ -237,6 +237,10 @@ type CredentialsConfig struct {
 // CacheConfig holds cache configuration.
 // These fields map to github.com/tigrisdata/ocache/embedded.Config.
 type CacheConfig struct {
+	// BulkDeleteConservativeThreshold skips per-key result decoding for proxy
+	// deletes with at least this many distinct keys. Nonpositive disables it.
+	BulkDeleteConservativeThreshold int `yaml:"bulk_delete_conservative_threshold"`
+
 	Enabled       *bool         `yaml:"enabled"`        // Enable caching (default: true when nil)
 	TTL           time.Duration `yaml:"ttl"`            // Default cache TTL (default: 24h)
 	SizeThreshold int64         `yaml:"size_threshold"` // Max object size to cache in bytes (default: 1GB)
@@ -668,6 +672,12 @@ func applyEnvOverrides(cfg *Config) {
 	// Disable cache from environment (explicit disable takes precedence)
 	if disabled := os.Getenv("TAG_CACHE_DISABLED"); disabled == "true" || disabled == "1" {
 		cfg.Cache.SetEnabled(false)
+	}
+
+	if threshold := os.Getenv("TAG_CACHE_BULK_DELETE_CONSERVATIVE_THRESHOLD"); threshold != "" {
+		if n, err := strconv.Atoi(threshold); err == nil {
+			cfg.Cache.BulkDeleteConservativeThreshold = n
+		}
 	}
 
 	// Embedded cache configuration from environment (only if cache is enabled)

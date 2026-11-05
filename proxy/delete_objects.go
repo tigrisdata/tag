@@ -224,7 +224,8 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	// key than upstream reported as errored. Counting by key (never matching version
 	// IDs) is robust to VersionId representation differences and to Quiet mode, and
 	// can never leave a truly-deleted object cached (a success is never an <Error>).
-	// A key whose entries ALL errored keeps its refill (it's still upstream).
+	// By default, a key whose entries ALL errored keeps its refill (it's still upstream).
+	// The opt-in conservative policy instead fences every requested key.
 	// Routed through invalidateObject so a failed re-invalidation is recorded/logged.
 	if err == nil && capture != nil && capture.StatusCode >= 200 && capture.StatusCode < 300 && s.cache.IsEnabled() {
 		// Upstream has committed the deletes, so a client disconnect must not
@@ -234,9 +235,17 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		// committed below, and the stale metadata ages out via TTL.
 		fenceCtx, cancelFence := context.WithTimeout(context.WithoutCancel(r.Context()), bulkDeleteFenceTimeout)
 		fencedKeys, skippedKeys := 0, 0
-		erroredCounts, parsed := erroredDeleteKeyCounts(capture.Body)
+		var erroredCounts map[string]int
+		parsed := false
+		threshold := s.config.Cache.BulkDeleteConservativeThreshold
+		// Tiered metadata may name the only copy; conservative eviction is a
+		// cache-retention tradeoff only in proxy modes. Keep response staging
+		// in both policies so the client cannot finish before the fences.
+		if tieredPriors != nil || threshold <= 0 || len(requestedCounts) < threshold {
+			erroredCounts, parsed = erroredDeleteKeyCounts(capture.Body)
+		}
 		for key, reqN := range requestedCounts {
-			// On a parse failure, over-invalidate every requested key (safe).
+			// Unparsed results, including conservative mode, fence every key.
 			if parsed && reqN <= erroredCounts[key] {
 				continue // every requested entry for this key errored — object still present
 			}
