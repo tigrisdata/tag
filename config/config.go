@@ -238,7 +238,8 @@ type CredentialsConfig struct {
 // These fields map to github.com/tigrisdata/ocache/embedded.Config.
 type CacheConfig struct {
 	// BulkDeleteConservativeThreshold skips per-key result decoding for proxy
-	// deletes with at least this many distinct keys. Nonpositive disables it.
+	// deletes without an Error token and at least this many distinct keys.
+	// Nonpositive disables it.
 	BulkDeleteConservativeThreshold int `yaml:"bulk_delete_conservative_threshold"`
 
 	Enabled       *bool         `yaml:"enabled"`        // Enable caching (default: true when nil)

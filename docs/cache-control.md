@@ -52,10 +52,11 @@ TAG automatically invalidates cached objects when they are modified through TAG:
 - **DeleteObject** — Cache entry deleted before forwarding the delete
 - **DeleteObjects** (bulk) — In proxy mode, requested cache entries are invalidated before forwarding. For cache-enabled requests with a nonempty parsed key list, TAG collects the upstream response before publishing it and waits for the post-success per-key invalidation attempts to return before completing a 2xx response.
 
-  By default, the post-success pass targets keys with at least one successful requested delete; keys whose requested entries all fail are not re-invalidated. An unparseable result uses the conservative all-requested-keys fallback. Cache-disabled requests, unparseable request bodies, and empty key lists keep the direct streaming path. Cache backend failures remain best-effort and may leave stale metadata. The post-success pass runs under a shared 10-second deadline: once it passes, no further per-key invalidations start, the remaining keys are left to age out via TTL, and TAG logs a warning with the fenced and skipped key counts before still returning the upstream 2xx. In tiered mode each key's own cleanup keeps its per-key timeout, so one key already in progress can extend the wait by at most that much.
+  The post-success pass targets keys with at least one successful requested delete; keys whose requested entries all fail are not re-invalidated. An unparseable result uses the conservative all-requested-keys fallback. Cache-disabled requests, unparseable request bodies, and empty key lists keep the direct streaming path. Cache backend failures remain best-effort and may leave stale metadata. The post-success pass runs under a shared 10-second deadline: once it passes, no further per-key invalidations start, the remaining keys are left to age out via TTL, and TAG logs a warning with the fenced and skipped key counts before still returning the upstream 2xx. In tiered mode each key's own cleanup keeps its per-key timeout, so one key already in progress can extend the wait by at most that much.
   Proxy mode can opt large batches into all-key invalidation with
-  `cache.bulk_delete_conservative_threshold`; this skips result decoding but can
-  discard a failed key's racing refill. The response barrier and deadline remain.
+  `cache.bulk_delete_conservative_threshold` when the response contains no `Error`
+  token. Error-bearing responses retain precise counting. The response barrier
+  and deadline remain.
 - **CopyObject** — Cache entry deleted for the destination key
 
 For a cacheable whole-object GET miss, metadata becomes visible only after its cache write consumes the broadcast stream successfully. If the cache listener is dropped or the upstream body read fails, the partial body is not published as a new entry.

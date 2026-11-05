@@ -224,8 +224,7 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	// key than upstream reported as errored. Counting by key (never matching version
 	// IDs) is robust to VersionId representation differences and to Quiet mode, and
 	// can never leave a truly-deleted object cached (a success is never an <Error>).
-	// By default, a key whose entries ALL errored keeps its refill (it's still upstream).
-	// The opt-in conservative policy instead fences every requested key.
+	// A key whose entries ALL errored keeps its refill (it's still upstream).
 	// Routed through invalidateObject so a failed re-invalidation is recorded/logged.
 	if err == nil && capture != nil && capture.StatusCode >= 200 && capture.StatusCode < 300 && s.cache.IsEnabled() {
 		// Upstream has committed the deletes, so a client disconnect must not
@@ -241,7 +240,9 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		// Tiered metadata may name the only copy; conservative eviction is a
 		// cache-retention tradeoff only in proxy modes. Keep response staging
 		// in both policies so the client cannot finish before the fences.
-		if tieredPriors != nil || threshold <= 0 || len(requestedCounts) < threshold {
+		// Error element names are literal XML tokens, including when namespaced.
+		// False positives (for example in a key) simply keep the precise path.
+		if tieredPriors != nil || threshold <= 0 || len(requestedCounts) < threshold || bytes.Contains(capture.Body, []byte("Error")) {
 			erroredCounts, parsed = erroredDeleteKeyCounts(capture.Body)
 		}
 		for key, reqN := range requestedCounts {
