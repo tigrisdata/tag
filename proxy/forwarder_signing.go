@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/auth"
@@ -61,11 +62,15 @@ func (f *signingForwarder) chunkVerifier(r *http.Request) (*auth.ChunkVerifier, 
 // signForward builds the upstream request: the (possibly decoded) body, the
 // headers as they will be sent, and a fresh SigV4 signature over them.
 func (f *signingForwarder) signForward(ctx context.Context, r *http.Request, body io.Reader, bodyHash string, contentLength int64, chunked bool, accessKey, secretKey string) (*http.Request, error) {
-	path := r.URL.Path
-	if r.URL.RawQuery != "" {
-		path = path + "?" + r.URL.RawQuery
+	path, rawQuery := r.URL.Path, r.URL.RawQuery
+	if strings.Contains(path, "?") {
+		// Preserve SignRequest's first-question-mark split for literal '?' paths.
+		if rawQuery != "" {
+			path += "?" + rawQuery
+		}
+		path, rawQuery, _ = strings.Cut(path, "?")
 	}
-	fwdReq, err := f.signer.SignRequest(ctx, r.Method, path, body, bodyHash, accessKey, secretKey, headersForForwardedSigning(r.Header, chunked))
+	fwdReq, err := f.signer.SignRequestWithQuery(ctx, r.Method, path, rawQuery, body, bodyHash, accessKey, secretKey, headersForForwardedSigning(r.Header, chunked))
 	if err != nil {
 		return nil, err
 	}
