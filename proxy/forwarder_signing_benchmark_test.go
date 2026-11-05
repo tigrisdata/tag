@@ -204,24 +204,36 @@ func newSigningPassthroughBenchmark(b testing.TB, method, path, body string, hea
 }
 
 // BenchmarkServiceHandlePassthroughSigning measures the signing-mode
-// passthrough handler for an object-tagging request. The controlled transport
-// keeps upstream network latency out of the request-signing workload.
+// passthrough handler for object-tagging and ListObjectsV2 requests. The list
+// queries use constructed opaque continuation tokens, not a traffic sample.
+// The controlled transport keeps upstream network latency out of the workload.
 func BenchmarkServiceHandlePassthroughSigning(b *testing.B) {
-	service, incomingRequest := newSigningPassthroughBenchmark(
-		b,
-		http.MethodGet,
-		signingForwarderBenchmarkGetPath,
-		"",
-		http.Header{"X-Amz-Expected-Bucket-Owner": {"123456789012"}},
-	)
-	req := incomingRequest.Clone(context.Background())
-	writer := signingForwarderBenchmarkResponseWriter{header: make(http.Header)}
-	b.ReportAllocs()
+	for _, target := range []struct {
+		name string
+		path string
+	}{
+		{"tagging", signingForwarderBenchmarkGetPath},
+		{"empty", "/benchmark-bucket"},
+		{"short", "/benchmark-bucket?list-type=2&max-keys=1000"},
+		{"2KiB", "/benchmark-bucket?list-type=2&continuation-token=" + strings.Repeat("a", 2048)},
+		{"8KiB", "/benchmark-bucket?list-type=2&continuation-token=" + strings.Repeat("a", 8192)},
+	} {
+		b.Run(target.name, func(b *testing.B) {
+			service, incomingRequest := newSigningPassthroughBenchmark(
+				b, http.MethodGet, target.path, "",
+				http.Header{"X-Amz-Expected-Bucket-Owner": {"123456789012"}},
+			)
+			req := incomingRequest.Clone(context.Background())
+			req.Body = http.NoBody // Match an empty HTTP server request.
+			writer := signingForwarderBenchmarkResponseWriter{header: make(http.Header)}
+			b.ReportAllocs()
 
-	for b.Loop() {
-		if err := service.HandlePassthrough(&writer, req); err != nil {
-			b.Fatal(err)
-		}
+			for b.Loop() {
+				if err := service.HandlePassthrough(&writer, req); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
