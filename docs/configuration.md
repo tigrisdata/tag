@@ -2,6 +2,21 @@
 
 TAG can be configured via a YAML configuration file and/or environment variables. Environment variables take precedence over file configuration.
 
+## Conservative bulk-delete results
+
+`cache.bulk_delete_conservative_threshold` (environment
+`TAG_CACHE_BULK_DELETE_CONSERVATIVE_THRESHOLD`) opts proxy-mode bulk deletes
+with at least that many distinct keys into all-key post-success invalidation
+when the result contains no `Error` token. Results containing that token retain
+exact per-key error counting, even when it appears in a key or other text.
+Nonpositive values disable it (the default). Smaller batches and tiered mode
+always keep exact counting.
+
+This avoids decoding ordinary all-success result XML, but still buffers the
+response so it cannot complete before the existing bounded cache fences.
+Failed-key refills remain protected by precise counting, with the existing
+all-key fallback for unparseable results.
+
 ## Environment Variables
 
 | Variable                          | Description                                                                     | Default                  |

@@ -1,0 +1,128 @@
+package proxy
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/tigrisdata/tag/cache"
+	"github.com/tigrisdata/tag/config"
+)
+
+type bulkDeletePolicyResponseWriter struct {
+	*httptest.ResponseRecorder
+	beforeWrite func()
+}
+
+func (w *bulkDeletePolicyResponseWriter) Write(body []byte) (int, error) {
+	w.beforeWrite()
+	return w.ResponseRecorder.Write(body)
+}
+
+func TestHandleDeleteObjects_ConservativeSuccessFencesRefills(t *testing.T) {
+	for _, mode := range []string{config.ModeTransparent, config.ModeSigning} {
+		t.Run(mode, func(t *testing.T) {
+			const response = `<DeleteResult><Deleted><Key>first</Key></Deleted><Deleted><Key>second</Key></Deleted></DeleteResult>`
+			var c *cache.Cache
+			forwarder := &mockForwarder{captureFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) (*ResponseCapture, error) {
+				for _, key := range []string{"first", "second"} {
+					meta := &cache.CachedObjectMeta{Bucket: "bucket", Key: key, ETag: `"refill"`, ContentLength: 1, StatusCode: 200}
+					if err := c.PutWithMeta(context.Background(), "bucket", key, meta, []byte("x"), 60); err != nil {
+						t.Fatal(err)
+					}
+					if _, found, err := c.GetMeta(context.Background(), "bucket", key); err != nil || !found {
+						t.Fatalf("refill for %q is not readable during forwarding: found=%t err=%v", key, found, err)
+					}
+				}
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(response))
+				return &ResponseCapture{StatusCode: http.StatusOK, Body: []byte(response), Complete: true}, nil
+			}}
+			s, store := newTestService(forwarder, true)
+			t.Cleanup(s.Stop)
+			c = store
+			s.config.Mode = mode
+			s.config.Cache.BulkDeleteConservativeThreshold = 2
+			checked := false
+			w := &bulkDeletePolicyResponseWriter{ResponseRecorder: httptest.NewRecorder(), beforeWrite: func() {
+				checked = true
+				for _, key := range []string{"first", "second"} {
+					if _, found, err := c.GetMeta(context.Background(), "bucket", key); err != nil || found {
+						t.Errorf("refill for %q still readable at response write: found=%t err=%v", key, found, err)
+					}
+				}
+			}}
+			r := httptest.NewRequest(http.MethodPost, "/bucket?delete", strings.NewReader(`<Delete><Object><Key>first</Key></Object><Object><Key>second</Key></Object></Delete>`))
+			if err := s.HandleDeleteObjects(w, r); err != nil {
+				t.Fatal(err)
+			}
+			if !checked {
+				t.Fatal("response body was not written")
+			}
+			if w.Code != http.StatusOK || w.Body.String() != response || w.Header().Get("Content-Type") != "application/xml" {
+				t.Fatal("upstream response changed")
+			}
+		})
+	}
+}
+
+func TestHandleDeleteObjects_ConservativeThreshold(t *testing.T) {
+	for _, response := range []string{
+		`<DeleteResult><Deleted><Key>ok</Key></Deleted><Error><Key>failed</Key><Code>AccessDenied</Code></Error></DeleteResult>`,
+		`<s:DeleteResult xmlns:s="urn:s3"><s:Deleted><s:Key>ok</s:Key></s:Deleted><s:Error><s:Key>failed</s:Key><s:Code>AccessDenied</s:Code></s:Error></s:DeleteResult>`,
+	} {
+		for _, mode := range []string{config.ModeTransparent, config.ModeSigning, config.ModeTiered} {
+			for _, threshold := range []int{-1, 0, 1, 2, 3} {
+				t.Run(fmt.Sprintf("%s/%d", mode, threshold), func(t *testing.T) {
+					var c *cache.Cache
+					forwarder := &mockForwarder{captureFunc: func(_ context.Context, w http.ResponseWriter, r *http.Request) (*ResponseCapture, error) {
+						for _, key := range []string{"ok", "failed"} {
+							meta := &cache.CachedObjectMeta{Bucket: "bucket", Key: key, ETag: `"refill"`, ContentLength: 1, StatusCode: 200}
+							if err := c.PutWithMeta(context.Background(), "bucket", key, meta, []byte("x"), 60); err != nil {
+								t.Fatal(err)
+							}
+						}
+						w.Header().Set("Content-Type", "application/xml")
+						w.WriteHeader(200)
+						_, _ = w.Write([]byte(response))
+						return &ResponseCapture{StatusCode: 200, Body: []byte(response), Complete: true}, nil
+					}}
+					var s *Service
+					var store *cache.Cache
+					if mode == config.ModeTiered {
+						s, store = newTieredTestService(forwarder, 1024)
+						meta := &cache.CachedObjectMeta{Bucket: "bucket", Key: "failed", ETag: `"local"`, ContentLength: 1, StatusCode: 200}
+						if err := store.PutWithMeta(context.Background(), "bucket", "failed", meta, []byte("x"), 60); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						s, store = newTestService(forwarder, true)
+					}
+					t.Cleanup(s.Stop)
+					c = store
+					s.config.Mode = mode
+					s.config.Cache.BulkDeleteConservativeThreshold = threshold
+					r := httptest.NewRequest(http.MethodPost, "/bucket?delete", strings.NewReader(`<Delete><Object><Key>ok</Key></Object><Object><Key>ok</Key></Object><Object><Key>failed</Key></Object></Delete>`))
+					w := httptest.NewRecorder()
+					if err := s.HandleDeleteObjects(w, r); err != nil {
+						t.Fatal(err)
+					}
+					if w.Code != 200 || w.Body.String() != response || w.Header().Get("Content-Type") != "application/xml" {
+						t.Fatal("upstream response changed")
+					}
+					_, found, err := c.GetMeta(context.Background(), "bucket", "failed")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !found {
+						t.Fatal("failed-key metadata was discarded")
+					}
+				})
+			}
+		}
+	}
+}
