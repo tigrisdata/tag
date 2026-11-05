@@ -12,6 +12,64 @@ import (
 	"github.com/tigrisdata/tag/config"
 )
 
+type bulkDeletePolicyResponseWriter struct {
+	*httptest.ResponseRecorder
+	beforeWrite func()
+}
+
+func (w *bulkDeletePolicyResponseWriter) Write(body []byte) (int, error) {
+	w.beforeWrite()
+	return w.ResponseRecorder.Write(body)
+}
+
+func TestHandleDeleteObjects_ConservativeSuccessFencesRefills(t *testing.T) {
+	for _, mode := range []string{config.ModeTransparent, config.ModeSigning} {
+		t.Run(mode, func(t *testing.T) {
+			const response = `<DeleteResult><Deleted><Key>first</Key></Deleted><Deleted><Key>second</Key></Deleted></DeleteResult>`
+			var c *cache.Cache
+			forwarder := &mockForwarder{captureFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request) (*ResponseCapture, error) {
+				for _, key := range []string{"first", "second"} {
+					meta := &cache.CachedObjectMeta{Bucket: "bucket", Key: key, ETag: `"refill"`, ContentLength: 1, StatusCode: 200}
+					if err := c.PutWithMeta(context.Background(), "bucket", key, meta, []byte("x"), 60); err != nil {
+						t.Fatal(err)
+					}
+					if _, found, err := c.GetMeta(context.Background(), "bucket", key); err != nil || !found {
+						t.Fatalf("refill for %q is not readable during forwarding: found=%t err=%v", key, found, err)
+					}
+				}
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(response))
+				return &ResponseCapture{StatusCode: http.StatusOK, Body: []byte(response), Complete: true}, nil
+			}}
+			s, store := newTestService(forwarder, true)
+			t.Cleanup(s.Stop)
+			c = store
+			s.config.Mode = mode
+			s.config.Cache.BulkDeleteConservativeThreshold = 2
+			checked := false
+			w := &bulkDeletePolicyResponseWriter{ResponseRecorder: httptest.NewRecorder(), beforeWrite: func() {
+				checked = true
+				for _, key := range []string{"first", "second"} {
+					if _, found, err := c.GetMeta(context.Background(), "bucket", key); err != nil || found {
+						t.Errorf("refill for %q still readable at response write: found=%t err=%v", key, found, err)
+					}
+				}
+			}}
+			r := httptest.NewRequest(http.MethodPost, "/bucket?delete", strings.NewReader(`<Delete><Object><Key>first</Key></Object><Object><Key>second</Key></Object></Delete>`))
+			if err := s.HandleDeleteObjects(w, r); err != nil {
+				t.Fatal(err)
+			}
+			if !checked {
+				t.Fatal("response body was not written")
+			}
+			if w.Code != http.StatusOK || w.Body.String() != response || w.Header().Get("Content-Type") != "application/xml" {
+				t.Fatal("upstream response changed")
+			}
+		})
+	}
+}
+
 func TestHandleDeleteObjects_ConservativeThreshold(t *testing.T) {
 	for _, response := range []string{
 		`<DeleteResult><Deleted><Key>ok</Key></Deleted><Error><Key>failed</Key><Code>AccessDenied</Code></Error></DeleteResult>`,
@@ -48,7 +106,6 @@ func TestHandleDeleteObjects_ConservativeThreshold(t *testing.T) {
 					c = store
 					s.config.Mode = mode
 					s.config.Cache.BulkDeleteConservativeThreshold = threshold
-					// The repeated successful key must not count toward the distinct-key threshold.
 					r := httptest.NewRequest(http.MethodPost, "/bucket?delete", strings.NewReader(`<Delete><Object><Key>ok</Key></Object><Object><Key>ok</Key></Object><Object><Key>failed</Key></Object></Delete>`))
 					w := httptest.NewRecorder()
 					if err := s.HandleDeleteObjects(w, r); err != nil {
