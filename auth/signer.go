@@ -93,24 +93,23 @@ func (s *RequestSigner) Endpoint() string {
 func (s *RequestSigner) SignRequest(ctx context.Context, method, path string,
 	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header) (*http.Request, error) {
 
+	pathPart, queryPart, _ := strings.Cut(path, "?")
+	return s.SignRequestWithQuery(ctx, method, pathPart, queryPart, body, bodyHash, accessKey, secretKey, headers)
+}
+
+// SignRequestWithQuery is SignRequest with a separate decoded path and raw query.
+// Unlike SignRequest, it takes path literally, without splitting it on '?'.
+func (s *RequestSigner) SignRequestWithQuery(ctx context.Context, method, path, rawQuery string,
+	body io.Reader, bodyHash string, accessKey, secretKey string, headers http.Header) (*http.Request, error) {
+
 	if s.endpointErr != nil {
 		return nil, fmt.Errorf("failed to parse endpoint: %w", s.endpointErr)
 	}
 
 	// Copy the immutable endpoint template before applying request-specific fields.
 	baseURL := *s.endpointURL
-
-	// Split path and query string
-	pathPart := path
-	queryPart := ""
-	if idx := strings.Index(path, "?"); idx != -1 {
-		pathPart = path[:idx]
-		queryPart = path[idx+1:]
-	}
-
-	// Set path (Go will properly encode special characters like % when converting to string)
-	baseURL.Path = pathPart
-	baseURL.RawQuery = queryPart
+	baseURL.Path = path
+	baseURL.RawQuery = rawQuery
 	return s.signURL(ctx, method, &baseURL, body, bodyHash, accessKey, secretKey, headers)
 }
 
