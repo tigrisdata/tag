@@ -236,6 +236,8 @@ export AWS_SECRET_ACCESS_KEY=your_secret_key
 TAG_LOG_LEVEL=debug ./tag
 ```
 
+The default upstream idle-connection cap is 1,024, matching the default S3 in-flight request limit. `upstream.max_idle_conns_per_host` and `TAG_MAX_IDLE_CONNS_PER_HOST` set the cap for both total and per-host idle connections. See [docs/configuration.md](docs/configuration.md) for details.
+
 ### Test
 
 ```bash

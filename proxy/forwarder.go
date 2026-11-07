@@ -11,6 +11,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/tigrisdata/tag/auth"
+	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
 )
 
@@ -178,7 +179,7 @@ type baseForwarder struct {
 // newBaseForwarder creates the shared base with HTTP client and signer.
 func newBaseForwarder(tigrisEndpoint, region string, maxIdleConnsPerHost int) baseForwarder {
 	if maxIdleConnsPerHost <= 0 {
-		maxIdleConnsPerHost = 100 // Default
+		maxIdleConnsPerHost = config.DefaultMaxIdleConnsPerHost
 	}
 
 	return baseForwarder{
