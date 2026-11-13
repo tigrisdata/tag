@@ -12,8 +12,11 @@ import (
 	"github.com/rs/zerolog/log"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/ocache/coordinator"
+	ocachestorageerrors "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/tag/config"
 	"github.com/tigrisdata/tag/metrics"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // localityChecker is an optional CacheClient capability: it reports whether a
@@ -34,6 +37,12 @@ type blockBytePutter interface {
 
 // ErrNotFound indicates the key was not found in the cache.
 var ErrNotFound = errors.New("not found in cache")
+
+// ErrInferredNotFound marks a body-read error that matched the legacy not-found
+// text fallback without a typed absence signal. Returned wrappers carrying it
+// also match ErrNotFound for existing proxy and block-cache callers; authoritative
+// whole-body decisions must treat the marker as an error.
+var ErrInferredNotFound = errors.New("body absence inferred from error text")
 
 // ErrCacheDisabled indicates the cache is disabled.
 var ErrCacheDisabled = errors.New("cache is disabled")
@@ -479,7 +488,7 @@ func (c *Cache) GetBodyStream(ctx context.Context, bucket, key, etag string, w i
 	if err != nil {
 		if isNotFoundError(err) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (body stream)")
-			return ErrNotFound
+			return bodyNotFoundError(err)
 		}
 		log.Debug().Err(err).Str("bucket", bucket).Str("key", key).Msg("Cache body stream error")
 		return err
@@ -654,7 +663,7 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 		if err != nil {
 			if isNotFoundError(err) {
 				log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
-				return ErrNotFound
+				return bodyNotFoundError(err)
 			}
 			return err
 		}
@@ -685,7 +694,7 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 	if err != nil {
 		if isNotFoundError(err) {
 			log.Debug().Str("bucket", bucket).Str("key", key).Msg("Cache miss (range)")
-			return ErrNotFound
+			return bodyNotFoundError(err)
 		}
 		log.Debug().Err(err).
 			Str("bucket", bucket).
@@ -726,9 +735,10 @@ func (c *Cache) getRangeStreamByKey(ctx context.Context, cacheKey, bucket, key s
 	return nil
 }
 
-// BodyExistsErr reports whether a whole-object body is present, with the same
-// error contract as BlockExistsErr: genuine absence is (false, nil), a transient
-// probe failure is (false, err). Same first-byte probe, on the body key.
+// BodyExistsErr reports whether a whole-object body is present. A typed miss is
+// (false, nil), while a probe failure—including a miss inferred only from error
+// text—is (false, err). The result gates authoritative whole-object responses, so
+// text alone cannot establish absence. Same first-byte probe as BlockExistsErr.
 func (c *Cache) BodyExistsErr(ctx context.Context, bucket, key, etag string) (present bool, err error) {
 	if !c.IsEnabled() || etag == "" {
 		return false, nil
@@ -736,6 +746,9 @@ func (c *Cache) BodyExistsErr(ctx context.Context, bucket, key, etag string) (pr
 	e := c.getRangeStreamByKey(ctx, MakeBodyKey(bucket, key, etag), bucket, key, 0, 0, io.Discard)
 	if e == nil {
 		return true, nil
+	}
+	if errors.Is(e, ErrInferredNotFound) {
+		return false, e // text alone does not establish body absence
 	}
 	if errors.Is(e, ErrNotFound) {
 		return false, nil // genuinely absent
@@ -751,12 +764,11 @@ func (c *Cache) BlockExists(ctx context.Context, bucket, key, etag string, block
 	return present
 }
 
-// BlockExistsErr reports whether a block is present, distinguishing genuine absence (present=false,
-// err=nil) from a transient probe failure (present=false, err!=nil) such as a canceled context or a
-// cluster gRPC error. Callers that make invalidation/amplification decisions from block presence
-// must NOT treat a transient probe error as "absent" — doing so could, e.g., delete a still-valid
-// entry when a network blip makes present blocks look missing. BlockExists (bool) collapses both to
-// false and is only safe where a probe error is equivalent to absent (a plain cache miss).
+// BlockExistsErr reports whether a block is present, distinguishing recognized cache misses
+// (present=false, err=nil) from other probe failures (present=false, err!=nil), such as a canceled
+// context or cluster gRPC error. For compatibility with block recovery, an untyped error that
+// matches the legacy not-found text fallback remains a miss here; callers must use this only where
+// that miss is equivalent to an absent block. BlockExists (bool) collapses misses and errors to false.
 func (c *Cache) BlockExistsErr(ctx context.Context, bucket, key, etag string, blockSize, blockIdx int64) (present bool, err error) {
 	if !c.IsEnabled() || etag == "" {
 		return false, nil
@@ -959,10 +971,48 @@ func (c *Cache) GetMode() string {
 	return string(c.client.GetMode())
 }
 
+// bodyNotFoundError prevents non-NotFound gRPC and typed storage errors from
+// becoming misses. The legacy text fallback still matches ErrNotFound for proxy
+// and block callers, but carries ErrInferredNotFound so authoritative whole-body
+// decisions can reject it.
+func bodyNotFoundError(err error) error {
+	if st, ok := status.FromError(err); ok {
+		if st.Code() == codes.NotFound {
+			return ErrNotFound
+		}
+		// An operational status can mention "not found" in its details without
+		// proving the body is absent.
+		return err
+	}
+	var storageErr *ocachestorageerrors.StorageError
+	if errors.As(err, &storageErr) {
+		if storageErr.GetType() == ocachestorageerrors.TypeNotFound {
+			return ErrNotFound
+		}
+		return err
+	}
+	if errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if isNotFoundError(err) {
+		// Do not unwrap the source error: the legacy fallback previously discarded
+		// it, and exposing wrapped cancellation would alter proxy healing behavior.
+		return fmt.Errorf("%w: %w: %v", ErrNotFound, ErrInferredNotFound, err)
+	}
+	return err
+}
+
 // isNotFoundError checks if the error indicates a cache miss.
 func isNotFoundError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if st, ok := status.FromError(err); ok {
+		return st.Code() == codes.NotFound
+	}
+	var storageErr *ocachestorageerrors.StorageError
+	if errors.As(err, &storageErr) {
+		return storageErr.GetType() == ocachestorageerrors.TypeNotFound
 	}
 	errStr := err.Error()
 	return errStr == "key not found" ||

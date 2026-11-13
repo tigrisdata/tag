@@ -335,6 +335,13 @@ func (s *Service) handleRevalidation200(
 // pre-commit callers invalidate and refetch exactly as for a missing body.
 var errCacheBodyLengthMismatch = errors.New("cache body length mismatch")
 
+func cacheBodyEmptyError(bucket, key string, meta *cache.CachedObjectMeta) error {
+	if err := checkCachedBodyLength(bucket, key, meta, 0); err != nil {
+		return err
+	}
+	return fmt.Errorf("cache body empty for %s/%s", bucket, key)
+}
+
 // checkCachedBodyLength compares the bytes a cache body produced with the
 // metadata's Content-Length. A negative ContentLength (unknown upstream
 // length) has nothing to compare against. For a body cut off mid-stream by
@@ -493,7 +500,7 @@ func (s *Service) serveFromCache(
 		if bodyErr != nil {
 			return fmt.Errorf("cache body read failed: %w", bodyErr)
 		}
-		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
+		return cacheBodyEmptyError(bucket, key, meta)
 	}
 
 	// Large objects: stream directly to a writer that commits only when the
@@ -527,7 +534,7 @@ func (s *Service) serveFromCache(
 		if bodyErr != nil {
 			return fmt.Errorf("cache body unavailable: %w", bodyErr)
 		}
-		return fmt.Errorf("cache body empty for %s/%s", bucket, key)
+		return cacheBodyEmptyError(bucket, key, meta)
 	}
 	if errors.Is(bodyErr, http.ErrContentLength) {
 		// Belt and braces: lengthBoundedWriter should have refused the excess
