@@ -4,6 +4,10 @@ branches:
 plugins:
   - - "@semantic-release/commit-analyzer"
     - releaseRules:
+        # Custom rules replace the defaults for a matching commit, so the
+        # breaking-change rule must be restated ahead of the build rule.
+        - breaking: true
+          release: major
         # A dependency bump (build:) ships on its own as a patch.
         - type: build
           release: patch
