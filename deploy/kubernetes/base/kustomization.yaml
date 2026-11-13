@@ -14,4 +14,4 @@ labels:
 
 images:
   - name: tigrisdata/tag
-    newTag: v1.23.1
+    newTag: v1.24.0

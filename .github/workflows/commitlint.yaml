@@ -37,9 +37,10 @@ jobs:
             - feat: new features (minor release)
             - fix: bug fixes (patch release)
             - perf: performance improvements (patch release)
+            - build: dependency bumps (patch release)
 
             Non-release types (still valid):
-            - docs, style, refactor, test, build, ci, chore, revert
+            - docs, style, refactor, test, ci, chore, revert
 
             Examples:
             - feat: add user authentication

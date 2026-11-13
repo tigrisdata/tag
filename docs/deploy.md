@@ -69,7 +69,7 @@ resources:
   - ../../base
 images:
   - name: tigrisdata/tag
-    newTag: v1.23.1
+    newTag: v1.24.0
 ```
 
 ## Production Considerations
@@ -283,6 +283,10 @@ v1.23.1 makes rolling restarts converge quickly (embedded engine ocache v1.14.1)
 - **Gossip after a restart.** A pod that comes back on a new address is now accepted by its peers within seconds. Previously, peers kept dialing the old address until the kernel connect timeout and refused the new one as a conflict, which could leave the ring split for minutes after a roll, with keys owned by a node marked unhealthy answering errors. The transport now bounds each gossip dial (2s) and write (5s), reclaims a dead node's name after 5s, and rejoins through the seed address every minute.
 - **Shutdown budget.** The HTTP drain is 20 seconds instead of 30, leaving 10 seconds of the base 30-second termination grace for the cache to announce leaving and leave the gossip cluster before the pod is killed (see [Graceful shutdown](#graceful-shutdown)). A request still running 20 seconds into shutdown is cancelled 10 seconds earlier than before.
 - **Watching a roll.** `memberlist_client_cluster_members_count` on each pod should return to the replica count, and `ring_members{name="ocache",state="Unhealthy"}` to zero, shortly after the last pod is ready.
+
+#### Upgrading to v1.24.0
+
+v1.24.0 adds `cache.populate_shed_reject` (`TAG_CACHE_POPULATE_SHED_REJECT`, default `false`). No configuration change is needed to upgrade. Set it where the upstream tier is slow to read back: a shed small PUT then answers `503 SlowDown` with the body unread instead of being placed upstream with a marker, so the object is a miss rather than a slow upstream-tier read. See the shedding notes under [Upgrading to v1.23.0](#upgrading-to-v1230).
 
 ### Health Checks
 
