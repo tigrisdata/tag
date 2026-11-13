@@ -67,6 +67,33 @@ type ValidatedRequest struct {
 	signature   string
 }
 
+// Resign signs a modified request as the validated caller, using the same
+// credential scope, signing time and authentication form. The caller must own
+// the request headers and URL. A signed streaming body must be decoded with a
+// verifier seeded by the original request signature, not the new signature.
+func (vr *ValidatedRequest) Resign(r *http.Request) {
+	r.Header.Set("Host", r.Host)
+	r.Header.Set("X-Amz-Date", vr.signingTime)
+	canonical, signedHeaders := (&RequestSigner{}).buildCanonicalRequest(r, r.Header.Get("X-Amz-Content-Sha256"))
+	presigned := r.Header.Get("Authorization") == ""
+	if presigned {
+		query := r.URL.Query()
+		query.Set("X-Amz-SignedHeaders", signedHeaders)
+		r.URL.RawQuery = query.Encode()
+		canonical = (&RequestValidator{}).buildCanonicalRequestPresigned(r, strings.Split(signedHeaders, ";"), unsignedPayload)
+	}
+	stringToSign := strings.Join([]string{algorithm, vr.signingTime, vr.scope, hashSHA256([]byte(canonical))}, "\n")
+	signature := hex.EncodeToString(hmacSHA256(vr.signingKey, []byte(stringToSign)))
+	if presigned {
+		query := r.URL.Query()
+		query.Set("X-Amz-Signature", signature)
+		r.URL.RawQuery = query.Encode()
+		return
+	}
+	r.Header.Set("Authorization", fmt.Sprintf("%s Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		algorithm, vr.AccessKey, vr.scope, signedHeaders, signature))
+}
+
 // ChunkVerifier returns a verifier for the request's signed chunk chain.
 func (vr *ValidatedRequest) ChunkVerifier() *ChunkVerifier {
 	return &ChunkVerifier{
