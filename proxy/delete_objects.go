@@ -234,9 +234,19 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		// committed below, and the stale metadata ages out via TTL.
 		fenceCtx, cancelFence := context.WithTimeout(context.WithoutCancel(r.Context()), bulkDeleteFenceTimeout)
 		fencedKeys, skippedKeys := 0, 0
-		erroredCounts, parsed := erroredDeleteKeyCounts(capture.Body)
+		var erroredCounts map[string]int
+		parsed := false
+		threshold := s.config.Cache.BulkDeleteConservativeThreshold
+		// Tiered metadata may name the only copy; conservative eviction is a
+		// cache-retention tradeoff only in proxy modes. Keep response staging
+		// in both policies so the client cannot finish before the fences.
+		// Error element names are literal XML tokens, including when namespaced.
+		// False positives (for example in a key) simply keep the precise path.
+		if tieredPriors != nil || threshold <= 0 || len(requestedCounts) < threshold || bytes.Contains(capture.Body, []byte("Error")) {
+			erroredCounts, parsed = erroredDeleteKeyCounts(capture.Body)
+		}
 		for key, reqN := range requestedCounts {
-			// On a parse failure, over-invalidate every requested key (safe).
+			// Unparsed results, including conservative mode, fence every key.
 			if parsed && reqN <= erroredCounts[key] {
 				continue // every requested entry for this key errored — object still present
 			}
