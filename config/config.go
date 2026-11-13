@@ -71,9 +71,11 @@ const (
 	// DefaultBroadcastChannelBuffer is the default buffer size per listener (1024 chunks = ~64MB).
 	DefaultBroadcastChannelBuffer = 1024
 
-	// DefaultMaxIdleConnsPerHost is the default HTTP connection pool size per upstream host.
-	// Higher values improve throughput for cache miss scenarios with high concurrency.
-	DefaultMaxIdleConnsPerHost = 100
+	// DefaultMaxIdleConnsPerHost is the bounded default upstream idle-connection cap.
+	// The proxy applies this value to both the total and per-host transport limits.
+	// It matches the default S3 request-admission limit; operators can change the
+	// cap with upstream.max_idle_conns_per_host or TAG_MAX_IDLE_CONNS_PER_HOST.
+	DefaultMaxIdleConnsPerHost = DefaultServerMaxInflightRequests
 
 	// DefaultCacheDeleteBatchSize is the default number of file deletions processed
 	// per deletion-queue batch. Mirrors ocache storage.DefaultDeleteBatchSize; kept
@@ -210,7 +212,7 @@ func (c *Config) ForwardsTransparently() bool {
 type UpstreamConfig struct {
 	Endpoint            string `yaml:"endpoint"`                // Tigris S3 endpoint (e.g., https://fly.storage.tigris.dev)
 	Region              string `yaml:"region"`                  // AWS region for signing (default: auto)
-	MaxIdleConnsPerHost int    `yaml:"max_idle_conns_per_host"` // HTTP connection pool size per host (default: 100)
+	MaxIdleConnsPerHost int    `yaml:"max_idle_conns_per_host"` // Idle connection cap for total and per-host pools (default: 1024)
 	TransparentProxy    *bool  `yaml:"transparent_proxy"`       // Forward client requests as-is with proxy headers (default: true when nil)
 }
 
