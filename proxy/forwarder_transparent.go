@@ -263,31 +263,32 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 		return AuthValidated, nil
 	}
 
-	// Parse auth info from the client's request
-	authInfo, err := auth.ParseAuthInfo(r)
+	// Validate the SigV4 signature locally. RequestValidator parses AuthInfo and
+	// retrieves the exact signing key before returning the validated access key.
+	validated, err := f.validator.Validate(r)
 	if err != nil {
-		// Missing auth (anonymous request) → forward to Tigris for authoritative
-		// handling (e.g., public bucket access). Only truly malformed auth headers
-		// are rejected as client errors.
-		if errors.Is(err, auth.ErrMissingAuth) {
-			metrics.RecordLocalAuthValidation("missing_auth")
+		// Parse failures retain the same missing-auth and malformed-auth behavior
+		// as the cache gate. Validate can report a missing content hash before the
+		// parse error when the header is absent, so inspect AuthInfo only on errors.
+		authInfo, parseErr := auth.ParseAuthInfo(r)
+		if parseErr != nil {
+			if errors.Is(parseErr, auth.ErrMissingAuth) {
+				metrics.RecordLocalAuthValidation("missing_auth")
+				return AuthNotValidated, nil
+			}
+			metrics.RecordLocalAuthValidation("parse_error")
+			return AuthNotValidated, mapAuthError(parseErr)
+		}
+
+		// Unknown access keys still skip local cache and go upstream. An exact
+		// signing-key miss for a known access key remains a signature-mismatch path.
+		if !f.derivedKeyStore.HasKey(authInfo.AccessKey) {
+			metrics.RecordLocalAuthValidation("unknown_key")
+			log.Debug().Msg("Local auth: unknown key - no signing keys learned for this access key")
 			return AuthNotValidated, nil
 		}
-		metrics.RecordLocalAuthValidation("parse_error")
-		return AuthNotValidated, mapAuthError(err)
-	}
-
-	// Check if we have any signing key for this access key
-	if !f.derivedKeyStore.HasKey(authInfo.AccessKey) {
-		metrics.RecordLocalAuthValidation("unknown_key")
-		log.Debug().Msg("Local auth: unknown key - no signing keys learned for this access key")
-		return AuthNotValidated, nil // Unknown key → skip cache, forward to Tigris
-	}
-
-	// Validate the SigV4 signature locally
-	if _, err := f.validator.ValidateRequest(r); err != nil {
 		// Any validation failure (signature mismatch, unknown date/region, key rotation)
-		// → skip cache, forward to Tigris to get authoritative decision + fresh keys
+		// skips cache so Tigris can make the authoritative decision.
 		metrics.RecordLocalAuthValidation("signature_mismatch")
 		log.Debug().Err(err).Msg("Local auth: signature mismatch")
 		return AuthNotValidated, nil
@@ -295,7 +296,7 @@ func (f *transparentForwarder) validateLocally(r *http.Request) (AuthResult, err
 
 	// Check authorization cache
 	bucket, _ := ParseBucketKey(r)
-	if !f.authzCache.IsAuthorized(authInfo.AccessKey, bucket) {
+	if !f.authzCache.IsAuthorized(validated.AccessKey, bucket) {
 		metrics.RecordLocalAuthValidation("authz_expired")
 		log.Debug().Str("bucket", bucket).Msg("Local auth: authz expired for bucket")
 		return AuthNotValidated, nil // AuthZ expired → forward to Tigris
