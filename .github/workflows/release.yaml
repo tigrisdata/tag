@@ -118,8 +118,8 @@ jobs:
       - name: Run semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
-        # The conventionalcommits preset is not bundled with semantic-release.
-        run: npx -p semantic-release -p conventional-changelog-conventionalcommits semantic-release --debug
+        # The conventionalcommits preset is not bundled; major 9 needs a newer changelog writer than the notes generator ships.
+        run: npx -p semantic-release -p conventional-changelog-conventionalcommits@8 semantic-release --debug
 
       - name: Get new release tag
         id: new_tag
