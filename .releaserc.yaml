@@ -2,6 +2,27 @@ branches:
   - release
 
 plugins:
-  - "@semantic-release/commit-analyzer"
-  - "@semantic-release/release-notes-generator"
+  - - "@semantic-release/commit-analyzer"
+    - preset: conventionalcommits
+      releaseRules:
+        # Custom rules replace the defaults for a matching commit, so the
+        # breaking-change rule must be restated ahead of the build rule.
+        - breaking: true
+          release: major
+        # A dependency bump (build:) ships on its own as a patch.
+        - type: build
+          release: patch
+  - - "@semantic-release/release-notes-generator"
+    - preset: conventionalcommits
+      # Types listed here appear in the release notes; all others are hidden.
+      presetConfig:
+        types:
+          - type: feat
+            section: Features
+          - type: fix
+            section: Bug Fixes
+          - type: perf
+            section: Performance
+          - type: build
+            section: Dependencies
   - "@semantic-release/github"
