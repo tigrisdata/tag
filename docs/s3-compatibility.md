@@ -73,6 +73,8 @@ In **transparent proxy mode** (default), chunked uploads are forwarded as-is sin
 
 In **signing mode**, when a client sends a PUT with `X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, the body is wrapped in an AWS-proprietary chunked format where each chunk includes a signature chained from the request-level seed signature. Because TAG re-signs requests with the upstream Tigris hostname (changing the `Host` header), these per-chunk signatures become invalid. TAG handles this by decoding the chunked body on-the-fly — stripping the chunk framing and signatures — and forwarding the raw payload as `UNSIGNED-PAYLOAD`. The decoded content length is read from the `X-Amz-Decoded-Content-Length` header. This is a streaming operation with no buffering of the full object.
 
+For DeleteObjects, TAG also decodes a separate view of request bodies marked with a supported AWS streaming payload hash to find the XML keys used for cache invalidation. Transparent mode still forwards the original signed wire body; signing mode continues its existing decode-and-resign path. The configured upstream determines whether it accepts this encoding for DeleteObjects.
+
 ## Caching Behavior
 
 TAG adds a caching layer for read operations. The `X-Cache` response header indicates cache status:
