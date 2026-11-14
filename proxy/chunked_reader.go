@@ -316,21 +316,24 @@ func (r *awsChunkedReader) readChunkHeader() error {
 }
 
 // readLine reads a single \n-terminated line from the reader, enforcing
-// maxChunkHeaderLen to prevent unbounded memory allocation.
+// maxChunkHeaderLen to prevent unbounded memory allocation. Its fixed buffer
+// avoids growing and copying a slice for each header.
 func (r *awsChunkedReader) readLine() (string, error) {
-	var line []byte
+	var line [maxChunkHeaderLen]byte
+	n := 0
 	for {
 		b, err := r.reader.ReadByte()
 		if err != nil {
 			return "", err
 		}
 		if b == '\n' {
-			return strings.TrimRight(string(line), "\r"), nil
+			return strings.TrimRight(string(line[:n]), "\r"), nil
 		}
-		line = append(line, b)
-		if len(line) > maxChunkHeaderLen {
+		if n == len(line) {
 			return "", fmt.Errorf("chunk header exceeds maximum length (%d bytes)", maxChunkHeaderLen)
 		}
+		line[n] = b
+		n++
 	}
 }
 
