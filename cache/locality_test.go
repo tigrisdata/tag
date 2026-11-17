@@ -16,10 +16,11 @@ import (
 // IsLocal without needing an actual cluster.
 type localityMockClient struct {
 	cacheclient.CacheClient
-	local bool
+	local     bool
+	remoteKey string
 }
 
-func (m *localityMockClient) IsLocal(string) bool { return m.local }
+func (m *localityMockClient) IsLocal(key string) bool { return m.local && key != m.remoteKey }
 
 func readLocality(t *testing.T, locality string) float64 {
 	t.Helper()
@@ -190,5 +191,23 @@ func TestIsBlockLocal(t *testing.T) {
 				t.Fatalf("IsBlockLocal = (local=%t, known=%t), want (%t, %t)", local, known, tc.wantLocal, tc.wantKnown)
 			}
 		})
+	}
+}
+
+func TestIsInvalidationLocal(t *testing.T) {
+	for _, remoteKey := range []string{"", MakeMetaKey("bucket", "key"), MakeTombstoneKey("bucket", "key")} {
+		t.Run(remoteKey, func(t *testing.T) {
+			client := &localityMockClient{CacheClient: cacheclient.NewMemoryCache(), local: true, remoteKey: remoteKey}
+			cfg := config.NewDefault()
+			store := NewCacheWithClient(client, &cfg.Cache)
+			if got := store.IsInvalidationLocal("bucket", "key"); got != (remoteKey == "") {
+				t.Fatalf("local=%t for remote key %q", got, remoteKey)
+			}
+		})
+	}
+	cfg := config.NewDefault()
+	unknown := NewCacheWithClient(cacheclient.NewMemoryCache(), &cfg.Cache)
+	if unknown.IsInvalidationLocal("bucket", "key") {
+		t.Fatal("unknown ownership reported local")
 	}
 }

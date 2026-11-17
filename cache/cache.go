@@ -597,6 +597,15 @@ func (c *Cache) IsBlockLocal(bucket, key, etag string, blockSize, blockIdx int64
 	return lc.IsLocal(MakeBlockKey(bucket, key, etag, blockSize, blockIdx)), true
 }
 
+// IsInvalidationLocal reports whether both metadata and tombstone keys are
+// local. Unknown ownership returns false. This is a scheduling hint only: a ring
+// change may move either key after the check, and the operation still routes
+// through the client normally. Checking both keys also covers legacy coordination.
+func (c *Cache) IsInvalidationLocal(bucket, key string) bool {
+	lc, ok := c.client.(localityChecker)
+	return ok && lc.IsLocal(MakeMetaKey(bucket, key)) && lc.IsLocal(MakeTombstoneKey(bucket, key))
+}
+
 // ============================================================================
 // Range request support
 // ============================================================================
