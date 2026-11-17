@@ -178,7 +178,7 @@ See [docs/architecture.md](docs/architecture.md) for detailed architecture docum
 
 ### Tiered Store Mode
 
-In tiered mode, validated plain-object PUTs no larger than `cache.size_threshold` are stored locally, and their metadata is authoritative. A background re-tier started by a GET is bound to the marker version seen by that GET, so it cannot replace metadata committed by a later write. See [docs/tiered-mode.md](docs/tiered-mode.md) for the full behavior.
+In tiered mode, validated plain-object PUTs no larger than `cache.size_threshold` are stored locally, and their metadata is authoritative. A background re-tier started by a GET is bound to the marker version seen by that GET, so it cannot replace metadata committed by a later write. For a live request, a pre-commit cache-body read error that does not establish absence or corruption returns an internal error and leaves metadata available for retry; confirmed absence and detected body-length/corruption failures remain `NoSuchKey` with version-guarded cleanup. After response headers are committed, existing incomplete/aborted stream handling remains in force. See [docs/tiered-mode.md](docs/tiered-mode.md) for the full behavior.
 
 ## Performance
 

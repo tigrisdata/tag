@@ -1,7 +1,12 @@
 package cache
 
 import (
+	"errors"
 	"testing"
+
+	ocachestorageerrors "github.com/tigrisdata/ocache/storage/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestIsNotFoundError(t *testing.T) {
@@ -34,6 +39,26 @@ func TestIsNotFoundError(t *testing.T) {
 			name:     "contains not found lowercase",
 			err:      &testError{msg: "cache: key not found in store"},
 			expected: true,
+		},
+		{
+			name:     "typed storage not-found error",
+			err:      ocachestorageerrors.NewNotFoundError("Get", "body|bucket|object"),
+			expected: true,
+		},
+		{
+			name:     "typed I/O key containing not-found text",
+			err:      ocachestorageerrors.NewIOError("Get", "body|bucket|not found|etag", errors.New("disk read failed")),
+			expected: false,
+		},
+		{
+			name:     "gRPC NotFound status",
+			err:      status.Error(codes.NotFound, "object is absent"),
+			expected: true,
+		},
+		{
+			name:     "gRPC Unavailable status containing not-found text",
+			err:      status.Error(codes.Unavailable, "node not found in ring"),
+			expected: false,
 		},
 		{
 			name:     "other error",
