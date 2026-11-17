@@ -10,7 +10,7 @@ TAG can be configured via a YAML configuration file and/or environment variables
 | `AWS_SECRET_ACCESS_KEY`           | S3 secret key for authentication                                                | (required)               |
 | `TAG_UPSTREAM_ENDPOINT`           | Tigris S3 endpoint URL                                                          | `https://t3.storage.dev` |
 | `TAG_UPSTREAM_REGION`             | Upstream region for SigV4 signing scope                                         | `auto`                   |
-| `TAG_MAX_IDLE_CONNS_PER_HOST`     | HTTP connection pool size per upstream host                                     | `100`                    |
+| `TAG_MAX_IDLE_CONNS_PER_HOST`     | Idle upstream connection cap (applies to total and per host)                    | `1024`                   |
 | `TAG_CACHE_TTL`                   | Default TTL for cached objects (Go duration, e.g. `12h`, `30m`)                 | `24h`                    |
 | `TAG_CACHE_DISABLED`              | Disable caching (`true` or `1`)                                                 | `false`                  |
 | `TAG_CACHE_DISK_PATH`             | Path to cache data directory                                                    | `/var/cache/tag`         |
@@ -106,10 +106,10 @@ upstream:
   # Default: "auto"
   region: "auto"
 
-  # HTTP connection pool size per upstream host
-  # Higher values improve throughput for cache miss scenarios
-  # Default: 100
-  max_idle_conns_per_host: 100
+  # Idle upstream connection cap. This value limits both total idle connections
+  # and idle connections per host; it does not limit active requests.
+  # Default: 1024 (matches server.max_inflight_requests)
+  max_idle_conns_per_host: 1024
 
   # Deprecated: use the top-level `mode` instead.
   # When true (default), client requests are forwarded as-is with proxy headers.
@@ -348,7 +348,7 @@ Configures the connection to upstream Tigris storage.
 | ------------------------- | ------ | -------------------------- | ------------------------------------------------ |
 | `endpoint`                | string | `"https://t3.storage.dev"` | Tigris S3 endpoint URL                           |
 | `region`                  | string | `"auto"`                   | AWS region for request signing                   |
-| `max_idle_conns_per_host` | int    | `100`                      | HTTP connection pool size per host               |
+| `max_idle_conns_per_host` | int    | `1024`                     | Idle upstream connection cap for the total pool and each host; active connections are not limited |
 | `transparent_proxy`       | bool   | `true`                     | **Deprecated** — use top-level `mode`. Forward client requests as-is with proxy headers |
 
 **Endpoint Validation:**
