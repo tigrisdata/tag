@@ -30,13 +30,29 @@ type bulkDeleteResponseCompletionBenchmark struct {
 	responseBody []byte
 }
 
-func newBulkDeleteResponseCompletionBenchmark(tb testing.TB) *bulkDeleteResponseCompletionBenchmark {
+func newBulkDeleteResponseCompletionBenchmark(tb testing.TB, keys int) *bulkDeleteResponseCompletionBenchmark {
 	tb.Helper()
 
+	var request, response strings.Builder
+	request.WriteString("<Delete>")
+	response.WriteString("<DeleteResult>")
+	for i := 0; i < keys; i++ {
+		key := bulkDeleteFenceKey
+		if i > 0 {
+			key = fmt.Sprintf("object-%04d", i)
+		}
+		fmt.Fprintf(&request, "<Object><Key>%s</Key></Object>", key)
+		fmt.Fprintf(&response, "<Deleted><Key>%s</Key></Deleted>", key)
+	}
+	request.WriteString("</Delete>")
+	if keys == 1 {
+		response.WriteString(strings.Repeat(" ", 128*1024))
+	}
+	response.WriteString("</DeleteResult>")
 	fixture := &bulkDeleteResponseCompletionBenchmark{
 		handlerDone:  make(chan struct{}, 1),
-		requestBody:  []byte(`<Delete><Object><Key>` + bulkDeleteFenceKey + `</Key></Object></Delete>`),
-		responseBody: []byte(`<DeleteResult><Deleted><Key>` + bulkDeleteFenceKey + `</Key></Deleted>` + strings.Repeat(" ", 128*1024) + `</DeleteResult>`),
+		requestBody:  []byte(request.String()),
+		responseBody: []byte(response.String()),
 	}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !r.URL.Query().Has("delete") {
@@ -153,14 +169,22 @@ func (f *bulkDeleteResponseCompletionBenchmark) waitForHandler(tb testing.TB) {
 
 // BenchmarkBulkDeleteResponseCompletion measures a successful cache-enabled
 // DeleteObjects response through the registered route and transparent forwarder.
-// The fixed-length result includes 128 KiB of runtime padding to exercise response
-// capture on a body large enough to flush; it is not a production size estimate.
+// The one-key control includes 128 KiB of padding to exercise response capture.
+// The 1,000-key case uses an ordinary verbose DeleteResult at the S3 batch limit.
 func BenchmarkBulkDeleteResponseCompletion(b *testing.B) {
+	for _, keys := range []int{1, 1000} {
+		b.Run(strconv.Itoa(keys), func(b *testing.B) {
+			benchmarkBulkDeleteResponseCompletion(b, keys)
+		})
+	}
+}
+
+func benchmarkBulkDeleteResponseCompletion(b *testing.B, keys int) {
 	oldLogger := log.Logger
 	log.Logger = log.Logger.Level(zerolog.WarnLevel)
 	b.Cleanup(func() { log.Logger = oldLogger })
 
-	fixture := newBulkDeleteResponseCompletionBenchmark(b)
+	fixture := newBulkDeleteResponseCompletionBenchmark(b, keys)
 	fixture.seedCachedObject(b)
 	warmResponse, err := fixture.newRequest()
 	if err != nil {

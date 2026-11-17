@@ -1528,3 +1528,29 @@ func TestLoad_PopulateShedDiskRatioDefaultAndEnv(t *testing.T) {
 		t.Errorf("Cache.PopulateShedDiskRatio = %v, want -1 (disabled)", cfg.Cache.PopulateShedDiskRatio)
 	}
 }
+
+func TestBulkDeleteConservativeThreshold(t *testing.T) {
+	t.Setenv("TAG_CACHE_BULK_DELETE_CONSERVATIVE_THRESHOLD", "")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("cache:\n  bulk_delete_conservative_threshold: 1000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := NewDefault().Cache.BulkDeleteConservativeThreshold; got != 0 {
+		t.Fatalf("default threshold = %d, want disabled", got)
+	}
+	for _, tc := range []struct {
+		value string
+		want  int
+	}{{"", 1000}, {"1", 1}, {"0", 0}, {"-1", -1}, {"invalid", 1000}} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv("TAG_CACHE_BULK_DELETE_CONSERVATIVE_THRESHOLD", tc.value)
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Cache.BulkDeleteConservativeThreshold; got != tc.want {
+				t.Fatalf("threshold = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
