@@ -4,11 +4,17 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 )
 
 func TestRequestValidator_ValidateRequest(t *testing.T) {
@@ -171,5 +177,98 @@ func TestRequestValidator_ValidateRequest_MissingContentHash(t *testing.T) {
 	}
 	if err != ErrMissingContentHash {
 		t.Errorf("ValidateRequest() error = %v, want %v", err, ErrMissingContentHash)
+	}
+}
+
+// A learned derived key must re-sign a changed request without substituting
+// TAG's background identity. Compare with the SDK, not TAG's own validator.
+func TestValidatedRequestResign(t *testing.T) {
+	const accessKey = "caller-access-key"
+	const secretKey = "caller-secret-key"
+	for _, derived := range []bool{false, true} {
+		t.Run(fmt.Sprintf("derived=%v", derived), func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Second)
+			r := httptest.NewRequest(http.MethodPut, "https://objects.example/bucket/a%20key?x=two&x=one", nil)
+			r.Header.Set("If-Match", `"local-only-etag"`)
+			r.Header.Set("X-Amz-Content-Sha256", emptyBodyHash)
+			r.Header.Add("X-Amz-Meta-Colour", "blue")
+			r.Header.Add("X-Amz-Meta-Colour", "green")
+			creds := aws.Credentials{AccessKeyID: accessKey, SecretAccessKey: secretKey}
+			sdk := v4.NewSigner(func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+			if err := sdk.SignHTTP(t.Context(), creds, r, emptyBodyHash, "s3", "us-east-1", now); err != nil {
+				t.Fatal(err)
+			}
+			store := NewCredentialStore()
+			store.AddCredential(accessKey, secretKey)
+			validator := NewRequestValidator(store)
+			if derived {
+				keys := NewDerivedKeyStore(time.Hour)
+				date := now.Format("20060102")
+				keys.Store(accessKey, date, "us-east-1", NewRequestSigner("https://objects.example", "us-east-1").deriveSigningKey(secretKey, date))
+				validator = NewRequestValidator(keys)
+			}
+			// Match net/http's inbound request shape: Host is not URL.Host.
+			r.URL.Scheme, r.URL.Host = "", ""
+			vr, err := validator.Validate(r)
+			if err != nil {
+				t.Fatalf("validate caller: %v", err)
+			}
+			r.Header.Del("If-Match")
+			vr.Resign(r)
+			got := r.Header.Get("Authorization")
+			expected := r.Clone(t.Context())
+			expected.Header.Del("Host")
+			if err := sdk.SignHTTP(t.Context(), creds, expected, emptyBodyHash, "s3", "us-east-1", now); err != nil {
+				t.Fatal(err)
+			}
+			if got != expected.Header.Get("Authorization") {
+				t.Fatalf("re-signed caller request differs from SDK: got %q, want %q", got, expected.Header.Get("Authorization"))
+			}
+		})
+	}
+}
+
+func TestValidatedRequestResignPresigned(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	credentials := aws.Credentials{AccessKeyID: "caller", SecretAccessKey: "secret", SessionToken: "session-token"}
+	r := httptest.NewRequest(http.MethodPut, "https://objects.example/bucket/a%20key?X-Amz-Expires=60", nil)
+	r.Header.Set("If-Match", `"local-only-etag"`)
+	r.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
+	sdk := v4.NewSigner(func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true; o.DisableHeaderHoisting = true })
+	uri, _, err := sdk.PresignHTTP(t.Context(), credentials, r, unsignedPayload, "s3", "us-east-1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.URL, err = url.Parse(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewCredentialStore()
+	store.AddCredential(credentials.AccessKeyID, credentials.SecretAccessKey)
+	vr, err := NewRequestValidator(store).Validate(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.URL.Scheme, r.URL.Host = "", ""
+	r.Header.Del("If-Match")
+	vr.Resign(r)
+	if r.Header.Get("Authorization") != "" {
+		t.Fatal("re-signing replaced query authentication with header authentication")
+	}
+	expected := r.Clone(t.Context())
+	expected.Header.Del("Host")
+	query := expected.URL.Query()
+	query.Del("X-Amz-Signature")
+	expected.URL.RawQuery = query.Encode()
+	uri, _, err = sdk.PresignHTTP(t.Context(), credentials, expected, unsignedPayload, "s3", "us-east-1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sdkURL, err := url.Parse(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(r.URL.Query(), sdkURL.Query()) {
+		t.Fatalf("re-signed query differs from SDK: got %v, want %v", r.URL.Query(), sdkURL.Query())
 	}
 }

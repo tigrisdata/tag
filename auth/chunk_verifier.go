@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"encoding/hex"
 	"errors"
+	"strings"
 )
 
 // ErrChunkSignatureMismatch is returned when a chunk of a
@@ -42,5 +43,17 @@ func (c *ChunkVerifier) VerifyChunk(signature string, chunkSHA256 []byte) error 
 		return ErrChunkSignatureMismatch
 	}
 	c.previous = expected
+	return nil
+}
+
+// VerifyTrailer authenticates the canonical trailing headers after the signed
+// terminal chunk of a STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER body.
+func (c *ChunkVerifier) VerifyTrailer(signature string, trailerSHA256 []byte) error {
+	prefix := strings.TrimPrefix(c.prefix, streamingAlgorithm)
+	stringToSign := "AWS4-HMAC-SHA256-TRAILER" + prefix + c.previous + "\n" + hex.EncodeToString(trailerSHA256)
+	expected := hex.EncodeToString(hmacSHA256(c.signingKey, []byte(stringToSign)))
+	if !hmac.Equal([]byte(expected), []byte(signature)) {
+		return ErrChunkSignatureMismatch
+	}
 	return nil
 }

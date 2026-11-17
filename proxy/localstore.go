@@ -339,6 +339,35 @@ func (s *Service) streamingChunkVerifier(r *http.Request) (*auth.ChunkVerifier, 
 	return p.chunkVerifier(r)
 }
 
+// checkPutConditions evaluates PUT conditions against the authoritative snapshot.
+// Both local stores and local-to-upstream transitions use servable existence;
+// an upstream marker exists without a local body probe.
+func (s *Service) checkPutConditions(r *http.Request, existing *cache.CachedObjectMeta, found bool) (s3err.ErrorCode, error) {
+	ifMatch := r.Header.Get("If-Match")
+	ifNoneMatch := r.Header.Get("If-None-Match")
+	if ifMatch == "" && ifNoneMatch == "" {
+		return "", nil
+	}
+	exists := found && existing != nil
+	if exists && !existing.BodyUpstream {
+		bucket, key := ParseBucketKey(r)
+		var err error
+		exists, err = s.entryServable(r.Context(), bucket, key, existing)
+		if err != nil {
+			return "", err
+		}
+	}
+	switch {
+	case ifMatch != "" && !exists:
+		return s3err.ErrNoSuchKey, nil
+	case ifMatch != "" && ifMatch != "*" && !existing.MatchesETagHeader(ifMatch, true):
+		return s3err.ErrPreconditionFailed, nil
+	case ifNoneMatch != "" && exists && (ifNoneMatch == "*" || existing.MatchesETagHeader(ifNoneMatch, false)):
+		return s3err.ErrPreconditionFailed, nil
+	}
+	return "", nil
+}
+
 // putPrior is a metadata snapshot the caller already read, threaded into the
 // engine PUT so a single GetMetaWithVersion serves both the caller's decision
 // and the engine's precondition/token — closing the double-read TOCTOU (a
@@ -397,52 +426,16 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 			return merr
 		}
 	}
-	conditional := false
-	ifMatch := r.Header.Get("If-Match")
-	ifNoneMatch := r.Header.Get("If-None-Match")
-	if ifMatch != "" || ifNoneMatch != "" {
-		conditional = true
-		// Existence means SERVABLE existence — the same gate every read uses. An
-		// incomplete entry (orphaned meta, missing blocks) is invisible on every
-		// request shape, so If-None-Match:* must store over it (that IS the
-		// healing put-if-absent) and If-Match must answer NoSuchKey, not 412.
-		// A probe ERROR aborts: read as "absent" it would let If-None-Match:*
-		// overwrite a live object during a transient blip.
-		exists := found && existing != nil
-		// A BodyUpstream tier marker IS an existing object — its body lives
-		// upstream, so the local-body servability probe below would read it
-		// as absent, letting If-None-Match:* overwrite a live object (and
-		// If-Match answer NoSuchKey for one). The steady-state tiered router
-		// forwards marker-prior conditionals upstream; this guard covers the
-		// race where a marker commits between the router's read and this one.
-		if exists && !existing.BodyUpstream {
-			var servErr error
-			exists, servErr = s.entryServable(ctx, bucket, key, existing)
-			if servErr != nil {
-				metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
-				return servErr
-			}
-		}
-		// The store applies against exactly the state this evaluation saw: the
-		// token above is the observed row's version when present (an unservable
-		// row still occupies the meta key, and the healing overwrite must
-		// replace that exact orphan), and the absence token when not — either
-		// way, whatever appears between this evaluation and the store refuses
-		// the commit.
-		switch {
-		case ifMatch != "" && !exists:
-			s3err.WriteError(w, r, s3err.ErrNoSuchKey)
-			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
-			return nil
-		case ifMatch != "" && ifMatch != "*" && !existing.MatchesETagHeader(ifMatch, true):
-			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
-			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
-			return nil
-		case ifNoneMatch != "" && exists && (ifNoneMatch == "*" || existing.MatchesETagHeader(ifNoneMatch, false)):
-			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
-			metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
-			return nil
-		}
+	conditional := r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != ""
+	code, err := s.checkPutConditions(r, existing, found)
+	if err != nil {
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return err
+	}
+	if code != "" {
+		s3err.WriteError(w, r, code)
+		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())
+		return nil
 	}
 
 	// Decoded size, not wire size: a streaming-signed SDK upload frames the body
@@ -659,7 +652,7 @@ func (s *Service) handleOriginlessPut(w http.ResponseWriter, r *http.Request, pr
 		return s.cache.PutMetaIfVersion(ctx, bucket, key, meta, ttl, token)
 	}
 	var wrote bool
-	wrote, err := store(expected)
+	wrote, err = store(expected)
 	if err != nil {
 		ambiguousCommit = true
 		metrics.RecordRequest("PutObject", "error", metrics.SourceLocal, time.Since(start).Seconds())

@@ -109,15 +109,34 @@ func decodeBody(r *http.Request, vr *auth.ValidatedRequest) (body io.ReadCloser,
 // (streaming SigV4), the body is decoded on-the-fly — verifying each chunk's
 // signature for the signed marker — and forwarded as UNSIGNED-PAYLOAD.
 func (f *signingForwarder) Forward(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+	return f.forward(ctx, w, r, false)
+}
+
+func (f *signingForwarder) forwardPutWithoutConditions(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+	return f.forward(ctx, w, r, true)
+}
+
+func (f *signingForwarder) forward(ctx context.Context, w http.ResponseWriter, r *http.Request, localConditions bool) error {
 	vr, secretKey, err := f.validate(r)
 	if err != nil {
 		return err
 	}
-	body, bodyHash, contentLength, chunked, err := decodeBody(r, vr)
-	if err != nil {
-		return err
+	var body io.ReadCloser
+	var bodyHash string
+	var contentLength int64
+	var chunked bool
+	if localConditions {
+		r, err = preparePutWithoutConditions(ctx, r, vr)
+		if err != nil {
+			return err
+		}
+		body, bodyHash, contentLength = r.Body, r.Header.Get("X-Amz-Content-Sha256"), r.ContentLength
+	} else {
+		body, bodyHash, contentLength, chunked, err = decodeBody(r, vr)
+		if err != nil {
+			return err
+		}
 	}
-
 	fwdReq, err := f.signForward(ctx, r, body, bodyHash, contentLength, chunked, vr.AccessKey, secretKey)
 	if err != nil {
 		return err

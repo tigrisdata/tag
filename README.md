@@ -178,7 +178,7 @@ See [docs/architecture.md](docs/architecture.md) for detailed architecture docum
 
 ### Tiered Store Mode
 
-In tiered mode, validated plain-object PUTs no larger than `cache.size_threshold` are stored locally, and their metadata is authoritative. A background re-tier started by a GET is bound to the marker version seen by that GET, so it cannot replace metadata committed by a later write. See [docs/tiered-mode.md](docs/tiered-mode.md) for the full behavior.
+In tiered mode, validated plain-object PUTs no larger than `cache.size_threshold` are stored locally, and their metadata is authoritative. PUT preconditions follow the prior tier even when a larger replacement moves the body upstream: TAG checks a local prior itself and leaves upstream-tier conditions to upstream. A background re-tier started by a GET is bound to the marker version seen by that GET, so it cannot replace metadata committed by a later write. See [docs/tiered-mode.md](docs/tiered-mode.md) for the full behavior.
 
 ## Performance
 

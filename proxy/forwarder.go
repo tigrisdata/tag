@@ -522,7 +522,7 @@ func headersForForwardedSigning(headers http.Header, chunked bool) http.Header {
 	}
 	forwarded := headers.Clone()
 	forwarded.Del("X-Amz-Decoded-Content-Length")
-	if ce := forwarded.Get("Content-Encoding"); ce != "" {
+	if ce := strings.Join(forwarded.Values("Content-Encoding"), ","); ce != "" {
 		if stripped := stripAWSChunkedToken(ce); stripped == "" {
 			forwarded.Del("Content-Encoding")
 		} else {
