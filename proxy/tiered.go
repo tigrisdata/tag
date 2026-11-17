@@ -170,7 +170,7 @@ func (s *Service) handleTieredPut(w http.ResponseWriter, r *http.Request) error 
 	// forwards and never needs the prior version — a metadata failure must not
 	// block a PUT that goes upstream anyway (including the unknown-key writes
 	// that bootstrap credential learning).
-	conditional := r.Header.Get("If-Match") != "" || r.Header.Get("If-None-Match") != ""
+	conditional := strings.Join(r.Header.Values("If-Match"), ",") != "" || strings.Join(r.Header.Values("If-None-Match"), ",") != ""
 
 	// A local-tier write while the store is over its disk budget would be
 	// evicted before it is read; send it upstream instead (the upstream tier is

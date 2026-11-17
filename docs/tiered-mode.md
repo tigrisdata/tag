@@ -23,8 +23,10 @@ routed to the local tier checks a concrete SigV4 payload hash against the
 streamed bytes before that commit.
 Conditional writes against an upstream-tier marker stay on the forwarding
 path. `UNSIGNED-PAYLOAD` and aws-chunked streaming markers retain their
-existing handling. `If-Match`/`If-None-Match` are honored; GET, HEAD, and
-DELETE are served entirely locally. Reads and writes of small objects
+existing handling. `If-Match`/`If-None-Match` are honored: repeated field
+lines are evaluated as one comma-separated entity-tag list, with strong
+comparison for `If-Match` and weak comparison for `If-None-Match`. GET, HEAD,
+and DELETE are served entirely locally. Reads and writes of small objects
 generate zero upstream traffic.
 
 **Large objects are the upstream tier.** The PUT passes through to upstream and
