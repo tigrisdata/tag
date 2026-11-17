@@ -275,6 +275,15 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 		return s.handleRangeWithBackgroundCache(ctx, w, r, bucket, key, accessKey, secretKey, start, xCache)
 	}
 
+	// Coalesce only locally validated callers. A listener receives the fetcher's
+	// upstream status, headers and body, so a caller TAG has not validated
+	// (anonymous, unknown key, bad signature, no cached authz for this bucket)
+	// must get Tigris's decision on its own request: it neither joins another
+	// caller's broadcast nor hosts one a validated caller could join.
+	if result != AuthValidated {
+		return s.fetchIndependently(ctx, w, r, bucket, key, accessKey, secretKey, start, xCache)
+	}
+
 	// Full object request: use broadcast manager for streaming coalescing
 	bcastKey := makeBroadcastKey(bucket, key, rangeHeader)
 	broadcaster, isFirstCaller := s.broadcastManager.GetOrCreate(bcastKey)
@@ -298,20 +307,27 @@ func (s *Service) HandleGetObject(w http.ResponseWriter, r *http.Request) error 
 		// Streaming already started (no late joiners). This request needs an
 		// independent broadcast: sharing a late key would let multiple upstream
 		// producers send different response headers and chunks to the same listeners.
-		metrics.RecordBroadcastFetch()
-		newBroadcaster := broadcast.NewBroadcaster(s.config.Broadcast.ChannelBuffer)
-		s.activeIndependentBroadcasts.Add(1)
-		s.setActiveBroadcasts()
-		defer func() {
-			s.activeIndependentBroadcasts.Add(-1)
-			s.setActiveBroadcasts()
-		}()
-		return s.fetchAndBroadcast(ctx, w, r, bucket, key, accessKey, secretKey, newBroadcaster, start, xCache)
+		return s.fetchIndependently(ctx, w, r, bucket, key, accessKey, secretKey, start, xCache)
 	}
 
 	// Successfully subscribed - receive streamed chunks
 	metrics.RecordBroadcastShared()
 	return s.receiveFromBroadcastListener(ctx, w, listener, start, xCache)
+}
+
+// fetchIndependently serves the request from its own upstream fetch through a
+// broadcaster that is never registered with the broadcast manager, so no other
+// caller can subscribe to it.
+func (s *Service) fetchIndependently(ctx context.Context, w http.ResponseWriter, r *http.Request, bucket, key, accessKey, secretKey string, start time.Time, xCache string) error {
+	metrics.RecordBroadcastFetch()
+	newBroadcaster := broadcast.NewBroadcaster(s.config.Broadcast.ChannelBuffer)
+	s.activeIndependentBroadcasts.Add(1)
+	s.setActiveBroadcasts()
+	defer func() {
+		s.activeIndependentBroadcasts.Add(-1)
+		s.setActiveBroadcasts()
+	}()
+	return s.fetchAndBroadcast(ctx, w, r, bucket, key, accessKey, secretKey, newBroadcaster, start, xCache)
 }
 
 // makeBroadcastKey creates a unique key for broadcast coalescing.
