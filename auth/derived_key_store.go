@@ -10,9 +10,7 @@ import (
 // 48 hours covers today + yesterday for SigV4 clock skew tolerance.
 const DefaultDerivedKeyTTL = 48 * time.Hour
 
-// maxDerivedKeyStoreSize is the maximum number of signing key entries.
-// Each entry is a composite key (~80 bytes) mapped to a 32-byte signing key,
-// plus LRU node overhead (~200 bytes). At ~300 bytes per entry, 100K entries ≈ 30MB.
+// maxDerivedKeyStoreSize bounds the total signing-key entries across all shards.
 const maxDerivedKeyStoreSize = 100_000
 
 // maxAccessKeyCacheSize is the maximum number of tracked access keys.
@@ -22,7 +20,7 @@ const maxAccessKeyCacheSize = 100_000
 // Keys are indexed by (accessKey, date, region) and expire after a configurable TTL.
 // It implements the KeyProvider interface.
 type DerivedKeyStore struct {
-	keys       *expirable.LRU[string, []byte]
+	keys       *readMostlyTTLTable[[]byte]
 	accessKeys *expirable.LRU[string, struct{}]
 }
 
@@ -32,14 +30,14 @@ func NewDerivedKeyStore(ttl time.Duration) *DerivedKeyStore {
 		ttl = DefaultDerivedKeyTTL
 	}
 	return &DerivedKeyStore{
-		keys:       expirable.NewLRU[string, []byte](maxDerivedKeyStoreSize, nil, ttl),
+		keys:       newReadMostlyTTLTable[[]byte](maxDerivedKeyStoreSize, ttl),
 		accessKeys: expirable.NewLRU[string, struct{}](maxAccessKeyCacheSize, nil, ttl),
 	}
 }
 
 // Store adds or updates a derived signing key for the given access key, date, and region.
 func (d *DerivedKeyStore) Store(accessKey, date, region string, signingKey []byte) {
-	d.keys.Add(makeKey(accessKey, date, region), signingKey)
+	d.keys.Store(makeKey(accessKey, date, region), signingKey)
 	d.accessKeys.Add(accessKey, struct{}{})
 }
 
@@ -55,7 +53,7 @@ func (d *DerivedKeyStore) GetSigningKey(accessKey, date, region string) ([]byte,
 }
 
 // HasKey returns whether any signing key exists for the given access key.
-// Implements the KeyProvider interface.
+// It is used only to classify validation failures. Implements KeyProvider.
 func (d *DerivedKeyStore) HasKey(accessKey string) bool {
 	_, ok := d.accessKeys.Get(accessKey)
 	return ok
