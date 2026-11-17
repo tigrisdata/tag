@@ -188,6 +188,41 @@ func TestCachedObjectMeta_IsCacheable(t *testing.T) {
 	}
 }
 
+func TestCachedObjectMeta_MatchesETagHeader(t *testing.T) {
+	tests := []struct {
+		name   string
+		etag   string
+		header string
+		strong bool
+		want   bool
+	}{
+		{name: "single comma tag", etag: `"a,b"`, header: `"a,b"`, want: true},
+		{name: "weak comma in list", etag: `"a,b"`, header: `"other", W/"a,b"`, want: true},
+		{name: "strong comma in list", etag: `"a,b"`, header: `"other", "a,b"`, strong: true, want: true},
+		{name: "weak client cannot match strongly", etag: `"a,b"`, header: `W/"a,b"`, strong: true},
+		{name: "weak stored tag cannot match strongly", etag: `W/"a,b"`, header: `"a,b"`, strong: true},
+		{name: "weak stored tag matches weakly", etag: `W/"a,b"`, header: `"a,b"`, want: true},
+		{name: "prefix is not a tag", etag: `"a"`, header: `"a,b"`},
+		{name: "suffix is not a tag", etag: `"b"`, header: `"a,b"`},
+		{name: "next tag after comma tag", etag: `"current"`, header: `"a,b", "current"`, want: true},
+		{name: "backslash is literal", etag: `"a\,b"`, header: `W/"a\,b", "other"`, want: true},
+		{name: "ordinary list", etag: `"current"`, header: `"old", "current"`, want: true},
+		{name: "bare tag compatibility", etag: `"current"`, header: `old, current`, want: true},
+		{name: "empty list elements", etag: `"a,b"`, header: `, , "a,b",`, want: true},
+		{name: "wildcard", etag: `"a,b"`, header: " * ", strong: true, want: true},
+		{name: "no stored validator", header: "*"},
+		{name: "empty header", etag: `"a,b"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta := &CachedObjectMeta{ETag: tt.etag}
+			if got := meta.MatchesETagHeader(tt.header, tt.strong); got != tt.want {
+				t.Errorf("MatchesETagHeader(%q, strong=%v) for %q = %v, want %v", tt.header, tt.strong, tt.etag, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestMakeMetaKey(t *testing.T) {
 	expected := "meta|my-bucket|path/to/object.txt"
 	result := MakeMetaKey("my-bucket", "path/to/object.txt")

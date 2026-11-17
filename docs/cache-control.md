@@ -8,7 +8,7 @@ TAG supports RFC 7234-compliant cache revalidation. Clients can control caching 
 | ------------- | -------------------------------------------------------------------------------- |
 | `HIT`         | A cache entry was selected to serve the response (including revalidation that confirmed the object is unchanged) |
 | `MISS`        | Not in cache, fetched from upstream and now cached                               |
-| `REVALIDATED` | Revalidated with upstream, object changed, new content returned                  |
+| `REVALIDATED` | Revalidation found a changed object; client validators may still yield a bodyless 304 |
 | `BYPASS`      | Cache bypassed entirely (client requested `no-store`, or the request carries a representation selector: `versionId`, `partNumber`, `response-*`) |
 | `DISABLED`    | Caching is disabled server-side (`TAG_CACHE_DISABLED=true`)                      |
 
@@ -16,7 +16,7 @@ In block mode, a committed stream can recover missing bytes from an upstream ran
 
 ## Force Revalidation
 
-Send `Cache-Control: no-cache` or `Cache-Control: max-age=0` to force TAG to check with upstream before serving a cached object. TAG sends a conditional request using the cached ETag. If the object hasn't changed, upstream returns 304 and TAG serves from cache (`X-Cache: HIT`). If changed, TAG streams the new content (`X-Cache: REVALIDATED`).
+Send `Cache-Control: no-cache` or `Cache-Control: max-age=0` to force TAG to check with upstream before serving a cached object. For GET, TAG sends a synthetic conditional request using the cached ETag. The origin reply checks cache freshness; TAG then evaluates the client's original validators against the confirmed representation. Multiple `If-None-Match` field values are treated as one comma-separated list, and `If-None-Match` takes precedence over `If-Modified-Since`. If they match, TAG returns a bodyless 304 without reading the cached body. Otherwise, an origin 304 serves the cached full object or requested range (`X-Cache: HIT`). If that 304 changes the cached ETag and the client still needs a body, TAG forwards the original request before committing so the body matches the new validator. An origin 200 or 206 returns the changed full or ranged response (`X-Cache: REVALIDATED`) unless the client's validator matches the new representation; in that case TAG returns a bodyless 304 while preserving the existing cache update or rewarm when eligible. This conditional-response behavior applies to GET; HEAD uses its separate revalidation path.
 
 ```bash
 # Force revalidation on GET
@@ -30,7 +30,7 @@ curl -H "Cache-Control: no-cache" -H "Range: bytes=0-99" \
   http://localhost:8080/my-bucket/my-key
 ```
 
-If the revalidation request to upstream fails, TAG serves the stale cached copy as a fallback.
+If the revalidation request to upstream fails, TAG serves the stale cached copy as a fallback. The client's validators are evaluated against that stale representation, but an origin failure remains a failed revalidation rather than a successful validation.
 
 ## Bypass Cache
 
