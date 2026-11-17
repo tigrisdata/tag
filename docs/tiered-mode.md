@@ -27,6 +27,11 @@ existing handling. `If-Match`/`If-None-Match` are honored; GET, HEAD, and
 DELETE are served entirely locally. Reads and writes of small objects
 generate zero upstream traffic.
 
+A forwarded `DeleteObjects` request removes local metadata only when a complete,
+parseable 2xx result establishes that at least one requested delete for the key
+succeeded; an incomplete or unparseable result does not authorize metadata
+removal.
+
 **Large objects are the upstream tier.** The PUT passes through to upstream and
 TAG stores a metadata marker locally. HEAD answers from the marker; GET
 forwards for the body — the mode's only body traffic. DELETE forwards and

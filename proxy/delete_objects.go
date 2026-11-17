@@ -49,8 +49,8 @@ type deleteObjectsResult struct {
 // whether the response parsed. Counting by key (not by version) is deliberate: it
 // is robust to VersionId representation differences between request and response
 // (omitted "" vs "null" vs a concrete id), which exact-tuple matching gets wrong.
-// On a parse failure the caller re-invalidates all requested keys (safe
-// over-invalidation).
+// On a parse failure proxy-mode callers keep their conservative all-key
+// invalidation fallback.
 func erroredDeleteKeyCounts(body []byte) (map[string]int, bool) {
 	var result deleteObjectsResult
 	if err := xml.Unmarshal(body, &result); err != nil {
@@ -141,7 +141,8 @@ func (w *deleteObjectsResponseStager) commit(dst http.ResponseWriter, capture *R
 }
 
 // HandleDeleteObjects handles POST /{bucket}?delete for bulk object deletion.
-// Invalidates cache for requested objects BEFORE forwarding to ensure consistency.
+// Proxy modes invalidate requested cache keys before forwarding; tiered mode
+// converges authoritative metadata only after a complete, parsed result.
 func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) error {
 	start := time.Now()
 	bucket, _ := ParseBucketKey(r)
@@ -155,8 +156,9 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	}
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
-	// Parse request to get keys being deleted and invalidate cache BEFORE forwarding
-	// This ensures cache consistency even if forwarding fails after cache invalidation.
+	// Parse the request to identify keys and capture tiered versions before forwarding.
+	// Proxy modes invalidate cache entries before forwarding for consistency; tiered
+	// mode keeps authoritative metadata until an upstream result authorizes convergence.
 	// requestedCounts tracks how many entries each key was requested under (the same
 	// key may appear multiple times with different version IDs).
 	var requestedCounts map[string]int
@@ -216,16 +218,15 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 	// <Error> elements for partial failures.
 	capture, err := s.forwarder.ForwardWithCapture(r.Context(), forwardWriter, r)
 
-	// Re-invalidate AFTER upstream confirms the deletes, for the same
-	// read-after-write reason as HandleDeleteObject: a GET racing the in-flight
-	// bulk delete may have re-cached a not-yet-deleted object; this second fence bump
-	// blocks that stale repopulation. A key is re-invalidated when at least one of
-	// its requested entries was deleted — i.e. more entries were requested for the
-	// key than upstream reported as errored. Counting by key (never matching version
-	// IDs) is robust to VersionId representation differences and to Quiet mode, and
-	// can never leave a truly-deleted object cached (a success is never an <Error>).
-	// A key whose entries ALL errored keeps its refill (it's still upstream).
-	// Routed through invalidateObject so a failed re-invalidation is recorded/logged.
+	// Reconcile cache state after a successful upstream status. For a parsed
+	// result, a key is re-invalidated when at least one requested entry was
+	// deleted — more entries were requested for the key than upstream reported as
+	// errored. Counting by key (not VersionId) handles representation differences
+	// and Quiet mode; keys whose entries all errored keep their metadata. Proxy modes
+	// retain conservative all-key invalidation for an unparseable result. Tiered mode
+	// processes results only when capture is complete and parsed, so an incomplete or
+	// unparseable result cannot remove authoritative metadata.
+	// Routed through invalidateObject so proxy-mode fence failures are recorded.
 	if err == nil && capture != nil && capture.StatusCode >= 200 && capture.StatusCode < 300 && s.cache.IsEnabled() {
 		// Upstream has committed the deletes, so a client disconnect must not
 		// abandon the fence (WithoutCancel); the timeout keeps a stalled cache
@@ -235,26 +236,32 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		fenceCtx, cancelFence := context.WithTimeout(context.WithoutCancel(r.Context()), bulkDeleteFenceTimeout)
 		fencedKeys, skippedKeys := 0, 0
 		erroredCounts, parsed := erroredDeleteKeyCounts(capture.Body)
-		for key, reqN := range requestedCounts {
-			// On a parse failure, over-invalidate every requested key (safe).
-			if parsed && reqN <= erroredCounts[key] {
-				continue // every requested entry for this key errored — object still present
+		// Proxy-mode caches can conservatively discard every requested key when
+		// the result cannot be parsed. Tiered metadata is authoritative, so only
+		// a complete, parsed result can authorize a versioned local converge.
+		if tieredPriors == nil || (capture.Complete && parsed) {
+			for key, reqN := range requestedCounts {
+				// Parse failures reach this loop only in proxy mode, which keeps its
+				// conservative all-key invalidation fallback.
+				if parsed && reqN <= erroredCounts[key] {
+					continue // every requested entry for this key errored — object still present
+				}
+				// Once the shared deadline has passed, stop starting per-key fences in
+				// either mode: the tiered helper runs under its own per-key timeout, so
+				// without this check a large tiered batch could hold the 2xx for N times
+				// that timeout. Skipped keys age out via TTL and are counted below.
+				if fenceCtx.Err() != nil {
+					skippedKeys++
+					continue
+				}
+				fencedKeys++
+				if tieredPriors != nil {
+					p := tieredPriors[key]
+					s.convergeTieredDelete(bucket, key, p.version, p.known)
+					continue
+				}
+				s.convergeInvalidation(fenceCtx, bucket, key)
 			}
-			// Once the shared deadline has passed, stop starting per-key fences in
-			// either mode: the tiered helper runs under its own per-key timeout, so
-			// without this check a large tiered batch could hold the 2xx for N times
-			// that timeout. Skipped keys age out via TTL and are counted below.
-			if fenceCtx.Err() != nil {
-				skippedKeys++
-				continue
-			}
-			fencedKeys++
-			if tieredPriors != nil {
-				p := tieredPriors[key]
-				s.convergeTieredDelete(bucket, key, p.version, p.known)
-				continue
-			}
-			s.convergeInvalidation(fenceCtx, bucket, key)
 		}
 		if fenceCtx.Err() != nil {
 			log.Warn().
