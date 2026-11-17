@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -140,6 +141,23 @@ func (w *deleteObjectsResponseStager) commit(dst http.ResponseWriter, capture *R
 	}
 }
 
+var deleteObjectsCopyBuffers = sync.Pool{
+	New: func() any { return new([32 * 1024]byte) },
+}
+
+// deleteObjectsStreamWriter reuses the fixed-size copy scratch instead of paying
+// io.Copy's allocation on every cache-disabled delete, including small replies.
+// The embedded recorder preserves capture forwarding's post-header error behavior.
+type deleteObjectsStreamWriter struct {
+	statusRecorder
+}
+
+func (w *deleteObjectsStreamWriter) ReadFrom(src io.Reader) (int64, error) {
+	buf := deleteObjectsCopyBuffers.Get().(*[32 * 1024]byte)
+	defer deleteObjectsCopyBuffers.Put(buf)
+	return io.CopyBuffer(&w.statusRecorder, src, buf[:])
+}
+
 // HandleDeleteObjects handles POST /{bucket}?delete for bulk object deletion.
 // Invalidates cache for requested objects BEFORE forwarding to ensure consistency.
 func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) error {
@@ -211,10 +229,21 @@ func (s *Service) HandleDeleteObjects(w http.ResponseWriter, r *http.Request) er
 		forwardWriter = responseStager
 	}
 
-	// Forward request to upstream, capturing the response so we can tell which
-	// per-object deletes actually succeeded — S3 returns 200 OK with per-key
-	// <Error> elements for partial failures.
-	capture, err := s.forwarder.ForwardWithCapture(r.Context(), forwardWriter, r)
+	// Only caching needs per-key results — S3 returns 200 OK with per-key
+	// <Error> elements for partial failures. Otherwise stream without a capture.
+	var capture *ResponseCapture
+	if s.cache.IsEnabled() {
+		capture, err = s.forwarder.ForwardWithCapture(r.Context(), forwardWriter, r)
+	} else {
+		rec := &deleteObjectsStreamWriter{statusRecorder: statusRecorder{ResponseWriter: w}}
+		err = s.forwarder.Forward(r.Context(), rec, r)
+		if rec.status != 0 {
+			// Capture forwarding reports body-copy failures via Complete rather
+			// than its error return. Preserve that return and metric behavior for
+			// cache-disabled deletes, which never inspected Complete.
+			err = nil
+		}
+	}
 
 	// Re-invalidate AFTER upstream confirms the deletes, for the same
 	// read-after-write reason as HandleDeleteObject: a GET racing the in-flight
