@@ -226,8 +226,8 @@ func (s *Server) setupRouter() *mux.Router {
 	// Mux rebuilds Router.Use chains on every match. Wrap the static route
 	// handlers once after registration to preserve the same middleware order.
 
-	// Health check endpoint
-	r.HandleFunc("/health", s.handleHealth).Methods("GET")
+	// Health check endpoint. HEAD too: the image HEALTHCHECK's `wget --spider` sends HEAD.
+	r.HandleFunc("/health", s.handleHealth).Methods("GET", "HEAD")
 
 	// Metrics endpoint for Prometheus
 	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
